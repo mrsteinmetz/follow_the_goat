@@ -1,0 +1,19 @@
+# Follow The Goat - Dependencies
+# ==============================
+
+# Database
+duckdb>=1.0.0
+
+# Scheduling (NO .bat files - use this instead)
+APScheduler>=3.10.0
+
+# HTTP requests
+requests>=2.31.0
+httpx>=0.27.0
+
+# Data processing
+pandas>=2.0.0
+
+# Environment management
+python-dotenv>=1.0.0
+

@@ -1,0 +1,50 @@
+DuckDB Setup for Trading Bot Price Data
+========================================
+
+Database File: 000data_feeds/1_jupiter_get_prices/prices.duckdb
+
+Tables:
+-------
+1. price_points (HOT TABLE - 24 hours)
+   - ts: TIMESTAMP - when price was fetched
+   - token: VARCHAR(10) - BTC, ETH, SOL
+   - price: DOUBLE - USD price
+   - Indexes: ts, token, (token, ts)
+
+2. price_points_archive (COLD STORAGE - all historical)
+   - Same schema as hot table
+   - Never auto-deleted
+
+CLI Commands:
+-------------
+# Open database
+./duckdb.exe ../000data_feeds/1_jupiter_get_prices/prices.duckdb
+
+# Query latest prices
+SELECT token, price, ts FROM price_points 
+WHERE (token, ts) IN (SELECT token, MAX(ts) FROM price_points GROUP BY token);
+
+# Price history for SOL (last hour)
+SELECT ts, price FROM price_points 
+WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 1 HOUR 
+ORDER BY ts;
+
+# Get OHLC candles (5 min)
+SELECT 
+    token,
+    time_bucket(INTERVAL '5 minutes', ts) AS bucket,
+    FIRST(price) AS open,
+    MAX(price) AS high,
+    MIN(price) AS low,
+    LAST(price) AS close
+FROM price_points
+WHERE token = 'BTC'
+GROUP BY token, bucket
+ORDER BY bucket DESC
+LIMIT 12;
+
+# Table stats
+SELECT 'hot' AS table_type, COUNT(*) as rows FROM price_points
+UNION ALL
+SELECT 'archive', COUNT(*) FROM price_points_archive;
+

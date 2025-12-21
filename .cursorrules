@@ -1,0 +1,166 @@
+# Follow The Goat - Project Rules
+
+## Project Overview
+This project is a clean rewrite migrating features from `000old_code/` to a new architecture.
+Once migration is complete, `000old_code/` will be deleted.
+
+---
+
+## Core Principles
+
+### 1. Clean Code
+- Minimal files - consolidate where possible
+- Clear, descriptive naming
+- Single responsibility per module
+- No duplicate code across features
+
+### 2. Database: DuckDB Only
+- **NO MySQL** - this project uses DuckDB exclusively
+- All database setup is documented in `duckdb/ARCHITECTURE.md`
+- Use the shared database connection pattern from `core/database.py`
+
+### 3. Hot/Cold Storage Pattern (24-Hour Window)
+Every data table follows this pattern:
+- **HOT table** (`table_name`): Last 24 hours only - optimized for speed
+- **COLD table** (`table_name_archive`): Historical data beyond 24 hours
+- Automatic archival runs via the scheduler
+
+```python
+# Example: price_points (hot) + price_points_archive (cold)
+# Data older than 24 hours is moved from hot to cold storage
+```
+
+### 4. Scheduling: APScheduler Only
+- **NEVER use .bat files** for scheduling Python scripts
+- All scheduled tasks run through `scheduler/master.py`
+- Use APScheduler with cron or interval triggers
+
+```python
+# Correct: APScheduler in master.py
+scheduler.add_job(archive_old_data, 'interval', hours=1)
+
+# WRONG: Never create .bat files for scheduling
+```
+
+---
+
+## Project Structure
+
+```
+follow_the_goat/
+├── .cursorrules           # This file
+├── core/                  # Shared utilities
+│   ├── database.py        # DuckDB connection manager
+│   ├── config.py          # Environment and settings
+│   └── logging.py         # Centralized logging
+├── scheduler/             # APScheduler master
+│   └── master.py          # Single entry point for all scheduled tasks
+├── features/              # Individual feature modules
+│   └── [feature_name]/    # One folder per feature
+├── duckdb/                # Database documentation
+│   ├── ARCHITECTURE.md    # Central DB schema reference
+│   └── duckdb.exe         # DuckDB CLI
+└── 000old_code/           # Legacy code (DO NOT MODIFY, reference only)
+```
+
+---
+
+## Database Conventions
+
+### Table Naming
+- Hot tables: `{feature}_{data_type}` (e.g., `trades_positions`)
+- Cold tables: `{feature}_{data_type}_archive` (e.g., `trades_positions_archive`)
+
+### Required Columns
+Every table must have:
+- `id`: INTEGER PRIMARY KEY (auto-increment)
+- `created_at`: TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+
+### Indexes
+Always create indexes on:
+- Timestamp columns used in queries
+- Foreign key relationships
+- Columns used in WHERE clauses
+
+---
+
+## Code Patterns
+
+### Database Connection
+```python
+from core.database import get_db
+
+def query_data():
+    with get_db() as conn:
+        result = conn.execute("SELECT * FROM table_name").fetchall()
+    return result
+```
+
+### Feature Module Structure
+```python
+# features/my_feature/main.py
+"""
+Feature: My Feature Name
+Migrated from: 000old_code/solana_node/path/to/original.py
+"""
+
+from core.database import get_db
+from core.config import settings
+
+def run():
+    """Main entry point for this feature."""
+    pass
+```
+
+### Scheduled Task Registration
+```python
+# In scheduler/master.py
+from features.my_feature.main import run as my_feature_run
+
+scheduler.add_job(
+    my_feature_run,
+    trigger='interval',
+    minutes=5,
+    id='my_feature',
+    name='My Feature Description'
+)
+```
+
+---
+
+## Migration Workflow
+
+When migrating a feature from `000old_code/`:
+
+1. **Reference only** - read the old code but don't modify it
+2. **Create new module** in `features/[feature_name]/`
+3. **Document origin** - note which old file(s) this replaces
+4. **Convert MySQL to DuckDB** queries
+5. **Implement hot/cold pattern** for any data storage
+6. **Register with scheduler** if it needs to run periodically
+7. **Test thoroughly** before marking migration complete
+
+---
+
+## Forbidden Practices
+
+❌ Never look in `/000old_code/` unless directly referenced for migration  
+❌ Never create `.bat` files for scheduling  
+❌ Never use MySQL - DuckDB only  
+❌ Never create duplicate utility files - use `core/`  
+❌ Never skip the hot/cold storage pattern for time-series data  
+
+---
+
+## File Locations
+
+| Purpose | Location |
+|---------|----------|
+| DuckDB databases | `000data_feeds/*/` or feature-specific |
+| DuckDB CLI | `duckdb/duckdb.exe` |
+| DB documentation | `duckdb/ARCHITECTURE.md` |
+| Scheduler | `scheduler/master.py` |
+| Shared code | `core/` |
+| Features | `features/` |
+| Legacy reference | `000old_code/` (read-only) |
+

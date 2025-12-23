@@ -1,0 +1,186 @@
+==================================================
+BUILD AND DEPLOY INSTRUCTIONS
+==================================================
+
+IMPORTANT: Build on YOUR computer, deploy to SERVER!
+The server doesn't need .NET SDK or internet access.
+
+==================================================
+STEP 1: BUILD ON YOUR LOCAL COMPUTER
+==================================================
+
+Location: C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+
+1. Open Command Prompt or PowerShell
+
+2. Navigate to the folder:
+   cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+
+3. Verify you're in the right place:
+   dir
+   (Should see Program.cs, SolWebhook.csproj, etc.)
+
+4. Run the build:
+   build-selfcontained.bat
+
+5. Wait for "SUCCESS! Build complete!"
+
+6. Verify 'publish-standalone' folder exists and has files
+
+==================================================
+STEP 2: COPY TO SERVER
+==================================================
+
+From: C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet\publish-standalone\
+To: C:\0000websites\quicknode\
+
+Copy ALL files and folders from publish-standalone to the server.
+
+Methods:
+- Remote Desktop: Copy/paste
+- Network share: \\server\share
+- USB drive
+- FTP/SFTP
+- Whatever you normally use to transfer files
+
+==================================================
+STEP 3: CONFIGURE ON SERVER
+==================================================
+
+On the server at: C:\0000websites\quicknode\
+
+1. You should now have:
+   - SolWebhook.exe
+   - Hundreds of .dll files
+   - web.config
+   - web-selfcontained.config
+   - appsettings.json
+   - etc.
+
+2. Delete or rename web.config (the old one)
+
+3. Rename web-selfcontained.config to web.config
+
+==================================================
+STEP 4: CONFIGURE IIS ON SERVER
+==================================================
+
+1. Open IIS Manager
+
+2. Create Application Pool:
+   - Name: SolWebhookPool
+   - .NET CLR Version: No Managed Code
+
+3. Create Site or Application:
+   - Physical path: C:\0000websites\quicknode
+   - Application Pool: SolWebhookPool
+   - Port: 80 (or your choice)
+   - Host name: (leave blank or set as needed)
+
+4. Make sure ASP.NET Core Module is installed:
+   - If you installed the hosting bundle earlier, you're good
+   - If not: https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+
+==================================================
+STEP 5: SET PERMISSIONS ON SERVER
+==================================================
+
+Give IIS permission to the folder:
+
+icacls "C:\0000websites\quicknode" /grant "IIS_IUSRS:(OI)(CI)F" /T
+
+==================================================
+STEP 6: RESTART IIS ON SERVER
+==================================================
+
+Open PowerShell as Administrator:
+
+iisreset
+
+==================================================
+STEP 7: TEST
+==================================================
+
+Open browser and go to:
+http://localhost/health
+
+Or:
+http://your-server-ip/health
+
+Should return:
+{"status":"healthy","timestamp":"..."}
+
+If you get this, SUCCESS! ✓
+
+==================================================
+STEP 8: UPDATE QUICKNODE
+==================================================
+
+1. Log into QuickNode dashboard
+
+2. Find your webhook configuration
+
+3. Update URL to:
+   http://your-server-ip/
+   (or http://your-domain.com/ if you have a domain)
+
+4. Test with PING from QuickNode
+
+5. Verify trades start being saved
+
+==================================================
+WHY BUILD ON LOCAL COMPUTER?
+==================================================
+
+✓ Local computer has internet (can download NuGet packages)
+✓ Server might not have internet
+✓ Server doesn't need .NET SDK (only runtime, which is included in self-contained build)
+✓ Build once, deploy anywhere
+
+The self-contained build includes everything needed to run,
+so the server doesn't need .NET installed at all!
+
+==================================================
+TROUBLESHOOTING
+==================================================
+
+Build fails on local computer:
+- Make sure you have internet connection
+- Make sure .NET SDK 8.0 is installed
+- Try: dotnet nuget list source
+  Should show: https://api.nuget.org/v3/index.json
+
+Can't access NuGet on local computer:
+- Check firewall
+- Check corporate proxy settings
+- Try: dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
+
+HTTP 500.31 on server:
+- Make sure you installed ASP.NET Core Module (hosting bundle)
+- Make sure web-selfcontained.config is renamed to web.config
+- Check Application Event Log for details
+
+Can't connect to database from server:
+- Verify MySQL is running: services.msc
+- Test connection: mysql -h 116.202.51.115 -u solcatcher -p
+- Check if database is on localhost (same machine)
+  If so, change connection string to: Server=localhost;...
+
+==================================================
+QUICK CHECKLIST
+==================================================
+
+□ Build on local computer (publish-standalone folder created)
+□ Copy to server: C:\0000websites\quicknode\
+□ Rename web-selfcontained.config to web.config
+□ Configure IIS site/app
+□ Set folder permissions (icacls)
+□ Install ASP.NET Core Module (hosting bundle)
+□ Restart IIS (iisreset)
+□ Test /health endpoint
+□ Update QuickNode URL
+□ Monitor trades being saved
+
+==================================================
+
+

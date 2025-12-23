@@ -1,0 +1,149 @@
+==================================================
+FIX: Build Errors / NuGet Package Resolution
+==================================================
+
+ERROR YOU'RE SEEING:
+- "Unable to resolve MySqlConnector"
+- "Unable to resolve Microsoft.NETCore.App.Runtime"
+- ".NET 6.0 is out of support"
+
+CAUSE:
+- Project was targeting .NET 6.0 (out of support)
+- Your SDK is .NET 10 (very new)
+- NuGet cache might have old/corrupted packages
+
+==================================================
+FIX 1: Use Updated Files (EASIEST)
+==================================================
+
+I've updated the project to .NET 8.0 (current LTS).
+The build script now clears cache automatically.
+
+STEPS:
+1. Make sure you're in the correct directory:
+   cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+
+2. Run the updated build script:
+   build-selfcontained.bat
+
+   This will:
+   - Clear NuGet cache
+   - Restore packages
+   - Build self-contained version
+
+3. If successful, you'll get a 'publish-standalone' folder
+
+==================================================
+FIX 2: Manual Cache Clear
+==================================================
+
+If build still fails, manually clear cache:
+
+1. Open PowerShell or Command Prompt
+
+2. Run these commands:
+   dotnet nuget locals all --clear
+   dotnet restore
+   dotnet publish -c Release -o publish-standalone --self-contained true -r win-x64
+
+==================================================
+FIX 3: Check NuGet Sources
+==================================================
+
+1. Check NuGet sources:
+   dotnet nuget list source
+
+2. Should see nuget.org:
+   https://api.nuget.org/v3/index.json
+
+3. If not there, add it:
+   dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org
+
+==================================================
+FIX 4: Use .NET 8.0 SDK Instead of .NET 10
+==================================================
+
+.NET 10 is a preview version. For production:
+
+1. Uninstall .NET 10 SDK (optional)
+
+2. Install .NET 8.0 SDK:
+   https://dotnet.microsoft.com/download/dotnet/8.0
+   Choose: SDK x64
+
+3. Restart Command Prompt / PowerShell
+
+4. Verify:
+   dotnet --version
+   (Should show 8.0.x)
+
+5. Try build again:
+   build-selfcontained.bat
+
+==================================================
+ALTERNATIVE: Build on Different Computer
+==================================================
+
+If you have another computer with .NET SDK installed:
+
+1. Copy this entire 'webhook-dotnet' folder to that computer
+
+2. Run: build-selfcontained.bat
+
+3. Copy the 'publish-standalone' folder back to your IIS server
+
+4. Deploy as normal
+
+==================================================
+VERIFY .NET SDK INSTALLATION
+==================================================
+
+Run these commands to check your setup:
+
+1. dotnet --version
+   Should show: 8.0.x or 10.0.x
+
+2. dotnet --list-sdks
+   Should show installed SDK versions
+
+3. dotnet --info
+   Shows detailed info about .NET installation
+
+==================================================
+COMMON ISSUES
+==================================================
+
+Issue: "dotnet command not found"
+Fix: .NET SDK not in PATH
+     Reinstall .NET SDK and restart terminal
+
+Issue: "NuGet package restore failed"
+Fix: Check internet connection
+     Check firewall/proxy settings
+     Clear NuGet cache
+
+Issue: "Out of support warning"
+Fix: This is just a warning (now using .NET 8.0)
+     Can be ignored or upgrade to .NET 8.0 SDK
+
+Issue: "Wrong path in error message"
+Fix: Make sure you're running from correct folder:
+     C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+     NOT from: C:\00pythonscripts\...
+
+==================================================
+QUICK TEST
+==================================================
+
+After successful build:
+
+1. Check publish-standalone folder exists
+2. Should have 80-100MB of files
+3. Should have SolWebhook.exe file
+4. Should have hundreds of .dll files
+
+If yes, you're ready to deploy!
+
+==================================================
+
+

@@ -1,0 +1,29 @@
+DEPLOYMENT STEPS FOR IIS
+========================
+
+1. Build the application:
+   dotnet publish -c Release -o publish
+
+2. Copy the 'publish' folder contents to your IIS server
+
+3. In IIS Manager:
+   - Create new Application Pool
+   - Set .NET CLR Version to "No Managed Code"
+   - Create new Website or Application
+   - Point to the publish folder
+   - Set Application Pool to the one created above
+
+4. Test:
+   http://your-server/health
+   
+5. Update QuickNode webhook URL to:
+   http://your-server/
+
+REQUIREMENTS:
+- .NET 6.0 Runtime or .NET 6.0 Hosting Bundle installed on IIS server
+- Download: https://dotnet.microsoft.com/download/dotnet/6.0
+- Alternative: .NET 8.0 also works (change TargetFramework in .csproj to net8.0)
+
+TESTING:
+curl -X POST http://your-server/ -H "Content-Type: application/json" -d "{\"message\":\"PING\"}"
+

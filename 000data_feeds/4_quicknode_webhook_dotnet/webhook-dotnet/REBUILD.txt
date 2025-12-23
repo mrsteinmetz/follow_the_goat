@@ -1,0 +1,48 @@
+==================================================
+UPDATED: Added Welcome Page at Root
+==================================================
+
+The webhook now has a nice welcome page when you visit
+the root URL in a browser.
+
+WHAT TO DO NOW:
+==================================================
+
+1. ON YOUR LOCAL COMPUTER:
+   cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+   
+   Run: build-selfcontained.bat
+
+2. COPY TO SERVER:
+   Copy ALL files from 'publish-standalone' to:
+   C:\0000websites\quicknode\
+   
+   (Replace existing files)
+
+3. ON SERVER:
+   iisreset
+
+4. TEST:
+   Browse to: http://your-server/
+   
+   You should now see a nice welcome page with:
+   ✓ Status indicator
+   ✓ Available endpoints
+   ✓ Link to /health endpoint
+
+==================================================
+ENDPOINTS NOW AVAILABLE:
+==================================================
+
+GET /
+  → Shows welcome page (what you see in browser)
+
+GET /health
+  → JSON health status with recent trade count
+
+POST /
+  → Main webhook for QuickNode to send trades
+
+==================================================
+
+

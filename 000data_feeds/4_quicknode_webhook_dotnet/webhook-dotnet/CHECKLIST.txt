@@ -1,0 +1,169 @@
+╔══════════════════════════════════════════════════════════════╗
+║                    DEPLOYMENT CHECKLIST                      ║
+║          For HTTP 500.31 Error (No .NET Core Runtime)        ║
+╚══════════════════════════════════════════════════════════════╝
+
+STEP 1: BUILD SELF-CONTAINED VERSION
+─────────────────────────────────────
+On YOUR computer (where you have these files):
+
+□ Double-click: build-selfcontained.bat
+  (Or run: build-selfcontained.ps1)
+
+□ Wait for "Build complete!" message
+
+□ Verify 'publish-standalone' folder was created
+
+STEP 2: COPY TO IIS SERVER
+─────────────────────────────────────
+□ Open: publish-standalone folder
+
+□ Select ALL files and folders inside
+
+□ Copy to IIS server at:
+  C:\inetpub\wwwroot\solwebhook\
+  (Or your chosen path)
+
+□ Verify all files copied successfully
+  (Should have SolWebhook.exe and many .dll files)
+
+STEP 3: FIX WEB.CONFIG
+─────────────────────────────────────
+In the folder on IIS server:
+
+□ Find: web.config (if it exists, DELETE it)
+
+□ Find: web-selfcontained.config
+
+□ Rename web-selfcontained.config to web.config
+
+STEP 4: INSTALL ASP.NET CORE MODULE (One-time only)
+─────────────────────────────────────
+On IIS SERVER:
+
+□ Download:
+  https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+
+□ Run the installer
+
+□ Follow the prompts (default options are fine)
+
+□ Installer completes
+
+NOTE: This is ONLY the IIS module, not full .NET!
+      Takes 1-2 minutes to install.
+
+STEP 5: RESTART IIS
+─────────────────────────────────────
+On IIS SERVER:
+
+□ Open PowerShell as Administrator
+
+□ Run: iisreset
+
+□ Wait for "Internet services successfully restarted"
+
+STEP 6: TEST
+─────────────────────────────────────
+□ Open browser
+
+□ Go to: http://YOUR-SERVER-IP/health
+  (Replace YOUR-SERVER-IP with actual IP or localhost)
+
+□ Should see: {"status":"healthy","timestamp":"...",...}
+
+□ If yes: SUCCESS! ✓
+
+□ If no: See TROUBLESHOOTING section below
+
+STEP 7: UPDATE QUICKNODE (If test passed)
+─────────────────────────────────────
+□ Log into QuickNode dashboard
+
+□ Find your webhook configuration
+
+□ Update URL to: http://YOUR-SERVER-IP/
+
+□ Save changes
+
+□ Test with PING from QuickNode
+
+□ Verify trades are being saved to database
+
+
+═══════════════════════════════════════════════════════════════
+
+TROUBLESHOOTING
+═══════════════════════════════════════════════════════════════
+
+ERROR: Still getting HTTP 500.31
+─────────────────────────────────────
+□ Check: Did you rename web-selfcontained.config to web.config?
+
+□ Check: Did you install ASP.NET Core Module?
+  Verify: Open IIS Manager > Server > Modules
+         Look for "AspNetCoreModuleV2"
+
+□ Check: Did you run iisreset?
+
+□ Check Application Event Log:
+  Run: eventvwr.msc
+  Look in: Windows Logs > Application
+  Look for ASP.NET Core errors
+
+
+ERROR: 404 Not Found
+─────────────────────────────────────
+□ Check: Is your IIS site/application pointing to correct folder?
+
+□ Check: Is the application pool running?
+
+□ Check: Are files actually in the folder?
+
+
+ERROR: 403 Forbidden
+─────────────────────────────────────
+□ Fix permissions:
+  Run as Admin: 
+  icacls "C:\inetpub\wwwroot\solwebhook" /grant "IIS_IUSRS:(OI)(CI)F" /T
+
+
+ERROR: Cannot connect to database
+─────────────────────────────────────
+□ Check: Is MySQL running?
+
+□ Check: Can you connect from IIS server?
+  Test: mysql -h 116.202.51.115 -u solcatcher -p
+
+□ Check: Firewall rules (if connecting remotely)
+
+
+═══════════════════════════════════════════════════════════════
+
+VERIFY EVERYTHING IS WORKING
+═══════════════════════════════════════════════════════════════
+
+Test 1: Health Check
+□ http://YOUR-SERVER/health
+□ Returns JSON with "status":"healthy"
+
+Test 2: PING
+□ curl -X POST http://YOUR-SERVER/ -H "Content-Type: application/json" -d "{\"message\":\"PING\"}"
+□ Returns: {"status":"success","message":"PONG"}
+
+Test 3: Database Check
+□ Run: SELECT COUNT(*) FROM sol_stablecoin_trades WHERE created_at >= NOW() - INTERVAL 5 MINUTE;
+□ Should show recent trades after QuickNode starts sending
+
+═══════════════════════════════════════════════════════════════
+
+DONE! Webhook should now be running on your fast IIS server!
+
+Expected performance:
+- Response time: < 10ms (vs 50ms on PHP server)
+- Zero network latency to database
+- 200x faster hardware
+
+═══════════════════════════════════════════════════════════════
+
+

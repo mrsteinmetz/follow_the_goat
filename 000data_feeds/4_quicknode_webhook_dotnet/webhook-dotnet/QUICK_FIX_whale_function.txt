@@ -1,0 +1,140 @@
+===================================================================
+ QUICK FIX - Whale Activity Raw Data JSON
+===================================================================
+
+PROBLEM:
+--------
+You added raw_data_json to the WRONG place in your JavaScript function.
+It's currently at the root result object, but needs to be on EACH 
+whale movement object.
+
+SOLUTION:
+---------
+Make TWO changes to your QuickNode whale activity function:
+
+===================================================================
+ CHANGE #1: Add raw_data_json to each whale movement
+===================================================================
+
+Find this section (around line 340):
+
+    whaleMovements.push({
+      signature: tx.transaction.signatures?.[0] || 'unknown',
+      wallet_address: walletAddress,
+      // ... lots of fields ...
+      perp_leverage: null,
+      perp_entry_price: null,
+      perp_debug_info: perpInfo.perp_details || null  // ← FIND THIS LINE
+    });
+
+Change it to:
+
+    whaleMovements.push({
+      signature: tx.transaction.signatures?.[0] || 'unknown',
+      wallet_address: walletAddress,
+      // ... lots of fields ...
+      perp_leverage: null,
+      perp_entry_price: null,
+      perp_debug_info: perpInfo.perp_details || null,  // ← ADD COMMA
+      
+      // ✅ ADD THIS LINE:
+      raw_data_json: data
+    });
+
+===================================================================
+ CHANGE #2: Remove raw_data_json from root result object
+===================================================================
+
+Find this section at the bottom (around line 410):
+
+    const result = {
+      whaleMovements: whaleMovements,
+      summary: { ... },
+      processingTimestamp: functionReceivedISO,
+      blockHeight: transactions[0]?.parentSlot || null,
+      raw_data_json: data  // ← REMOVE THIS LINE
+    };
+
+Change it to:
+
+    const result = {
+      whaleMovements: whaleMovements,
+      summary: { ... },
+      processingTimestamp: functionReceivedISO,
+      blockHeight: transactions[0]?.parentSlot || null
+      // ✅ raw_data_json removed from here - it's now on each movement
+    };
+
+===================================================================
+ WHY THIS MATTERS
+===================================================================
+
+Your C# webhook expects the data structure to be:
+
+{
+  "whaleMovements": [
+    {
+      "signature": "...",
+      "wallet_address": "...",
+      "raw_data_json": { ... }  ← HERE (on each movement)
+    }
+  ],
+  "summary": { ... }
+}
+
+NOT:
+
+{
+  "whaleMovements": [ ... ],
+  "summary": { ... },
+  "raw_data_json": { ... }  ← NOT HERE (on root)
+}
+
+===================================================================
+ AFTER MAKING CHANGES
+===================================================================
+
+1. Save the function in QuickNode
+2. Deploy it
+3. Wait 5-10 minutes for whale activity
+4. Check your database:
+
+   SELECT 
+       signature, 
+       whale_type, 
+       abs_change,
+       CASE 
+           WHEN raw_data_json IS NULL THEN '❌ NULL'
+           WHEN JSON_VALID(raw_data_json) THEN '✅ VALID'
+           ELSE '⚠️ INVALID'
+       END as status,
+       JSON_LENGTH(raw_data_json) as json_elements,
+       created_at
+   FROM whale_movements
+   ORDER BY created_at DESC
+   LIMIT 5;
+
+You should see '✅ VALID' in the status column.
+
+===================================================================
+ TROUBLESHOOTING
+===================================================================
+
+Still NULL after changes?
+-------------------------
+1. Check QuickNode function was saved AND deployed
+2. Check IIS is running the NEW build (rebuild & redeploy)
+3. Check IIS logs for errors:
+   [ERROR] Failed to insert whale movement
+   [WARNING] Failed to serialize raw_data_json
+
+No new whale movements at all?
+-------------------------------
+1. Check whale thresholds are being met:
+   - Wallet must have 1000+ SOL
+   - Movement must be 50+ SOL
+2. Check QuickNode stream is active
+3. Look at your last working movement to see the pattern
+
+===================================================================
+

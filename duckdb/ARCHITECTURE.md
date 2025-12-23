@@ -5,11 +5,48 @@
 
 ---
 
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         DATA FLOW ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ┌──────────────┐         ┌──────────────────┐         ┌────────────┐  │
+│   │   Python     │         │   Central API    │         │    PHP     │  │
+│   │   Services   │────────▶│  (Flask :5050)   │◀────────│  Frontend  │  │
+│   └──────────────┘         └────────┬─────────┘         └────────────┘  │
+│                                     │                                    │
+│                          ┌──────────┴──────────┐                        │
+│                          │    DUAL WRITE       │                        │
+│                          └──────────┬──────────┘                        │
+│                                     │                                    │
+│              ┌──────────────────────┼──────────────────────┐            │
+│              │                      │                      │            │
+│              ▼                      │                      ▼            │
+│   ┌──────────────────┐             │         ┌──────────────────┐      │
+│   │     DuckDB       │             │         │      MySQL       │      │
+│   │   (24hr Hot)     │◀────────────┘────────▶│  (Full History)  │      │
+│   │  central.duckdb  │                       │    solcatcher    │      │
+│   └──────────────────┘                       └──────────────────┘      │
+│                                                                          │
+│   • Fast reads for                            • Master storage           │
+│     recent data                               • All historical data      │
+│   • Auto-cleanup                              • Never deleted            │
+│     after 24 hours                            • Source of truth          │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Database Files
 
 | Database | Location | Purpose |
 |----------|----------|---------|
-| `prices.duckdb` | `000data_feeds/1_jupiter_get_prices/` | Token price data from Jupiter |
+| `central.duckdb` | `000data_feeds/` | Central DuckDB for all hot data (24hr) |
+| `prices.duckdb` | `000data_feeds/1_jupiter_get_prices/` | Jupiter price data (24hr hot, no archive) |
+| `solcatcher` | MySQL (116.202.51.115) | Master MySQL database (full history) |
 
 ---
 
@@ -23,106 +60,451 @@ Every time-series table follows this pattern:
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    HOT TABLE (24 hours)                          │
-│  • Fast queries for recent data                                  │
-│  • Indexes optimized for real-time access                        │
-│  • Auto-purged after 24 hours                                    │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    (after 24 hours)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    COLD TABLE (archive)                          │
-│  • Historical data storage                                       │
-│  • Compressed for space efficiency                               │
-│  • Queried only for analytics/backtesting                        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### Archive Query (run hourly via scheduler)
-```sql
--- Move data older than 24 hours from hot to cold
-INSERT INTO {table}_archive 
-SELECT * FROM {table} 
-WHERE created_at < NOW() - INTERVAL 24 HOUR;
-
-DELETE FROM {table} 
-WHERE created_at < NOW() - INTERVAL 24 HOUR;
+                    ┌─────────────────┐
+                    │   DUAL WRITE    │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+              ▼              │              ▼
+┌─────────────────────┐      │   ┌─────────────────────┐
+│   DuckDB (HOT)      │      │   │   MySQL (MASTER)    │
+│   Last 24 hours     │      │   │   Full history      │
+│   Fast queries      │      │   │   Never deleted     │
+│   Auto-cleanup      │      │   │   Source of truth   │
+└─────────────────────┘      │   └─────────────────────┘
+                             │
+                    (hourly cleanup)
+                             │
+                             ▼
+                    Data older than 24h
+                    deleted from DuckDB
+                    (kept in MySQL)
 ```
 
 ---
 
-## Database: prices.duckdb
+## Database: central.duckdb
 
-### Table: price_points (HOT)
-Real-time price data for the last 24 hours.
+### Table: follow_the_goat_plays (FULL DATA)
+Play definitions - not time-based, keeps full data synced from MySQL.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `ts` | TIMESTAMP | When price was fetched |
-| `token` | VARCHAR(10) | Token symbol (BTC, ETH, SOL) |
-| `price` | DOUBLE | USD price |
+| `id` | INTEGER | Primary key |
+| `created_at` | TIMESTAMP | When play was created |
+| `name` | VARCHAR(60) | Play name |
+| `description` | VARCHAR(500) | Play description |
+| `find_wallets_sql` | JSON | SQL query to find wallets |
+| `max_buys_per_cycle` | INTEGER | Max buys per cycle |
+| `sell_logic` | JSON | Sell logic configuration |
+| `sorting` | INTEGER | Sort order |
+| `short_play` | INTEGER | 1 if short play |
+| `tricker_on_perp` | JSON | Trigger on perpetual config |
+| `timing_conditions` | JSON | Timing conditions |
+| `bundle_trades` | JSON | Bundle trades config |
+| `is_active` | INTEGER | 1 if active |
+| `project_id` | INTEGER | Pattern config project ID |
+| `project_ids` | JSON | Multiple project IDs |
+
+### Table: follow_the_goat_buyins (24hr HOT)
+Live trades - last 24 hours only.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT | Primary key |
+| `play_id` | INTEGER | Reference to play |
+| `wallet_address` | VARCHAR(255) | Wallet address |
+| `original_trade_id` | BIGINT | Original trade reference |
+| `tolerance` | DOUBLE | Tolerance setting |
+| `block_timestamp` | TIMESTAMP | Blockchain timestamp |
+| `price` | DECIMAL(20,8) | Entry price |
+| `followed_at` | TIMESTAMP | When we followed |
+| `our_entry_price` | DECIMAL(20,8) | Our entry price |
+| `our_exit_price` | DECIMAL(20,8) | Our exit price |
+| `our_exit_timestamp` | TIMESTAMP | Exit time |
+| `our_profit_loss` | DECIMAL(20,8) | P/L percentage |
+| `our_status` | VARCHAR(20) | Status (pending, sold, no_go) |
+| `current_price` | DECIMAL(20,8) | Current price |
 
 **Indexes:**
-- `idx_price_points_ts` on `(ts)`
-- `idx_price_points_token` on `(token)`
-- `idx_price_points_token_ts` on `(token, ts)`
+- `idx_buyins_wallet` on `(wallet_address)`
+- `idx_buyins_followed_at` on `(followed_at)`
+- `idx_buyins_status` on `(our_status)`
+- `idx_buyins_play_id` on `(play_id)`
 
-### Table: price_points_archive (COLD)
-Historical price data beyond 24 hours.
+### Table: follow_the_goat_buyins_price_checks (24hr HOT)
+Price checks for active trades.
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `ts` | TIMESTAMP | When price was fetched |
-| `token` | VARCHAR(10) | Token symbol (BTC, ETH, SOL) |
-| `price` | DOUBLE | USD price |
+| `id` | UBIGINT | Primary key |
+| `buyin_id` | UINTEGER | Reference to buyin |
+| `checked_at` | TIMESTAMP | When checked |
+| `current_price` | DECIMAL(20,8) | Current price |
+| `entry_price` | DECIMAL(20,8) | Entry price |
+| `highest_price` | DECIMAL(20,8) | Highest seen |
+| `gain_from_entry` | DECIMAL(10,6) | Gain from entry |
+| `drop_from_high` | DECIMAL(10,6) | Drop from high |
+| `tolerance` | DECIMAL(10,6) | Current tolerance |
+| `should_sell` | BOOLEAN | Should sell flag |
+
+### Table: price_points (24hr HOT)
+Price data points.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT | Primary key |
+| `ts_idx` | BIGINT | Timestamp index |
+| `value` | DOUBLE | Price value |
+| `created_at` | TIMESTAMP | When recorded |
+| `coin_id` | INTEGER | Coin ID (5 = SOL) |
+
+### Table: price_analysis (24hr HOT)
+Price cycle analysis data - tracks price movements at multiple thresholds.
+Populated by `000data_feeds/2_create_price_cycles/create_price_cycles.py`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Primary key |
+| `coin_id` | INTEGER | Coin ID (5 = SOL) |
+| `price_point_id` | BIGINT | Reference to source price point (timestamp ms) |
+| `sequence_start_id` | BIGINT | ID of price point that started this cycle (timestamp ms) |
+| `sequence_start_price` | DECIMAL(20,8) | Price at cycle start |
+| `current_price` | DECIMAL(20,8) | Current price |
+| `percent_threshold` | DECIMAL(5,2) | Threshold (0.1, 0.2, 0.3, 0.4, 0.5) |
+| `percent_increase` | DECIMAL(10,4) | Percent increase from cycle start |
+| `highest_price_recorded` | DECIMAL(20,8) | Highest price in this cycle |
+| `lowest_price_recorded` | DECIMAL(20,8) | Lowest price in this cycle |
+| `procent_change_from_highest_price_recorded` | DECIMAL(10,4) | Drop from high |
+| `percent_increase_from_lowest` | DECIMAL(10,4) | Rise from low |
+| `price_cycle` | BIGINT | Reference to cycle_tracker.id |
+| `created_at` | TIMESTAMP | When recorded |
+| `processed_at` | TIMESTAMP | When processed |
+
+**Indexes:**
+- `idx_price_analysis_coin` on `(coin_id)`
+- `idx_price_analysis_created_at` on `(created_at)`
+- `idx_price_analysis_price_cycle` on `(price_cycle)`
+
+### Table: cycle_tracker (24hr HOT)
+Price cycle tracking - one record per cycle per threshold.
+A new cycle starts when price drops from the highest by the threshold percentage.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT | Primary key (unique cycle ID) |
+| `coin_id` | INTEGER | Coin ID (5 = SOL) |
+| `threshold` | DECIMAL(5,2) | Threshold percentage (0.1-0.5) |
+| `cycle_start_time` | TIMESTAMP | When cycle started |
+| `cycle_end_time` | TIMESTAMP | When cycle ended (NULL if active) |
+| `sequence_start_id` | BIGINT | Price point ID at cycle start (timestamp ms) |
+| `sequence_start_price` | DECIMAL(20,8) | Price at cycle start |
+| `highest_price_reached` | DECIMAL(20,8) | Peak price in cycle |
+| `lowest_price_reached` | DECIMAL(20,8) | Lowest price in cycle |
+| `max_percent_increase` | DECIMAL(10,4) | Max growth from start |
+| `max_percent_increase_from_lowest` | DECIMAL(10,4) | Max growth from low |
+| `total_data_points` | INTEGER | Number of price points in cycle |
+| `created_at` | TIMESTAMP | When record created |
+
+**Indexes:**
+- `idx_cycle_tracker_coin` on `(coin_id)`
+- `idx_cycle_tracker_start` on `(cycle_start_time)`
+- `idx_cycle_tracker_threshold` on `(threshold)`
+
+### Table: order_book_features (24hr HOT)
+Binance order book features streamed via WebSocket.
+Populated by `000data_feeds/3_binance_order_book_data/stream_binance_order_book_data.py`.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | INTEGER | Primary key |
+| `ts` | TIMESTAMP | When recorded |
+| `venue` | VARCHAR(20) | Exchange venue (binance) |
+| `quote_asset` | VARCHAR(10) | Quote asset (USDT) |
+| `symbol` | VARCHAR(20) | Trading pair (SOLUSDT) |
+| `best_bid` | DOUBLE | Best bid price |
+| `best_ask` | DOUBLE | Best ask price |
+| `mid_price` | DOUBLE | Mid price (bid+ask)/2 |
+| `absolute_spread` | DOUBLE | Absolute spread (ask-bid) |
+| `relative_spread_bps` | DOUBLE | Relative spread in basis points |
+| `bid_depth_10` | DOUBLE | Total bid depth (top 10 levels) |
+| `ask_depth_10` | DOUBLE | Total ask depth (top 10 levels) |
+| `total_depth_10` | DOUBLE | Total depth (bid + ask) |
+| `volume_imbalance` | DOUBLE | Volume imbalance (-1 to 1) |
+| `bid_vwap_10` | DOUBLE | Bid VWAP (top 10 levels) |
+| `ask_vwap_10` | DOUBLE | Ask VWAP (top 10 levels) |
+| `bid_slope` | DOUBLE | Bid price-size slope |
+| `ask_slope` | DOUBLE | Ask price-size slope |
+| `microprice` | DOUBLE | Size-weighted mid price |
+| `microprice_dev_bps` | DOUBLE | Microprice deviation from mid (bps) |
+| `bid_depth_bps_5` | DOUBLE | Bid depth within 5 bps |
+| `ask_depth_bps_5` | DOUBLE | Ask depth within 5 bps |
+| `bid_depth_bps_10` | DOUBLE | Bid depth within 10 bps |
+| `ask_depth_bps_10` | DOUBLE | Ask depth within 10 bps |
+| `bid_depth_bps_25` | DOUBLE | Bid depth within 25 bps |
+| `ask_depth_bps_25` | DOUBLE | Ask depth within 25 bps |
+| `net_liquidity_change_1s` | DOUBLE | Net liquidity change over 1 second |
+| `bids_json` | VARCHAR | JSON of top 20 bid levels |
+| `asks_json` | VARCHAR | JSON of top 20 ask levels |
+| `source` | VARCHAR(20) | Data source (WEBSOCKET) |
+
+**Indexes:**
+- `idx_order_book_features_ts` on `(ts)`
+- `idx_order_book_features_symbol` on `(symbol)`
 
 ---
 
-## Common Query Patterns
+## Feature: Binance Order Book Stream
 
-### Get Latest Price per Token
-```sql
-SELECT token, price, ts 
-FROM price_points 
-WHERE (token, ts) IN (
-    SELECT token, MAX(ts) 
-    FROM price_points 
-    GROUP BY token
-);
+The Binance order book stream (`000data_feeds/3_binance_order_book_data/`) provides real-time order book data via WebSocket.
+
+### How It Works
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                     BINANCE ORDER BOOK STREAM                           │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   Binance WebSocket    stream_binance_order_book_data.py               │
+│   (depth20@100ms)  ──▶  (continuous stream)  ──▶  TradingDataEngine    │
+│                               │                    (in-memory DuckDB)  │
+│                               │                          │             │
+│                               │                          ▼             │
+│                               │                    Background Sync     │
+│                               │                          │             │
+│                               ▼                          ▼             │
+│                            MySQL                      MySQL            │
+│                     (order_book_features)      (full history)          │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Price History (Last Hour)
-```sql
-SELECT ts, price 
-FROM price_points 
-WHERE token = 'SOL' 
-  AND ts >= NOW() - INTERVAL 1 HOUR 
-ORDER BY ts;
+### Features Calculated
+
+| Feature | Description |
+|---------|-------------|
+| `mid_price` | (best_bid + best_ask) / 2 |
+| `relative_spread_bps` | Spread in basis points |
+| `volume_imbalance` | (bid_depth - ask_depth) / total_depth |
+| `microprice` | Size-weighted mid price |
+| `microprice_dev_bps` | Microprice deviation from mid |
+| `bid/ask_depth_bps_X` | Depth within X basis points |
+| `net_liquidity_change_1s` | Total depth change over 1 second |
+
+### Usage
+
+```python
+# Started automatically by scheduler/master.py at startup
+# To run standalone for testing:
+python 000data_feeds/3_binance_order_book_data/stream_binance_order_book_data.py
 ```
 
-### OHLC Candles (5-minute)
-```sql
-SELECT 
-    token,
-    time_bucket(INTERVAL '5 minutes', ts) AS bucket,
-    FIRST(price) AS open,
-    MAX(price) AS high,
-    MIN(price) AS low,
-    LAST(price) AS close
-FROM price_points
-WHERE token = 'BTC'
-GROUP BY token, bucket
-ORDER BY bucket DESC
-LIMIT 12;
+---
+
+## Feature: Price Cycles
+
+The price cycles feature (`000data_feeds/2_create_price_cycles/`) tracks SOL price movements at multiple thresholds, detecting cycles based on price drops from highs.
+
+### How It Works
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                         PRICE CYCLE DETECTION                           │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   prices.duckdb         create_price_cycles.py        central.duckdb   │
+│   (price_points)  ────▶  (process every 5s)  ────▶  (price_analysis)   │
+│                                    │                 (cycle_tracker)    │
+│                                    │                                    │
+│                                    ▼                                    │
+│                                 MySQL                                   │
+│                          (full history)                                │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Hot vs Cold Stats
-```sql
-SELECT 'hot' AS storage, COUNT(*) as rows FROM price_points
-UNION ALL
-SELECT 'cold', COUNT(*) FROM price_points_archive;
+### Thresholds Monitored
+
+| Threshold | Cycle Reset Condition |
+|-----------|----------------------|
+| 0.1% | Price drops 0.1% from cycle high |
+| 0.2% | Price drops 0.2% from cycle high |
+| 0.3% | Price drops 0.3% from cycle high |
+| 0.4% | Price drops 0.4% from cycle high |
+| 0.5% | Price drops 0.5% from cycle high |
+
+### Cycle Logic
+
+1. **New Cycle**: Starts when no previous data exists, or when price drops below the cycle's highest recorded price by the threshold amount
+2. **Cycle Continues**: As long as price stays within threshold of the cycle high
+3. **Tracking**: Each cycle tracks highest/lowest price, percent changes, and total data points
+
+### Usage
+
+```python
+# The scheduler runs this automatically every 5 seconds
+# To run manually:
+from create_price_cycles import process_price_cycles
+processed = process_price_cycles()  # Returns number of price points processed
+
+# For continuous testing:
+python 000data_feeds/2_create_price_cycles/create_price_cycles.py --continuous
+```
+
+---
+
+## API Endpoints
+
+The Central API (`features/price_api/api.py`) provides these endpoints:
+
+### Health & Status
+- `GET /health` - Health check (DuckDB + MySQL status)
+- `GET /stats` - Database statistics
+
+### Plays
+- `GET /plays` - Get all plays
+- `GET /plays/<id>` - Get single play
+
+### Buyins (Trades)
+- `GET /buyins` - Get trades (params: play_id, status, hours, limit)
+- `POST /buyins` - Create trade (dual-write)
+- `PUT /buyins/<id>` - Update trade (dual-write)
+
+### Price Checks
+- `GET /price_checks` - Get price checks for a buyin
+- `POST /price_checks` - Create price check (dual-write)
+
+### Price Data
+- `POST /price_points` - Get price points for charting (legacy)
+- `GET /latest_prices` - Get latest prices (legacy)
+- `GET /price_analysis` - Get price analysis
+- `GET /cycle_tracker` - Get cycle data
+
+### Admin
+- `POST /admin/init_tables` - Initialize DuckDB tables
+- `POST /admin/cleanup` - Clean up old DuckDB data
+- `POST /admin/sync_from_mysql` - Sync from MySQL to DuckDB
+
+### Generic Query
+- `POST /query` - Flexible query endpoint
+
+---
+
+## Scheduler Jobs
+
+The scheduler (`scheduler/master.py`) runs these jobs:
+
+| Job | Interval | Description |
+|-----|----------|-------------|
+| `fetch_jupiter_prices` | 2 seconds | Fetch SOL/BTC/ETH prices from Jupiter API |
+| `process_price_cycles` | 5 seconds | Process price data into cycle analysis |
+| `cleanup_jupiter_prices` | 1 hour | Clean up old data from prices.duckdb |
+| `cleanup_duckdb_hot_tables` | 1 hour | Remove data older than 24h from DuckDB |
+| `sync_plays_from_mysql` | 5 minutes | Sync plays table from MySQL |
+| `archive_price_points` | 1 hour | Legacy price_points cleanup |
+
+### Background Streams (Started Once at Startup)
+
+| Stream | Description |
+|--------|-------------|
+| `binance_order_book_stream` | WebSocket stream of SOLUSDT order book from Binance (100ms updates) |
+
+---
+
+## Python Connection Patterns
+
+### DuckDB (Hot Data - 24hr)
+```python
+from core.database import get_duckdb
+
+with get_duckdb("central") as conn:
+    result = conn.execute("SELECT * FROM follow_the_goat_buyins LIMIT 10").fetchall()
+```
+
+### MySQL (Historical Data)
+```python
+from core.database import get_mysql
+
+with get_mysql() as conn:
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT * FROM follow_the_goat_buyins_archive LIMIT 10")
+        result = cursor.fetchall()
+```
+
+### Dual Write (Both)
+```python
+from core.database import dual_write_insert
+
+data = {
+    'play_id': 1,
+    'wallet_address': 'ABC123...',
+    'our_status': 'pending'
+}
+duckdb_ok, mysql_ok = dual_write_insert('follow_the_goat_buyins', data)
+```
+
+### Smart Query (Auto-Routes)
+```python
+from core.database import smart_query
+from datetime import datetime, timedelta
+
+# Automatically uses DuckDB for recent data, MySQL for historical
+results = smart_query(
+    table='follow_the_goat_buyins',
+    where={'play_id': 1},
+    time_column='followed_at',
+    start_time=datetime.now() - timedelta(hours=6),
+    order_by='followed_at DESC',
+    limit=100
+)
+```
+
+---
+
+## PHP Connection Pattern
+
+```php
+<?php
+require_once 'includes/DuckDBClient.php';
+
+$client = new DuckDBClient('http://127.0.0.1:5050');
+
+// Get trades from last 24 hours (DuckDB)
+$result = $client->getBuyins(playId: 1, hours: '24');
+
+// Get historical trades (MySQL)
+$result = $client->getBuyins(playId: 1, hours: 'all');
+
+// Create trade (dual-write)
+$client->createBuyin([
+    'play_id' => 1,
+    'wallet_address' => 'ABC123...',
+]);
+```
+
+---
+
+## Initial Setup
+
+1. Initialize DuckDB tables:
+```bash
+python features/price_api/api.py --init
+```
+
+2. Sync data from MySQL:
+```bash
+python features/price_api/sync_from_mysql.py --init --hours 24
+```
+
+3. Start the API server:
+```bash
+python features/price_api/api.py
+```
+
+4. Start the scheduler:
+```bash
+python scheduler/master.py
 ```
 
 ---
@@ -131,7 +513,7 @@ SELECT 'cold', COUNT(*) FROM price_points_archive;
 
 ```bash
 # From project root
-./duckdb/duckdb.exe 000data_feeds/1_jupiter_get_prices/prices.duckdb
+./duckdb/duckdb.exe 000data_feeds/central.duckdb
 
 # Common commands
 .tables              -- List all tables
@@ -142,65 +524,29 @@ SELECT 'cold', COUNT(*) FROM price_points_archive;
 
 ---
 
-## Python Connection Pattern
+## Migration from MySQL
 
-```python
-import duckdb
-from pathlib import Path
+When migrating code that uses MySQL directly:
 
-# Standard connection
-DB_PATH = Path(__file__).parent.parent / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb"
+1. **For reads**: Use the API or `get_duckdb()` for recent data, `get_mysql()` for historical
+2. **For writes**: Use `dual_write_insert()` / `dual_write_update()` to write to both
+3. **For PHP**: Use `DuckDBClient` class instead of direct MySQL PDO
 
-def get_connection():
-    return duckdb.connect(str(DB_PATH))
-
-# Usage with context manager
-with get_connection() as conn:
-    result = conn.execute("SELECT * FROM price_points LIMIT 10").fetchdf()
-```
-
----
-
-## Adding New Tables
-
-When adding a new table:
-
-1. **Update this document** with the new schema
-2. **Create both hot and cold versions** if it's time-series data
-3. **Add indexes** for query performance
-4. **Register archive job** in `scheduler/master.py`
-
-### Template for New Time-Series Table
-```sql
--- HOT table
-CREATE TABLE IF NOT EXISTS new_table (
-    id INTEGER PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    -- your columns here
-);
-
-CREATE INDEX IF NOT EXISTS idx_new_table_created_at ON new_table(created_at);
-
--- COLD table (same schema)
-CREATE TABLE IF NOT EXISTS new_table_archive (
-    id INTEGER PRIMARY KEY,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    -- your columns here
-);
-```
-
----
-
-## Migration Notes
-
-When migrating from MySQL (000old_code):
+### MySQL → DuckDB Type Mapping
 
 | MySQL | DuckDB |
 |-------|--------|
-| `INT AUTO_INCREMENT` | `INTEGER PRIMARY KEY` (use sequences if needed) |
+| `INT AUTO_INCREMENT` | `INTEGER PRIMARY KEY` |
+| `BIGINT` | `BIGINT` |
 | `DATETIME` | `TIMESTAMP` |
+| `VARCHAR(n)` | `VARCHAR(n)` |
 | `TEXT` | `VARCHAR` or `TEXT` |
-| `DECIMAL(10,2)` | `DECIMAL(10,2)` or `DOUBLE` |
-| `NOW()` | `CURRENT_TIMESTAMP` or `NOW()` |
-| `DATE_SUB(NOW(), INTERVAL 24 HOUR)` | `NOW() - INTERVAL 24 HOUR` |
+| `DECIMAL(20,8)` | `DECIMAL(20,8)` |
+| `JSON` | `JSON` |
+| `TINYINT(1)` | `BOOLEAN` |
+| `ENUM(...)` | `VARCHAR(...)` |
 
+### Column Name Changes
+| MySQL | DuckDB |
+|-------|--------|
+| `15_min_trail` | `fifteen_min_trail` |

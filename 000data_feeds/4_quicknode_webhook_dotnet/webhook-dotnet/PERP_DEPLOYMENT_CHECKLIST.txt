@@ -1,0 +1,266 @@
+================================================================================
+PERPETUAL POSITION FIELDS - DEPLOYMENT CHECKLIST
+================================================================================
+
+Date: October 26, 2025
+Feature: Add perp position tracking to sol_stablecoin_trades AND whale_movements
+
+================================================================================
+PRE-DEPLOYMENT CHECKS
+================================================================================
+
+[✓] Database Schema - Main Table Updated
+    - You confirmed sol_stablecoin_trades has the new columns
+
+[✓] Database Schema - Whale Movements Table Updated
+    - You confirmed whale_movements has the new columns
+    
+[ ] Database Schema - Archive Table
+    ACTION: Run add_perp_fields_to_archive.sql
+    COMMAND: mysql -u solcatcher -p solcatcher < add_perp_fields_to_archive.sql
+    OR: Run the SQL commands manually in your MySQL client
+    
+[ ] Verify Archive Table Updated
+    COMMAND: DESCRIBE sol_stablecoin_trades_archive;
+    VERIFY: Check that perp columns exist
+
+================================================================================
+BUILD & DEPLOY
+================================================================================
+
+[ ] Backup Current Deployment
+    ACTION: Copy current webhook folder to backup location
+    
+[ ] Rebuild Webhook
+    ACTION: Run build-selfcontained.bat
+    VERIFY: Check for successful build in publish-standalone folder
+    
+[ ] Stop IIS Application Pool
+    ACTION: In IIS Manager, stop the webhook application pool
+    
+[ ] Deploy New Build
+    ACTION: Copy files from publish-standalone to IIS directory
+    VERIFY: Ensure all DLLs and files are copied
+    
+[ ] Start IIS Application Pool
+    ACTION: In IIS Manager, start the webhook application pool
+    
+[ ] Verify IIS Status
+    ACTION: Check that the website is running
+    URL: http://localhost:5000 or your configured URL
+
+================================================================================
+TESTING
+================================================================================
+
+[ ] Test Health Endpoint
+    ACTION: Open browser to http://localhost:5000/health
+    VERIFY: Status shows "healthy"
+    
+[ ] Test Trades with Sample Payload
+    ACTION: Run test_perp_fields.bat
+    VERIFY: All 3 tests pass successfully
+
+[ ] Test Whale Movements with Sample Payload
+    ACTION: Run test_whale_perp_fields.bat
+    VERIFY: All 3 tests pass successfully
+    
+[ ] Check Database Insertion
+    ACTION: Run query below
+    QUERY: 
+    SELECT 
+        signature, 
+        wallet_address, 
+        direction, 
+        has_perp_position, 
+        perp_platform, 
+        perp_direction, 
+        perp_size 
+    FROM sol_stablecoin_trades 
+    ORDER BY id DESC 
+    LIMIT 5;
+    
+    VERIFY: Test records appear with perp data
+    
+[ ] Check Archive Table Insertion
+    ACTION: Run same query on sol_stablecoin_trades_archive
+    VERIFY: Records are being archived with perp data
+
+[ ] Check Whale Movements Insertion
+    ACTION: Run query below
+    QUERY:
+    SELECT 
+        signature, 
+        wallet_address, 
+        whale_type, 
+        direction,
+        has_perp_position, 
+        perp_platform, 
+        perp_direction, 
+        perp_size 
+    FROM whale_movements 
+    ORDER BY id DESC 
+    LIMIT 5;
+    
+    VERIFY: Whale movement records appear with perp data
+    
+[ ] Check Console Logs
+    ACTION: View IIS logs or application logs
+    VERIFY: Look for messages like:
+    - Trades: "[PERP: drift long 250 SOL]"
+    - Whales: "Whale movement: mega_whale sending 5000.25 SOL (large) [PERP: drift long 15000 SOL]"
+
+================================================================================
+QUICKNODE CONFIGURATION
+================================================================================
+
+[ ] Update QuickNode Trade Stream
+    ACTION: Configure your QuickNode trade stream to include perp fields
+    
+[ ] Update QuickNode Whale Stream
+    ACTION: Configure your QuickNode whale activity stream to include perp fields
+    FIELDS TO ADD:
+    - has_perp_position (boolean)
+    - perp_platform (string: 'drift'|'jupiter'|'mango'|'zeta')
+    - perp_direction (string: 'long'|'short')
+    - perp_size (number)
+    - perp_leverage (number, optional)
+    - perp_entry_price (number, optional)
+    
+[ ] Test QuickNode Trade Payload
+    ACTION: Wait for real trade data from QuickNode
+    VERIFY: Check sol_stablecoin_trades for real perp position data
+
+[ ] Test QuickNode Whale Payload
+    ACTION: Wait for real whale data from QuickNode
+    VERIFY: Check whale_movements for real perp position data
+    
+[ ] Monitor Error Logs
+    ACTION: Watch for any errors in IIS logs
+    LOOK FOR: SQL errors, data type mismatches, enum violations
+
+================================================================================
+POST-DEPLOYMENT VERIFICATION
+================================================================================
+
+[ ] Verify Trade Data Quality
+    QUERY:
+    SELECT 
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN has_perp_position THEN 1 ELSE 0 END) as with_perp,
+        COUNT(DISTINCT perp_platform) as platforms_used
+    FROM sol_stablecoin_trades
+    WHERE trade_timestamp >= DATE_SUB(NOW(), INTERVAL 1 HOUR);
+    
+    VERIFY: Numbers make sense
+
+[ ] Verify Whale Data Quality
+    QUERY:
+    SELECT 
+        COUNT(*) as total_movements,
+        SUM(CASE WHEN has_perp_position THEN 1 ELSE 0 END) as with_perp,
+        COUNT(DISTINCT perp_platform) as platforms_used
+    FROM whale_movements
+    WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 1 HOUR);
+    
+    VERIFY: Numbers make sense
+    
+[ ] Check Platform Distribution
+    QUERY:
+    SELECT 
+        perp_platform, 
+        COUNT(*) as count 
+    FROM sol_stablecoin_trades 
+    WHERE has_perp_position = TRUE 
+    GROUP BY perp_platform;
+    
+    VERIFY: Platforms are valid (drift, jupiter, mango, zeta)
+    
+[ ] Check Direction Distribution
+    QUERY:
+    SELECT 
+        perp_direction, 
+        COUNT(*) as count 
+    FROM sol_stablecoin_trades 
+    WHERE has_perp_position = TRUE 
+    GROUP BY perp_direction;
+    
+    VERIFY: Directions are valid (long, short)
+    
+[ ] Check Index Performance
+    QUERY:
+    EXPLAIN SELECT * FROM sol_stablecoin_trades 
+    WHERE has_perp_position = TRUE 
+    AND perp_platform = 'drift';
+    
+    VERIFY: Using idx_perp_platform index
+
+================================================================================
+ROLLBACK PLAN (IF NEEDED)
+================================================================================
+
+If something goes wrong:
+
+[ ] Stop IIS Application Pool
+
+[ ] Restore Previous Webhook Build
+    ACTION: Copy backup files back to IIS directory
+    
+[ ] Start IIS Application Pool
+
+[ ] Test Basic Functionality
+    ACTION: Send old payload format (without perp fields)
+    VERIFY: Should still work due to backward compatibility
+    
+[ ] Database Rollback (ONLY IF NECESSARY)
+    WARNING: This will remove the new columns and data!
+    
+    For Main Table:
+    ALTER TABLE sol_stablecoin_trades
+    DROP COLUMN has_perp_position,
+    DROP COLUMN perp_platform,
+    DROP COLUMN perp_direction,
+    DROP COLUMN perp_size,
+    DROP COLUMN perp_leverage,
+    DROP COLUMN perp_entry_price;
+    
+    For Archive Table:
+    ALTER TABLE sol_stablecoin_trades_archive
+    DROP COLUMN has_perp_position,
+    DROP COLUMN perp_platform,
+    DROP COLUMN perp_direction,
+    DROP COLUMN perp_size,
+    DROP COLUMN perp_leverage,
+    DROP COLUMN perp_entry_price;
+
+================================================================================
+DOCUMENTATION
+================================================================================
+
+Files to Reference:
+- PERP_FIELDS_README.md - Complete documentation for trades
+- WHALE_PERP_FIELDS_README.md - Complete documentation for whale movements
+- PERP_FIELDS_CHANGELOG.md - List of changes
+- test_payload_with_perp.json - Sample trade payload
+- test_whale_payload_with_perp.json - Sample whale payload
+- add_perp_fields_to_archive.sql - Archive table schema
+
+================================================================================
+COMPLETED?
+================================================================================
+
+Once all checkboxes are checked:
+
+[✓] YES - All tests passed, deployment successful
+[ ] NO - Issues found, see PERP_FIELDS_README.md troubleshooting section
+
+Notes:
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+
+Deployed By: ______________________  Date: _______________  Time: ___________
+
+================================================================================
+

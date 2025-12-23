@@ -1,0 +1,150 @@
+==================================================
+MANUAL BUILD INSTRUCTIONS
+==================================================
+
+If the build scripts don't work, follow these steps:
+
+STEP 1: Verify You're in Correct Location
+==================================================
+Open Command Prompt or PowerShell and navigate to:
+
+cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+
+Verify you're there:
+dir
+
+You should see:
+- Program.cs
+- SolWebhook.csproj
+- build-selfcontained.bat
+- etc.
+
+STEP 2: Clear NuGet Cache
+==================================================
+dotnet nuget locals all --clear
+
+Wait for "Clearing cache succeeded"
+
+STEP 3: Restore Packages
+==================================================
+dotnet restore
+
+Should download MySqlConnector and other packages.
+Watch for any errors.
+
+STEP 4: Build Self-Contained
+==================================================
+dotnet publish -c Release -o publish-standalone --self-contained true -r win-x64
+
+This will take 1-2 minutes.
+Should see "Build succeeded" at the end.
+
+STEP 5: Verify Build
+==================================================
+Check the publish-standalone folder:
+
+dir publish-standalone
+
+Should have:
+- SolWebhook.exe (main executable)
+- Hundreds of .dll files
+- web.config
+- appsettings.json
+- Total size: ~80-100MB
+
+STEP 6: Deploy to IIS
+==================================================
+1. Copy ALL files from 'publish-standalone' to IIS server:
+   C:\inetpub\wwwroot\solwebhook\
+
+2. On IIS server, in that folder:
+   - Delete: web.config
+   - Rename: web-selfcontained.config to web.config
+
+3. Make sure ASP.NET Core Module is installed on IIS server:
+   https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+
+4. Restart IIS:
+   iisreset
+
+5. Test:
+   http://your-server/health
+
+==================================================
+TROUBLESHOOTING BUILD ISSUES
+==================================================
+
+Error: "dotnet command not found"
+───────────────────────────────────────────────
+Fix: Install .NET SDK
+     https://dotnet.microsoft.com/download/dotnet/8.0
+     Download and install "SDK x64"
+     Restart Command Prompt after install
+
+Error: "Unable to resolve MySqlConnector"
+───────────────────────────────────────────────
+Fix 1: Check internet connection
+Fix 2: Clear NuGet cache (step 2 above)
+Fix 3: Check NuGet sources:
+       dotnet nuget list source
+       Should have: https://api.nuget.org/v3/index.json
+
+Error: "The specified framework is not found"
+───────────────────────────────────────────────
+Fix: Make sure you copied updated SolWebhook.csproj
+     It should say: <TargetFramework>net8.0</TargetFramework>
+
+Error: "Build FAILED" (other errors)
+───────────────────────────────────────────────
+Fix 1: Delete obj and bin folders if they exist:
+       rmdir /s /q obj
+       rmdir /s /q bin
+       Then try again from Step 2
+
+Fix 2: Try building without self-contained first:
+       dotnet publish -c Release -o publish-test
+       If this works, then try self-contained again
+
+==================================================
+IF YOU CAN'T BUILD
+==================================================
+
+Option 1: Use a different computer
+──────────────────────────────────
+Copy this folder to a computer with .NET SDK and build there.
+Then copy publish-standalone folder back.
+
+Option 2: Use the PHP version
+──────────────────────────────
+The fixed PHP webhook works great too!
+It's already in the webhook/ folder and ready to use.
+
+Option 3: Let me know
+──────────────────────────────────
+Provide the exact error message and I can help debug.
+
+==================================================
+QUICK REFERENCE COMMANDS
+==================================================
+
+# Check .NET version
+dotnet --version
+
+# List installed SDKs
+dotnet --list-sdks
+
+# Clear cache
+dotnet nuget locals all --clear
+
+# Restore packages
+dotnet restore
+
+# Build self-contained
+dotnet publish -c Release -o publish-standalone --self-contained true -r win-x64
+
+# Build regular (smaller, requires .NET on server)
+dotnet publish -c Release -o publish
+
+==================================================
+
+

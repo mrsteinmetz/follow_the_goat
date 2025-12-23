@@ -1,0 +1,156 @@
+===============================================
+WHALE TRACKING ENDPOINT - QUICK START GUIDE
+===============================================
+
+WHAT'S NEW:
+-----------
+✓ New endpoint: POST /webhooks/whale-activity
+✓ New database table: whale_movements
+✓ Tracks large SOL holder movements
+✓ All existing endpoints still work perfectly
+
+EXISTING ENDPOINTS (UNCHANGED):
+-------------------------------
+✓ GET  /              - Welcome page
+✓ GET  /health        - Health check (now includes whale stats)
+✓ POST /              - DEX swaps webhook (unchanged)
+
+DEPLOYMENT STEPS:
+-----------------
+
+1. CREATE DATABASE TABLE
+   Run this command in MySQL:
+   
+   mysql -u solcatcher -p solcatcher < create_whale_movements_table.sql
+   
+   Or manually run the SQL in the file.
+
+2. BUILD THE PROJECT
+   Run one of these:
+   
+   .\build-selfcontained.bat
+   
+   OR
+   
+   dotnet publish -c Release -r win-x64 --self-contained
+
+3. DEPLOY TO IIS
+   - Copy files from: publish-standalone\
+   - To your IIS directory
+   - Restart IIS app pool
+
+4. TEST THE ENDPOINT
+   Run the test script:
+   
+   .\test_whale_endpoint.bat
+   
+   Or manually:
+   
+   powershell -ExecutionPolicy Bypass -File test_whale_endpoint.ps1
+
+5. CONFIGURE QUICKNODE
+   - Add webhook destination
+   - URL: https://yourdomain.com/webhooks/whale-activity
+   - Method: POST
+   - Content-Type: application/json
+
+VERIFY INSTALLATION:
+--------------------
+
+1. Check health endpoint:
+   http://yourdomain.com/health
+   
+   Should show:
+   - status: "healthy"
+   - recent_trades: <number>
+   - recent_whale_movements: <number>
+
+2. Check database:
+   SELECT * FROM whale_movements LIMIT 10;
+
+3. Check IIS logs:
+   Look for "[INFO] Whale movement:" entries
+
+TESTING WITH CURL:
+------------------
+
+curl -X POST http://yourdomain.com/webhooks/whale-activity ^
+  -H "Content-Type: application/json" ^
+  -d "{\"whaleMovements\":[{\"signature\":\"test123\",\"wallet_address\":\"testWallet\",\"whale_type\":\"WHALE\",\"current_balance\":15000.00,\"sol_change\":-1000.00,\"abs_change\":1000.00,\"percentage_moved\":6.67,\"direction\":\"sending\",\"action\":\"SENT\",\"movement_significance\":\"HIGH\",\"previous_balance\":16000.00,\"fee_paid\":0.000005,\"block_time\":1729771234,\"timestamp\":\"2025-10-24T12:34:56Z\",\"received_at\":\"2025-10-24T12:35:01Z\",\"slot\":123456789}]}"
+
+WHALE CLASSIFICATIONS:
+----------------------
+MEGA_WHALE:       100,000+ SOL
+SUPER_WHALE:       50,000-100,000 SOL
+WHALE:             10,000-50,000 SOL
+LARGE_HOLDER:       5,000-10,000 SOL
+MODERATE_HOLDER:    1,000-5,000 SOL
+
+MOVEMENT SIGNIFICANCE:
+----------------------
+CRITICAL:  5,000+ SOL moved
+HIGH:      1,000-5,000 SOL moved
+MEDIUM:    500-1,000 SOL moved
+LOW:       50-500 SOL moved
+
+MONITORING QUERIES:
+-------------------
+
+-- Recent whale activity
+SELECT * FROM whale_movements 
+ORDER BY created_at DESC 
+LIMIT 20;
+
+-- Whale type breakdown
+SELECT whale_type, COUNT(*) as count, 
+       SUM(abs_change) as total_volume
+FROM whale_movements 
+GROUP BY whale_type;
+
+-- Top active whales (last 24h)
+SELECT wallet_address, whale_type,
+       COUNT(*) as movements,
+       SUM(abs_change) as total_moved
+FROM whale_movements
+WHERE timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+GROUP BY wallet_address, whale_type
+ORDER BY total_moved DESC
+LIMIT 20;
+
+-- Significant movements only
+SELECT * FROM whale_movements
+WHERE movement_significance IN ('CRITICAL', 'HIGH')
+ORDER BY timestamp DESC
+LIMIT 50;
+
+TROUBLESHOOTING:
+----------------
+
+Problem: Endpoint returns 404
+Solution: Verify IIS deployment and web.config
+
+Problem: Database errors
+Solution: Check create_whale_movements_table.sql was run
+
+Problem: No data appearing
+Solution: Check QuickNode webhook configuration
+
+Problem: Performance issues
+Solution: Database has indexes, should be fast
+
+For detailed documentation, see:
+- WHALE_TRACKING_README.md (full documentation)
+- Program.cs (implementation)
+- create_whale_movements_table.sql (database schema)
+
+SUPPORT:
+--------
+Check these files for more info:
+- WHALE_TRACKING_README.md - Complete documentation
+- BUILD_AND_DEPLOY.txt - Build instructions
+- FIX_500_ERROR.txt - Error troubleshooting
+
+===============================================
+Ready to track whale movements! 🐋
+===============================================
+

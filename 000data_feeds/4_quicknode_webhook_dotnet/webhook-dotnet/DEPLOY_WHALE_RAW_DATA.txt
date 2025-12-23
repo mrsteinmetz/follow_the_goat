@@ -1,0 +1,278 @@
+===================================================================
+ WHALE ACTIVITY - RAW DATA JSON SUPPORT DEPLOYMENT
+===================================================================
+
+QUICK DEPLOY CHECKLIST:
+
+[ ] 1. Update Database Schema (5 minutes)
+[ ] 2. Update QuickNode Function (10 minutes)
+[ ] 3. Rebuild C# Webhook (5 minutes)
+[ ] 4. Deploy to IIS (5 minutes)
+[ ] 5. Verify Everything Works (5 minutes)
+
+Total Time: ~30 minutes
+
+===================================================================
+ STEP 1: UPDATE DATABASE SCHEMA
+===================================================================
+
+Option A - Using SQL File:
+--------------------------
+cd webhook-dotnet
+mysql -u solcatcher -p solcatcher < add_raw_data_json_whale.sql
+
+Option B - Manual SQL:
+---------------------
+Run this in your MySQL client:
+
+ALTER TABLE `whale_movements` 
+ADD COLUMN `raw_data_json` LONGTEXT NULL;
+
+Verify the column was added:
+DESCRIBE whale_movements;
+
+You should see 'raw_data_json' in the list.
+
+===================================================================
+ STEP 2: UPDATE QUICKNODE FUNCTION
+===================================================================
+
+1. Go to QuickNode Dashboard:
+   https://dashboard.quicknode.com/
+
+2. Navigate to:
+   Streams → Your Whale Activity Stream → Edit Function
+
+3. Find this section (around line 330):
+
+   OLD CODE:
+   --------
+   whaleMovements.push({
+     signature: tx.transaction.signatures?.[0] || 'unknown',
+     wallet_address: walletAddress,
+     whale_type: whaleType,
+     // ... more fields ...
+     perp_debug_info: perpInfo.perp_details || null  // ← Last line
+   });
+
+   NEW CODE (add ONE line):
+   ------------------------
+   whaleMovements.push({
+     signature: tx.transaction.signatures?.[0] || 'unknown',
+     wallet_address: walletAddress,
+     whale_type: whaleType,
+     // ... more fields ...
+     perp_debug_info: perpInfo.perp_details || null,
+     
+     // 🔥 ADD THIS LINE:
+     raw_data_json: data  // ← NEW LINE - Store complete transaction data
+   });
+
+4. OR: Copy the entire function from:
+   whale_activity_function_UPDATED.js
+
+5. Test the function (if QuickNode provides a test feature)
+
+6. Save and Deploy
+
+===================================================================
+ STEP 3: REBUILD C# WEBHOOK
+===================================================================
+
+On your local development machine:
+
+cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+build-selfcontained.bat
+
+Wait for build to complete (should take ~30 seconds).
+
+Look for: "Build succeeded."
+
+===================================================================
+ STEP 4: DEPLOY TO IIS
+===================================================================
+
+1. Stop IIS (on your server):
+   iisreset /stop
+
+2. Copy built files to IIS directory:
+   - Source: webhook-dotnet\publish-standalone\*
+   - Destination: Your IIS wwwroot directory
+   
+   (Or use your existing deployment process)
+
+3. Start IIS:
+   iisreset /start
+
+4. Verify webhook is running:
+   Navigate to: http://your-server/
+   You should see: "🚀 SOL Stablecoin Trades Webhook"
+
+===================================================================
+ STEP 5: VERIFY EVERYTHING WORKS
+===================================================================
+
+Wait 5-10 minutes for whale activity, then check:
+
+1. Check Recent Whale Movements:
+   -------------------------------
+   SELECT 
+       id,
+       signature,
+       whale_type,
+       abs_change,
+       CASE 
+           WHEN raw_data_json IS NULL THEN '❌ MISSING'
+           WHEN JSON_VALID(raw_data_json) THEN '✅ VALID'
+           ELSE '⚠️ INVALID'
+       END as raw_data_status,
+       CHAR_LENGTH(raw_data_json) as size_bytes,
+       created_at
+   FROM whale_movements 
+   ORDER BY created_at DESC 
+   LIMIT 10;
+
+   Expected Results:
+   - raw_data_status: ✅ VALID
+   - size_bytes: 10,000 to 100,000+ bytes
+   - created_at: Recent timestamp
+
+2. Check Webhook Health:
+   ---------------------
+   http://your-server/health
+
+   Expected Response:
+   {
+       "status": "healthy",
+       "timestamp": "2025-10-28T...",
+       "recent_trades": X,
+       "recent_whale_movements": Y
+   }
+
+3. Check IIS Logs:
+   ---------------
+   Look for recent entries:
+   [INFO] Whale movement: WHALE sending 150 SOL (MEDIUM)
+   
+   Should NOT see:
+   [WARNING] Failed to serialize raw_data_json
+   [ERROR] Failed to insert whale movement
+
+===================================================================
+ TROUBLESHOOTING
+===================================================================
+
+Problem: Column already exists error
+------------------------------------
+Solution: The column was already added. Skip Step 1 and continue.
+
+Problem: No new whale movements appearing
+-----------------------------------------
+Cause: QuickNode function not updated or not receiving data
+Solution: 
+1. Check QuickNode stream status
+2. Verify function was saved and deployed
+3. Check if whale movements meet thresholds (1000+ SOL balance, 50+ SOL movement)
+
+Problem: raw_data_json is NULL
+-------------------------------
+Cause: JavaScript function not sending the field
+Solution: 
+1. Double-check QuickNode function update (Step 2)
+2. Make sure you added: raw_data_json: data
+3. Redeploy the function in QuickNode
+
+Problem: Build errors in Step 3
+--------------------------------
+Solution: Check FIX_BUILD_ERRORS.txt in the webhook-dotnet folder
+
+Problem: IIS not starting after deploy
+---------------------------------------
+Solution:
+1. Check IIS logs: Event Viewer → Windows Logs → Application
+2. Verify all DLL files were copied
+3. Check web.config is correct
+4. Make sure .NET 8.0 runtime is installed on server
+
+===================================================================
+ VERIFICATION QUERIES
+===================================================================
+
+-- Count whale movements with raw data:
+SELECT 
+    COUNT(*) as total,
+    SUM(CASE WHEN raw_data_json IS NOT NULL THEN 1 ELSE 0 END) as with_raw_data,
+    SUM(CASE WHEN raw_data_json IS NULL THEN 1 ELSE 0 END) as without_raw_data
+FROM whale_movements
+WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR);
+
+-- View sample raw data:
+SELECT 
+    signature,
+    whale_type,
+    abs_change,
+    LEFT(raw_data_json, 200) as raw_data_preview
+FROM whale_movements
+WHERE raw_data_json IS NOT NULL
+ORDER BY created_at DESC
+LIMIT 1;
+
+-- Check storage size:
+SELECT 
+    TABLE_NAME,
+    ROUND(((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024), 2) AS 'Size_MB'
+FROM information_schema.TABLES
+WHERE TABLE_SCHEMA = 'solcatcher' 
+    AND TABLE_NAME = 'whale_movements';
+
+===================================================================
+ ROLLBACK PROCEDURE (If something goes wrong)
+===================================================================
+
+1. Restore previous webhook build:
+   - Copy old files back to IIS directory
+   - iisreset
+
+2. Revert JavaScript function in QuickNode:
+   - Remove the 'raw_data_json: data' line
+   - Save and deploy
+
+3. Remove database column (optional):
+   ALTER TABLE whale_movements DROP COLUMN raw_data_json;
+
+Note: The column doesn't hurt anything if left there, even if 
+      the webhook isn't populating it.
+
+===================================================================
+ SUCCESS CRITERIA
+===================================================================
+
+✅ Database column exists and accepts LONGTEXT
+✅ QuickNode function is updated and running
+✅ C# webhook is rebuilt and deployed
+✅ IIS is running without errors
+✅ New whale movements have raw_data_json populated
+✅ raw_data_json contains valid JSON
+✅ Data size is reasonable (10KB-100KB+ per movement)
+
+===================================================================
+ SUPPORT FILES
+===================================================================
+
+- WHALE_RAW_DATA_FIX.md - Complete technical documentation
+- add_raw_data_json_whale.sql - Database migration script
+- whale_activity_function_UPDATED.js - Complete updated function
+- Program.cs - Updated C# code (already modified)
+
+===================================================================
+ CONTACT / NOTES
+===================================================================
+
+Date: 2025-10-28
+Change: Added raw_data_json support to whale activity webhook
+Purpose: Capture complete transaction data for debugging/analysis
+Impact: Each whale movement will now store ~50KB+ of additional data
+
+Estimated monthly storage increase: 
+- ~100 whale movements/day = ~5MB/day = ~150MB/month
+

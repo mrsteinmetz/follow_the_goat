@@ -1,0 +1,139 @@
+==================================================
+FIX HTTP 500.31 ERROR - ASP.NET Core Runtime Not Found
+==================================================
+
+PROBLEM:
+You have .NET Framework 4.8, but need .NET Core 6.0+
+(They are different things!)
+
+==================================================
+SOLUTION 1: SELF-CONTAINED BUILD (EASIEST!)
+==================================================
+
+This bundles the runtime WITH your app, so you don't 
+need to install anything on the IIS server.
+
+STEPS:
+------
+1. ON YOUR COMPUTER (where you have the files):
+   Run: build-selfcontained.bat
+   
+   This creates: publish-standalone folder
+
+2. COPY TO IIS SERVER:
+   Copy EVERYTHING from 'publish-standalone' folder to:
+   C:\inetpub\wwwroot\solwebhook\
+   
+3. ON IIS SERVER:
+   a) IMPORTANT: Replace web.config with web-selfcontained.config
+      - Delete the existing web.config
+      - Rename web-selfcontained.config to web.config
+   
+   b) Make sure AspNetCoreModuleV2 is installed:
+      - Open IIS Manager
+      - Click on your server name
+      - Double-click "Modules"
+      - Look for "AspNetCoreModuleV2"
+      
+      If NOT there, install it:
+      https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+      (Only need to run installer, don't need SDK)
+
+4. RESTART IIS:
+   In PowerShell (as Admin):
+   iisreset
+
+5. TEST:
+   http://your-server/health
+
+ADVANTAGES:
+✓ No need to install .NET on server
+✓ App includes everything it needs
+✓ Works immediately
+
+DISADVANTAGES:
+- Larger file size (~80MB vs 200KB)
+- Need to rebuild for updates
+
+==================================================
+SOLUTION 2: INSTALL .NET HOSTING BUNDLE (Smaller)
+==================================================
+
+Install .NET runtime on the server once, then use
+smaller deployments.
+
+STEPS:
+------
+1. ON IIS SERVER:
+   Download and install:
+   https://dotnet.microsoft.com/download/dotnet/6.0
+   
+   Choose: "Hosting Bundle"
+   Direct link:
+   https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+
+2. RESTART IIS:
+   In PowerShell (as Admin):
+   iisreset
+
+3. COPY FILES:
+   Use the regular 'publish' folder (from build.bat)
+   Copy to: C:\inetpub\wwwroot\solwebhook\
+
+4. TEST:
+   http://your-server/health
+
+ADVANTAGES:
+✓ Smaller deployments
+✓ Faster updates
+✓ Multiple apps can share runtime
+
+DISADVANTAGES:
+- Need to install something on server
+- One-time setup required
+
+==================================================
+WHICH SOLUTION SHOULD YOU USE?
+==================================================
+
+USE SOLUTION 1 (SELF-CONTAINED) IF:
+✓ You want it working NOW
+✓ You can't/don't want to install things on server
+✓ File size doesn't matter
+✓ This is the only .NET Core app on server
+
+USE SOLUTION 2 (HOSTING BUNDLE) IF:
+✓ You plan to run multiple .NET apps
+✓ You want smaller deployments
+✓ You can install software on server
+✓ You want easier updates
+
+==================================================
+RECOMMENDED: SOLUTION 1 (Self-Contained)
+==================================================
+
+Just run: build-selfcontained.bat
+Then copy publish-standalone folder to server
+Replace web.config with web-selfcontained.config
+Done!
+
+==================================================
+TROUBLESHOOTING
+==================================================
+
+Error: "AspNetCoreModuleV2 is not installed"
+Fix: Install hosting bundle (even for self-contained)
+     https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+
+Error: "Access Denied"
+Fix: Give IIS user permissions to folder:
+     icacls "C:\inetpub\wwwroot\solwebhook" /grant "IIS_IUSRS:(OI)(CI)F" /T
+
+Error: Still 500.31
+Fix: Check Application Event Log for details
+     Run: eventvwr.msc
+     Look under: Windows Logs > Application
+
+==================================================
+
+

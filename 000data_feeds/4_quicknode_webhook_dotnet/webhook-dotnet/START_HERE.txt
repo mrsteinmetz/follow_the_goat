@@ -1,0 +1,61 @@
+==================================================
+GOT HTTP 500.31 ERROR? START HERE!
+==================================================
+
+Your IIS server has .NET Framework 4.8, but this 
+webhook needs .NET Core 8.0 (different thing).
+
+UPDATE: Project now targets .NET 8.0 (was 6.0)
+This fixes the "out of support" warning.
+
+EASIEST FIX (No installation on server needed):
+==================================================
+
+1. ON THIS COMPUTER (where these files are):
+   
+   Make sure you're in the right folder:
+   C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+   
+   Then double-click: build-selfcontained.bat
+   
+   (This creates a 'publish-standalone' folder)
+   
+   If build fails, see: FIX_BUILD_ERRORS.txt
+
+2. COPY TO IIS SERVER:
+   Copy ALL files from 'publish-standalone' to:
+   C:\inetpub\wwwroot\solwebhook\
+
+3. ON IIS SERVER:
+   a) Go to the folder: C:\inetpub\wwwroot\solwebhook\
+   
+   b) Delete: web.config
+   
+   c) Rename: web-selfcontained.config 
+      to: web.config
+
+4. INSTALL ASP.NET CORE MODULE (one-time):
+   Download and run:
+   https://dotnet.microsoft.com/permalink/dotnetcore-current-windows-runtime-bundle-installer
+   
+   This is a small installer that adds IIS support.
+   You DON'T need to install full .NET runtime!
+
+5. RESTART IIS:
+   Open PowerShell as Administrator:
+   iisreset
+
+6. TEST:
+   Open browser: http://your-server-ip/health
+   Should show: {"status":"healthy",...}
+
+THAT'S IT!
+
+The self-contained version includes everything
+needed to run, so you don't need to install
+.NET Core on the server.
+
+For detailed troubleshooting, see: FIX_500_ERROR.txt
+
+==================================================
+

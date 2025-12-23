@@ -1,0 +1,240 @@
+===============================================================================
+                    QUICKNODE CONFIGURATION FIX
+                        WHALE ACTIVITY ISSUE
+===============================================================================
+
+PROBLEM: Whale endpoint receiving TRADES data instead of WHALE data
+
+YOUR LOGS SHOW:
+  [8a604376] Raw payload: {"matchedTransactions":[],...}
+  [8a604376] Parsed 0 whale movements from payload
+
+This is WRONG data structure for whale endpoint!
+
+===============================================================================
+                        WHAT'S HAPPENING NOW
+===============================================================================
+
+QuickNode Stream
+      |
+      | (Sending TRADES data)
+      |
+      v
+  Your Server: /webhooks/whale-activity
+      |
+      | (Looking for "whaleMovements" field)
+      |
+      v
+  Receives: {"matchedTransactions": [...]}  ❌ WRONG!
+      |
+      v
+  Result: whaleMovements = null
+          Parsed 0 whale movements
+          Nothing saved to database
+
+===============================================================================
+                        WHAT SHOULD HAPPEN
+===============================================================================
+
+QuickNode Stream
+      |
+      | (Should send WHALE data)
+      |
+      v
+  Your Server: /webhooks/whale-activity
+      |
+      | (Looking for "whaleMovements" field)
+      |
+      v
+  Receives: {"whaleMovements": [{...}]}  ✅ CORRECT!
+      |
+      v
+  Result: whaleMovements = [whale objects]
+          Parsed 5 whale movements
+          Data saved to database ✅
+
+===============================================================================
+                        CURRENT CONFIGURATION
+===============================================================================
+
+You have TWO endpoints working:
+
+1. MAIN TRADES ENDPOINT (Working ✅)
+   URL: http://yourserver/
+   Receives: {"matchedTransactions": [...]}
+   Function: Your trades function
+   Status: ✅ Inserting trades successfully
+   
+   Log evidence:
+   [INFO] Inserted: sell 1.1271 SOL @ $194.52
+   [INFO] Inserted: buy 2.5705 SOL @ $194.51
+
+2. WHALE ACTIVITY ENDPOINT (Wrong Function ❌)
+   URL: http://yourserver/webhooks/whale-activity
+   Receives: {"matchedTransactions": [...]}  ← WRONG DATA!
+   Function: YOUR TRADES FUNCTION (should be whale function)
+   Status: ❌ Parsing 0 movements (wrong structure)
+   
+   Log evidence:
+   [8a604376] Raw payload: {"matchedTransactions":[],...}
+   [8a604376] Parsed 0 whale movements
+
+===============================================================================
+                            THE FIX
+===============================================================================
+
+STEP 1: Go to QuickNode Dashboard
+  → https://dashboard.quicknode.com/
+
+STEP 2: Find Your Webhooks
+  You should see at least 2 webhooks or 2 destinations
+
+STEP 3: Identify Which is Which
+
+  WEBHOOK/STREAM A:
+    Destination: http://yourserver/ (or http://yourserver:5000/)
+    Purpose: SOL/Stablecoin Trades
+    Function: (Current function - keep it)
+    Status: ✅ Leave this alone - it's working
+
+  WEBHOOK/STREAM B:
+    Destination: http://yourserver/webhooks/whale-activity
+    Purpose: Whale Activity Tracking
+    Function: ❌ Currently using TRADES function
+    Status: ❌ NEEDS TO BE CHANGED
+
+STEP 4: Change the Function for Webhook B
+
+  Option A: If you have whale_activity_function_UPDATED.js already:
+    → Select it from dropdown
+
+  Option B: If you don't have it yet:
+    → Click "Add Function"
+    → Copy/paste code from webhook-dotnet/whale_activity_function_UPDATED.js
+    → Name it "whale_activity_function"
+    → Save
+    → Assign to Webhook B
+
+STEP 5: Verify the Function Returns Correct Structure
+
+  The whale function MUST return:
+  
+  ```javascript
+  return {
+    whaleMovements: whaleMovements,    // ← Must have this field
+    summary: {
+      totalMovements: whaleMovements.length,
+      totalVolume: ...,
+      ...
+    }
+  };
+  ```
+
+  NOT:
+  
+  ```javascript
+  return {
+    matchedTransactions: matchedTransactions,  // ← This is for TRADES only!
+    ...
+  };
+  ```
+
+STEP 6: Save and Test
+
+===============================================================================
+                        VERIFICATION
+===============================================================================
+
+After fixing QuickNode configuration:
+
+1. Monitor the logs:
+   
+   cd webhook-dotnet
+   .\monitor-whale-logs.bat
+
+2. Wait for whale activity (or send test)
+
+3. You should see:
+
+   BEFORE FIX (Current):
+   [xxxxxxxx] Raw payload: {"matchedTransactions":[],...}
+   [xxxxxxxx] Parsed 0 whale movements
+   [xxxxxxxx] No movements to process
+
+   AFTER FIX (Expected):
+   [xxxxxxxx] Raw payload: {"whaleMovements":[{"signature":"...
+   [xxxxxxxx] Parsed 5 whale movements from payload
+   [xxxxxxxx] Starting async processing of 5 movements
+   [xxxxxxxx] ProcessWhaleMovements - START
+   [xxxxxxxx] Database connection opened successfully
+   [xxxxxxxx] [SUCCESS] Whale movement inserted: MEGA_WHALE...
+
+===============================================================================
+                        QUICK CHECKLIST
+===============================================================================
+
+Before Fix:
+[ ] Endpoint receives data ✅ (logs show requests coming in)
+[ ] JSON parses successfully ✅ (no JSON errors)
+[ ] WhaleMovements field exists ❌ (it's "matchedTransactions" instead)
+[ ] Data saved to database ❌ (0 movements to process)
+
+After Fix:
+[ ] Endpoint receives data ✅
+[ ] JSON parses successfully ✅
+[ ] WhaleMovements field exists ✅ (correct structure)
+[ ] Data saved to database ✅ (movements processed and inserted)
+
+===============================================================================
+                        COMMON QUESTIONS
+===============================================================================
+
+Q: Why is the trades endpoint working but not whale endpoint?
+A: Because they're using the SAME function, but whale endpoint expects
+   DIFFERENT data structure. Each endpoint needs its own function.
+
+Q: Do I need to change my C# code?
+A: NO! Your C# code is 100% correct and working perfectly. The logs
+   prove it's correctly parsing the JSON and looking for "whaleMovements".
+   The issue is QuickNode sending wrong data structure.
+
+Q: How do I know when it's fixed?
+A: The logs will show "Parsed X whale movements" (X > 0) instead of
+   "Parsed 0 whale movements", followed by database insert success messages.
+
+Q: Will this break my trades endpoint?
+A: No! Trades endpoint will continue working. You're only changing which
+   function is used for the WHALE webhook.
+
+===============================================================================
+                        CONTACT INFO
+===============================================================================
+
+If you need help with QuickNode configuration:
+- QuickNode Support: https://support.quicknode.com/
+- QuickNode Discord: https://discord.gg/quicknode
+
+Show them:
+1. You have 2 webhooks
+2. Webhook B (whale activity) needs to use whale function
+3. Whale function must return {"whaleMovements": [...]} structure
+
+===============================================================================
+                            SUMMARY
+===============================================================================
+
+Problem:     Whale webhook using wrong function
+Cause:       QuickNode sending trades data to whale endpoint
+Evidence:    Logs show "matchedTransactions" instead of "whaleMovements"
+Solution:    Change QuickNode webhook to use whale function
+Result:      Whale movements will be inserted into database
+
+Your C# code is fine ✅
+Your database schema is fine ✅
+Your logging is working perfectly ✅
+
+Just need to fix QuickNode configuration! 🎯
+
+===============================================================================
+
+

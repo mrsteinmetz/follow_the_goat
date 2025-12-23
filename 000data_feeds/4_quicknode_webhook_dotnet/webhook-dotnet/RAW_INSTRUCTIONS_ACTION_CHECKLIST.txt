@@ -1,0 +1,161 @@
+===============================================================================
+RAW INSTRUCTIONS DATA - FIX ACTION CHECKLIST
+===============================================================================
+
+PROBLEM FIXED:
+The raw_instructions_data field was appearing as NULL because the C# code was 
+looking for it inside perp_debug_info instead of at the top level.
+
+FILES MODIFIED:
+✅ Program.cs - Added RawInstructionsData property and updated extraction logic
+✅ test_raw_instructions.json - Moved raw_instructions_data to top level
+✅ Created: RAW_INSTRUCTIONS_FIX_SUMMARY.md
+✅ Created: verify_raw_instructions.sql
+
+===============================================================================
+ACTION ITEMS - FOLLOW THESE STEPS:
+===============================================================================
+
+STEP 1: REBUILD THE APPLICATION
+--------------------------------
+Open PowerShell in the webhook-dotnet directory and run:
+
+    cd C:\Users\ander\OneDrive\00000WORK\solana_node\webhook-dotnet
+    .\build-selfcontained.bat
+
+Expected output:
+- Build successful
+- Files created in: bin\Release\net8.0\win-x64\publish\
+
+STEP 2: STOP IIS APPLICATION POOL
+----------------------------------
+1. Open IIS Manager
+2. Find "SolWebhook" application pool
+3. Click "Stop" in the Actions panel
+4. Wait for it to fully stop
+
+STEP 3: DEPLOY NEW FILES
+-------------------------
+Copy the published files to your IIS directory:
+
+From: webhook-dotnet\bin\Release\net8.0\win-x64\publish\*
+To:   C:\inetpub\wwwroot\solwebhook\  (or your IIS path)
+
+Make sure to overwrite existing files, especially:
+- SolWebhook.dll (contains the fix)
+- SolWebhook.exe
+
+STEP 4: START IIS APPLICATION POOL
+-----------------------------------
+1. In IIS Manager, select "SolWebhook" application pool
+2. Click "Start" in the Actions panel
+3. Wait a few seconds for it to initialize
+
+STEP 5: TEST THE FIX LOCALLY
+-----------------------------
+Run the test script:
+
+    .\test_raw_instructions.bat
+
+Expected console output:
+- Status Code: 200
+- Response: {"status":"accepted","received":3,...}
+
+STEP 6: VERIFY IN DATABASE
+---------------------------
+Open MySQL and run:
+
+    USE solcatcher;
+    
+    SELECT 
+        signature,
+        CASE 
+            WHEN raw_instructions_data IS NULL THEN '❌ NULL'
+            ELSE '✅ POPULATED'
+        END AS status,
+        CHAR_LENGTH(raw_instructions_data) AS data_length,
+        created_at
+    FROM sol_stablecoin_trades
+    ORDER BY created_at DESC
+    LIMIT 5;
+
+You should see:
+- status: ✅ POPULATED (not ❌ NULL)
+- data_length: > 100 (actual JSON length)
+
+STEP 7: CHECK REAL-TIME DATA
+-----------------------------
+Wait for QuickNode to send real transactions (or trigger a test from QuickNode).
+
+Then verify new transactions have raw_instructions_data:
+
+    SELECT 
+        signature,
+        wallet_address,
+        JSON_LENGTH(raw_instructions_data) AS instruction_count,
+        created_at
+    FROM sol_stablecoin_trades
+    WHERE created_at > NOW() - INTERVAL 10 MINUTE
+      AND raw_instructions_data IS NOT NULL;
+
+Expected: New transactions should have instruction_count >= 1
+
+===============================================================================
+TROUBLESHOOTING
+===============================================================================
+
+ISSUE: Still seeing NULL in database
+SOLUTION: 
+- Check that SolWebhook.dll was actually replaced
+- Verify IIS restarted successfully (check Event Viewer)
+- Check console logs for "[WARNING] Failed to extract raw_instructions_data"
+
+ISSUE: Test returns error 500
+SOLUTION:
+- Check IIS application pool is running
+- Check Windows Event Viewer -> Application logs
+- Verify Program.cs compiled without errors
+
+ISSUE: Old transactions still have NULL
+SOLUTION:
+- This is EXPECTED - only NEW transactions will have the data
+- Old transactions will remain NULL (that's fine)
+- Focus on verifying NEW transactions after deployment
+
+===============================================================================
+EXPECTED RESULTS
+===============================================================================
+
+BEFORE FIX:
+| signature | raw_instructions_data | created_at          |
+|-----------|-----------------------|---------------------|
+| abc123... | NULL                  | 2024-10-28 10:00:00 |
+| def456... | NULL                  | 2024-10-28 10:05:00 |
+
+AFTER FIX:
+| signature | raw_instructions_data                              | created_at          |
+|-----------|----------------------------------------------------|---------------------|
+| abc123... | NULL                                               | 2024-10-28 10:00:00 |
+| def456... | NULL                                               | 2024-10-28 10:05:00 |
+| ghi789... | [{"program_id":"dRifty...","base58_data":"874e... | 2024-10-28 10:30:00 | ✅ NEW
+
+===============================================================================
+ADDITIONAL RESOURCES
+===============================================================================
+
+📄 RAW_INSTRUCTIONS_FIX_SUMMARY.md - Technical details of the fix
+📄 verify_raw_instructions.sql - SQL queries to verify the fix
+📄 test_raw_instructions.json - Updated test payload
+
+===============================================================================
+QUESTIONS OR ISSUES?
+===============================================================================
+
+If raw_instructions_data is still NULL after following all steps:
+1. Check Program.cs line 268-279 (extraction logic)
+2. Check Program.cs line 565 (TradeData model)
+3. Verify JavaScript is sending raw_instructions_data at TOP LEVEL (not inside perp_debug_info)
+4. Check IIS logs: C:\inetpub\logs\LogFiles\
+
+===============================================================================
+

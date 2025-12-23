@@ -1,0 +1,248 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║               RAW INSTRUCTIONS DATA FIELD - DEPLOYMENT CHECKLIST             ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+OVERVIEW
+────────
+This update adds the raw_instructions_data field to capture Base58-encoded 
+instruction data from perp transactions. This is extracted from the 
+perp_debug_info.raw_instructions_data array sent by the QuickNode stream.
+
+WHAT CHANGED
+────────────
+✓ Added raw_instructions_data TEXT column to database tables
+✓ Updated C# TradeData model to capture perp_debug_info
+✓ Modified INSERT statements for main and archive tables
+✓ Updated table creation SQL in EnsureTablesExist()
+
+FILES MODIFIED
+──────────────
+✓ webhook-dotnet/Program.cs
+  - Added PerpDebugInfo property to TradeData model
+  - Added extraction logic for raw_instructions_data
+  - Updated INSERT SQL statements
+  - Updated table creation statements
+
+FILES CREATED
+─────────────
+✓ webhook-dotnet/add_raw_instructions_column.sql
+  - Migration SQL to add the new column
+
+✓ webhook-dotnet/RAW_INSTRUCTIONS_README.md
+  - Complete documentation
+
+✓ webhook-dotnet/test_raw_instructions.json
+  - Test payload with sample data
+
+✓ webhook-dotnet/test_raw_instructions.bat
+  - Automated test script
+
+✓ webhook-dotnet/DEPLOYMENT_CHECKLIST_RAW_INSTRUCTIONS.txt
+  - This file
+
+DEPLOYMENT STEPS
+────────────────
+
+[ ] STEP 1: Backup Database
+    Run this command:
+    
+    mysqldump -u solcatcher -p solcatcher sol_stablecoin_trades > backup_before_raw_instructions.sql
+    mysqldump -u solcatcher -p solcatcher sol_stablecoin_trades_archive >> backup_before_raw_instructions.sql
+
+[ ] STEP 2: Update Database Schema
+    Run the migration:
+    
+    cd webhook-dotnet
+    mysql -u solcatcher -p solcatcher < add_raw_instructions_column.sql
+    
+    Verify columns exist:
+    
+    mysql -u solcatcher -p solcatcher -e "DESCRIBE sol_stablecoin_trades" | grep raw_instructions
+    mysql -u solcatcher -p solcatcher -e "DESCRIBE sol_stablecoin_trades_archive" | grep raw_instructions
+
+[ ] STEP 3: Build Updated Webhook
+    
+    cd webhook-dotnet
+    build-selfcontained.bat
+    
+    Verify build succeeded - check for:
+    - publish-standalone folder created
+    - Program.dll exists
+    - No build errors
+
+[ ] STEP 4: Stop IIS Application Pool
+    
+    Open IIS Manager:
+    - Find "SolWebhook" application pool
+    - Click "Stop"
+    - Wait for "Stopped" status
+
+[ ] STEP 5: Deploy Updated Files
+    
+    Copy files from webhook-dotnet\publish-standalone\ to IIS directory:
+    C:\inetpub\wwwroot\solwebhook\
+    
+    Overwrite all files when prompted.
+
+[ ] STEP 6: Start IIS Application Pool
+    
+    In IIS Manager:
+    - Select "SolWebhook" application pool
+    - Click "Start"
+    - Verify "Running" status
+
+[ ] STEP 7: Test Health Endpoint
+    
+    Open browser or run:
+    
+    curl http://localhost:8080/health
+    
+    Expected response:
+    {
+      "status": "healthy",
+      "timestamp": "...",
+      "recent_trades": 0
+    }
+
+[ ] STEP 8: Run Test Suite
+    
+    cd webhook-dotnet
+    test_raw_instructions.bat
+    
+    This will:
+    - Check health endpoint
+    - Send test payload with perp_debug_info
+    - Wait for processing
+    
+    Expected: No errors, "accepted" response
+
+[ ] STEP 9: Verify Database Data
+    
+    Run these queries:
+    
+    -- Check that new column exists
+    DESCRIBE sol_stablecoin_trades;
+    
+    -- Check for test data (if test ran)
+    SELECT 
+        signature,
+        perp_platform,
+        LEFT(raw_instructions_data, 100) as preview
+    FROM sol_stablecoin_trades
+    WHERE raw_instructions_data IS NOT NULL
+    ORDER BY id DESC
+    LIMIT 3;
+    
+    -- Validate JSON format
+    SELECT 
+        signature,
+        JSON_VALID(raw_instructions_data) as is_valid_json
+    FROM sol_stablecoin_trades
+    WHERE raw_instructions_data IS NOT NULL
+    LIMIT 1;
+
+[ ] STEP 10: Monitor Live Data
+    
+    Watch for incoming trades:
+    
+    -- Check recent trades with raw data
+    SELECT 
+        signature,
+        perp_platform,
+        perp_direction,
+        CASE 
+            WHEN raw_instructions_data IS NOT NULL THEN 'YES'
+            ELSE 'NO'
+        END as has_raw_data
+    FROM sol_stablecoin_trades
+    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+    ORDER BY id DESC
+    LIMIT 10;
+
+ROLLBACK PLAN
+─────────────
+If something goes wrong:
+
+1. Restore IIS:
+   - Stop application pool
+   - Copy back old files from previous build
+   - Start application pool
+
+2. The database changes are backward compatible, so the old code will work
+   with the new schema (it will just leave raw_instructions_data as NULL)
+
+3. If you need to remove the column:
+   
+   ALTER TABLE sol_stablecoin_trades DROP COLUMN raw_instructions_data;
+   ALTER TABLE sol_stablecoin_trades_archive DROP COLUMN raw_instructions_data;
+
+VERIFICATION QUERIES
+────────────────────
+
+After deployment, run these to verify everything works:
+
+-- 1. Check column exists
+SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE 
+FROM INFORMATION_SCHEMA.COLUMNS 
+WHERE TABLE_NAME = 'sol_stablecoin_trades' 
+AND COLUMN_NAME = 'raw_instructions_data';
+
+-- 2. Check data is being saved
+SELECT 
+    COUNT(*) as total_trades,
+    COUNT(raw_instructions_data) as trades_with_raw_data,
+    ROUND(COUNT(raw_instructions_data) / COUNT(*) * 100, 2) as percentage
+FROM sol_stablecoin_trades
+WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 HOUR);
+
+-- 3. Sample raw instructions data
+SELECT 
+    signature,
+    perp_platform,
+    perp_direction,
+    raw_instructions_data
+FROM sol_stablecoin_trades
+WHERE raw_instructions_data IS NOT NULL
+ORDER BY id DESC
+LIMIT 1\G
+
+-- 4. Extract program_id from JSON (MySQL 5.7+)
+SELECT 
+    signature,
+    perp_platform,
+    JSON_EXTRACT(raw_instructions_data, '$[0].program_id') as program_id,
+    JSON_LENGTH(raw_instructions_data) as instruction_count
+FROM sol_stablecoin_trades
+WHERE raw_instructions_data IS NOT NULL
+ORDER BY id DESC
+LIMIT 5;
+
+POST-DEPLOYMENT
+───────────────
+
+[ ] Documentation updated
+[ ] Team notified of new field
+[ ] Analytics queries updated to use new data
+[ ] Backup schedule verified
+[ ] Monitoring alerts configured (if needed)
+
+NOTES
+─────
+- The field is nullable, so old/non-perp trades will have NULL
+- Only trades with perp_debug_info will have this data
+- JSON is stored as TEXT for MySQL compatibility
+- Archive table also includes this field
+- Field extraction is safe - errors are caught and logged
+
+SUPPORT
+───────
+For issues:
+1. Check IIS logs: C:\inetpub\logs\LogFiles
+2. Check Windows Event Viewer
+3. Review webhook console output
+4. Check database for errors in recent trades
+
+═══════════════════════════════════════════════════════════════════════════════
+                              DEPLOYMENT COMPLETE ✓
+═══════════════════════════════════════════════════════════════════════════════
+

@@ -1,0 +1,152 @@
+================================================================================
+PERP POSITION INTEGRATION - QUICK START
+================================================================================
+
+Your webhook handler now supports perp position tracking for BOTH:
+  - Spot trades (sol_stablecoin_trades)
+  - Whale movements (whale_movements)
+
+================================================================================
+WHAT'S NEW?
+================================================================================
+
+6 New Fields Added to Each Table:
+  1. has_perp_position (BOOLEAN) - Does wallet have a perp position?
+  2. perp_platform (ENUM) - drift, jupiter, mango, zeta
+  3. perp_direction (ENUM) - long, short
+  4. perp_size (DECIMAL) - Position size in SOL
+  5. perp_leverage (DECIMAL) - Leverage multiplier (optional)
+  6. perp_entry_price (DECIMAL) - Entry price (optional)
+
+================================================================================
+QUICK DEPLOYMENT (5 STEPS)
+================================================================================
+
+Step 1: Update Archive Table
+  Command: mysql -u solcatcher -p solcatcher < add_perp_fields_to_archive.sql
+  Time: ~5 seconds
+
+Step 2: Rebuild Webhook
+  Command: build-selfcontained.bat
+  Time: ~30 seconds
+
+Step 3: Deploy to IIS
+  Action: Copy files from publish-standalone to IIS directory
+  Time: ~2 minutes
+
+Step 4: Test Trades
+  Command: test_perp_fields.bat
+  Expected: "SUCCESS: Test payload accepted"
+
+Step 5: Test Whales
+  Command: test_whale_perp_fields.bat
+  Expected: "SUCCESS: Whale movements accepted"
+
+================================================================================
+VERIFY IT'S WORKING
+================================================================================
+
+Quick Database Check:
+
+  -- Check trades
+  SELECT signature, wallet_address, has_perp_position, perp_platform 
+  FROM sol_stablecoin_trades 
+  ORDER BY id DESC LIMIT 5;
+
+  -- Check whales
+  SELECT signature, wallet_address, has_perp_position, perp_platform 
+  FROM whale_movements 
+  ORDER BY id DESC LIMIT 5;
+
+Console Log Check:
+  Look for: [PERP: drift long 250 SOL]
+
+================================================================================
+QUICKNODE CONFIGURATION
+================================================================================
+
+Add These Fields to BOTH Streams:
+  {
+    "has_perp_position": true,
+    "perp_platform": "drift",
+    "perp_direction": "long",
+    "perp_size": 250.0,
+    "perp_leverage": null,
+    "perp_entry_price": null
+  }
+
+Valid Platform Values: drift, jupiter, mango, zeta
+Valid Direction Values: long, short
+
+================================================================================
+TEST PAYLOADS
+================================================================================
+
+Test files created:
+  - test_payload_with_perp.json (trades)
+  - test_whale_payload_with_perp.json (whales)
+
+Run tests:
+  - test_perp_fields.bat (trades)
+  - test_whale_perp_fields.bat (whales)
+
+================================================================================
+DOCUMENTATION
+================================================================================
+
+Quick Reference:
+  - COMPLETE_PERP_INTEGRATION_SUMMARY.md (START HERE!)
+  - PERP_DEPLOYMENT_CHECKLIST.txt (step-by-step)
+
+Detailed Guides:
+  - PERP_FIELDS_README.md (trades)
+  - WHALE_PERP_FIELDS_README.md (whales)
+  - PERP_FIELDS_CHANGELOG.md (what changed)
+
+================================================================================
+USEFUL QUERIES
+================================================================================
+
+Find Traders with Perp Positions:
+  SELECT wallet_address, direction, perp_platform, perp_direction 
+  FROM sol_stablecoin_trades 
+  WHERE has_perp_position = TRUE 
+  ORDER BY id DESC LIMIT 10;
+
+Find Whales with Perp Positions:
+  SELECT wallet_address, whale_type, abs_change, perp_platform 
+  FROM whale_movements 
+  WHERE has_perp_position = TRUE 
+  ORDER BY id DESC LIMIT 10;
+
+Perp Platform Distribution:
+  SELECT perp_platform, COUNT(*) as count 
+  FROM sol_stablecoin_trades 
+  WHERE has_perp_position = TRUE 
+  GROUP BY perp_platform;
+
+================================================================================
+NEED HELP?
+================================================================================
+
+Everything not working?
+  1. Check webhook is running: http://localhost:5000
+  2. Run test_perp_fields.bat
+  3. Check IIS logs
+  4. See PERP_DEPLOYMENT_CHECKLIST.txt
+
+Database errors?
+  - Verify all tables have perp columns
+  - Check ENUM values are valid (drift/jupiter/mango/zeta)
+  - See PERP_FIELDS_README.md troubleshooting section
+
+================================================================================
+READY TO GO!
+================================================================================
+
+Your webhook is now perp-position aware!
+
+Next: Configure QuickNode to send perp data → Start seeing insights!
+
+================================================================================
+

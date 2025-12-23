@@ -1,0 +1,139 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "SolWebhook/1.0.0": {
+        "dependencies": {
+          "DuckDB.NET.Data.Full": "1.4.3",
+          "MySqlConnector": "2.4.0"
+        },
+        "runtime": {
+          "SolWebhook.dll": {}
+        }
+      },
+      "DuckDB.NET.Bindings.Full/1.4.3": {
+        "runtime": {
+          "lib/net8.0/DuckDB.NET.Bindings.dll": {
+            "assemblyVersion": "1.4.3.0",
+            "fileVersion": "1.4.3.0"
+          }
+        },
+        "runtimeTargets": {
+          "runtimes/linux-arm64/native/libduckdb.so": {
+            "rid": "linux-arm64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          },
+          "runtimes/linux-x64/native/libduckdb.so": {
+            "rid": "linux-x64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          },
+          "runtimes/osx/native/libduckdb.dylib": {
+            "rid": "osx",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          },
+          "runtimes/win-arm64/native/duckdb.dll": {
+            "rid": "win-arm64",
+            "assetType": "native",
+            "fileVersion": "1.4.3.0"
+          },
+          "runtimes/win-x64/native/duckdb.dll": {
+            "rid": "win-x64",
+            "assetType": "native",
+            "fileVersion": "1.4.3.0"
+          }
+        }
+      },
+      "DuckDB.NET.Data.Full/1.4.3": {
+        "dependencies": {
+          "DuckDB.NET.Bindings.Full": "1.4.3"
+        },
+        "runtime": {
+          "lib/net8.0/DuckDB.NET.Data.dll": {
+            "assemblyVersion": "1.4.3.0",
+            "fileVersion": "1.4.3.0"
+          }
+        }
+      },
+      "Microsoft.Extensions.DependencyInjection.Abstractions/8.0.2": {
+        "runtime": {
+          "lib/net8.0/Microsoft.Extensions.DependencyInjection.Abstractions.dll": {
+            "assemblyVersion": "8.0.0.0",
+            "fileVersion": "8.0.1024.46610"
+          }
+        }
+      },
+      "Microsoft.Extensions.Logging.Abstractions/8.0.2": {
+        "dependencies": {
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "8.0.2"
+        },
+        "runtime": {
+          "lib/net8.0/Microsoft.Extensions.Logging.Abstractions.dll": {
+            "assemblyVersion": "8.0.0.0",
+            "fileVersion": "8.0.1024.46610"
+          }
+        }
+      },
+      "MySqlConnector/2.4.0": {
+        "dependencies": {
+          "Microsoft.Extensions.DependencyInjection.Abstractions": "8.0.2",
+          "Microsoft.Extensions.Logging.Abstractions": "8.0.2"
+        },
+        "runtime": {
+          "lib/net8.0/MySqlConnector.dll": {
+            "assemblyVersion": "2.0.0.0",
+            "fileVersion": "2.4.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "SolWebhook/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "DuckDB.NET.Bindings.Full/1.4.3": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-hZwm0zTKJ5HdUGKcase2JX52Lquyh7dCUFweECvR877QEA2gF8gSl3qrtb71BvRlgZ7pfjh0bRBCiAKOJMLE+A==",
+      "path": "duckdb.net.bindings.full/1.4.3",
+      "hashPath": "duckdb.net.bindings.full.1.4.3.nupkg.sha512"
+    },
+    "DuckDB.NET.Data.Full/1.4.3": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-tg1FWmePN+k536O1cx2VhKWa3xT7DXrcGg4kGgiSWQyur9UWwZ2i2YMpD+XVYv1ARozyy1Tt7OW2cMrNPoPj9g==",
+      "path": "duckdb.net.data.full/1.4.3",
+      "hashPath": "duckdb.net.data.full.1.4.3.nupkg.sha512"
+    },
+    "Microsoft.Extensions.DependencyInjection.Abstractions/8.0.2": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-3iE7UF7MQkCv1cxzCahz+Y/guQbTqieyxyaWKhrRO91itI9cOKO76OHeQDahqG4MmW5umr3CcCvGmK92lWNlbg==",
+      "path": "microsoft.extensions.dependencyinjection.abstractions/8.0.2",
+      "hashPath": "microsoft.extensions.dependencyinjection.abstractions.8.0.2.nupkg.sha512"
+    },
+    "Microsoft.Extensions.Logging.Abstractions/8.0.2": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-nroMDjS7hNBPtkZqVBbSiQaQjWRDxITI8Y7XnDs97rqG3EbzVTNLZQf7bIeUJcaHOV8bca47s1Uxq94+2oGdxA==",
+      "path": "microsoft.extensions.logging.abstractions/8.0.2",
+      "hashPath": "microsoft.extensions.logging.abstractions.8.0.2.nupkg.sha512"
+    },
+    "MySqlConnector/2.4.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-78M+gVOjbdZEDIyXQqcA7EYlCGS3tpbUELHvn6638A2w0pkPI625ixnzsa5staAd3N9/xFmPJtkKDYwsXpFi/w==",
+      "path": "mysqlconnector/2.4.0",
+      "hashPath": "mysqlconnector.2.4.0.nupkg.sha512"
+    }
+  }
+}

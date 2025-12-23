@@ -1,37 +1,99 @@
 """
-Jupiter Price Fetcher with DuckDB Storage
-Optimized for trading bot performance with hot (24h) and cold (archive) tables.
+Jupiter Price Fetcher with TradingDataEngine
+=============================================
+High-performance price fetcher using in-memory DuckDB with zero locks.
+
+Architecture:
+- TradingDataEngine: In-memory DuckDB (24hr hot storage, zero lock contention)
+- MySQL: Full historical master storage (via background sync)
+
+Data flow:
+1. Fetch prices from Jupiter API every 2 seconds
+2. Write to TradingDataEngine (non-blocking, queued)
+3. Engine auto-syncs to MySQL every 30s
+4. Engine auto-cleans data older than 24 hours
+
+Jupiter API Migration (effective Jan 31, 2026):
+- Old: https://lite-api.jup.ag/price/v3 (deprecated)
+- New: https://api.jup.ag/price/v2/price (requires API key)
+- Docs: https://dev.jup.ag/portal/migrate-from-lite-api
 """
+
+import sys
+import os
+from pathlib import Path
+
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load .env file if it exists
+try:
+    from dotenv import load_dotenv
+    env_path = PROJECT_ROOT / ".env"
+    if env_path.exists():
+        load_dotenv(env_path, encoding='utf-16')  # Windows often uses utf-16
+    else:
+        load_dotenv()  # Try default locations
+except ImportError:
+    pass  # dotenv not installed, use regular env vars
 
 import requests
 import time
 import duckdb
+import logging
 from datetime import datetime, timedelta
-from pathlib import Path
+from typing import Optional, Tuple
+
+from core.database import get_duckdb, get_mysql, get_trading_engine
+from core.config import settings
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("jupiter_prices")
 
 # --- Configuration ---
-FETCH_INTERVAL_SECONDS = 1.0
-JUPITER_API_URL = "https://lite-api.jup.ag/price/v3"
-CLEANUP_INTERVAL = 3600  # Run cleanup every hour (in iterations based on fetch interval)
+FETCH_INTERVAL_SECONDS = 1.0  # 1 second = 60 req/min (matches free tier limit)
+CLEANUP_INTERVAL = 3600  # Run cleanup every hour
+
+# Jupiter Price API v3 (requires API key from portal.jup.ag)
+# Migration guide: https://dev.jup.ag/portal/migrate-from-lite-api
+JUPITER_API_URL = "https://api.jup.ag/price/v3"
+
+# API Key - Get yours free at https://portal.jup.ag
+# Free tier: 60 requests/minute
+# Set via environment variable or .env file (supports both JUPITER_API_KEY and jupiter_api_key)
+JUPITER_API_KEY = (
+    os.getenv("JUPITER_API_KEY", "") or 
+    os.getenv("jupiter_api_key", "") or 
+    getattr(settings, 'jupiter_api_key', "")
+)
 
 # Token mint addresses on Solana
 TOKENS = {
+    "SOL": "So11111111111111111111111111111111111111112",   # Native SOL
     "BTC": "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",  # Wrapped BTC (Portal)
     "ETH": "7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs",  # Wrapped ETH (Portal)
-    "SOL": "So11111111111111111111111111111111111111112",   # Native SOL
 }
 
 # Reverse lookup
 MINT_TO_TOKEN = {v: k for k, v in TOKENS.items()}
 
-# Database path
-DB_PATH = Path(__file__).parent / "prices.duckdb"
+# Legacy database path (for backward compatibility)
+LEGACY_DB_PATH = Path(__file__).parent / "prices.duckdb"
+
+# Rate limiting state
+_last_rate_limit_time = 0
+_backoff_seconds = 0
+_consecutive_errors = 0
 
 
-def init_database(con: duckdb.DuckDBPyConnection) -> None:
-    """Initialize database tables optimized for time-series price data."""
-    
-    # Hot table - last 24 hours of data, optimized for fast reads
+def init_legacy_database(con: duckdb.DuckDBPyConnection) -> None:
+    """Initialize DuckDB hot table (24hr fast storage)."""
     con.execute("""
         CREATE TABLE IF NOT EXISTS price_points (
             ts TIMESTAMP NOT NULL,
@@ -39,92 +101,298 @@ def init_database(con: duckdb.DuckDBPyConnection) -> None:
             price DOUBLE NOT NULL
         )
     """)
-    
-    # Archive table - all historical data
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS price_points_archive (
-            ts TIMESTAMP NOT NULL,
-            token VARCHAR(10) NOT NULL,
-            price DOUBLE NOT NULL
-        )
-    """)
-    
-    # Create indexes for fast queries
     con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_ts ON price_points(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_token ON price_points(token)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_token_ts ON price_points(token, ts)")
-    
-    con.execute("CREATE INDEX IF NOT EXISTS idx_archive_ts ON price_points_archive(ts)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_archive_token ON price_points_archive(token)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_archive_token_ts ON price_points_archive(token, ts)")
-    
-    print(f"Database initialized at: {DB_PATH}")
 
 
 def fetch_prices() -> dict | None:
-    """Fetch token prices from Jupiter API with retry logic."""
+    """
+    Fetch token prices from Jupiter Price API v2.
+    
+    API Docs: https://dev.jup.ag/docs/price-api
+    Migration: https://dev.jup.ag/portal/migrate-from-lite-api
+    
+    Batch request format:
+        GET https://api.jup.ag/price/v2/price?ids=MINT1,MINT2,MINT3
+        Header: x-api-key: YOUR_API_KEY
+    
+    Response format:
+        {
+            "data": {
+                "MINT1": {"id": "...", "price": "123.45", ...},
+                "MINT2": {"id": "...", "price": "456.78", ...}
+            },
+            "timeTaken": 0.001
+        }
+    
+    Rate limits (free tier): 60 requests/minute
+    
+    Returns:
+        Dict mapping mint address to price data, or None on failure
+    """
+    global _last_rate_limit_time, _backoff_seconds, _consecutive_errors
+    
+    # Check if API key is configured
+    if not JUPITER_API_KEY:
+        logger.error(
+            "[ERROR] JUPITER_API_KEY not set! "
+            "Get a free API key at https://portal.jup.ag and set JUPITER_API_KEY environment variable"
+        )
+        return None
+    
+    # Check if we're in backoff period
+    if _backoff_seconds > 0:
+        elapsed = time.time() - _last_rate_limit_time
+        if elapsed < _backoff_seconds:
+            remaining = _backoff_seconds - elapsed
+            logger.debug(f"In backoff period, {remaining:.1f}s remaining")
+            return None
+        else:
+            logger.info(f"Backoff period ended, resuming API calls")
+            _backoff_seconds = 0
+    
+    # Build the batch request URL
     ids = ",".join(TOKENS.values())
+    url = f"{JUPITER_API_URL}?ids={ids}"
+    
+    # Headers with API key (required for api.jup.ag)
+    headers = {
+        "x-api-key": JUPITER_API_KEY,
+        "Accept": "application/json"
+    }
+    
+    logger.debug(f"API Request: {url}")
     
     for attempt in range(3):
         try:
-            response = requests.get(
-                JUPITER_API_URL, 
-                params={"ids": ids}, 
-                timeout=5
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            print(f"API error (attempt {attempt + 1}/3): {e}")
+            start_time = time.perf_counter()
+            response = requests.get(url, headers=headers, timeout=10)
+            elapsed = (time.perf_counter() - start_time) * 1000
+            
+            # Log rate limit headers if present
+            rate_limit_headers = {
+                k: v for k, v in response.headers.items() 
+                if k.lower().startswith('x-ratelimit') or k.lower().startswith('retry-after')
+            }
+            if rate_limit_headers:
+                logger.info(f"Rate limit headers: {rate_limit_headers}")
+            
+            # Check for authentication errors (401)
+            if response.status_code == 401:
+                logger.error(
+                    "[AUTH ERROR] UNAUTHORIZED (401)! Invalid or missing API key. "
+                    "Get a free key at https://portal.jup.ag"
+                )
+                logger.error(f"Response: {response.text[:200]}")
+                return None
+            
+            # Check for rate limiting (429)
+            if response.status_code == 429:
+                _consecutive_errors += 1
+                _last_rate_limit_time = time.time()
+                
+                # Exponential backoff: 5s, 10s, 20s, 40s, max 60s
+                _backoff_seconds = min(5 * (2 ** (_consecutive_errors - 1)), 60)
+                
+                retry_after = response.headers.get('Retry-After')
+                if retry_after:
+                    try:
+                        _backoff_seconds = max(_backoff_seconds, int(retry_after))
+                    except ValueError:
+                        pass
+                
+                logger.warning(
+                    f"[RATE LIMIT] (429)! Backing off for {_backoff_seconds}s "
+                    f"(consecutive errors: {_consecutive_errors}). "
+                    f"Free tier: 60 req/min. Consider upgrading at https://portal.jup.ag"
+                )
+                logger.warning(f"Response: {response.text[:200]}")
+                return None
+            
+            # Check for other errors
+            if response.status_code != 200:
+                logger.error(f"API Error {response.status_code}: {response.text[:200]}")
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                return None
+            
+            # Parse response
+            data = response.json()
+            
+            # Reset error counter on success
+            _consecutive_errors = 0
+            
+            # Log success
+            logger.debug(f"API Response ({elapsed:.0f}ms): {response.status_code}")
+            
+            # Parse response - v3 API returns mint address as key with usdPrice field
+            # Example: {"MINT": {"usdPrice": 123.45, ...}}
+            prices = {}
+            
+            # Check if response has "data" wrapper (some API versions)
+            price_data_dict = data.get("data", data) if isinstance(data, dict) else data
+            
+            for mint, price_data in price_data_dict.items():
+                if isinstance(price_data, dict):
+                    # Try usdPrice first (v3), then price (older versions)
+                    price_val = price_data.get("usdPrice") or price_data.get("price")
+                    if price_val is not None:
+                        prices[mint] = {"price": float(price_val)}
+                        logger.debug(f"  {MINT_TO_TOKEN.get(mint, mint)}: ${float(price_val):,.4f}")
+            
+            if prices:
+                return prices
+            else:
+                logger.warning(f"No valid prices in response: {str(data)[:200]}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logger.warning(f"Request timeout (attempt {attempt + 1}/3)")
             if attempt < 2:
-                time.sleep(1)
+                time.sleep(0.5)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error (attempt {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(0.5)
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            return None
     
+    logger.error("All retry attempts failed")
     return None
 
 
-def insert_prices(con: duckdb.DuckDBPyConnection, prices_data: dict) -> int:
-    """Insert prices into both hot and archive tables. Returns count of records inserted."""
+def insert_prices_via_engine(prices_data: dict) -> tuple[int, bool]:
+    """
+    Insert prices via TradingDataEngine (non-blocking).
+    
+    Returns:
+        Tuple of (record_count, success)
+    """
     if not prices_data:
-        return 0
+        return 0, False
+    
+    ts = datetime.now()
+    
+    try:
+        engine = get_trading_engine()
+        count = 0
+        
+        for mint, data in prices_data.items():
+            if data and "price" in data:
+                token = MINT_TO_TOKEN.get(mint)
+                if token:
+                    price = float(data["price"])
+                    engine.write('prices', {
+                        'ts': ts,
+                        'token': token,
+                        'price': price
+                    })
+                    count += 1
+        
+        return count, True
+        
+    except Exception as e:
+        logger.error(f"Engine write error: {e}")
+        return 0, False
+
+
+def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
+    """
+    Insert prices into both DuckDB (hot) and MySQL (master).
+    ALWAYS writes to both - no shortcuts!
+    
+    Returns:
+        Tuple of (record_count, duckdb_success, mysql_success)
+    """
+    if not prices_data:
+        return 0, False, False
     
     ts = datetime.now()
     records = []
     
     for mint, data in prices_data.items():
-        if data and "usdPrice" in data:
+        if data and "price" in data:
             token = MINT_TO_TOKEN.get(mint)
             if token:
-                price = float(data["usdPrice"])
+                price = float(data["price"])
                 records.append((ts, token, price))
     
     if not records:
-        return 0
+        return 0, False, False
     
-    # Batch insert into both tables
-    con.executemany(
-        "INSERT INTO price_points (ts, token, price) VALUES (?, ?, ?)",
-        records
-    )
-    con.executemany(
-        "INSERT INTO price_points_archive (ts, token, price) VALUES (?, ?, ?)",
-        records
-    )
+    duckdb_success = False
+    mysql_success = False
     
-    return len(records)
+    # Write to TradingDataEngine (in-memory DuckDB) if available
+    try:
+        engine = get_trading_engine()
+        if engine._running:
+            for ts_val, token, price in records:
+                engine.write('prices', {
+                    'ts': ts_val,
+                    'token': token,
+                    'price': price
+                })
+            duckdb_success = True
+    except Exception as e:
+        logger.debug(f"Engine write skipped: {e}")
+    
+    # Also write to file-based DuckDB (prices.duckdb) as backup
+    if not duckdb_success:
+        try:
+            with get_duckdb("prices") as con:
+                init_legacy_database(con)
+                con.executemany(
+                    "INSERT INTO price_points (ts, token, price) VALUES (?, ?, ?)",
+                    records
+                )
+                duckdb_success = True
+        except Exception as e:
+            logger.error(f"DuckDB write error: {e}")
+    
+    # Write to MySQL (master storage)
+    try:
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COALESCE(MAX(id), 0) FROM price_points")
+                max_id = cursor.fetchone()['COALESCE(MAX(id), 0)']
+                
+                for i, (ts_val, token, price) in enumerate(records):
+                    new_id = max_id + i + 1
+                    ts_idx = int(ts_val.timestamp() * 1000)
+                    coin_id = 5 if token == 'SOL' else (6 if token == 'BTC' else 7)
+                    
+                    cursor.execute("""
+                        INSERT INTO price_points (id, ts_idx, value, created_at, coin_id)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, [new_id, ts_idx, price, ts_val, coin_id])
+                
+                mysql_success = True
+    except Exception as e:
+        logger.error(f"MySQL write error: {e}")
+    
+    return len(records), duckdb_success, mysql_success
 
 
-def cleanup_old_data(con: duckdb.DuckDBPyConnection) -> int:
-    """Remove data older than 24 hours from hot table."""
+def cleanup_old_data() -> int:
+    """Remove data older than 24 hours from DuckDB hot table."""
     cutoff = datetime.now() - timedelta(hours=24)
+    deleted = 0
     
-    result = con.execute(
-        "DELETE FROM price_points WHERE ts < ? RETURNING *",
-        [cutoff]
-    ).fetchall()
-    
-    deleted = len(result)
-    if deleted > 0:
-        print(f"Cleaned up {deleted} old records from hot table")
+    try:
+        with get_duckdb("prices") as con:
+            result = con.execute(
+                "DELETE FROM price_points WHERE ts < ? RETURNING *",
+                [cutoff]
+            ).fetchall()
+            deleted = len(result)
+            if deleted > 0:
+                logger.info(f"Cleaned up {deleted} old records from DuckDB")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
     
     return deleted
 
@@ -132,61 +400,192 @@ def cleanup_old_data(con: duckdb.DuckDBPyConnection) -> int:
 def display_prices(prices_data: dict) -> None:
     """Display current prices to console."""
     if not prices_data:
-        print("No price data received")
         return
     
     parts = []
     for mint, data in prices_data.items():
         token = MINT_TO_TOKEN.get(mint, "???")
-        if data and "usdPrice" in data:
-            price = float(data["usdPrice"])
+        if data and "price" in data:
+            price = float(data["price"])
             parts.append(f"{token}: ${price:,.2f}")
         else:
             parts.append(f"{token}: --")
     
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {' | '.join(parts)}")
+    logger.info(f"[PRICES] {' | '.join(parts)}")
 
 
-def get_latest_prices(con: duckdb.DuckDBPyConnection) -> dict:
-    """Get the most recent price for each token (utility function for trading bot)."""
-    result = con.execute("""
-        SELECT token, price, ts
-        FROM price_points
-        WHERE (token, ts) IN (
-            SELECT token, MAX(ts) FROM price_points GROUP BY token
-        )
-    """).fetchall()
+def get_latest_prices() -> dict:
+    """Get the most recent price for each token."""
+    try:
+        engine = get_trading_engine()
+        if engine._running:
+            results = engine.read("""
+                SELECT token, price, ts
+                FROM prices
+                WHERE (token, ts) IN (
+                    SELECT token, MAX(ts) FROM prices GROUP BY token
+                )
+            """)
+            return {row['token']: {"price": row['price'], "ts": row['ts']} for row in results}
+    except:
+        pass
     
-    return {row[0]: {"price": row[1], "ts": row[2]} for row in result}
+    try:
+        with get_duckdb("prices") as con:
+            result = con.execute("""
+                SELECT token, price, ts
+                FROM price_points
+                WHERE (token, ts) IN (
+                    SELECT token, MAX(ts) FROM price_points GROUP BY token
+                )
+            """).fetchall()
+            return {row[0]: {"price": row[1], "ts": row[2]} for row in result}
+    except:
+        return {}
 
 
-def get_price_history(con: duckdb.DuckDBPyConnection, token: str, hours: float = 1.0) -> list:
-    """Get price history for a token (utility function for trading bot)."""
+def get_price_history(token: str, hours: float = 1.0) -> list:
+    """Get price history for a token."""
     cutoff = datetime.now() - timedelta(hours=hours)
     
-    result = con.execute("""
-        SELECT ts, price FROM price_points
-        WHERE token = ? AND ts >= ?
-        ORDER BY ts ASC
-    """, [token, cutoff]).fetchall()
+    try:
+        engine = get_trading_engine()
+        if engine._running:
+            results = engine.read("""
+                SELECT ts, price FROM prices
+                WHERE token = ? AND ts >= ?
+                ORDER BY ts ASC
+            """, [token, cutoff])
+            return [(row['ts'], row['price']) for row in results]
+    except:
+        pass
     
-    return [(row[0], row[1]) for row in result]
+    try:
+        with get_duckdb("prices") as con:
+            result = con.execute("""
+                SELECT ts, price FROM price_points
+                WHERE token = ? AND ts >= ?
+                ORDER BY ts ASC
+            """, [token, cutoff]).fetchall()
+            return [(row[0], row[1]) for row in result]
+    except:
+        return []
+
+
+def fetch_and_store_once() -> tuple[int, bool, bool]:
+    """
+    Fetch prices once and store them (for scheduler use).
+    
+    Returns:
+        Tuple of (record_count, duckdb_success, mysql_success)
+    """
+    prices = fetch_prices()
+    if prices:
+        count, duck_ok, mysql_ok = insert_prices_dual_write(prices)
+        if count > 0:
+            # Log success with prices
+            price_str = ", ".join([
+                f"{MINT_TO_TOKEN.get(m, '?')}=${d['price']:.2f}" 
+                for m, d in prices.items() if d
+            ])
+            logger.debug(f"Stored {count} prices: {price_str}")
+        return count, duck_ok, mysql_ok
+    return 0, False, False
+
+
+def test_api_connection() -> None:
+    """Test the Jupiter API connection and show detailed info."""
+    print("=" * 60)
+    print("Jupiter API Connection Test")
+    print("=" * 60)
+    
+    ids = ",".join(TOKENS.values())
+    url = f"{JUPITER_API_URL}?ids={ids}"
+    
+    print(f"\nEndpoint: {JUPITER_API_URL}")
+    print(f"Full URL: {url}")
+    print(f"\nAPI Key: {'[OK] Set (' + JUPITER_API_KEY[:8] + '...)' if JUPITER_API_KEY else '[ERROR] NOT SET'}")
+    print(f"\nTokens:")
+    for token, mint in TOKENS.items():
+        print(f"  {token}: {mint}")
+    
+    if not JUPITER_API_KEY:
+        print(f"\n[WARNING] JUPITER_API_KEY not set!")
+        print(f"   Get a free API key at: https://portal.jup.ag")
+        print(f"   Then set: JUPITER_API_KEY=your_key_here")
+        print(f"\n   Free tier: 60 requests/minute")
+        return
+    
+    headers = {
+        "x-api-key": JUPITER_API_KEY,
+        "Accept": "application/json"
+    }
+    
+    print(f"\nMaking request with API key...")
+    
+    try:
+        start = time.perf_counter()
+        response = requests.get(url, headers=headers, timeout=10)
+        elapsed = (time.perf_counter() - start) * 1000
+        
+        print(f"\nResponse:")
+        print(f"  Status: {response.status_code}")
+        print(f"  Time: {elapsed:.0f}ms")
+        
+        # Show all headers
+        print(f"\nHeaders:")
+        for key, value in response.headers.items():
+            if any(x in key.lower() for x in ['rate', 'limit', 'retry', 'x-']):
+                print(f"  {key}: {value}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            print(f"\n[OK] Success! Response:")
+            
+            if "data" in data:
+                print(f"  Format: v6 (data field)")
+                for mint, price_data in data["data"].items():
+                    token = MINT_TO_TOKEN.get(mint, mint[:8])
+                    if price_data and "price" in price_data:
+                        print(f"  {token}: ${float(price_data['price']):,.4f}")
+            else:
+                print(f"  Format: legacy")
+                print(f"  Raw: {str(data)[:500]}")
+        else:
+            print(f"\n[ERROR] Response:")
+            print(f"  {response.text[:500]}")
+            
+    except Exception as e:
+        print(f"\n[ERROR] Request Failed: {e}")
 
 
 def main():
     """Main loop to fetch and store Jupiter prices."""
     print("=" * 60)
-    print("Jupiter Price Fetcher - DuckDB Edition")
+    print("Jupiter Price Fetcher - Dual Write (DuckDB + MySQL)")
     print(f"Tokens: {', '.join(TOKENS.keys())}")
     print(f"Fetch interval: {FETCH_INTERVAL_SECONDS}s")
+    print(f"API: {JUPITER_API_URL}")
+    print(f"API Key: {'[OK] Set' if JUPITER_API_KEY else '[ERROR] NOT SET'}")
     print("=" * 60)
     
-    # Initialize database
-    con = duckdb.connect(str(DB_PATH))
-    init_database(con)
+    if not JUPITER_API_KEY:
+        print("\n[ERROR] JUPITER_API_KEY environment variable not set!")
+        print("   Jupiter requires an API key as of Jan 31, 2026.")
+        print("   Get a FREE key at: https://portal.jup.ag")
+        print("   Then set: JUPITER_API_KEY=your_key_here")
+        print("\n   Free tier provides 60 requests/minute.")
+        return
+    
+    # Initialize legacy database
+    with get_duckdb("prices") as con:
+        init_legacy_database(con)
+        logger.info(f"Database initialized at: {LEGACY_DB_PATH}")
     
     iteration = 0
     cleanup_iterations = int(CLEANUP_INTERVAL / FETCH_INTERVAL_SECONDS)
+    success_count = 0
+    error_count = 0
     
     try:
         while True:
@@ -196,14 +595,27 @@ def main():
             prices = fetch_prices()
             if prices:
                 display_prices(prices)
-                count = insert_prices(con, prices)
-                if count == 0:
-                    print("Warning: No valid prices to insert")
+                count, duck_ok, mysql_ok = insert_prices_dual_write(prices)
+                if count > 0:
+                    success_count += 1
+                else:
+                    error_count += 1
+                    logger.warning("No valid prices to insert")
+                if not duck_ok or not mysql_ok:
+                    logger.warning(f"Partial write - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
+            else:
+                error_count += 1
+            
+            # Periodic status report (every 60 iterations)
+            if iteration > 0 and iteration % 60 == 0:
+                total = success_count + error_count
+                rate = (success_count / total * 100) if total > 0 else 0
+                logger.info(f"[STATS] {success_count}/{total} successful ({rate:.1f}%)")
             
             # Periodic cleanup
             iteration += 1
             if iteration >= cleanup_iterations:
-                cleanup_old_data(con)
+                cleanup_old_data()
                 iteration = 0
             
             # Precise sleep to maintain interval
@@ -214,50 +626,63 @@ def main():
                 
     except KeyboardInterrupt:
         print("\nShutting down...")
-    finally:
-        con.close()
-        print("Database connection closed.")
+        total = success_count + error_count
+        if total > 0:
+            print(f"Final stats: {success_count}/{total} successful ({success_count/total*100:.1f}%)")
 
 
 if __name__ == "__main__":
-    import sys
-    
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
         
-        if cmd == "--cleanup":
+        if cmd == "--test":
+            test_api_connection()
+            
+        elif cmd == "--cleanup":
             print("Running manual cleanup...")
-            con = duckdb.connect(str(DB_PATH))
-            init_database(con)
-            cleanup_old_data(con)
-            con.close()
+            cleanup_old_data()
             
         elif cmd == "--stats":
             print("Database statistics:")
-            con = duckdb.connect(str(DB_PATH))
-            init_database(con)
             
-            hot = con.execute("SELECT COUNT(*) FROM price_points").fetchone()[0]
-            archive = con.execute("SELECT COUNT(*) FROM price_points_archive").fetchone()[0]
+            try:
+                with get_duckdb("prices") as con:
+                    hot = con.execute("SELECT COUNT(*) FROM price_points").fetchone()[0]
+                    print(f"  DuckDB Hot (24h): {hot:,} records")
+            except Exception as e:
+                print(f"  DuckDB error: {e}")
             
-            print(f"  Hot table (24h): {hot:,} records")
-            print(f"  Archive table:   {archive:,} records")
+            try:
+                with get_mysql() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT COUNT(*) as cnt FROM price_points")
+                        mysql_count = cursor.fetchone()['cnt']
+                        print(f"  MySQL:            {mysql_count:,} records")
+            except Exception as e:
+                print(f"  MySQL error: {e}")
             
-            if hot > 0:
-                latest = get_latest_prices(con)
+            latest = get_latest_prices()
+            if latest:
                 print("\nLatest prices:")
                 for token, data in latest.items():
                     print(f"  {token}: ${data['price']:,.2f} @ {data['ts']}")
             
-            con.close()
+        elif cmd == "--once":
+            print("Fetching prices once...")
+            count, duck_ok, mysql_ok = fetch_and_store_once()
+            print(f"Inserted {count} records - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
             
         elif cmd == "--help":
             print("Usage: python get_prices_from_jupiter.py [OPTIONS]")
             print("\nOptions:")
+            print("  --test      Test API connection and show detailed info")
             print("  --cleanup   Run manual cleanup of old data")
             print("  --stats     Show database statistics")
+            print("  --once      Fetch and store prices once (for scheduler)")
             print("  --help      Show this help message")
             print("\nNo arguments starts the price fetcher loop.")
+        else:
+            print(f"Unknown command: {cmd}")
+            print("Use --help for usage information")
     else:
         main()
-

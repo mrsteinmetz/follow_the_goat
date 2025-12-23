@@ -1,0 +1,190 @@
+===============================================================================
+                    WHALE LOGGING - QUICK START
+===============================================================================
+
+You have issues with whale activity endpoint where stream sends data but 
+nothing gets inserted into the database.
+
+I've added comprehensive logging to track down the exact problem.
+
+===============================================================================
+                        STEP-BY-STEP GUIDE
+===============================================================================
+
+STEP 1: DEPLOY THE UPDATED CODE
+--------------------------------
+
+Open PowerShell in the webhook-dotnet folder and run:
+
+    .\quick-deploy.ps1
+
+This will:
+✓ Build the updated code with logging
+✓ Stop IIS
+✓ Copy files to IIS directory
+✓ Start IIS
+
+If quick-deploy.ps1 doesn't work, see WHALE_LOGGING_DEPLOYMENT.md for manual steps.
+
+
+STEP 2: START MONITORING LOGS
+------------------------------
+
+Double-click this file:
+
+    monitor-whale-logs.bat
+
+OR run in PowerShell:
+
+    .\monitor-whale-logs.ps1
+
+Keep this window OPEN - you'll see logs appear in real-time as data arrives.
+
+
+STEP 3: LET THE STREAM SEND DATA
+---------------------------------
+
+Now just wait for QuickNode to send whale activity data.
+
+OR send a test request:
+
+    .\test_whale_endpoint.ps1
+
+
+STEP 4: WATCH THE LOGS
+----------------------
+
+In your monitoring window, you'll see detailed logs like:
+
+[a1b2c3d4] ============================================
+[a1b2c3d4] WHALE WEBHOOK - Received request at 2025-10-29 15:30:45
+[a1b2c3d4] Raw payload length: 1234 bytes
+[a1b2c3d4] JSON deserialization successful
+[a1b2c3d4] Parsed 1 whale movements from payload
+[a1b2c3d4] Opening database connection...
+[a1b2c3d4] Database connection opened successfully
+[a1b2c3d4] Validating movement data...
+[a1b2c3d4] Validation passed
+[a1b2c3d4] Field values:
+[a1b2c3d4]   current_balance: 1000.50
+[a1b2c3d4]   sol_change: 100.25
+... more details ...
+[a1b2c3d4] SQL executed successfully
+[a1b2c3d4] [SUCCESS] Whale movement inserted
+
+
+STEP 5: IDENTIFY THE PROBLEM
+-----------------------------
+
+The logs will show you EXACTLY where it fails:
+
+IF YOU SEE:
+  "[ERROR] JSON deserialization failed"
+  → Problem: Payload format doesn't match expected structure
+  → Send me the "Raw payload preview" from logs
+
+IF YOU SEE:
+  "[ERROR] Validation failed - missing required fields"
+  → Problem: Required fields (signature, wallet_address, whale_type) are empty
+  → Send me the logs showing which fields are empty
+
+IF YOU SEE:
+  "[ERROR] MySQL error: Error Number: 1054"
+  → Problem: Table schema mismatch - column doesn't exist
+  → Send me the error message and run: SHOW CREATE TABLE whale_movements;
+
+IF YOU SEE:
+  "[ERROR] MySQL error: Error Number: 1062" (and many of these)
+  → NOT A PROBLEM! This means duplicates - data is being inserted!
+  → Check your database: SELECT COUNT(*) FROM whale_movements;
+
+IF YOU SEE:
+  "[ERROR] Unable to connect to any of the specified MySQL hosts"
+  → Problem: Can't reach database
+  → Check if database server is running
+  → Check firewall settings
+
+IF YOU SEE:
+  "SQL executed successfully" but no data in table
+  → This shouldn't happen with these logs, but if it does:
+  → Send me the complete log sequence
+
+
+STEP 6: SEND ME THE LOGS
+-------------------------
+
+Copy the relevant logs and send them to me. I need to see:
+
+Required:
+✓ The request ID banner: [xxxxxxxx] ============
+✓ Raw payload preview
+✓ Validation results
+✓ Any [ERROR] lines
+✓ The SUMMARY at the end
+
+Optional but helpful:
+- Your table schema: SHOW CREATE TABLE whale_movements;
+- Database connection test: SELECT 1;
+- Recent entries: SELECT * FROM whale_movements ORDER BY created_at DESC LIMIT 5;
+
+
+===============================================================================
+                            QUICK REFERENCE
+===============================================================================
+
+Deploy code:        .\quick-deploy.ps1
+Monitor logs:       monitor-whale-logs.bat  (or .ps1)
+Test endpoint:      .\test_whale_endpoint.ps1
+View log files:     C:\inetpub\wwwroot\solwebhook\logs\
+
+Log colors:
+  RED    = [ERROR]   - Something went wrong
+  YELLOW = [WARNING] - Not critical but worth noting
+  GREEN  = [SUCCESS] - Data inserted successfully
+  CYAN   = Request headers / section dividers
+  MAGENTA = Summary statistics
+
+===============================================================================
+                         MOST LIKELY CAUSES
+===============================================================================
+
+Based on "stream sending data but nothing inserted":
+
+1. PAYLOAD FORMAT MISMATCH (Most Common)
+   - QuickNode function output doesn't match expected format
+   - Logs will show: JSON deserialization failed
+   - OR: Validation failed - missing required fields
+
+2. MISSING REQUIRED FIELDS
+   - signature, wallet_address, or whale_type not being sent
+   - Logs will show: Validation failed with specific fields listed
+
+3. TABLE SCHEMA MISMATCH
+   - Your table structure differs from expected
+   - Logs will show: MySQL error: Unknown column 'xyz'
+
+4. SILENT DUPLICATES
+   - Data IS being inserted but you're checking wrong time period
+   - Logs will show: Many [DUPLICATE] messages
+   - Check: SELECT COUNT(*) FROM whale_movements;
+
+5. DATABASE CONNECTION ISSUES
+   - Can't connect to MySQL server
+   - Logs will show: Unable to connect / Connection timeout
+
+The logs will tell us EXACTLY which one it is!
+
+===============================================================================
+                              WHAT'S NEXT?
+===============================================================================
+
+1. Run: .\quick-deploy.ps1
+2. Run: monitor-whale-logs.bat (keep open)
+3. Wait for stream data (or send test)
+4. Read the logs
+5. Send me the logs if you need help
+
+The comprehensive logging will pinpoint the exact issue!
+
+===============================================================================
+

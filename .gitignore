@@ -10,6 +10,8 @@ env/
 *.egg-info/
 dist/
 build/
+# Ignore all content from the legacy reference folder (do not upload to git)
+000old_code/
 
 # DuckDB databases (uncomment if you want to track them)
 # *.duckdb

@@ -1,0 +1,59 @@
+{
+  "matchedTransactions": [
+    {
+      "signature": "5abc123def456gh789ijk012lmn345opq678rst901uvw234xyz567ABC890DEF123",
+      "wallet_address": "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",
+      "direction": "buy",
+      "sol_amount": 150.5,
+      "stablecoin": "USDC",
+      "stablecoin_amount": 22500.75,
+      "price": 149.50,
+      "block_height": 285000000,
+      "slot": 285000123,
+      "block_time": 1729900000,
+      "has_perp_position": true,
+      "perp_platform": "drift",
+      "perp_direction": "long",
+      "perp_size": 250.0,
+      "perp_leverage": null,
+      "perp_entry_price": null
+    },
+    {
+      "signature": "6xyz789abc012def345ghi678jkl901mno234pqr567stu890vwx123YZA456BCD789",
+      "wallet_address": "2mN6pBwDx3LkQ9jV8rR4sC7fT5hU1wX0yA3eG6iK9m",
+      "direction": "sell",
+      "sol_amount": 75.25,
+      "stablecoin": "USDT",
+      "stablecoin_amount": 11250.00,
+      "price": 149.50,
+      "block_height": 285000001,
+      "slot": 285000456,
+      "block_time": 1729900005,
+      "has_perp_position": false,
+      "perp_platform": null,
+      "perp_direction": null,
+      "perp_size": null,
+      "perp_leverage": null,
+      "perp_entry_price": null
+    },
+    {
+      "signature": "7def012ghi345jkl678mno901pqr234stu567vwx890yza123BCD456EFG789HIJ012",
+      "wallet_address": "4rK8pL2qM5nN7oO9pQ1rS3tT5uU7vV9wW1xX3yY5zZ",
+      "direction": "buy",
+      "sol_amount": 500.0,
+      "stablecoin": "USDC",
+      "stablecoin_amount": 75000.00,
+      "price": 150.00,
+      "block_height": 285000002,
+      "slot": 285000789,
+      "block_time": 1729900010,
+      "has_perp_position": true,
+      "perp_platform": "jupiter",
+      "perp_direction": "short",
+      "perp_size": 100.5,
+      "perp_leverage": null,
+      "perp_entry_price": null
+    }
+  ]
+}
+

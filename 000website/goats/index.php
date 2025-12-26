@@ -1,27 +1,23 @@
 <?php
 /**
  * Goats (Plays) Page - Follow The Goat Trading Plays
- * Ported from chart/plays/index.php to v2 template system
+ * Migrated to use DuckDBClient API
  */
 
-// --- Load Configuration from .env ---
-require_once __DIR__ . '/../../chart/config.php';
+// --- Load DuckDB Client ---
+require_once __DIR__ . '/../includes/DuckDBClient.php';
 
 // --- Base URL for v2 template ---
 $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
 $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . dirname(dirname($_SERVER['SCRIPT_NAME']));
 
-// --- Data Fetching ---
-$dsn = "mysql:host=$db_host;dbname=$db_name;charset=$db_charset";
-$options = [
-    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    PDO::ATTR_EMULATE_PREPARES   => false,
-];
+// --- Initialize API Client ---
+$client = new DuckDBClient();
 
 $plays_data = [];
 $error_message = '';
 $success_message = '';
+$api_available = $client->isAvailable();
 
 // Check for success/error messages from save/update operation
 if (isset($_GET['success'])) {
@@ -35,16 +31,16 @@ if (isset($_GET['error'])) {
     $error_message = htmlspecialchars($_GET['error']);
 }
 
-try {
-    $pdo = new PDO($dsn, $db_user, $db_pass, $options);
-
-    // Fetch all plays
-    $stmt = $pdo->prepare("SELECT id, created_at, name, description, sorting, short_play, tricker_on_perp, timing_conditions, play_log FROM solcatcher.follow_the_goat_plays ORDER BY sorting ASC, id DESC");
-    $stmt->execute();
-    $plays_data = $stmt->fetchAll();
-
-} catch (\PDOException $e) {
-    $error_message = "Database connection failed: " . $e->getMessage();
+// --- Fetch plays from API ---
+if ($api_available) {
+    $result = $client->getPlays();
+    if ($result && isset($result['plays'])) {
+        $plays_data = $result['plays'];
+    } else {
+        $error_message = 'Failed to load plays from API';
+    }
+} else {
+    $error_message = 'API server is not available. Please ensure master.py is running.';
 }
 
 // --- Page Styles ---
@@ -274,6 +270,33 @@ ob_start();
         margin-top: 0.25rem;
     }
     
+    .api-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.25rem 0.75rem;
+        border-radius: 0.25rem;
+        font-size: 0.75rem;
+        font-weight: 500;
+    }
+    
+    .api-status.online {
+        background: rgba(var(--success-rgb), 0.1);
+        color: rgb(var(--success-rgb));
+    }
+    
+    .api-status.offline {
+        background: rgba(var(--danger-rgb), 0.1);
+        color: rgb(var(--danger-rgb));
+    }
+    
+    .api-status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: currentColor;
+    }
+    
     @media (max-width: 768px) {
         .tolerance-rules-container {
             grid-template-columns: 1fr;
@@ -302,6 +325,10 @@ ob_start();
         <h1 class="page-title fw-medium fs-18 mb-0">Follow The Goat Plays</h1>
     </div>
     <div class="page-header-actions">
+        <span class="api-status <?php echo $api_available ? 'online' : 'offline'; ?>">
+            <span class="api-status-dot"></span>
+            API <?php echo $api_available ? 'Online' : 'Offline'; ?>
+        </span>
         <select id="timeInterval" class="form-select" style="width: auto; min-width: 140px;" onchange="changeTimeInterval()">
             <option value="24">24 Hours</option>
             <option value="12">12 Hours</option>
@@ -336,7 +363,7 @@ ob_start();
 <!-- Create Play Form -->
 <div class="form-container hidden" id="createPlayForm">
     <h3>Create New Play</h3>
-    <form action="/chart/plays/save.php" method="POST" onsubmit="return validateForm()">
+    <form id="createForm" onsubmit="return handleCreatePlay(event)">
         <div class="mb-3">
             <label class="form-label" for="name">Name *</label>
             <input type="text" class="form-control" id="name" name="name" maxlength="60" required>
@@ -413,7 +440,7 @@ ob_start();
         </div>
 
         <div class="form-actions">
-            <button type="submit" class="btn btn-primary">Create Play</button>
+            <button type="submit" class="btn btn-primary" id="createPlayBtn">Create Play</button>
             <button type="button" class="btn btn-secondary" onclick="toggleCreateForm()">Cancel</button>
         </div>
     </form>
@@ -452,19 +479,23 @@ ob_start();
                 // Parse trigger mode and timing conditions
                 $trigger_mode = 'any';
                 if (!empty($play['tricker_on_perp'])) {
-                    $trigger_data = json_decode($play['tricker_on_perp'], true);
+                    $trigger_data = is_string($play['tricker_on_perp']) 
+                        ? json_decode($play['tricker_on_perp'], true) 
+                        : $play['tricker_on_perp'];
                     $trigger_mode = $trigger_data['mode'] ?? 'any';
                 }
                 
                 $timing_enabled = false;
                 $timing_display = '';
                 if (!empty($play['timing_conditions'])) {
-                    $timing_data = json_decode($play['timing_conditions'], true);
+                    $timing_data = is_string($play['timing_conditions']) 
+                        ? json_decode($play['timing_conditions'], true) 
+                        : $play['timing_conditions'];
                     if (!empty($timing_data['enabled'])) {
                         $timing_enabled = true;
-                        $direction = $timing_data['price_direction'] === 'increase' ? '↑' : '↓';
-                        $time_window = $timing_data['time_window_seconds'];
-                        $threshold_decimal = $timing_data['price_change_threshold'];
+                        $direction = ($timing_data['price_direction'] ?? 'increase') === 'increase' ? '↑' : '↓';
+                        $time_window = $timing_data['time_window_seconds'] ?? 0;
+                        $threshold_decimal = $timing_data['price_change_threshold'] ?? 0;
                         $threshold_percent = $threshold_decimal * 100;
                         
                         if ($time_window < 60) {
@@ -504,69 +535,10 @@ ob_start();
         </div>
         
         <div class="play-card-body">
-            <?php
-                $wallets_found = null;
-                $total_wallets = null;
-                $filtered_wallets = null;
-                $query_duration_seconds = null;
-
-                if (!empty($play['play_log'])) {
-                    $decoded = json_decode($play['play_log'], true);
-                    if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                        $cache_used = isset($decoded['cache']['used']) && $decoded['cache']['used'];
-                        
-                        if ($cache_used && isset($decoded['cache']['wallet_count'])) {
-                            $total_wallets = (int) $decoded['cache']['wallet_count'];
-                        } elseif (isset($decoded['wallets']['initial_count'])) {
-                            $total_wallets = (int) $decoded['wallets']['initial_count'];
-                        } elseif (isset($decoded['query']['row_count'])) {
-                            $total_wallets = (int) $decoded['query']['row_count'];
-                        }
-                        
-                        if (isset($decoded['bundle']['applied']) && $decoded['bundle']['applied']) {
-                            if (isset($decoded['bundle']['filtered_count'])) {
-                                $filtered_wallets = (int) $decoded['bundle']['filtered_count'];
-                            }
-                        } elseif (isset($decoded['wallets']['filtered_count'])) {
-                            $filtered_wallets = (int) $decoded['wallets']['filtered_count'];
-                        }
-                        
-                        $wallets_found = $filtered_wallets ?? $total_wallets;
-
-                        if (isset($decoded['duration_ms'])) {
-                            $query_duration_seconds = max(0, (float) $decoded['duration_ms']) / 1000;
-                        } elseif (isset($decoded['query']['duration_ms'])) {
-                            $query_duration_seconds = max(0, (float) $decoded['query']['duration_ms']) / 1000;
-                        }
-                    }
-                }
-            ?>
             <div class="play-card-description">
                 <div class="play-card-description-text">
-                    <?php echo nl2br(htmlspecialchars($play['description'])); ?>
+                    <?php echo nl2br(htmlspecialchars($play['description'] ?? '')); ?>
                 </div>
-                <?php if ($wallets_found !== null || $query_duration_seconds !== null): ?>
-                <div class="play-log-summary">
-                    <?php if ($wallets_found !== null): ?>
-                    <div class="play-log-item">
-                        <span class="play-log-label">Wallets <?php echo $filtered_wallets !== null && $total_wallets !== null && $filtered_wallets !== $total_wallets ? 'Active' : 'Found'; ?></span>
-                        <span class="play-log-value">
-                            <?php if ($filtered_wallets !== null && $total_wallets !== null && $filtered_wallets !== $total_wallets): ?>
-                                <?php echo number_format($filtered_wallets); ?> <span class="text-muted opacity-50">/ <?php echo number_format($total_wallets); ?></span>
-                            <?php else: ?>
-                                <?php echo number_format($wallets_found); ?>
-                            <?php endif; ?>
-                        </span>
-                    </div>
-                    <?php endif; ?>
-                    <?php if ($query_duration_seconds !== null): ?>
-                    <div class="play-log-item">
-                        <span class="play-log-label">Query Runtime</span>
-                        <span class="play-log-value"><?php echo number_format($query_duration_seconds, 2); ?>s</span>
-                    </div>
-                    <?php endif; ?>
-                </div>
-                <?php endif; ?>
             </div>
             
             <!-- Performance Metrics -->
@@ -616,6 +588,9 @@ ob_start();
 <?php endif; ?>
 
 <script>
+    // API Base URL - uses PHP proxy to reach Flask API on server
+    const API_BASE = '<?php echo dirname($_SERVER["SCRIPT_NAME"]); ?>/../api/proxy.php';
+    
     function toggleCreateForm() {
         const createForm = document.getElementById('createPlayForm');
         createForm.classList.toggle('hidden');
@@ -669,29 +644,91 @@ ob_start();
         });
     });
 
-    function convertPipsToDecimals(form) {
-        form.querySelectorAll('.pip-input').forEach(input => {
-            const pips = parseFloat(input.value) || 0;
-            const decimal = pips / 10000;
-            input.value = decimal;
-        });
-        return true;
+    function buildSellLogic(form) {
+        const decreases = [];
+        const increases = [];
+        
+        // Process decreases
+        const decreaseTolerance = form.querySelectorAll('[name="decrease_tolerance[]"]');
+        const decreaseFrom = form.querySelectorAll('[name="decrease_range_from[]"]');
+        const decreaseTo = form.querySelectorAll('[name="decrease_range_to[]"]');
+        
+        for (let i = 0; i < decreaseTolerance.length; i++) {
+            const pips = parseFloat(decreaseTolerance[i].value) || 0;
+            decreases.push({
+                range_from: parseFloat(decreaseFrom[i]?.value || -999999) / 10000,
+                range_to: parseFloat(decreaseTo[i]?.value || 0) / 10000,
+                tolerance: pips / 10000
+            });
+        }
+        
+        // Process increases
+        const increaseTolerance = form.querySelectorAll('[name="increase_tolerance[]"]');
+        const increaseFrom = form.querySelectorAll('[name="increase_range_from[]"]');
+        const increaseTo = form.querySelectorAll('[name="increase_range_to[]"]');
+        
+        for (let i = 0; i < increaseTolerance.length; i++) {
+            increases.push({
+                range_from: parseFloat(increaseFrom[i].value) / 10000,
+                range_to: parseFloat(increaseTo[i].value) / 10000,
+                tolerance: parseFloat(increaseTolerance[i].value) / 10000
+            });
+        }
+        
+        return {
+            tolerance_rules: {
+                decreases: decreases,
+                increases: increases
+            }
+        };
     }
 
-    function validateForm() {
-        const sql = document.getElementById('find_wallets_sql').value.trim();
-        if (!sql) {
-            alert('Please enter a SQL query.');
-            return false;
+    async function handleCreatePlay(event) {
+        event.preventDefault();
+        
+        const form = event.target;
+        const submitBtn = document.getElementById('createPlayBtn');
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<i class="ri-loader-4-line me-1"></i>Creating...';
+        
+        try {
+            const data = {
+                name: form.querySelector('[name="name"]').value,
+                description: form.querySelector('[name="description"]').value,
+                find_wallets_sql: form.querySelector('[name="find_wallets_sql"]').value,
+                sell_logic: buildSellLogic(form),
+                max_buys_per_cycle: parseInt(form.querySelector('[name="max_buys_per_cycle"]').value)
+            };
+            
+            const response = await fetch(API_BASE + '/plays', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            });
+            
+            const result = await response.json();
+            
+            if (result.success) {
+                window.location.href = '?success=1';
+            } else {
+                alert('Error creating play: ' + (result.error || 'Unknown error'));
+            }
+        } catch (error) {
+            console.error('Error creating play:', error);
+            alert('Error creating play. Please try again.');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = 'Create Play';
         }
-        const form = document.querySelector('#createPlayForm form');
-        convertPipsToDecimals(form);
-        return true;
+        
+        return false;
     }
 
     function viewDetails(event, playId) {
         event.stopPropagation();
-        window.location.href = '/v2/goats/unique/?id=' + playId;
+        window.location.href = 'unique/?id=' + playId;
     }
 
     function changeTimeInterval() {
@@ -707,7 +744,7 @@ ob_start();
 
     async function loadPlayMetrics() {
         const playIds = <?php echo json_encode(array_column($plays_data, 'id')); ?>;
-        const timeInterval = document.getElementById('timeInterval')?.value || '24';
+        const timeInterval = document.getElementById('timeInterval')?.value || 'all';
         
         for (const playId of playIds) {
             const titleElement = document.getElementById('perf-title-' + playId);
@@ -718,7 +755,7 @@ ob_start();
         }
         
         try {
-            const response = await fetch('/chart/plays/get_all_performance.php?hours=' + timeInterval);
+            const response = await fetch(API_BASE + '/plays/performance?hours=' + timeInterval);
             const result = await response.json();
             
             if (!result.success) {
@@ -730,8 +767,35 @@ ob_start();
             const timeString = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
             
             for (const playId of playIds) {
-                const data = result.plays[playId];
-                if (!data) continue;
+                // JSON keys are strings, convert playId to string for lookup
+                const data = result.plays[String(playId)];
+                if (!data) {
+                    // No data means no trades - show zeros
+                    document.getElementById('updated-' + playId).textContent = timeString;
+                    const sumElement = document.getElementById('perf-sum-' + playId);
+                    if (sumElement) {
+                        sumElement.textContent = '+0.00%';
+                        sumElement.className = 'play-performance-value neutral';
+                    }
+                    const winLossElement = document.getElementById('perf-winloss-' + playId);
+                    if (winLossElement) {
+                        const winSpan = winLossElement.querySelector('.win-count');
+                        const lossSpan = winLossElement.querySelector('.loss-count');
+                        if (winSpan) winSpan.textContent = '0';
+                        if (lossSpan) lossSpan.textContent = '0';
+                    }
+                    const activeElement = document.getElementById('perf-active-' + playId);
+                    if (activeElement) {
+                        const activeDisplaySpan = activeElement.querySelector('.active-display');
+                        if (activeDisplaySpan) activeDisplaySpan.textContent = '0';
+                    }
+                    const noGoElement = document.getElementById('perf-nogo-' + playId);
+                    if (noGoElement) {
+                        const noGoSpan = noGoElement.querySelector('.nogo-count');
+                        if (noGoSpan) noGoSpan.textContent = '0';
+                    }
+                    continue;
+                }
                 
                 const playCard = document.querySelector(`[data-play-id="${playId}"]`);
                 const isShortPlay = playCard && playCard.getAttribute('data-short-play') == '1';
@@ -813,7 +877,9 @@ ob_start();
         button.innerHTML = '<i class="ri-loader-4-line me-1"></i>Cleaning...';
         
         try {
-            const response = await fetch('/chart/plays/cleanup_no_gos.php');
+            const response = await fetch(API_BASE + '/buyins/cleanup_no_gos', {
+                method: 'DELETE'
+            });
             const data = await response.json();
             
             if (data.success) {
@@ -840,12 +906,12 @@ ob_start();
         }
         
         try {
-            const response = await fetch('/chart/plays/duplicate.php', {
+            const response = await fetch(API_BASE + '/plays/' + playId + '/duplicate', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Content-Type': 'application/json',
                 },
-                body: 'id=' + playId + '&new_name=' + encodeURIComponent(newName.trim())
+                body: JSON.stringify({ new_name: newName.trim() })
             });
             const data = await response.json();
             
@@ -869,4 +935,3 @@ $scripts = '';
 // Include the base layout
 include __DIR__ . '/../pages/layouts/base.php';
 ?>
-

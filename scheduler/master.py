@@ -90,9 +90,13 @@ def cleanup_jupiter_prices():
 
 @track_job("cleanup_duckdb_hot_tables", "Clean up DuckDB hot tables (every hour)")
 def cleanup_duckdb_hot_tables():
-    """Clean up all DuckDB hot tables (remove data older than 24 hours)."""
-    logger.info("Running DuckDB hot table cleanup...")
-    total_cleaned = cleanup_all_hot_tables("central", settings.hot_storage_hours)
+    """
+    Clean up all DuckDB hot tables.
+    - Trades: 72 hours retention (settings.trades_hot_storage_hours)
+    - Other tables: 24 hours retention (settings.hot_storage_hours)
+    """
+    logger.info(f"Running DuckDB hot table cleanup (trades: {settings.trades_hot_storage_hours}h, others: {settings.hot_storage_hours}h)...")
+    total_cleaned = cleanup_all_hot_tables("central")  # Uses per-table settings
     logger.info(f"Cleanup complete: {total_cleaned} records removed")
 
 
@@ -122,6 +126,32 @@ def process_price_cycles():
     processed = run_price_cycles()
     if processed > 0:
         logger.debug(f"Price cycles: processed {processed} price points")
+
+
+@track_job("process_wallet_profiles", "Build wallet profiles (every 5s)")
+def process_wallet_profiles():
+    """Build wallet profiles from trades and price cycles (dual-write to DuckDB + MySQL)."""
+    from pathlib import Path
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "000data_feeds" / "5_create_profiles"))
+    from create_profiles import process_wallet_profiles as run_profiles
+    
+    processed = run_profiles()
+    if processed > 0:
+        logger.debug(f"Wallet profiles: processed {processed} profiles")
+
+
+@track_job("cleanup_wallet_profiles", "Clean up wallet profiles (every hour)")
+def cleanup_wallet_profiles():
+    """Clean up old wallet profiles from BOTH DuckDB and MySQL (24hr retention)."""
+    from pathlib import Path
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "000data_feeds" / "5_create_profiles"))
+    from create_profiles import cleanup_old_profiles
+    
+    deleted = cleanup_old_profiles(hours=24)
+    if deleted > 0:
+        logger.info(f"Cleaned up {deleted} old wallet profiles")
 
 
 # =============================================================================
@@ -331,6 +361,30 @@ def create_scheduler() -> BackgroundScheduler:
         coalesce=True,    # Combine missed runs
     )
     
+    # Wallet Profile Builder (runs every 5 seconds)
+    # Builds profiles from trades + completed cycles at all thresholds
+    # Dual-writes to DuckDB (24hr hot) + MySQL (also 24hr - special case)
+    scheduler.add_job(
+        func=process_wallet_profiles,
+        trigger=IntervalTrigger(seconds=5),
+        id="process_wallet_profiles",
+        name="Build wallet profiles (every 5s)",
+        replace_existing=True,
+        max_instances=1,  # Prevent overlapping runs
+        coalesce=True,    # Combine missed runs
+    )
+    
+    # Wallet Profile Cleanup (every hour)
+    # Cleans up profiles older than 24 hours from BOTH DuckDB and MySQL
+    # This is different from standard architecture - both databases only keep 24 hours
+    scheduler.add_job(
+        func=cleanup_wallet_profiles,
+        trigger=IntervalTrigger(hours=1),
+        id="cleanup_wallet_profiles",
+        name="Clean up wallet profiles (24hr window in both DuckDB and MySQL)",
+        replace_existing=True,
+    )
+    
     return scheduler
 
 
@@ -360,7 +414,7 @@ def main():
     logger.info("Starting Follow The Goat - Master Controller")
     logger.info("=" * 60)
     logger.info(f"Timezone: {settings.scheduler_timezone}")
-    logger.info(f"Hot storage window: {settings.hot_storage_hours} hours")
+    logger.info(f"Hot storage: {settings.hot_storage_hours}h (general), {settings.trades_hot_storage_hours}h (trades)")
     logger.info(f"MySQL: {settings.mysql.host}/{settings.mysql.database}")
     logger.info(f"DuckDB Central: {settings.central_db_path}")
     
@@ -419,10 +473,21 @@ def main():
     time.sleep(2)
     
     # =====================================================
-    # STEP 4: Create and start the scheduler
+    # STEP 4: Sync plays from MySQL immediately on startup
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 4: Starting Scheduler...")
+    logger.info("STEP 4: Syncing plays from MySQL (startup sync)...")
+    try:
+        sync_plays_from_mysql()
+        logger.info("Plays sync complete")
+    except Exception as e:
+        logger.error(f"Failed to sync plays on startup: {e}")
+    
+    # =====================================================
+    # STEP 5: Create and start the scheduler
+    # =====================================================
+    logger.info("-" * 60)
+    logger.info("STEP 5: Starting Scheduler...")
     _scheduler = create_scheduler()
     
     # Log all registered jobs
@@ -484,6 +549,8 @@ def shutdown_all():
         logger.info("      TradingDataEngine stopped")
     else:
         logger.info("[4/4] TradingDataEngine not running")
+    
+    logger.info("Note: Plays were synced on startup and are preserved in MySQL")
     
     logger.info("=" * 60)
     logger.info("SHUTDOWN COMPLETE - Goodbye!")

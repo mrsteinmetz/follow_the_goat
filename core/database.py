@@ -519,31 +519,71 @@ def archive_old_data(table_name: str, db_name: str = "central", hours: int = 24)
         return 0
     
     with get_duckdb(db_name) as conn:
-        # Count records to delete
-        count_result = conn.execute(f"""
-            SELECT COUNT(*) FROM {table_name}
-            WHERE {ts_col} < NOW() - INTERVAL {hours} HOUR
-        """).fetchone()
-        count = count_result[0] if count_result else 0
-        
-        if count > 0:
-            # Delete old records
-            conn.execute(f"""
-                DELETE FROM {table_name}
+        # Special handling for cycle_tracker: only delete completed cycles older than 24h
+        if table_name == "cycle_tracker":
+            # Count records to delete (only completed cycles)
+            count_result = conn.execute(f"""
+                SELECT COUNT(*) FROM {table_name}
+                WHERE cycle_end_time IS NOT NULL 
+                AND cycle_end_time < NOW() - INTERVAL {hours} HOUR
+            """).fetchone()
+            count = count_result[0] if count_result else 0
+            
+            if count > 0:
+                # Delete old completed cycles only
+                conn.execute(f"""
+                    DELETE FROM {table_name}
+                    WHERE cycle_end_time IS NOT NULL 
+                    AND cycle_end_time < NOW() - INTERVAL {hours} HOUR
+                """)
+                print(f"Cleaned up {count} old completed cycles from {table_name}")
+        else:
+            # Count records to delete
+            count_result = conn.execute(f"""
+                SELECT COUNT(*) FROM {table_name}
                 WHERE {ts_col} < NOW() - INTERVAL {hours} HOUR
-            """)
-            print(f"Cleaned up {count} old records from {table_name}")
+            """).fetchone()
+            count = count_result[0] if count_result else 0
+            
+            if count > 0:
+                # Delete old records
+                conn.execute(f"""
+                    DELETE FROM {table_name}
+                    WHERE {ts_col} < NOW() - INTERVAL {hours} HOUR
+                """)
+                print(f"Cleaned up {count} old records from {table_name}")
         
         return count
 
 
-def cleanup_all_hot_tables(db_name: str = "central", hours: int = 24):
-    """Clean up all hot tables in DuckDB."""
+def cleanup_all_hot_tables(db_name: str = "central", hours: int = None):
+    """
+    Clean up all hot tables in DuckDB.
+    
+    Uses different retention periods:
+    - Trades (follow_the_goat_buyins): 72 hours (settings.trades_hot_storage_hours)
+    - Other tables: 24 hours (settings.hot_storage_hours)
+    
+    Args:
+        db_name: DuckDB database name
+        hours: Override hours for all tables (None = use per-table settings)
+    """
     from features.price_api.schema import HOT_TABLES
+    
+    # Tables that use trades retention (72h)
+    TRADES_TABLES = ['follow_the_goat_buyins', 'follow_the_goat_buyins_price_checks']
     
     total_cleaned = 0
     for table in HOT_TABLES:
-        cleaned = archive_old_data(table, db_name, hours)
+        # Determine hours for this table
+        if hours is not None:
+            table_hours = hours
+        elif table in TRADES_TABLES:
+            table_hours = settings.trades_hot_storage_hours  # 72 hours for trades
+        else:
+            table_hours = settings.hot_storage_hours  # 24 hours for others
+        
+        cleaned = archive_old_data(table, db_name, table_hours)
         total_cleaned += cleaned
     
     return total_cleaned

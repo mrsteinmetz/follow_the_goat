@@ -8,7 +8,7 @@ at multiple thresholds, writing results to:
 - TradingDataEngine (in-memory DuckDB for fast 24hr hot storage)
 - MySQL (historical persistence)
 
-Thresholds: 0.1%, 0.2%, 0.3%, 0.4%, 0.5%
+Thresholds: 0.2%, 0.25%, 0.3%, 0.35%, 0.4%, 0.45%, 0.5%
 Coin: SOL only (coin_id = 5)
 
 IMPORTANT: This module uses the TradingDataEngine singleton which runs in-memory.
@@ -32,7 +32,7 @@ from core.config import settings
 logger = logging.getLogger("price_cycles")
 
 # --- Configuration ---
-THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
+THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 COIN_ID = 5  # SOL
 BATCH_SIZE = 100  # Process up to 100 price points per run
 

@@ -56,8 +56,11 @@ class Settings:
     # Project paths
     project_root: Path = Path(__file__).parent.parent
     
-    # Hot/Cold storage threshold
+    # Hot/Cold storage threshold (default for most tables)
     hot_storage_hours: int = 24
+    
+    # Trades-specific hot storage (72 hours for buyins/trades)
+    trades_hot_storage_hours: int = 72
     
     # Scheduler settings
     scheduler_timezone: str = "UTC"
@@ -83,6 +86,7 @@ class Settings:
         """Load settings from environment variables."""
         return cls(
             hot_storage_hours=int(os.getenv("HOT_STORAGE_HOURS", "24")),
+            trades_hot_storage_hours=int(os.getenv("TRADES_HOT_STORAGE_HOURS", "72")),
             scheduler_timezone=os.getenv("SCHEDULER_TZ", "UTC"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             mysql=MySQLSettings.from_env(),

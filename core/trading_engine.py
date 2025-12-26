@@ -888,10 +888,18 @@ class TradingDataEngine:
         with self._conn_lock:
             for table, ts_col in TIMESTAMP_COLUMNS.items():
                 try:
-                    result = self._conn.execute(
-                        f"DELETE FROM {table} WHERE {ts_col} < ? RETURNING id",
-                        [cutoff]
-                    ).fetchall()
+                    # Special handling for cycle_tracker: use cycle_end_time and only delete completed cycles
+                    if table == "cycle_tracker":
+                        result = self._conn.execute(
+                            "DELETE FROM cycle_tracker WHERE cycle_end_time IS NOT NULL AND cycle_end_time < ? RETURNING id",
+                            [cutoff]
+                        ).fetchall()
+                    else:
+                        result = self._conn.execute(
+                            f"DELETE FROM {table} WHERE {ts_col} < ? RETURNING id",
+                            [cutoff]
+                        ).fetchall()
+                    
                     deleted = len(result)
                     if deleted > 0:
                         total_deleted += deleted

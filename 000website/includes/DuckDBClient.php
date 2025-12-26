@@ -50,6 +50,14 @@ class DuckDBClient {
     }
     
     /**
+     * Make a DELETE request to the API
+     */
+    private function delete(string $endpoint): ?array {
+        $url = $this->apiBaseUrl . $endpoint;
+        return $this->request($url, 'DELETE');
+    }
+    
+    /**
      * Make HTTP request using cURL
      */
     private function request(string $url, string $method = 'GET', ?array $data = null): ?array {
@@ -73,6 +81,8 @@ class DuckDBClient {
             if ($data !== null) {
                 curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
             }
+        } elseif ($method === 'DELETE') {
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
         }
         
         $response = curl_exec($ch);
@@ -150,6 +160,68 @@ class DuckDBClient {
         return $this->get("/plays/{$playId}");
     }
     
+    /**
+     * Get a single play with all fields for editing
+     */
+    public function getPlayForEdit(int $playId): ?array {
+        return $this->get("/plays/{$playId}/for_edit");
+    }
+    
+    /**
+     * Create a new play
+     * 
+     * @param array $data Play data with keys: name, description, find_wallets_sql, etc.
+     */
+    public function createPlay(array $data): ?array {
+        return $this->post('/plays', $data);
+    }
+    
+    /**
+     * Update a play
+     * 
+     * @param int $playId Play ID
+     * @param array $data Fields to update
+     */
+    public function updatePlay(int $playId, array $data): ?array {
+        return $this->put("/plays/{$playId}", $data);
+    }
+    
+    /**
+     * Delete a play
+     */
+    public function deletePlay(int $playId): ?array {
+        return $this->delete("/plays/{$playId}");
+    }
+    
+    /**
+     * Duplicate a play
+     * 
+     * @param int $playId Play ID to duplicate
+     * @param string $newName Name for the duplicated play
+     */
+    public function duplicatePlay(int $playId, string $newName): ?array {
+        return $this->post("/plays/{$playId}/duplicate", ['new_name' => $newName]);
+    }
+    
+    /**
+     * Get performance metrics for a single play
+     * 
+     * @param int $playId Play ID
+     * @param string $hours Time window ('all', '24', '12', '6', '2')
+     */
+    public function getPlayPerformance(int $playId, string $hours = 'all'): ?array {
+        return $this->get("/plays/{$playId}/performance", ['hours' => $hours]);
+    }
+    
+    /**
+     * Get performance metrics for all plays (batch operation)
+     * 
+     * @param string $hours Time window ('all', '24', '12', '6', '2')
+     */
+    public function getAllPlaysPerformance(string $hours = 'all'): ?array {
+        return $this->get('/plays/performance', ['hours' => $hours]);
+    }
+    
     // =========================================================================
     // Buyins (Trades)
     // =========================================================================
@@ -182,6 +254,23 @@ class DuckDBClient {
      */
     public function updateBuyin(int $buyinId, array $data): ?array {
         return $this->put("/buyins/{$buyinId}", $data);
+    }
+    
+    /**
+     * Get a single buyin/trade by ID
+     * 
+     * @param int $buyinId Buyin ID
+     * @param string $source 'live' for active trades, 'archive' for completed
+     */
+    public function getSingleBuyin(int $buyinId, string $source = 'live'): ?array {
+        return $this->get("/buyins/{$buyinId}", ['source' => $source]);
+    }
+    
+    /**
+     * Delete all no_go trades older than 24 hours
+     */
+    public function cleanupNoGos(): ?array {
+        return $this->delete('/buyins/cleanup_no_gos');
     }
     
     // =========================================================================
@@ -258,6 +347,51 @@ class DuckDBClient {
         if ($threshold !== null) $params['threshold'] = $threshold;
         
         return $this->get('/cycle_tracker', $params);
+    }
+    
+    // =========================================================================
+    // Wallet Profiles
+    // =========================================================================
+    
+    /**
+     * Get wallet profiles data
+     * 
+     * @param float|null $threshold Filter by threshold value
+     * @param string $hours Time window ('all', '1', '24', etc.)
+     * @param int $limit Max records to return
+     * @param string $orderBy Ordering: 'recent' or 'trade_count'
+     * @param string|null $wallet Filter by specific wallet address
+     */
+    public function getProfiles(
+        ?float $threshold = null,
+        string $hours = '24',
+        int $limit = 100,
+        string $orderBy = 'recent',
+        ?string $wallet = null
+    ): ?array {
+        $params = [
+            'hours' => $hours,
+            'limit' => $limit,
+            'order_by' => $orderBy
+        ];
+        
+        if ($threshold !== null) $params['threshold'] = $threshold;
+        if ($wallet !== null) $params['wallet'] = $wallet;
+        
+        return $this->get('/profiles', $params);
+    }
+    
+    /**
+     * Get wallet profiles statistics
+     * 
+     * @param float|null $threshold Filter by threshold value
+     * @param string $hours Time window ('all', '1', '24', etc.)
+     */
+    public function getProfilesStats(?float $threshold = null, string $hours = 'all'): ?array {
+        $params = ['hours' => $hours];
+        if ($threshold !== null) $params['threshold'] = $threshold;
+        
+        return $this->get('/profiles/stats', $params);
     }
     
     // =========================================================================

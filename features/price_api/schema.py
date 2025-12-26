@@ -11,6 +11,7 @@ Tables:
 - price_points (24hr hot)
 - price_analysis (24hr hot)
 - cycle_tracker (24hr hot)
+- wallet_profiles (24hr hot)
 """
 
 # =============================================================================
@@ -177,6 +178,34 @@ CREATE INDEX IF NOT EXISTS idx_cycle_tracker_start ON cycle_tracker(cycle_start_
 CREATE INDEX IF NOT EXISTS idx_cycle_tracker_threshold ON cycle_tracker(threshold);
 """
 
+SCHEMA_WALLET_PROFILES = """
+CREATE TABLE IF NOT EXISTS wallet_profiles (
+    id BIGINT PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    threshold DECIMAL(5,2) NOT NULL,
+    trade_id BIGINT NOT NULL,
+    trade_timestamp TIMESTAMP NOT NULL,
+    price_cycle BIGINT NOT NULL,
+    price_cycle_start_time TIMESTAMP,
+    price_cycle_end_time TIMESTAMP,
+    trade_entry_price_org DECIMAL(20,8) NOT NULL,
+    stablecoin_amount DOUBLE,
+    trade_entry_price DECIMAL(20,8) NOT NULL,
+    sequence_start_price DECIMAL(20,8) NOT NULL,
+    highest_price_reached DECIMAL(20,8) NOT NULL,
+    lowest_price_reached DECIMAL(20,8) NOT NULL,
+    long_short VARCHAR(10),
+    short TINYINT DEFAULT 2,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_wallet_profiles_wallet ON wallet_profiles(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_wallet_profiles_threshold ON wallet_profiles(threshold);
+CREATE INDEX IF NOT EXISTS idx_wallet_profiles_trade_timestamp ON wallet_profiles(trade_timestamp);
+CREATE INDEX IF NOT EXISTS idx_wallet_profiles_price_cycle ON wallet_profiles(price_cycle);
+CREATE INDEX IF NOT EXISTS idx_wallet_profiles_short ON wallet_profiles(short);
+"""
+
 # =============================================================================
 # ALL SCHEMAS COMBINED
 # =============================================================================
@@ -188,6 +217,7 @@ ALL_SCHEMAS = [
     ("price_points", SCHEMA_PRICE_POINTS),
     ("price_analysis", SCHEMA_PRICE_ANALYSIS),
     ("cycle_tracker", SCHEMA_CYCLE_TRACKER),
+    ("wallet_profiles", SCHEMA_WALLET_PROFILES),
 ]
 
 # Tables that use 24-hour hot storage (time-based cleanup)
@@ -200,6 +230,7 @@ HOT_TABLES = [
     "price_points",
     "price_analysis",
     "cycle_tracker",
+    "wallet_profiles",
 ]
 
 # Tables that keep full data (no time-based cleanup)
@@ -208,12 +239,14 @@ FULL_DATA_TABLES = [
 ]
 
 # Timestamp column used for cleanup in each table
+# Note: cycle_tracker uses cycle_end_time (only completed cycles are cleaned up)
 TIMESTAMP_COLUMNS = {
     "follow_the_goat_buyins": "followed_at",
     "follow_the_goat_buyins_price_checks": "checked_at",
     "price_points": "created_at",
     "price_analysis": "created_at",
-    "cycle_tracker": "cycle_start_time",
+    "cycle_tracker": "cycle_end_time",  # Only completed cycles older than 24h are cleaned
+    "wallet_profiles": "trade_timestamp",  # Profiles older than 24h are cleaned from both DuckDB and MySQL
 }
 
 

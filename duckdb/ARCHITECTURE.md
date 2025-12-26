@@ -212,6 +212,39 @@ A new cycle starts when price drops from the highest by the threshold percentage
 - `idx_cycle_tracker_start` on `(cycle_start_time)`
 - `idx_cycle_tracker_threshold` on `(threshold)`
 
+### Table: wallet_profiles (24hr HOT - Special)
+Wallet trading profiles - maps trades to completed price cycles.
+Populated by `000data_feeds/5_create_profiles/create_profiles.py`.
+
+**SPECIAL**: Both DuckDB AND MySQL only keep 24 hours of data (cleaned up hourly).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | BIGINT | Primary key |
+| `wallet_address` | VARCHAR(255) | Wallet address |
+| `threshold` | DECIMAL(5,2) | Cycle threshold (0.2-0.5) |
+| `trade_id` | BIGINT | Reference to sol_stablecoin_trades.id |
+| `trade_timestamp` | TIMESTAMP | When trade occurred |
+| `price_cycle` | BIGINT | Reference to cycle_tracker.id |
+| `price_cycle_start_time` | TIMESTAMP | When cycle started |
+| `price_cycle_end_time` | TIMESTAMP | When cycle ended |
+| `trade_entry_price_org` | DECIMAL(20,8) | Original trade price |
+| `stablecoin_amount` | DOUBLE | Trade size in stablecoin |
+| `trade_entry_price` | DECIMAL(20,8) | Entry price from price_points |
+| `sequence_start_price` | DECIMAL(20,8) | Cycle start price |
+| `highest_price_reached` | DECIMAL(20,8) | Cycle peak price |
+| `lowest_price_reached` | DECIMAL(20,8) | Cycle low price |
+| `long_short` | VARCHAR(10) | Perp direction (long/short/null) |
+| `short` | TINYINT | 0=long, 1=short, 2=none |
+| `created_at` | TIMESTAMP | When record created |
+
+**Indexes:**
+- `idx_wallet_profiles_wallet` on `(wallet_address)`
+- `idx_wallet_profiles_threshold` on `(threshold)`
+- `idx_wallet_profiles_trade_timestamp` on `(trade_timestamp)`
+- `idx_wallet_profiles_price_cycle` on `(price_cycle)`
+- `idx_wallet_profiles_short` on `(short)`
+
 ### Table: order_book_features (24hr HOT)
 Binance order book features streamed via WebSocket.
 Populated by `000data_feeds/3_binance_order_book_data/stream_binance_order_book_data.py`.
@@ -354,6 +387,59 @@ python 000data_feeds/2_create_price_cycles/create_price_cycles.py --continuous
 
 ---
 
+## Feature: Wallet Profiles
+
+The wallet profiles feature (`000data_feeds/5_create_profiles/`) builds trading profiles by mapping wallet buy trades to completed price cycles.
+
+### How It Works
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        WALLET PROFILE BUILDER                           │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   sol_stablecoin_trades    create_profiles.py       wallet_profiles    │
+│   (direction=buy)     ──▶  (process every 5s)  ──▶  (DuckDB 24hr)      │
+│         │                        │                        │            │
+│         │                        │                        │            │
+│   cycle_tracker ─────────────────┘                        │            │
+│   (cycle_end_time NOT NULL)                               ▼            │
+│         │                                             MySQL            │
+│   price_points ─────────────────────────────────▶  (also 24hr only)   │
+│   (trade_entry_price)                                                  │
+│                                                                         │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Key Features
+
+1. **All Thresholds**: Processes all thresholds (0.2%, 0.25%, 0.3%, 0.35%, 0.4%, 0.45%, 0.5%)
+2. **Completed Cycles Only**: Only processes trades within completed cycles (cycle_end_time NOT NULL)
+3. **Minimum Buys**: Wallets must have at least 10 buy trades to qualify
+4. **24hr Retention in BOTH databases**: Unlike other tables, MySQL also only keeps 24 hours
+
+### Data Joined
+
+| Source Table | Data Used |
+|--------------|-----------|
+| `sol_stablecoin_trades` | Wallet address, trade timestamp, price, stablecoin amount, perp direction |
+| `cycle_tracker` | Cycle ID, start/end times, sequence prices, high/low prices |
+| `price_points` | Entry price (first price after trade timestamp) |
+
+### Usage
+
+```python
+# The scheduler runs this automatically every 5 seconds
+# To run manually:
+from create_profiles import process_wallet_profiles
+processed = process_wallet_profiles()  # Returns number of profiles processed
+
+# For continuous testing:
+python 000data_feeds/5_create_profiles/create_profiles.py --continuous
+```
+
+---
+
 ## API Endpoints
 
 The Central API (`features/price_api/api.py`) provides these endpoints:
@@ -397,12 +483,13 @@ The scheduler (`scheduler/master.py`) runs these jobs:
 
 | Job | Interval | Description |
 |-----|----------|-------------|
-| `fetch_jupiter_prices` | 2 seconds | Fetch SOL/BTC/ETH prices from Jupiter API |
+| `fetch_jupiter_prices` | 1 second | Fetch SOL/BTC/ETH prices from Jupiter API |
 | `process_price_cycles` | 5 seconds | Process price data into cycle analysis |
+| `process_wallet_profiles` | 5 seconds | Build wallet profiles from trades + cycles |
 | `cleanup_jupiter_prices` | 1 hour | Clean up old data from prices.duckdb |
 | `cleanup_duckdb_hot_tables` | 1 hour | Remove data older than 24h from DuckDB |
+| `cleanup_wallet_profiles` | 1 hour | Clean up old profiles from BOTH DuckDB and MySQL |
 | `sync_plays_from_mysql` | 5 minutes | Sync plays table from MySQL |
-| `archive_price_points` | 1 hour | Legacy price_points cleanup |
 
 ### Background Streams (Started Once at Startup)
 

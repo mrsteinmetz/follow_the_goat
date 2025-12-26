@@ -21,7 +21,8 @@ $price_cycle_id = $_GET['price_cycle_id'] ?? null;
 $threshold = $_GET['threshold'] ?? 0.3;
 $increase = $_GET['increase'] ?? 0.5;
 $investment = $_GET['investment'] ?? 500;
-$candle_interval = isset($_GET['candle_interval']) ? max(1, min(10, (int)$_GET['candle_interval'])) : 5;
+// Candle interval in minutes (0.5 = 30 seconds, 1-10 = minutes)
+$candle_interval = isset($_GET['candle_interval']) ? max(0.5, min(10, floatval($_GET['candle_interval']))) : 0.5;
 $token = 'SOL';
 $coin_id = 5;
 
@@ -41,16 +42,16 @@ $chart_data = [
 /**
  * Aggregate raw price points into OHLC candles
  * @param array $prices Array of ['x' => timestamp, 'y' => price]
- * @param int $intervalMinutes Candle interval in minutes
+ * @param float $intervalMinutes Candle interval in minutes (0.5 = 30 seconds, 1+ = minutes)
  * @return array Array of candles in ApexCharts format
  */
-function aggregateToCandles(array $prices, int $intervalMinutes = 1): array {
+function aggregateToCandles(array $prices, float $intervalMinutes = 1): array {
     if (empty($prices)) {
         return [];
     }
     
     $candles = [];
-    $intervalSeconds = $intervalMinutes * 60;
+    $intervalSeconds = $intervalMinutes * 60; // Handles 0.5 (30 sec) correctly
     
     // Group prices by interval
     $buckets = [];
@@ -93,7 +94,7 @@ if ($use_duckdb) {
         $chart_data['prices'] = $price_response['prices'];
     }
 } else {
-    $error_message = "DuckDB API is not available. Please start the API server: python scheduler/master.py";
+    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
 }
 
 // Aggregate prices into OHLC candles based on selected interval
@@ -212,7 +213,7 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
     .status-grid {
         display: grid;
         grid-template-columns: repeat(4, 1fr);
-        gap: 1rem;
+        gap: 0.75rem;
     }
     @media (max-width: 992px) {
         .status-grid {
@@ -225,7 +226,7 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
         }
     }
     .status-btn {
-        padding: 1rem;
+        padding: 0.6rem 0.75rem;
         border-radius: 0.5rem;
         border: 1px solid rgba(255,255,255,0.1);
         background: rgba(var(--body-bg-rgb2), 1);
@@ -253,16 +254,17 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
         border-color: rgba(255,255,255,0.2);
     }
     .status-title {
-        font-size: 0.75rem;
+        font-size: 0.7rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        margin-bottom: 0.5rem;
+        margin-bottom: 0.25rem;
         color: rgba(255,255,255,0.7);
     }
     .status-info {
-        font-size: 0.8rem;
+        font-size: 0.75rem;
         color: rgba(255,255,255,0.9);
+        font-weight: 500;
     }
     #sol-candlestick-chart {
         min-height: 450px;
@@ -441,8 +443,9 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                                         <div class="col-xl-2 col-lg-3 col-md-4">
                                             <label for="candle_interval" class="form-label">Candle Grouping</label>
                                             <select id="candle_interval" name="candle_interval" class="form-select">
+                                                <option value="0.5" <?php echo $candle_interval == 0.5 ? 'selected' : ''; ?>>30 sec</option>
                                                 <?php for ($i = 1; $i <= 10; $i++): ?>
-                                                <option value="<?php echo $i; ?>" <?php echo $candle_interval == $i ? 'selected' : ''; ?>><?php echo $i; ?> min</option>
+                                                <option value="<?php echo $i; ?>" <?php echo abs($candle_interval - $i) < 0.01 ? 'selected' : ''; ?>><?php echo $i; ?> min</option>
                                                 <?php endfor; ?>
                                             </select>
                                         </div>
@@ -480,83 +483,13 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                     </div>
                     <!-- End:: Status Buttons -->
 
-                    <!-- Start:: Scheduler Job Status -->
-                    <div class="row mb-3">
-                        <div class="col-xl-12">
-                            <div class="card custom-card">
-                                <div class="card-header">
-                                    <div class="card-title">
-                                        <i class="ti ti-clock-play me-2"></i>Scheduler Jobs Status
-                                    </div>
-                                    <div class="ms-auto d-flex gap-2 align-items-center">
-                                        <span class="scheduler-uptime" id="schedulerUptime">-</span>
-                                        <button class="btn btn-sm btn-outline-light" onclick="refreshSchedulerStatus()" title="Refresh">
-                                            <i class="ti ti-refresh"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                <div class="card-body">
-                                    <?php if (empty($scheduler_jobs)): ?>
-                                    <div class="text-center py-4">
-                                        <i class="ti ti-clock-off fs-1 text-muted mb-3 d-block"></i>
-                                        <h6 class="text-muted">No scheduler data available</h6>
-                                        <p class="text-muted fs-13">Start the scheduler to see job status: <code>python scheduler/master.py</code></p>
-                                    </div>
-                                    <?php else: ?>
-                                    <div class="job-status-grid" id="jobStatusGrid">
-                                        <?php foreach ($scheduler_jobs as $job_id => $job): ?>
-                                        <div class="job-card job-<?php echo htmlspecialchars($job['status'] ?? 'unknown'); ?><?php echo !empty($job['is_service']) || !empty($job['is_stream']) ? ' job-service' : ''; ?>" data-job-id="<?php echo htmlspecialchars($job_id); ?>">
-                                            <div class="job-header">
-                                                <span class="job-name"><?php echo htmlspecialchars($job_id); ?></span>
-                                                <span class="job-status-badge bg-<?php 
-                                                    $status = $job['status'] ?? 'unknown';
-                                                    echo match($status) {
-                                                        'running' => 'info',
-                                                        'success' => 'success',
-                                                        'error' => 'danger',
-                                                        'stopped' => 'secondary',
-                                                        default => 'secondary'
-                                                    };
-                                                ?>-transparent"><?php echo htmlspecialchars($status); ?></span>
-                                            </div>
-                                            <div class="job-desc"><?php echo htmlspecialchars($job['description'] ?? ''); ?></div>
-                                            <div class="job-meta">
-                                                <?php if (!empty($job['last_success'])): ?>
-                                                <div class="job-meta-item">
-                                                    <span class="job-meta-label">Last OK:</span>
-                                                    <span class="job-meta-value job-time" data-time="<?php echo htmlspecialchars($job['last_success']); ?>">-</span>
-                                                </div>
-                                                <?php endif; ?>
-                                                <?php if (!empty($job['run_count'])): ?>
-                                                <div class="job-meta-item">
-                                                    <span class="job-meta-label">Runs:</span>
-                                                    <span class="job-meta-value"><?php echo number_format($job['run_count']); ?></span>
-                                                </div>
-                                                <?php endif; ?>
-                                                <?php if (!empty($job['error_message'])): ?>
-                                                <div class="job-meta-item" style="flex-basis: 100%;">
-                                                    <span class="job-meta-label">Error:</span>
-                                                    <span class="job-meta-value text-danger"><?php echo htmlspecialchars(substr($job['error_message'], 0, 50)); ?></span>
-                                                </div>
-                                                <?php endif; ?>
-                                            </div>
-                                        </div>
-                                        <?php endforeach; ?>
-                                    </div>
-                                    <?php endif; ?>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <!-- End:: Scheduler Job Status -->
-
                     <!-- Start:: Candlestick Chart -->
                     <div class="row mb-3">
                         <div class="col-xl-12">
                             <div class="card custom-card">
                                 <div class="card-header">
                                     <div class="card-title">
-                                        SOL Price Chart - Candlestick (<?php echo $candle_interval; ?> min)
+                                        SOL Price Chart - Candlestick (<?php echo $candle_interval == 0.5 ? '30 sec' : $candle_interval . ' min'; ?>)
                                     </div>
                                     <div class="ms-auto">
                                         <span class="badge bg-primary-transparent"><?php echo count($chart_data['candles']); ?> candles</span>
@@ -637,6 +570,76 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                         </div>
                     </div>
                     <!-- End:: Candlestick Chart -->
+
+                    <!-- Start:: Scheduler Job Status -->
+                    <div class="row mb-3">
+                        <div class="col-xl-12">
+                            <div class="card custom-card">
+                                <div class="card-header">
+                                    <div class="card-title">
+                                        <i class="ti ti-clock-play me-2"></i>Scheduler Jobs Status
+                                    </div>
+                                    <div class="ms-auto d-flex gap-2 align-items-center">
+                                        <span class="scheduler-uptime" id="schedulerUptime">-</span>
+                                        <button class="btn btn-sm btn-outline-light" onclick="refreshSchedulerStatus()" title="Refresh">
+                                            <i class="ti ti-refresh"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="card-body">
+                                    <?php if (empty($scheduler_jobs)): ?>
+                                    <div class="text-center py-4">
+                                        <i class="ti ti-clock-off fs-1 text-muted mb-3 d-block"></i>
+                                        <h6 class="text-muted">No scheduler data available</h6>
+                                        <p class="text-muted fs-13">Start the scheduler to see job status: <code>python scheduler/master.py</code></p>
+                                    </div>
+                                    <?php else: ?>
+                                    <div class="job-status-grid" id="jobStatusGrid">
+                                        <?php foreach ($scheduler_jobs as $job_id => $job): ?>
+                                        <div class="job-card job-<?php echo htmlspecialchars($job['status'] ?? 'unknown'); ?><?php echo !empty($job['is_service']) || !empty($job['is_stream']) ? ' job-service' : ''; ?>" data-job-id="<?php echo htmlspecialchars($job_id); ?>">
+                                            <div class="job-header">
+                                                <span class="job-name"><?php echo htmlspecialchars($job_id); ?></span>
+                                                <span class="job-status-badge bg-<?php 
+                                                    $status = $job['status'] ?? 'unknown';
+                                                    echo match($status) {
+                                                        'running' => 'info',
+                                                        'success' => 'success',
+                                                        'error' => 'danger',
+                                                        'stopped' => 'secondary',
+                                                        default => 'secondary'
+                                                    };
+                                                ?>-transparent"><?php echo htmlspecialchars($status); ?></span>
+                                            </div>
+                                            <div class="job-desc"><?php echo htmlspecialchars($job['description'] ?? ''); ?></div>
+                                            <div class="job-meta">
+                                                <?php if (!empty($job['last_success'])): ?>
+                                                <div class="job-meta-item">
+                                                    <span class="job-meta-label">Last OK:</span>
+                                                    <span class="job-meta-value job-time" data-time="<?php echo htmlspecialchars($job['last_success']); ?>">-</span>
+                                                </div>
+                                                <?php endif; ?>
+                                                <?php if (!empty($job['run_count'])): ?>
+                                                <div class="job-meta-item">
+                                                    <span class="job-meta-label">Runs:</span>
+                                                    <span class="job-meta-value"><?php echo number_format($job['run_count']); ?></span>
+                                                </div>
+                                                <?php endif; ?>
+                                                <?php if (!empty($job['error_message'])): ?>
+                                                <div class="job-meta-item" style="flex-basis: 100%;">
+                                                    <span class="job-meta-label">Error:</span>
+                                                    <span class="job-meta-value text-danger"><?php echo htmlspecialchars(substr($job['error_message'], 0, 50)); ?></span>
+                                                </div>
+                                                <?php endif; ?>
+                                            </div>
+                                        </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- End:: Scheduler Job Status -->
 
                     <!-- Start:: Cycle Tracker Table -->
                     <?php if (!empty($analysis_data)): ?>
@@ -734,7 +737,7 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                                         <h6 class="mb-0">No Cycles Found</h6>
                                         <p class="mb-0">No price cycles found with ><?php echo htmlspecialchars($increase); ?>% increase for threshold <?php echo htmlspecialchars($threshold); ?>% in the last 24 hours.</p>
                                         <?php if (!$use_duckdb): ?>
-                                        <p class="mb-0 mt-2"><strong>Tip:</strong> Make sure the API server is running: <code>python scheduler/master.py</code></p>
+                                        <p class="mb-0 mt-2"><strong>Tip:</strong> Make sure the scheduler is running: <code>python scheduler/master.py</code></p>
                                         <?php endif; ?>
                                     </div>
                                 </div>

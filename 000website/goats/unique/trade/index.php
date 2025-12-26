@@ -1,18 +1,20 @@
 <?php
 /**
  * Trade Details Page - Individual Trade View
- * Ported from chart/plays/unique/trade/index.php to v2 template system
+ * Migrated to use DuckDBClient API
  */
 
-// --- Load Configuration from .env ---
-require_once __DIR__ . '/../../../../chart/config.php';
+// --- Load DuckDB Client ---
+require_once __DIR__ . '/../../../includes/DuckDBClient.php';
+// API Base URL - uses PHP proxy to reach Flask API on server
+$API_BASE = dirname($_SERVER["SCRIPT_NAME"]) . '/../../../api/proxy.php';
 
 // Get trade ID, play ID, and return URL from query parameters
 $trade_id = (int)($_GET['id'] ?? 0);
 $play_id = (int)($_GET['play_id'] ?? 0);
 $return_url = $_GET['return_url'] ?? '../?id=' . $play_id;
-$requested_source = strtolower($_GET['source'] ?? '');
-$source = null;
+$requested_source = strtolower($_GET['source'] ?? 'live');
+$source = $requested_source;
 
 if ($trade_id <= 0) {
     header('Location: ../../?error=' . urlencode('Invalid trade ID'));
@@ -23,57 +25,34 @@ if ($trade_id <= 0) {
 $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
 $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . dirname(dirname(dirname(dirname($_SERVER['SCRIPT_NAME']))));
 
-// --- Data Fetching ---
-$dsn = "mysql:host=$db_host;dbname=$db_name;charset=$db_charset";
-$options = [
-    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    PDO::ATTR_EMULATE_PREPARES   => false,
-];
+// --- Initialize API Client ---
+$client = new DuckDBClient();
+$api_available = $client->isAvailable();
 
 $trade = null;
 $play = null;
 $error_message = '';
-$trade_table_name = 'solcatcher.follow_the_goat_buyins_archive';
+$trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
 
-try {
-    $pdo = new PDO($dsn, $db_user, $db_pass, $options);
-
-    // Fetch trade details from the requested source, falling back if needed
-    $tableMap = [
-        'archive' => 'solcatcher.follow_the_goat_buyins_archive',
-        'live' => 'solcatcher.follow_the_goat_buyins',
-    ];
-    $queryTemplate = "
-        SELECT 
-            id,
-            play_id,
-            wallet_address,
-            tolerance,
-            block_timestamp,
-            price as org_price_entry,
-            followed_at,
-            our_entry_price,
-            our_exit_price,
-            our_exit_timestamp,
-            our_profit_loss,
-            our_status,
-            price_movements,
-            entry_log
-        FROM %s
-        WHERE id = :id
-    ";
-    $sourceOrder = ['archive', 'live'];
-
-    foreach ($sourceOrder as $sourceKey) {
-        $stmt = $pdo->prepare(sprintf($queryTemplate, $tableMap[$sourceKey]));
-        $stmt->execute(['id' => $trade_id]);
-        $trade = $stmt->fetch();
-
-        if ($trade) {
-            $source = $sourceKey;
-            $trade_table_name = $tableMap[$sourceKey];
-            break;
+if (!$api_available) {
+    $error_message = 'API server is not available. Please ensure master.py is running.';
+} else {
+    // Fetch trade details via API
+    $buyin_result = $client->getSingleBuyin($trade_id, $source);
+    
+    if ($buyin_result && isset($buyin_result['buyin'])) {
+        $trade = $buyin_result['buyin'];
+        $source = $buyin_result['source'] ?? $source;
+        $trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
+    } else {
+        // Try the other source
+        $alt_source = $source === 'live' ? 'archive' : 'live';
+        $buyin_result = $client->getSingleBuyin($trade_id, $alt_source);
+        
+        if ($buyin_result && isset($buyin_result['buyin'])) {
+            $trade = $buyin_result['buyin'];
+            $source = $buyin_result['source'] ?? $alt_source;
+            $trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
         }
     }
     
@@ -84,132 +63,20 @@ try {
     
     // Update play_id if not provided
     if ($play_id <= 0) {
-        $play_id = $trade['play_id'];
+        $play_id = $trade['play_id'] ?? 0;
     }
     
-    // Fetch play details
-    $stmt = $pdo->prepare("SELECT id, name, description, short_play FROM solcatcher.follow_the_goat_plays WHERE id = :id");
-    $stmt->execute(['id' => $play_id]);
-    $play = $stmt->fetch();
-    
-    // Fetch price checks from the appropriate table based on trade source
-    $price_checks = [];
-    $price_checks_source = 'live';
-    
-    $priceChecksTableMap = [
-        'live' => 'solcatcher.follow_the_goat_buyins_price_checks',
-        'archive' => 'solcatcher.follow_the_goat_buyins_price_checks_archive',
-    ];
-    
-    $priceChecksOrder = ($source === 'archive') ? ['archive', 'live'] : ['live', 'archive'];
-    
-    $priceChecksQuery = "
-        SELECT 
-            id,
-            buyin_id,
-            checked_at,
-            current_price,
-            entry_price,
-            highest_price,
-            reference_price,
-            gain_from_entry,
-            drop_from_high,
-            drop_from_entry,
-            drop_from_reference,
-            tolerance,
-            basis,
-            bucket,
-            applied_rule,
-            should_sell,
-            is_backfill,
-            created_at
-        FROM %s
-        WHERE buyin_id = :buyin_id
-        ORDER BY checked_at ASC
-    ";
-    
-    foreach ($priceChecksOrder as $pcSource) {
-        try {
-            $stmt = $pdo->prepare(sprintf($priceChecksQuery, $priceChecksTableMap[$pcSource]));
-            $stmt->execute(['buyin_id' => $trade_id]);
-            $price_checks = $stmt->fetchAll();
-            
-            if (!empty($price_checks)) {
-                $price_checks_source = $pcSource;
-                break;
-            }
-        } catch (\PDOException $e) {
-            continue;
-        }
-    }
-
-    // Fetch filter validation results from trade_filter_results table
-    $filter_results = [];
-    $filter_results_summary = [];
-    try {
-        $stmt = $pdo->prepare("
-            SELECT 
-                tfr.id,
-                tfr.project_id,
-                tfr.filter_id,
-                tfr.filter_name,
-                tfr.field_column,
-                tfr.section,
-                tfr.minute,
-                tfr.from_value,
-                tfr.to_value,
-                tfr.actual_value,
-                tfr.passed,
-                tfr.error,
-                tfr.evaluated_at,
-                pcp.name as project_name
-            FROM trade_filter_results tfr
-            LEFT JOIN pattern_config_projects pcp ON tfr.project_id = pcp.id
-            WHERE tfr.buyin_id = :buyin_id
-            ORDER BY tfr.project_id, tfr.filter_id
-        ");
-        $stmt->execute(['buyin_id' => $trade_id]);
-        $filter_results = $stmt->fetchAll();
-        
-        // Build summary per project
-        if (!empty($filter_results)) {
-            $project_groups = [];
-            foreach ($filter_results as $fr) {
-                $pid = $fr['project_id'];
-                if (!isset($project_groups[$pid])) {
-                    $project_groups[$pid] = [
-                        'project_id' => $pid,
-                        'project_name' => $fr['project_name'] ?? "Project #$pid",
-                        'total' => 0,
-                        'passed' => 0,
-                        'failed' => 0,
-                        'filters' => []
-                    ];
-                }
-                $project_groups[$pid]['total']++;
-                if ($fr['passed']) {
-                    $project_groups[$pid]['passed']++;
-                } else {
-                    $project_groups[$pid]['failed']++;
-                }
-                $project_groups[$pid]['filters'][] = $fr;
-            }
-            
-            // Determine which projects passed (all filters passed)
-            foreach ($project_groups as $pid => &$pg) {
-                $pg['all_passed'] = ($pg['failed'] === 0 && $pg['passed'] > 0);
-            }
-            unset($pg);
-            
-            $filter_results_summary = array_values($project_groups);
-        }
-    } catch (\PDOException $e) {
-        // Table might not exist yet - that's okay
-    }
-
-} catch (\PDOException $e) {
-    $error_message = "Database error: " . $e->getMessage();
+    // Fetch play details via API
+    $play_result = $client->getPlay($play_id);
+    $play = $play_result['play'] ?? null;
 }
+
+// Price checks and filter results - would need API expansion
+// For now, use empty arrays (these features can be added later via API)
+$price_checks = [];
+$price_checks_source = 'live';
+$filter_results = [];
+$filter_results_summary = [];
 
 $entry_log_pretty = null;
 $entry_log_raw = null;

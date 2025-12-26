@@ -19,6 +19,7 @@ $baseUrl = '../..';
 $threshold_filter = isset($_GET['threshold']) ? floatval($_GET['threshold']) : null;
 $hours = isset($_GET['hours']) ? $_GET['hours'] : 'all';
 $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 50;
+$refresh_interval = isset($_GET['refresh']) ? intval($_GET['refresh']) : 30; // Default 30 seconds
 
 // --- Fetch Cycle Data ---
 function fetchCycleData($duckdb, $threshold, $hours, $limit) {
@@ -59,6 +60,18 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
     ];
 }
 
+// Fetch ALL cycles (no threshold filter) for the threshold range table
+function fetchAllCyclesForRangeTable($duckdb, $hours, $limit) {
+    if ($duckdb->isAvailable()) {
+        // Fetch without threshold filter (null = all thresholds)
+        $response = $duckdb->getCycleTracker(null, $hours, $limit);
+        if ($response && isset($response['cycles'])) {
+            return $response['cycles'];
+        }
+    }
+    return [];
+}
+
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
@@ -82,6 +95,9 @@ $error_message = $result['error_message'];
 $data_source = $result['data_source'];
 $actual_source = $result['actual_source'];
 
+// Fetch ALL cycles for the threshold range table (ignoring threshold filter)
+$all_cycles_for_table = fetchAllCyclesForRangeTable($duckdb, $hours, 1000);
+
 // Calculate stats
 $active_cycles = 0;
 $completed_cycles = 0;
@@ -99,6 +115,50 @@ foreach ($cycles as $cycle) {
 
 if (count($cycles) > 0) {
     $avg_max_increase = $total_increase / count($cycles);
+}
+
+// Calculate cycle counts by threshold and percent increase range
+// Rows: percent increase ranges, Columns: threshold values
+// Use STRING keys to avoid PHP float comparison issues
+$thresholds = ['0.2', '0.25', '0.3', '0.35', '0.4', '0.45', '0.5'];
+$ranges = [
+    '0.0 - 0.1' => [0.0, 0.1],
+    '0.1 - 0.2' => [0.1, 0.2],
+    '0.2 - 0.3' => [0.2, 0.3],
+    '0.3 - 0.4' => [0.3, 0.4],
+    '0.4 - 0.5' => [0.4, 0.5],
+    '0.5+' => [0.5, 999]
+];
+
+$threshold_range_counts = [];
+foreach ($ranges as $range_name => $range_bounds) {
+    $threshold_range_counts[$range_name] = [];
+    foreach ($thresholds as $th) {
+        $threshold_range_counts[$range_name][$th] = 0;
+    }
+}
+
+// Use all_cycles_for_table instead of filtered cycles
+foreach ($all_cycles_for_table as $cycle) {
+    $threshold = floatval($cycle['threshold'] ?? 0);
+    $max_increase = floatval($cycle['max_percent_increase'] ?? 0);
+    
+    // Convert threshold to string key (e.g., 0.25 -> "0.25")
+    // Use 2 decimal places to handle thresholds like 0.25, 0.35, 0.45
+    $threshold_key = rtrim(rtrim(number_format($threshold, 2), '0'), '.');
+    
+    // Only count if this is one of our tracked thresholds
+    if (!in_array($threshold_key, $thresholds)) {
+        continue;
+    }
+    
+    // Find which range this cycle's max_percent_increase falls into
+    foreach ($ranges as $range_name => $range_bounds) {
+        if ($max_increase >= $range_bounds[0] && ($range_bounds[1] == 999 || $max_increase < $range_bounds[1])) {
+            $threshold_range_counts[$range_name][$threshold_key]++;
+            break;
+        }
+    }
 }
 ?>
 
@@ -224,6 +284,14 @@ if (count($cycles) > 0) {
                                 <span class="pulse-dot"></span>
                                 <?php echo $use_duckdb ? 'Connected' : 'Disconnected'; ?>
                             </span>
+                            <select id="refreshInterval" class="form-select form-select-sm" style="width: auto;" onchange="updateRefreshInterval(this.value)">
+                                <option value="5" <?php echo $refresh_interval == 5 ? 'selected' : ''; ?>>5 sec</option>
+                                <option value="10" <?php echo $refresh_interval == 10 ? 'selected' : ''; ?>>10 sec</option>
+                                <option value="30" <?php echo $refresh_interval == 30 ? 'selected' : ''; ?>>30 sec</option>
+                                <option value="60" <?php echo $refresh_interval == 60 ? 'selected' : ''; ?>>1 min</option>
+                                <option value="300" <?php echo $refresh_interval == 300 ? 'selected' : ''; ?>>5 min</option>
+                                <option value="0" <?php echo $refresh_interval == 0 ? 'selected' : ''; ?>>Off</option>
+                            </select>
                             <button class="btn btn-sm btn-primary" onclick="refreshData()">
                                 <i class="ri-refresh-line me-1"></i> Refresh
                             </button>
@@ -294,6 +362,91 @@ if (count($cycles) > 0) {
                         </div>
                     </div>
 
+                    <!-- Threshold Range Counts Table -->
+                    <div class="card custom-card mb-4">
+                        <div class="card-header">
+                            <h5 class="card-title mb-0">Cycles by Threshold Range</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="table-responsive">
+                                <table class="table mb-0">
+                                    <thead>
+                                        <tr>
+                                            <th>Range</th>
+                                            <th class="text-center">0.2%</th>
+                                            <th class="text-center">0.25%</th>
+                                            <th class="text-center">0.3%</th>
+                                            <th class="text-center">0.35%</th>
+                                            <th class="text-center">0.4%</th>
+                                            <th class="text-center">0.45%</th>
+                                            <th class="text-center">0.5%</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="threshold-range-body">
+                                        <?php foreach ($threshold_range_counts as $range_name => $counts): 
+                                            // Check if this row has any non-zero values
+                                            $row_total = ($counts['0.2'] ?? 0) + ($counts['0.25'] ?? 0) + ($counts['0.3'] ?? 0) + ($counts['0.35'] ?? 0) + ($counts['0.4'] ?? 0) + ($counts['0.45'] ?? 0) + ($counts['0.5'] ?? 0);
+                                            if ($row_total == 0) continue;
+                                        ?>
+                                        <tr>
+                                            <td class="fw-medium"><?php echo htmlspecialchars($range_name); ?>%</td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.2'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.2']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.25'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.25']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.3'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.3']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.35'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.35']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.4'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.4']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.45'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.45']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="text-center">
+                                                <?php if (($counts['0.5'] ?? 0) > 0): ?>
+                                                <span class="badge bg-primary-transparent"><?php echo $counts['0.5']; ?></span>
+                                                <?php else: ?>
+                                                <span class="text-muted">-</span>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Filters -->
                     <div class="card custom-card mb-4">
                         <div class="card-body py-3">
@@ -303,29 +456,33 @@ if (count($cycles) > 0) {
                                    class="btn btn-sm btn-outline-light filter-btn <?php echo $threshold_filter === null ? 'active' : ''; ?>">
                                     All
                                 </a>
-                                <?php foreach ([0.1, 0.2, 0.3, 0.4, 0.5] as $t): ?>
+                                <?php foreach ([0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5] as $t): ?>
                                 <a href="?threshold=<?php echo $t; ?>&hours=<?php echo $hours; ?>&limit=<?php echo $limit; ?>" 
                                    class="btn btn-sm btn-outline-light filter-btn <?php echo $threshold_filter == $t ? 'active' : ''; ?>">
                                     <?php echo $t; ?>%
                                 </a>
                                 <?php endforeach; ?>
                                 
-                                <span class="text-muted fs-13 ms-3 me-1">Created:</span>
-                                <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=1&limit=<?php echo $limit; ?>" 
-                                   class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == '1' ? 'active' : ''; ?>">
-                                    1h
-                                </a>
-                                <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=24&limit=<?php echo $limit; ?>" 
-                                   class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == '24' ? 'active' : ''; ?>">
-                                    24h
-                                </a>
-                                <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=all&limit=<?php echo $limit; ?>" 
-                                   class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == 'all' ? 'active' : ''; ?>">
-                                    All
-                                </a>
+                            <span class="text-muted fs-13 ms-3 me-1">Created:</span>
+                            <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=1&limit=<?php echo $limit; ?>" 
+                               class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == '1' ? 'active' : ''; ?>">
+                                1h
+                            </a>
+                            <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=24&limit=<?php echo $limit; ?>" 
+                               class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == '24' ? 'active' : ''; ?>">
+                                24h
+                            </a>
+                            <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=all&limit=<?php echo $limit; ?>" 
+                               class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == 'all' ? 'active' : ''; ?>"
+                               title="<?php echo $actual_source == 'engine' ? 'All (24h max - DuckDB)' : 'All (Historical - MySQL)'; ?>">
+                                All<?php echo $actual_source == 'engine' ? ' (24h)' : ''; ?>
+                            </a>
 
                                 <span class="ms-auto data-source-info" id="data-source">
                                     Data: <?php echo $data_source; ?>
+                                    <?php if ($actual_source == 'engine' && $hours == 'all'): ?>
+                                        <span class="text-muted ms-1" style="font-size: 0.7rem;">(24h max)</span>
+                                    <?php endif; ?>
                                 </span>
                             </div>
                         </div>
@@ -416,22 +573,46 @@ if (count($cycles) > 0) {
 <?php ob_start(); ?>
 
 <script>
-    // Auto-refresh every 5 seconds
+    // Auto-refresh interval (default 30 seconds)
     let autoRefreshInterval = null;
+    let refreshIntervalSeconds = <?php echo $refresh_interval; ?>;
+    
+    function updateRefreshInterval(seconds) {
+        refreshIntervalSeconds = parseInt(seconds);
+        
+        // Update URL parameter without reload
+        const url = new URL(window.location);
+        if (refreshIntervalSeconds > 0) {
+            url.searchParams.set('refresh', refreshIntervalSeconds);
+        } else {
+            url.searchParams.delete('refresh');
+        }
+        window.history.replaceState({}, '', url);
+        
+        // Restart auto-refresh with new interval
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+        }
+        
+        if (refreshIntervalSeconds > 0) {
+            autoRefreshInterval = setInterval(refreshData, refreshIntervalSeconds * 1000);
+        }
+    }
     
     function refreshData() {
         const params = new URLSearchParams(window.location.search);
         params.set('ajax', 'refresh');
         
-        fetch('?' + params.toString())
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    updateStats(data);
-                    updateTable(data.cycles);
-                    updateDataSource(data.data_source);
-                }
-            })
+            fetch('?' + params.toString())
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        updateStats(data);
+                        updateTable(data.cycles);
+                        const hours = new URLSearchParams(window.location.search).get('hours') || 'all';
+                        updateDataSource(data.data_source, data.actual_source, hours);
+                    }
+                })
             .catch(err => {
                 console.error('Refresh failed:', err);
             });
@@ -453,11 +634,101 @@ if (count($cycles) > 0) {
         const avgEl = document.getElementById('stat-avg');
         avgEl.textContent = avg.toFixed(4) + '%';
         avgEl.className = 'stat-value ' + (avg >= 0 ? 'price-up' : 'price-down');
+        
+        // Update threshold range table
+        updateThresholdRanges(data.cycles);
     }
     
-    function updateDataSource(source) {
+    function updateThresholdRanges(cycles) {
+        const thresholds = ['0.2', '0.25', '0.3', '0.35', '0.4', '0.45', '0.5'];
+        const ranges = {
+            '0.0 - 0.1': [0.0, 0.1],
+            '0.1 - 0.2': [0.1, 0.2],
+            '0.2 - 0.3': [0.2, 0.3],
+            '0.3 - 0.4': [0.3, 0.4],
+            '0.4 - 0.5': [0.4, 0.5],
+            '0.5+': [0.5, 999]
+        };
+        
+        const counts = {};
+        Object.keys(ranges).forEach(rangeName => {
+            counts[rangeName] = {};
+            thresholds.forEach(th => {
+                counts[rangeName][th] = 0;
+            });
+        });
+        
+        cycles.forEach(cycle => {
+            let threshold = parseFloat(cycle.threshold || 0);
+            const maxIncrease = parseFloat(cycle.max_percent_increase || 0);
+            
+            // Convert threshold to string key (handles 0.25, 0.35, 0.45)
+            const thresholdKey = parseFloat(threshold.toFixed(2)).toString();
+            
+            // Only count if this is one of our tracked thresholds
+            if (!thresholds.includes(thresholdKey)) {
+                return;
+            }
+            
+            // Find which range this cycle falls into
+            for (const [rangeName, rangeBounds] of Object.entries(ranges)) {
+                if (maxIncrease >= rangeBounds[0] && (rangeBounds[1] == 999 || maxIncrease < rangeBounds[1])) {
+                    if (counts[rangeName] && counts[rangeName].hasOwnProperty(thresholdKey)) {
+                        counts[rangeName][thresholdKey]++;
+                    }
+                    break;
+                }
+            }
+        });
+        
+        const tbody = document.getElementById('threshold-range-body');
+        if (tbody) {
+            // Filter out rows with all zeros
+            const rows = Object.entries(counts)
+                .filter(([rangeName, rangeCounts]) => {
+                    const total = thresholds.reduce((sum, th) => sum + rangeCounts[th], 0);
+                    return total > 0;
+                })
+                .map(([rangeName, rangeCounts]) => `
+                <tr>
+                    <td class="fw-medium">${rangeName}%</td>
+                    <td class="text-center">
+                        ${rangeCounts['0.2'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.2']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.25'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.25']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.3'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.3']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.35'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.35']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.4'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.4']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.45'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.45']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                    <td class="text-center">
+                        ${rangeCounts['0.5'] > 0 ? `<span class="badge bg-primary-transparent">${rangeCounts['0.5']}</span>` : '<span class="text-muted">-</span>'}
+                    </td>
+                </tr>
+            `).join('');
+            tbody.innerHTML = rows;
+        }
+    }
+    
+    function updateDataSource(source, actualSource, hours) {
         const el = document.getElementById('data-source');
-        if (el) el.textContent = 'Data: ' + source;
+        if (el) {
+            let text = 'Data: ' + source;
+            // Show 24h max indicator when using DuckDB engine with "all" filter
+            if (actualSource === 'engine' && hours === 'all') {
+                text += ' <span class="text-muted ms-1" style="font-size: 0.7rem;">(24h max)</span>';
+            }
+            el.innerHTML = text;
+        }
     }
     
     function updateTable(cycles) {
@@ -516,11 +787,14 @@ if (count($cycles) > 0) {
         return `${months[date.getUTCMonth()]} ${date.getUTCDate()}, ${String(date.getUTCHours()).padStart(2,'0')}:${String(date.getUTCMinutes()).padStart(2,'0')}:${String(date.getUTCSeconds()).padStart(2,'0')}`;
     }
     
-    // Start auto-refresh
-    autoRefreshInterval = setInterval(refreshData, 5000);
+    // Start auto-refresh with configured interval
+    if (refreshIntervalSeconds > 0) {
+        autoRefreshInterval = setInterval(refreshData, refreshIntervalSeconds * 1000);
+    }
 </script>
 
 <?php $scripts = ob_get_clean(); ?>
 
 <!-- Render using base layout -->
 <?php include __DIR__ . '/../layouts/base.php'; ?>
+

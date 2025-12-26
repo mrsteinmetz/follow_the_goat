@@ -430,6 +430,77 @@ class DuckDBClient {
     }
     
     // =========================================================================
+    // Pattern Config
+    // =========================================================================
+    
+    /**
+     * Get all pattern config projects with filter counts
+     */
+    public function getPatternProjects(): ?array {
+        return $this->get('/patterns/projects');
+    }
+    
+    /**
+     * Get a single pattern config project by ID
+     */
+    public function getPatternProject(int $projectId): ?array {
+        return $this->get("/patterns/projects/{$projectId}");
+    }
+    
+    /**
+     * Create a new pattern config project
+     * 
+     * @param string $name Project name
+     * @param string|null $description Optional description
+     */
+    public function createPatternProject(string $name, ?string $description = null): ?array {
+        return $this->post('/patterns/projects', [
+            'name' => $name,
+            'description' => $description
+        ]);
+    }
+    
+    /**
+     * Delete a pattern config project and all its filters
+     */
+    public function deletePatternProject(int $projectId): ?array {
+        return $this->delete("/patterns/projects/{$projectId}");
+    }
+    
+    /**
+     * Get all filters for a pattern config project
+     */
+    public function getPatternFilters(int $projectId): ?array {
+        return $this->get("/patterns/projects/{$projectId}/filters");
+    }
+    
+    /**
+     * Create a new pattern config filter
+     * 
+     * @param array $data Filter data: project_id, name, field_name, section, minute, etc.
+     */
+    public function createPatternFilter(array $data): ?array {
+        return $this->post('/patterns/filters', $data);
+    }
+    
+    /**
+     * Update a pattern config filter
+     * 
+     * @param int $filterId Filter ID
+     * @param array $data Fields to update
+     */
+    public function updatePatternFilter(int $filterId, array $data): ?array {
+        return $this->put("/patterns/filters/{$filterId}", $data);
+    }
+    
+    /**
+     * Delete a pattern config filter
+     */
+    public function deletePatternFilter(int $filterId): ?array {
+        return $this->delete("/patterns/filters/{$filterId}");
+    }
+    
+    // =========================================================================
     // Admin Operations
     // =========================================================================
     

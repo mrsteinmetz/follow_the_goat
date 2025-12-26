@@ -330,11 +330,12 @@ ob_start();
             API <?php echo $api_available ? 'Online' : 'Offline'; ?>
         </span>
         <select id="timeInterval" class="form-select" style="width: auto; min-width: 140px;" onchange="changeTimeInterval()">
+            <option value="168" selected>7 Days</option>
+            <option value="72">3 Days</option>
             <option value="24">24 Hours</option>
             <option value="12">12 Hours</option>
             <option value="6">6 Hours</option>
             <option value="2">2 Hours</option>
-            <option value="all" selected>All Time</option>
         </select>
         <button class="btn btn-danger" onclick="cleanupNoGos()" title="Delete no_go trades older than 24 hours">
             <i class="ri-delete-bin-line me-1"></i>Cleanup No-Gos
@@ -744,12 +745,12 @@ ob_start();
 
     async function loadPlayMetrics() {
         const playIds = <?php echo json_encode(array_column($plays_data, 'id')); ?>;
-        const timeInterval = document.getElementById('timeInterval')?.value || 'all';
+        const timeInterval = document.getElementById('timeInterval')?.value || '168';
         
         for (const playId of playIds) {
             const titleElement = document.getElementById('perf-title-' + playId);
             if (titleElement) {
-                const titleText = timeInterval === 'all' ? 'All Time Performance' : timeInterval + 'h Performance';
+                const titleText = timeInterval + 'h Performance';
                 titleElement.textContent = titleText;
             }
         }

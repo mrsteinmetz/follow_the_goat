@@ -115,6 +115,21 @@ def sync_plays_from_mysql():
     logger.info(f"Plays sync complete: {synced} records")
 
 
+@track_job("sync_pattern_config_from_mysql", "Sync pattern config from MySQL (every 5 min)")
+def sync_pattern_config_from_mysql():
+    """Sync pattern config tables from MySQL to DuckDB (full data, not time-based)."""
+    logger.info("Syncing pattern config from MySQL...")
+    from features.price_api.sync_from_mysql import sync_table
+    
+    # Sync projects
+    synced_projects = sync_table("pattern_config_projects", full_sync=True)
+    
+    # Sync filters  
+    synced_filters = sync_table("pattern_config_filters", full_sync=True)
+    
+    logger.info(f"Pattern config sync complete: {synced_projects} projects, {synced_filters} filters")
+
+
 @track_job("process_price_cycles", "Process price cycles (every 5s)")
 def process_price_cycles():
     """Process price points into price cycle analysis (dual-write to DuckDB + MySQL)."""
@@ -152,6 +167,24 @@ def cleanup_wallet_profiles():
     deleted = cleanup_old_profiles(hours=24)
     if deleted > 0:
         logger.info(f"Cleaned up {deleted} old wallet profiles")
+
+
+@track_job("train_validator", "Validator training cycle (every 30s)")
+def run_train_validator():
+    """Run a single validator training cycle.
+    
+    Creates a synthetic trade, generates a 15-minute trail, runs pattern 
+    validation, and updates the trade record with the validation result.
+    """
+    import os
+    enabled = os.getenv("TRAIN_VALIDATOR_ENABLED", "0") == "1"
+    if not enabled:
+        return
+    
+    from _000trading.train_validator import run_training_cycle
+    success = run_training_cycle()
+    if not success:
+        logger.warning("Train validator cycle failed")
 
 
 # =============================================================================
@@ -336,6 +369,16 @@ def create_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     
+    # Sync pattern config from MySQL (every 5 minutes)
+    # Keeps DuckDB pattern_config_projects and pattern_config_filters in sync
+    scheduler.add_job(
+        func=sync_pattern_config_from_mysql,
+        trigger=IntervalTrigger(minutes=5),
+        id="sync_pattern_config_from_mysql",
+        name="Sync pattern config tables from MySQL to DuckDB",
+        replace_existing=True,
+    )
+    
     # =====================================================
     # LEGACY JOBS (for backward compatibility)
     # =====================================================
@@ -383,6 +426,23 @@ def create_scheduler() -> BackgroundScheduler:
         id="cleanup_wallet_profiles",
         name="Clean up wallet profiles (24hr window in both DuckDB and MySQL)",
         replace_existing=True,
+    )
+    
+    # =====================================================
+    # TRADING MODULE JOBS
+    # =====================================================
+    
+    # Validator Training (runs every 30 seconds)
+    # Creates synthetic trades and validates them against pattern schemas
+    # Only runs when TRAIN_VALIDATOR_ENABLED=1 in .env
+    scheduler.add_job(
+        func=run_train_validator,
+        trigger=IntervalTrigger(seconds=30),
+        id="train_validator",
+        name="Validator training cycle (every 30s)",
+        replace_existing=True,
+        max_instances=1,  # Prevent overlapping runs
+        coalesce=True,    # Combine missed runs
     )
     
     return scheduler
@@ -473,15 +533,24 @@ def main():
     time.sleep(2)
     
     # =====================================================
-    # STEP 4: Sync plays from MySQL immediately on startup
+    # STEP 4: Sync config tables from MySQL immediately on startup
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 4: Syncing plays from MySQL (startup sync)...")
+    logger.info("STEP 4: Syncing config tables from MySQL (startup sync)...")
+    
+    # Sync plays
     try:
         sync_plays_from_mysql()
         logger.info("Plays sync complete")
     except Exception as e:
         logger.error(f"Failed to sync plays on startup: {e}")
+    
+    # Sync pattern config
+    try:
+        sync_pattern_config_from_mysql()
+        logger.info("Pattern config sync complete")
+    except Exception as e:
+        logger.error(f"Failed to sync pattern config on startup: {e}")
     
     # =====================================================
     # STEP 5: Create and start the scheduler

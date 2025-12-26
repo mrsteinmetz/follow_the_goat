@@ -124,10 +124,9 @@ if ($trade && $trade['followed_at']) {
     $status = strtolower($trade['our_status']);
     
     if ($status !== 'completed' && $status !== 'sold') {
-        $stmt = $pdo->query("SELECT NOW() as server_time");
-        $current_time_row = $stmt->fetch();
-        $effective_exit_timestamp = $current_time_row['server_time'];
-        $effective_exit_ms = strtotime($effective_exit_timestamp);
+        // Use PHP's current time instead of MySQL query (DuckDB only)
+        $effective_exit_timestamp = date('Y-m-d H:i:s');
+        $effective_exit_ms = time();
         
         $price_movements = json_decode($trade['price_movements'] ?? '[]', true);
         if (is_array($price_movements) && count($price_movements) > 0) {

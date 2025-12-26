@@ -207,6 +207,46 @@ CREATE INDEX IF NOT EXISTS idx_wallet_profiles_short ON wallet_profiles(short);
 """
 
 # =============================================================================
+# PATTERN CONFIG TABLES (Full data, not time-based)
+# =============================================================================
+
+SCHEMA_PATTERN_CONFIG_PROJECTS = """
+CREATE TABLE IF NOT EXISTS pattern_config_projects (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_projects_name ON pattern_config_projects(name);
+CREATE INDEX IF NOT EXISTS idx_pattern_projects_created_at ON pattern_config_projects(created_at);
+"""
+
+SCHEMA_PATTERN_CONFIG_FILTERS = """
+CREATE TABLE IF NOT EXISTS pattern_config_filters (
+    id INTEGER PRIMARY KEY,
+    project_id INTEGER,
+    name VARCHAR(255) NOT NULL,
+    section VARCHAR(100),
+    minute TINYINT,
+    field_name VARCHAR(100) NOT NULL,
+    field_column VARCHAR(100),
+    from_value DECIMAL(20,8),
+    to_value DECIMAL(20,8),
+    include_null TINYINT DEFAULT 0,
+    play_id INTEGER,
+    is_active TINYINT DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pattern_filters_project_id ON pattern_config_filters(project_id);
+CREATE INDEX IF NOT EXISTS idx_pattern_filters_section_minute ON pattern_config_filters(section, minute);
+CREATE INDEX IF NOT EXISTS idx_pattern_filters_is_active ON pattern_config_filters(is_active);
+"""
+
+# =============================================================================
 # ALL SCHEMAS COMBINED
 # =============================================================================
 
@@ -218,6 +258,8 @@ ALL_SCHEMAS = [
     ("price_analysis", SCHEMA_PRICE_ANALYSIS),
     ("cycle_tracker", SCHEMA_CYCLE_TRACKER),
     ("wallet_profiles", SCHEMA_WALLET_PROFILES),
+    ("pattern_config_projects", SCHEMA_PATTERN_CONFIG_PROJECTS),
+    ("pattern_config_filters", SCHEMA_PATTERN_CONFIG_FILTERS),
 ]
 
 # Tables that use 24-hour hot storage (time-based cleanup)
@@ -236,6 +278,8 @@ HOT_TABLES = [
 # Tables that keep full data (no time-based cleanup)
 FULL_DATA_TABLES = [
     "follow_the_goat_plays",
+    "pattern_config_projects",
+    "pattern_config_filters",
 ]
 
 # Timestamp column used for cleanup in each table

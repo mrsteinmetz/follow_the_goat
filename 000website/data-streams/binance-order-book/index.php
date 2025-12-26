@@ -168,6 +168,19 @@ $json_orderbook_data = json_encode($orderbook_data);
 <?php ob_start(); ?>
 
 <style>
+    /* Trader-focused color scheme */
+    :root {
+        --bid-color: #00d4aa;
+        --ask-color: #ff4444;
+        --bid-bg: rgba(0, 212, 170, 0.15);
+        --ask-bg: rgba(255, 68, 68, 0.15);
+        --spread-tight: #00d4aa;
+        --spread-normal: #ffa500;
+        --spread-wide: #ff4444;
+        --depth-high: rgba(0, 212, 170, 0.3);
+        --depth-low: rgba(255, 255, 255, 0.05);
+    }
+    
     .status-grid {
         display: grid;
         grid-template-columns: repeat(5, 1fr);
@@ -223,32 +236,209 @@ $json_orderbook_data = json_encode($orderbook_data);
         font-size: 0.8rem;
         color: rgba(255,255,255,0.9);
     }
+    
+    /* Trader table styling */
+    .orderbook-table {
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 8px;
+    }
+    .orderbook-table thead th {
+        background: rgba(0, 0, 0, 0.5) !important;
+        border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+        font-weight: 700;
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.5px;
+        padding: 1rem 0.75rem;
+    }
+    .orderbook-table tbody tr {
+        transition: all 0.15s ease;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .orderbook-table tbody tr:hover {
+        background: rgba(255, 255, 255, 0.05);
+        transform: scale(1.01);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    }
+    .orderbook-table tbody tr:first-child {
+        background: rgba(0, 212, 170, 0.1);
+        border-left: 3px solid var(--bid-color);
+    }
+    
+    /* Bid/Ask color coding */
+    .cell-bid {
+        color: var(--bid-color);
+        font-weight: 600;
+        background: var(--bid-bg);
+        padding: 0.5rem;
+        border-radius: 4px;
+    }
+    .cell-ask {
+        color: var(--ask-color);
+        font-weight: 600;
+        background: var(--ask-bg);
+        padding: 0.5rem;
+        border-radius: 4px;
+    }
+    .cell-mid-price {
+        color: #fff;
+        font-weight: 700;
+        font-size: 0.95rem;
+        background: linear-gradient(135deg, rgba(0, 212, 170, 0.2), rgba(255, 68, 68, 0.2));
+        padding: 0.5rem;
+        border-radius: 4px;
+    }
+    
+    /* Spread visualization */
+    .spread-cell {
+        position: relative;
+        padding: 0.5rem;
+        border-radius: 4px;
+        font-weight: 600;
+    }
+    .spread-tight {
+        color: var(--spread-tight);
+        background: rgba(0, 212, 170, 0.15);
+    }
+    .spread-normal {
+        color: var(--spread-normal);
+        background: rgba(255, 165, 0, 0.15);
+    }
+    .spread-wide {
+        color: var(--spread-wide);
+        background: rgba(255, 68, 68, 0.15);
+    }
+    
+    /* Depth visualization */
+    .depth-bar-container {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        min-width: 100px;
+    }
+    .depth-bar {
+        height: 20px;
+        border-radius: 3px;
+        min-width: 4px;
+        transition: all 0.3s ease;
+    }
+    .depth-bar-bid {
+        background: linear-gradient(90deg, var(--bid-color), rgba(0, 212, 170, 0.6));
+    }
+    .depth-bar-ask {
+        background: linear-gradient(90deg, var(--ask-color), rgba(255, 68, 68, 0.6));
+    }
+    .depth-value {
+        font-weight: 600;
+        min-width: 60px;
+        text-align: right;
+    }
+    
+    /* Imbalance visualization */
+    .imbalance-cell {
+        position: relative;
+        padding: 0.5rem;
+        border-radius: 4px;
+        font-weight: 600;
+    }
+    .imbalance-bullish {
+        color: var(--bid-color);
+        background: rgba(0, 212, 170, 0.2);
+    }
+    .imbalance-bearish {
+        color: var(--ask-color);
+        background: rgba(255, 68, 68, 0.2);
+    }
+    .imbalance-neutral {
+        color: rgba(255, 255, 255, 0.6);
+        background: rgba(255, 255, 255, 0.05);
+    }
+    
+    /* Liquidity change indicators */
+    .liquidity-positive {
+        color: var(--bid-color);
+        font-weight: 700;
+        background: rgba(0, 212, 170, 0.15);
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+    }
+    .liquidity-positive::before {
+        content: '↑';
+        margin-right: 0.25rem;
+    }
+    .liquidity-negative {
+        color: var(--ask-color);
+        font-weight: 700;
+        background: rgba(255, 68, 68, 0.15);
+        padding: 0.25rem 0.5rem;
+        border-radius: 4px;
+    }
+    .liquidity-negative::before {
+        content: '↓';
+        margin-right: 0.25rem;
+    }
+    
+    /* Microprice deviation */
+    .microprice-positive {
+        color: var(--bid-color);
+        font-weight: 600;
+    }
+    .microprice-negative {
+        color: var(--ask-color);
+        font-weight: 600;
+    }
+    
     .mono-cell {
         font-family: 'Courier New', monospace;
-        font-size: 0.8rem;
+        font-size: 0.85rem;
+        letter-spacing: 0.5px;
     }
     .value-positive {
-        color: rgb(var(--success-rgb));
+        color: var(--bid-color);
+        font-weight: 600;
     }
     .value-negative {
-        color: rgb(var(--danger-rgb));
+        color: var(--ask-color);
+        font-weight: 600;
     }
     .value-warning {
-        color: rgb(var(--warning-rgb));
+        color: var(--spread-normal);
+        font-weight: 600;
     }
+    
     .table-responsive {
         max-height: 70vh;
         overflow-y: auto;
+        border-radius: 8px;
     }
+    .table-responsive::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    .table-responsive::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 4px;
+    }
+    .table-responsive::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.2);
+        border-radius: 4px;
+    }
+    .table-responsive::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.3);
+    }
+    
     .data-source-badge {
         position: fixed;
         top: 70px;
         right: 20px;
         z-index: 9999;
-        padding: 4px 12px;
-        border-radius: 4px;
+        padding: 6px 14px;
+        border-radius: 6px;
         font-size: 11px;
-        font-weight: 600;
+        font-weight: 700;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
     }
     .live-indicator {
         display: inline-flex;
@@ -256,15 +446,30 @@ $json_orderbook_data = json_encode($orderbook_data);
         gap: 0.5rem;
     }
     .live-dot {
-        width: 8px;
-        height: 8px;
-        background: rgb(var(--success-rgb));
+        width: 10px;
+        height: 10px;
+        background: var(--bid-color);
         border-radius: 50%;
         animation: pulse 1.5s infinite;
+        box-shadow: 0 0 8px var(--bid-color);
     }
     @keyframes pulse {
         0%, 100% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.5; transform: scale(1.2); }
+        50% { opacity: 0.6; transform: scale(1.3); }
+    }
+    
+    /* Price change indicator */
+    .price-change-up {
+        color: var(--bid-color);
+    }
+    .price-change-down {
+        color: var(--ask-color);
+    }
+    
+    /* Enhanced card header */
+    .card-header {
+        background: linear-gradient(135deg, rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.2));
+        border-bottom: 2px solid rgba(255, 255, 255, 0.1);
     }
 </style>
 
@@ -350,7 +555,7 @@ $json_orderbook_data = json_encode($orderbook_data);
                                 </div>
                                 <div class="card-body">
                                     <div class="table-responsive">
-                                        <table class="table table-bordered text-nowrap table-sm">
+                                        <table class="table table-bordered text-nowrap table-sm orderbook-table">
                                             <thead class="table-dark">
                                                 <tr>
                                                     <th>Time</th>
@@ -368,31 +573,87 @@ $json_orderbook_data = json_encode($orderbook_data);
                                             </thead>
                                             <tbody id="orderbookTableBody">
                                                 <?php if (!empty($orderbook_data)): ?>
-                                                    <?php foreach ($orderbook_data as $row): 
+                                                    <?php 
+                                                    $prevMidPrice = null;
+                                                    foreach ($orderbook_data as $idx => $row): 
                                                         $spread = $row['relative_spread_bps'] ?? 0;
                                                         $imbalance = $row['volume_imbalance'] ?? 0;
                                                         $micropriceDev = $row['microprice_dev_bps'] ?? 0;
                                                         $netLiq = $row['net_liquidity_change_1s'] ?? 0;
+                                                        $bidDepth = $row['bid_depth_10'] ?? 0;
+                                                        $askDepth = $row['ask_depth_10'] ?? 0;
+                                                        $totalDepth = $row['total_depth_10'] ?? 0;
+                                                        $midPrice = $row['mid_price'] ?? 0;
                                                         
-                                                        $spreadClass = $spread >= 2.0 ? 'value-warning' : '';
-                                                        $imbalanceClass = $imbalance > 0.1 ? 'value-positive' : ($imbalance < -0.1 ? 'value-negative' : '');
-                                                        $micropriceClass = $micropriceDev > 0 ? 'value-positive' : ($micropriceDev < 0 ? 'value-negative' : '');
-                                                        $netLiqClass = $netLiq > 0 ? 'value-positive' : ($netLiq < 0 ? 'value-negative' : '');
+                                                        // Spread classification
+                                                        if ($spread < 1.0) {
+                                                            $spreadClass = 'spread-tight';
+                                                        } elseif ($spread < 2.0) {
+                                                            $spreadClass = 'spread-normal';
+                                                        } else {
+                                                            $spreadClass = 'spread-wide';
+                                                        }
+                                                        
+                                                        // Imbalance classification
+                                                        if ($imbalance > 0.1) {
+                                                            $imbalanceClass = 'imbalance-bullish';
+                                                        } elseif ($imbalance < -0.1) {
+                                                            $imbalanceClass = 'imbalance-bearish';
+                                                        } else {
+                                                            $imbalanceClass = 'imbalance-neutral';
+                                                        }
+                                                        
+                                                        // Microprice class
+                                                        $micropriceClass = $micropriceDev > 0 ? 'microprice-positive' : ($micropriceDev < 0 ? 'microprice-negative' : '');
+                                                        
+                                                        // Net liquidity class
+                                                        $netLiqClass = '';
+                                                        $netLiqDisplay = '--';
+                                                        if ($netLiq !== null && $netLiq != 0) {
+                                                            $netLiqClass = $netLiq > 0 ? 'liquidity-positive' : 'liquidity-negative';
+                                                            $netLiqDisplay = number_format(abs($netLiq), 2);
+                                                        }
+                                                        
+                                                        // Depth bar calculations
+                                                        $maxDepth = max($bidDepth, $askDepth, 1);
+                                                        $bidDepthPercent = ($bidDepth / $maxDepth) * 100;
+                                                        $askDepthPercent = ($askDepth / $maxDepth) * 100;
+                                                        
+                                                        // Price change indicator
+                                                        $priceChangeClass = '';
+                                                        if ($prevMidPrice !== null && $midPrice > 0) {
+                                                            if ($midPrice > $prevMidPrice) {
+                                                                $priceChangeClass = 'price-change-up';
+                                                            } elseif ($midPrice < $prevMidPrice) {
+                                                                $priceChangeClass = 'price-change-down';
+                                                            }
+                                                        }
+                                                        $prevMidPrice = $midPrice;
                                                         
                                                         $timestamp = isset($row['ts']) ? date('H:i:s', strtotime($row['ts'])) : '--';
                                                     ?>
                                                     <tr>
                                                         <td class="mono-cell"><?php echo $timestamp; ?></td>
-                                                        <td class="text-end mono-cell"><?php echo number_format($row['best_bid'] ?? 0, 4); ?></td>
-                                                        <td class="text-end mono-cell"><?php echo number_format($row['best_ask'] ?? 0, 4); ?></td>
-                                                        <td class="text-end mono-cell"><strong><?php echo number_format($row['mid_price'] ?? 0, 4); ?></strong></td>
-                                                        <td class="text-end mono-cell <?php echo $spreadClass; ?>"><?php echo number_format($spread, 2); ?></td>
-                                                        <td class="text-end mono-cell"><?php echo number_format($row['bid_depth_10'] ?? 0, 2); ?></td>
-                                                        <td class="text-end mono-cell"><?php echo number_format($row['ask_depth_10'] ?? 0, 2); ?></td>
-                                                        <td class="text-end mono-cell"><?php echo number_format($row['total_depth_10'] ?? 0, 2); ?></td>
-                                                        <td class="text-end mono-cell <?php echo $imbalanceClass; ?>"><?php echo number_format($imbalance, 4); ?></td>
+                                                        <td class="text-end mono-cell cell-bid"><?php echo number_format($row['best_bid'] ?? 0, 4); ?></td>
+                                                        <td class="text-end mono-cell cell-ask"><?php echo number_format($row['best_ask'] ?? 0, 4); ?></td>
+                                                        <td class="text-end mono-cell cell-mid-price <?php echo $priceChangeClass; ?>"><?php echo number_format($midPrice, 4); ?></td>
+                                                        <td class="text-end mono-cell spread-cell <?php echo $spreadClass; ?>"><?php echo number_format($spread, 2); ?></td>
+                                                        <td class="text-end">
+                                                            <div class="depth-bar-container">
+                                                                <div class="depth-bar depth-bar-bid" style="width: <?php echo min($bidDepthPercent, 100); ?>%"></div>
+                                                                <span class="mono-cell depth-value"><?php echo number_format($bidDepth, 2); ?></span>
+                                                            </div>
+                                                        </td>
+                                                        <td class="text-end">
+                                                            <div class="depth-bar-container">
+                                                                <div class="depth-bar depth-bar-ask" style="width: <?php echo min($askDepthPercent, 100); ?>%"></div>
+                                                                <span class="mono-cell depth-value"><?php echo number_format($askDepth, 2); ?></span>
+                                                            </div>
+                                                        </td>
+                                                        <td class="text-end mono-cell"><?php echo number_format($totalDepth, 2); ?></td>
+                                                        <td class="text-end mono-cell imbalance-cell <?php echo $imbalanceClass; ?>"><?php echo number_format($imbalance, 4); ?></td>
                                                         <td class="text-end mono-cell <?php echo $micropriceClass; ?>"><?php echo number_format($micropriceDev, 2); ?></td>
-                                                        <td class="text-end mono-cell <?php echo $netLiqClass; ?>"><?php echo $netLiq !== null ? number_format($netLiq, 2) : '--'; ?></td>
+                                                        <td class="text-end mono-cell <?php echo $netLiqClass; ?>"><?php echo $netLiqDisplay; ?></td>
                                                     </tr>
                                                     <?php endforeach; ?>
                                                 <?php else: ?>
@@ -568,32 +829,91 @@ $json_orderbook_data = json_encode($orderbook_data);
                     return;
                 }
                 
-                // Build table rows
+                // Build table rows with trader-focused styling
                 let html = '';
-                orderbookData.forEach(row => {
+                let prevMidPrice = null;
+                
+                orderbookData.forEach((row, idx) => {
                     const spread = parseFloat(row.relative_spread_bps || 0);
                     const imbalance = parseFloat(row.volume_imbalance || 0);
                     const micropriceDev = parseFloat(row.microprice_dev_bps || 0);
                     const netLiq = parseFloat(row.net_liquidity_change_1s || 0);
+                    const bidDepth = parseFloat(row.bid_depth_10 || 0);
+                    const askDepth = parseFloat(row.ask_depth_10 || 0);
+                    const totalDepth = parseFloat(row.total_depth_10 || 0);
+                    const midPrice = parseFloat(row.mid_price || 0);
                     
-                    const spreadClass = spread >= 2.0 ? 'value-warning' : '';
-                    const imbalanceClass = imbalance > 0.1 ? 'value-positive' : (imbalance < -0.1 ? 'value-negative' : '');
-                    const micropriceClass = micropriceDev > 0 ? 'value-positive' : (micropriceDev < 0 ? 'value-negative' : '');
-                    const netLiqClass = netLiq > 0 ? 'value-positive' : (netLiq < 0 ? 'value-negative' : '');
+                    // Spread classification
+                    let spreadClass = 'spread-normal';
+                    if (spread < 1.0) {
+                        spreadClass = 'spread-tight';
+                    } else if (spread >= 2.0) {
+                        spreadClass = 'spread-wide';
+                    }
+                    
+                    // Imbalance classification
+                    let imbalanceClass = 'imbalance-neutral';
+                    if (imbalance > 0.1) {
+                        imbalanceClass = 'imbalance-bullish';
+                    } else if (imbalance < -0.1) {
+                        imbalanceClass = 'imbalance-bearish';
+                    }
+                    
+                    // Microprice class
+                    let micropriceClass = '';
+                    if (micropriceDev > 0) {
+                        micropriceClass = 'microprice-positive';
+                    } else if (micropriceDev < 0) {
+                        micropriceClass = 'microprice-negative';
+                    }
+                    
+                    // Net liquidity class and display
+                    let netLiqClass = '';
+                    let netLiqDisplay = '--';
+                    if (netLiq !== null && netLiq != 0) {
+                        netLiqClass = netLiq > 0 ? 'liquidity-positive' : 'liquidity-negative';
+                        netLiqDisplay = formatNumber(Math.abs(netLiq), 2);
+                    }
+                    
+                    // Depth bar calculations
+                    const maxDepth = Math.max(bidDepth, askDepth, 1);
+                    const bidDepthPercent = Math.min((bidDepth / maxDepth) * 100, 100);
+                    const askDepthPercent = Math.min((askDepth / maxDepth) * 100, 100);
+                    
+                    // Price change indicator
+                    let priceChangeClass = '';
+                    if (prevMidPrice !== null && midPrice > 0) {
+                        if (midPrice > prevMidPrice) {
+                            priceChangeClass = 'price-change-up';
+                        } else if (midPrice < prevMidPrice) {
+                            priceChangeClass = 'price-change-down';
+                        }
+                    }
+                    prevMidPrice = midPrice;
                     
                     html += `
                         <tr>
                             <td class="mono-cell">${formatTimestamp(row.ts)}</td>
-                            <td class="text-end mono-cell">${formatNumber(row.best_bid, 4)}</td>
-                            <td class="text-end mono-cell">${formatNumber(row.best_ask, 4)}</td>
-                            <td class="text-end mono-cell"><strong>${formatNumber(row.mid_price, 4)}</strong></td>
-                            <td class="text-end mono-cell ${spreadClass}">${formatNumber(spread, 2)}</td>
-                            <td class="text-end mono-cell">${formatNumber(row.bid_depth_10, 2)}</td>
-                            <td class="text-end mono-cell">${formatNumber(row.ask_depth_10, 2)}</td>
-                            <td class="text-end mono-cell">${formatNumber(row.total_depth_10, 2)}</td>
-                            <td class="text-end mono-cell ${imbalanceClass}">${formatNumber(imbalance, 4)}</td>
+                            <td class="text-end mono-cell cell-bid">${formatNumber(row.best_bid, 4)}</td>
+                            <td class="text-end mono-cell cell-ask">${formatNumber(row.best_ask, 4)}</td>
+                            <td class="text-end mono-cell cell-mid-price ${priceChangeClass}">${formatNumber(midPrice, 4)}</td>
+                            <td class="text-end mono-cell spread-cell ${spreadClass}">${formatNumber(spread, 2)}</td>
+                            <td class="text-end">
+                                <div class="depth-bar-container">
+                                    <div class="depth-bar depth-bar-bid" style="width: ${bidDepthPercent}%"></div>
+                                    <span class="mono-cell depth-value">${formatNumber(bidDepth, 2)}</span>
+                                </div>
+                            </td>
+                            <td class="text-end">
+                                <div class="depth-bar-container">
+                                    <div class="depth-bar depth-bar-ask" style="width: ${askDepthPercent}%"></div>
+                                    <span class="mono-cell depth-value">${formatNumber(askDepth, 2)}</span>
+                                </div>
+                            </td>
+                            <td class="text-end mono-cell">${formatNumber(totalDepth, 2)}</td>
+                            <td class="text-end mono-cell imbalance-cell ${imbalanceClass}">${formatNumber(imbalance, 4)}</td>
                             <td class="text-end mono-cell ${micropriceClass}">${formatNumber(micropriceDev, 2)}</td>
-                            <td class="text-end mono-cell ${netLiqClass}">${row.net_liquidity_change_1s !== null ? formatNumber(netLiq, 2) : '--'}</td>
+                            <td class="text-end mono-cell ${netLiqClass}">${netLiqDisplay}</td>
                         </tr>
                     `;
                 });

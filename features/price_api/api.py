@@ -1577,6 +1577,383 @@ def admin_sync_from_mysql():
 
 
 # =============================================================================
+# PATTERN CONFIG ENDPOINTS
+# =============================================================================
+
+def ensure_pattern_tables_mysql():
+    """Ensure pattern config tables exist in MySQL."""
+    with get_mysql() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS `pattern_config_projects` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `name` VARCHAR(255) NOT NULL,
+                    `description` TEXT NULL,
+                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX `idx_name` (`name`),
+                    INDEX `idx_created_at` (`created_at`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS `pattern_config_filters` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `project_id` INT NULL,
+                    `name` VARCHAR(255) NOT NULL,
+                    `section` VARCHAR(100) NULL,
+                    `minute` TINYINT NULL,
+                    `field_name` VARCHAR(100) NOT NULL,
+                    `field_column` VARCHAR(100) NULL,
+                    `from_value` DECIMAL(20,8) NULL,
+                    `to_value` DECIMAL(20,8) NULL,
+                    `include_null` TINYINT(1) DEFAULT 0,
+                    `play_id` INT NULL,
+                    `is_active` TINYINT(1) DEFAULT 1,
+                    `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    `updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX `idx_project_id` (`project_id`),
+                    INDEX `idx_section_minute` (`section`, `minute`),
+                    INDEX `idx_is_active` (`is_active`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+
+
+@app.route('/patterns/projects', methods=['GET'])
+def get_pattern_projects():
+    """Get all pattern config projects with filter counts."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        p.*,
+                        COUNT(f.id) AS filter_count,
+                        SUM(CASE WHEN f.is_active = 1 THEN 1 ELSE 0 END) AS active_filter_count
+                    FROM pattern_config_projects p
+                    LEFT JOIN pattern_config_filters f ON f.project_id = p.id
+                    GROUP BY p.id
+                    ORDER BY p.updated_at DESC, p.created_at DESC
+                """)
+                projects = cursor.fetchall()
+        
+        # Convert datetime objects
+        for project in projects:
+            if project.get('created_at'):
+                project['created_at'] = project['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+            if project.get('updated_at'):
+                project['updated_at'] = project['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        return jsonify({
+            'success': True,
+            'projects': projects,
+            'count': len(projects)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects', methods=['POST'])
+def create_pattern_project():
+    """Create a new pattern config project (dual-write to MySQL + DuckDB)."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        name = data.get('name', '').strip()
+        description = data.get('description', '').strip() or None
+        
+        if not name:
+            return jsonify({'success': False, 'error': 'Project name is required'}), 400
+        
+        # Write to MySQL first to get the auto-generated ID
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO pattern_config_projects (name, description)
+                    VALUES (%s, %s)
+                """, [name, description])
+                new_id = cursor.lastrowid
+        
+        # Also write to DuckDB (for consistency)
+        try:
+            with get_duckdb("central") as duckdb_conn:
+                duckdb_conn.execute("""
+                    INSERT INTO pattern_config_projects (id, name, description, created_at, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, [new_id, name, description])
+        except Exception as e:
+            print(f"DuckDB write failed (MySQL succeeded): {e}")
+        
+        return jsonify({
+            'success': True,
+            'id': new_id,
+            'message': f"Project '{name}' created successfully"
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['GET'])
+def get_pattern_project(project_id):
+    """Get a single pattern config project by ID."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        p.*,
+                        COUNT(f.id) AS filter_count,
+                        SUM(CASE WHEN f.is_active = 1 THEN 1 ELSE 0 END) AS active_filter_count
+                    FROM pattern_config_projects p
+                    LEFT JOIN pattern_config_filters f ON f.project_id = p.id
+                    WHERE p.id = %s
+                    GROUP BY p.id
+                """, [project_id])
+                project = cursor.fetchone()
+        
+        if not project:
+            return jsonify({'success': False, 'error': 'Project not found'}), 404
+        
+        # Convert datetime objects
+        if project.get('created_at'):
+            project['created_at'] = project['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+        if project.get('updated_at'):
+            project['updated_at'] = project['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
+        
+        return jsonify({
+            'success': True,
+            'project': project
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['DELETE'])
+def delete_pattern_project(project_id):
+    """Delete a pattern config project and all its filters (dual-write)."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        # Delete from MySQL
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                # First delete associated filters
+                cursor.execute("DELETE FROM pattern_config_filters WHERE project_id = %s", [project_id])
+                filters_deleted = cursor.rowcount
+                
+                # Then delete the project
+                cursor.execute("DELETE FROM pattern_config_projects WHERE id = %s", [project_id])
+                project_deleted = cursor.rowcount
+        
+        # Also delete from DuckDB
+        try:
+            with get_duckdb("central") as duckdb_conn:
+                duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE project_id = ?", [project_id])
+                duckdb_conn.execute("DELETE FROM pattern_config_projects WHERE id = ?", [project_id])
+        except Exception as e:
+            print(f"DuckDB delete failed (MySQL succeeded): {e}")
+        
+        if project_deleted == 0:
+            return jsonify({'success': False, 'error': 'Project not found'}), 404
+        
+        return jsonify({
+            'success': True,
+            'filters_deleted': filters_deleted,
+            'message': 'Project deleted successfully'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>/filters', methods=['GET'])
+def get_pattern_filters(project_id):
+    """Get all filters for a pattern config project."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM pattern_config_filters
+                    WHERE project_id = %s
+                    ORDER BY section, minute, field_name
+                """, [project_id])
+                filters = cursor.fetchall()
+        
+        # Convert datetime objects and Decimal types
+        for f in filters:
+            if f.get('created_at'):
+                f['created_at'] = f['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+            if f.get('updated_at'):
+                f['updated_at'] = f['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
+            if f.get('from_value') is not None:
+                f['from_value'] = float(f['from_value'])
+            if f.get('to_value') is not None:
+                f['to_value'] = float(f['to_value'])
+        
+        return jsonify({
+            'success': True,
+            'filters': filters,
+            'count': len(filters)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/filters', methods=['POST'])
+def create_pattern_filter():
+    """Create a new pattern config filter (dual-write to MySQL + DuckDB)."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        # Required fields
+        project_id = data.get('project_id')
+        name = data.get('name', '').strip()
+        field_name = data.get('field_name', '').strip()
+        
+        if not name or not field_name:
+            return jsonify({'success': False, 'error': 'name and field_name are required'}), 400
+        
+        # Optional fields
+        section = data.get('section')
+        minute = data.get('minute')
+        field_column = data.get('field_column')
+        from_value = data.get('from_value')
+        to_value = data.get('to_value')
+        include_null = data.get('include_null', 0)
+        play_id = data.get('play_id')
+        is_active = data.get('is_active', 1)
+        
+        # Write to MySQL first
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO pattern_config_filters 
+                    (project_id, name, section, minute, field_name, field_column, 
+                     from_value, to_value, include_null, play_id, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, [project_id, name, section, minute, field_name, field_column,
+                      from_value, to_value, include_null, play_id, is_active])
+                new_id = cursor.lastrowid
+        
+        # Also write to DuckDB
+        try:
+            with get_duckdb("central") as duckdb_conn:
+                duckdb_conn.execute("""
+                    INSERT INTO pattern_config_filters 
+                    (id, project_id, name, section, minute, field_name, field_column,
+                     from_value, to_value, include_null, play_id, is_active, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, [new_id, project_id, name, section, minute, field_name, field_column,
+                      from_value, to_value, include_null, play_id, is_active])
+        except Exception as e:
+            print(f"DuckDB write failed (MySQL succeeded): {e}")
+        
+        return jsonify({
+            'success': True,
+            'id': new_id,
+            'message': 'Filter created successfully'
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['PUT'])
+def update_pattern_filter(filter_id):
+    """Update a pattern config filter (dual-write)."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        # Build update query dynamically
+        allowed_fields = ['name', 'section', 'minute', 'field_name', 'field_column',
+                         'from_value', 'to_value', 'include_null', 'play_id', 'is_active']
+        
+        updates = []
+        values = []
+        for field in allowed_fields:
+            if field in data:
+                updates.append(f"{field} = %s")
+                values.append(data[field])
+        
+        if not updates:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+        
+        values.append(filter_id)
+        
+        # Update MySQL
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"UPDATE pattern_config_filters SET {', '.join(updates)} WHERE id = %s",
+                    values
+                )
+                updated = cursor.rowcount
+        
+        # Also update DuckDB
+        try:
+            duck_updates = [f"{field} = ?" for field in allowed_fields if field in data]
+            duck_values = [data[field] for field in allowed_fields if field in data]
+            duck_values.append(filter_id)
+            
+            with get_duckdb("central") as duckdb_conn:
+                duckdb_conn.execute(
+                    f"UPDATE pattern_config_filters SET {', '.join(duck_updates)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    duck_values
+                )
+        except Exception as e:
+            print(f"DuckDB update failed (MySQL succeeded): {e}")
+        
+        if updated == 0:
+            return jsonify({'success': False, 'error': 'Filter not found'}), 404
+        
+        return jsonify({'success': True, 'message': 'Filter updated successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['DELETE'])
+def delete_pattern_filter(filter_id):
+    """Delete a pattern config filter (dual-write)."""
+    try:
+        ensure_pattern_tables_mysql()
+        
+        # Delete from MySQL
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM pattern_config_filters WHERE id = %s", [filter_id])
+                deleted = cursor.rowcount
+        
+        # Also delete from DuckDB
+        try:
+            with get_duckdb("central") as duckdb_conn:
+                duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE id = ?", [filter_id])
+        except Exception as e:
+            print(f"DuckDB delete failed (MySQL succeeded): {e}")
+        
+        if deleted == 0:
+            return jsonify({'success': False, 'error': 'Filter not found'}), 404
+        
+        return jsonify({'success': True, 'message': 'Filter deleted successfully'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
 # GENERIC QUERY ENDPOINT
 # =============================================================================
 

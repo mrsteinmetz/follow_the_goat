@@ -69,15 +69,14 @@ if (!$client->isAvailable()) {
     exit;
 }
 
-// Update via API (dual-write to DuckDB and MySQL)
+// Update via API (DuckDB)
 $result = $client->updateBuyin($trade_id, $valid_updates);
 
 if ($result && ($result['success'] ?? false)) {
     echo json_encode([
         'success' => true,
         'updated_fields' => count($valid_updates),
-        'duckdb' => $result['duckdb'] ?? false,
-        'mysql' => $result['mysql'] ?? false
+        'duckdb' => $result['duckdb'] ?? false
     ]);
 } else {
     echo json_encode([

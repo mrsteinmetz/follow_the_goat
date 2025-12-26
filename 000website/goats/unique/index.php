@@ -52,13 +52,13 @@ if (isset($_GET['error'])) {
     $error_message = htmlspecialchars($_GET['error']);
 }
 
-// Handle AJAX Load More Request (still uses MySQL for now as it needs pagination)
+// Handle AJAX Load More Request (DuckDB only)
 if (isset($_GET['ajax_load_more']) && $api_available) {
     $offset = (int)($_GET['offset'] ?? 0);
     $table_type = $_GET['table'] ?? 'archive';
     
     // For AJAX load more, we call the API directly
-    $hours = '72'; // Use 72h window for trades
+    $hours = '168'; // Use 7-day window for trades (DuckDB only)
     $limit = 100;
     
     $url = $API_BASE . '/buyins?' . http_build_query([
@@ -67,9 +67,8 @@ if (isset($_GET['ajax_load_more']) && $api_available) {
         'limit' => $limit
     ]);
     
-    // Since the API doesn't support offset yet, we'll use MySQL for load more
-    // This is a graceful fallback
-    echo '<!-- Load more requires direct MySQL access - API enhancement needed -->';
+    // Note: API doesn't support offset yet - will need API enhancement for pagination
+    echo '<!-- Load more requires API offset support - enhancement needed -->';
     exit;
 }
 
@@ -88,9 +87,9 @@ if (!$api_available) {
         exit;
     }
     
-    // Fetch trades from API (72h hot data)
+    // Fetch trades from API (168h = 7 days DuckDB data)
     $timing['before_trades_query'] = microtime(true);
-    $buyins_result = $client->getBuyins($play_id, null, '72', 100);
+    $buyins_result = $client->getBuyins($play_id, null, '168', 100);
     $timing['after_trades_query'] = microtime(true);
     
     if ($buyins_result && isset($buyins_result['buyins'])) {
@@ -104,13 +103,9 @@ if (!$api_available) {
     }
     $timing['trades_count'] = count($trades);
     
-    // For archived trades, we need to call MySQL directly via API
-    // The current API doesn't have a dedicated archive endpoint, so we'll use performance endpoint
-    // For now, archived trades will need MySQL fallback or API enhancement
-    
-    // Get performance stats
+    // Get performance stats (using 168h = 7 days DuckDB window)
     $timing['before_stats_query'] = microtime(true);
-    $perf_result = $client->getPlayPerformance($play_id, 'all');
+    $perf_result = $client->getPlayPerformance($play_id, '168');
     $timing['after_stats_query'] = microtime(true);
 }
 
@@ -666,7 +661,7 @@ ob_start();
 <!-- Live Trades -->
 <div class="card custom-card mb-3">
     <div class="card-header">
-        <div class="card-title">Live Trades (72h Hot Data)</div>
+        <div class="card-title">Live Trades (7-Day DuckDB Data)</div>
         <div class="ms-auto d-flex gap-2 align-items-center">
             <span class="badge bg-info-transparent">Showing <?php echo count($trades); ?></span>
         </div>

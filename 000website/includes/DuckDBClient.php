@@ -501,6 +501,52 @@ class DuckDBClient {
     }
     
     // =========================================================================
+    // Trail Data (for Pattern Builder analysis)
+    // =========================================================================
+    
+    /**
+     * Get available trail data sections and their fields
+     * 
+     * @param string|null $section Specific section to get fields for (null = list all sections)
+     */
+    public function getTrailSections(?string $section = null): ?array {
+        $params = [];
+        if ($section !== null) {
+            $params['section'] = $section;
+        }
+        return $this->get('/trail/sections', $params);
+    }
+    
+    /**
+     * Get field statistics for a section/minute, broken down by gain ranges
+     * 
+     * @param array $options Query options:
+     *   - project_id: Project ID for filters
+     *   - section: Section name (price_movements, order_book_signals, etc.)
+     *   - minute: Minute value (0-14)
+     *   - status: Trade status filter (all, sold, no_go)
+     *   - hours: Time window in hours
+     *   - analyse_mode: 'all' or 'passed' (apply filters)
+     */
+    public function getTrailFieldStats(array $options): ?array {
+        return $this->post('/trail/field_stats', $options);
+    }
+    
+    /**
+     * Get trade count distribution across gain ranges
+     * 
+     * @param array $options Query options:
+     *   - project_id: Project ID for filters
+     *   - minute: Minute value (0-14)
+     *   - status: Trade status filter (all, sold, no_go)
+     *   - hours: Time window in hours
+     *   - apply_filters: Whether to apply project filters
+     */
+    public function getTrailGainDistribution(array $options): ?array {
+        return $this->post('/trail/gain_distribution', $options);
+    }
+    
+    // =========================================================================
     // Admin Operations
     // =========================================================================
     

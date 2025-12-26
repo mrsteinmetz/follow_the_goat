@@ -349,9 +349,7 @@ ob_start();
 <script>
     function navigateToProject(projectId, event) {
         if (event.target.closest('.btn-outline-danger')) return;
-        // TODO: Navigate to project detail page when it's created
-        // window.location.href = '/pages/features/patterns/project.php?id=' + projectId;
-        alert('Project detail page coming soon! Project ID: ' + projectId);
+        window.location.href = '/pages/features/patterns/project.php?id=' + projectId;
     }
 
     function showDeleteModal(projectId, projectName, event) {

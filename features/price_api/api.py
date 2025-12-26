@@ -1954,6 +1954,457 @@ def delete_pattern_filter(filter_id):
 
 
 # =============================================================================
+# TRAIL DATA ENDPOINTS (for Pattern Builder analysis)
+# =============================================================================
+
+# Trail sections configuration
+TRAIL_SECTIONS = {
+    'price_movements': 'Price Movements',
+    'order_book_signals': 'Order Book Signals',
+    'transactions': 'Transactions',
+    'whale_activity': 'Whale Activity',
+    'patterns': 'Patterns'
+}
+
+# Section prefix mapping for flattened table columns
+SECTION_PREFIXES = {
+    'price_movements': 'pm_',
+    'order_book_signals': 'ob_',
+    'transactions': 'tx_',
+    'whale_activity': 'wh_',
+    'patterns': 'pat_'
+}
+
+# Gain range definitions
+GAIN_RANGES = [
+    {'id': 0, 'label': '< 0%', 'min': None, 'max': 0},
+    {'id': 1, 'label': '0 - 0.2%', 'min': 0, 'max': 0.2},
+    {'id': 2, 'label': '0.2 - 0.5%', 'min': 0.2, 'max': 0.5},
+    {'id': 3, 'label': '0.5 - 1%', 'min': 0.5, 'max': 1.0},
+    {'id': 4, 'label': '1 - 2%', 'min': 1.0, 'max': 2.0},
+    {'id': 5, 'label': '2%+', 'min': 2.0, 'max': None},
+]
+
+
+@app.route('/trail/sections', methods=['GET'])
+def get_trail_sections():
+    """Get available trail data sections and their fields."""
+    try:
+        section = request.args.get('section')
+        
+        # If no section specified, return all sections
+        if not section:
+            return jsonify({
+                'success': True,
+                'sections': TRAIL_SECTIONS,
+                'prefixes': SECTION_PREFIXES
+            })
+        
+        # Get fields for specific section
+        if section not in TRAIL_SECTIONS:
+            return jsonify({'success': False, 'error': f'Invalid section: {section}'}), 400
+        
+        prefix = SECTION_PREFIXES.get(section, '')
+        fields = []
+        field_types = {}
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                # Get columns from trail_data_flattened table
+                cursor.execute("""
+                    SELECT COLUMN_NAME, DATA_TYPE
+                    FROM information_schema.COLUMNS 
+                    WHERE TABLE_SCHEMA = DATABASE() 
+                      AND TABLE_NAME = 'trail_data_flattened'
+                      AND COLUMN_NAME LIKE %s
+                    ORDER BY ORDINAL_POSITION
+                """, [prefix + '%'])
+                columns = cursor.fetchall()
+                
+                for col in columns:
+                    field_name = col['COLUMN_NAME'][len(prefix):]  # Remove prefix
+                    fields.append(field_name)
+                    
+                    # Determine if boolean based on data type or name
+                    data_type = col['DATA_TYPE'].upper()
+                    is_bool = data_type in ('TINYINT', 'BOOLEAN', 'BOOL') or field_name.startswith('is_') or field_name.startswith('has_')
+                    field_types[field_name] = 'BOOLEAN' if is_bool else 'NUMERIC'
+        
+        return jsonify({
+            'success': True,
+            'section': section,
+            'section_label': TRAIL_SECTIONS[section],
+            'prefix': prefix,
+            'fields': fields,
+            'field_types': field_types,
+            'count': len(fields)
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/trail/field_stats', methods=['POST'])
+def get_trail_field_stats():
+    """
+    Get field statistics for a section/minute, broken down by gain ranges.
+    
+    Request JSON:
+    {
+        "project_id": 1,
+        "section": "price_movements",
+        "minute": 0,
+        "status": "all",  // "all", "sold", "no_go"
+        "hours": 6,
+        "analyse_mode": "all"  // "all" or "passed" (apply filters)
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        
+        project_id = data.get('project_id')
+        section = data.get('section', 'price_movements')
+        minute = data.get('minute', 0)
+        status = data.get('status', 'all')
+        hours = data.get('hours', 6)
+        analyse_mode = data.get('analyse_mode', 'all')
+        
+        if section not in TRAIL_SECTIONS:
+            return jsonify({'success': False, 'error': f'Invalid section: {section}'}), 400
+        
+        prefix = SECTION_PREFIXES.get(section, '')
+        
+        # Get fields for this section
+        fields = []
+        field_types = {}
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                # Get section fields
+                cursor.execute("""
+                    SELECT COLUMN_NAME, DATA_TYPE
+                    FROM information_schema.COLUMNS 
+                    WHERE TABLE_SCHEMA = DATABASE() 
+                      AND TABLE_NAME = 'trail_data_flattened'
+                      AND COLUMN_NAME LIKE %s
+                    ORDER BY ORDINAL_POSITION
+                """, [prefix + '%'])
+                columns = cursor.fetchall()
+                
+                for col in columns:
+                    field_name = col['COLUMN_NAME'][len(prefix):]
+                    fields.append(field_name)
+                    data_type = col['DATA_TYPE'].upper()
+                    is_bool = data_type in ('TINYINT', 'BOOLEAN', 'BOOL') or field_name.startswith('is_') or field_name.startswith('has_')
+                    field_types[field_name] = 'BOOLEAN' if is_bool else 'NUMERIC'
+                
+                # Build base WHERE clause
+                where_clauses = ["minute = %s"]
+                params = [minute]
+                
+                where_clauses.append("followed_at >= NOW() - INTERVAL %s HOUR")
+                params.append(hours)
+                
+                if status != 'all':
+                    where_clauses.append("our_status = %s")
+                    params.append(status)
+                
+                # Get active filters if analyse_mode is 'passed'
+                active_filters = []
+                if analyse_mode == 'passed' and project_id:
+                    cursor.execute("""
+                        SELECT * FROM pattern_config_filters 
+                        WHERE project_id = %s AND is_active = 1
+                    """, [project_id])
+                    active_filters = cursor.fetchall()
+                    
+                    # Apply filter conditions
+                    for idx, f in enumerate(active_filters):
+                        db_col = f['field_column'] or f['field_name']
+                        from_val = f['from_value']
+                        to_val = f['to_value']
+                        include_null = f.get('include_null', 0)
+                        exclude_mode = f.get('exclude_mode', 0)
+                        
+                        if db_col:
+                            if exclude_mode:
+                                # Exclude mode: keep values outside range
+                                excl_parts = []
+                                if from_val is not None:
+                                    excl_parts.append(f"`{db_col}` < %s")
+                                    params.append(float(from_val))
+                                if to_val is not None:
+                                    excl_parts.append(f"`{db_col}` > %s")
+                                    params.append(float(to_val))
+                                if include_null:
+                                    excl_parts.append(f"`{db_col}` IS NULL")
+                                if excl_parts:
+                                    where_clauses.append("(" + " OR ".join(excl_parts) + ")")
+                            else:
+                                # Normal mode: keep values in range
+                                range_parts = []
+                                if from_val is not None:
+                                    range_parts.append(f"`{db_col}` >= %s")
+                                    params.append(float(from_val))
+                                if to_val is not None:
+                                    range_parts.append(f"`{db_col}` <= %s")
+                                    params.append(float(to_val))
+                                if range_parts:
+                                    range_sql = " AND ".join(range_parts)
+                                    if include_null:
+                                        where_clauses.append(f"(({range_sql}) OR `{db_col}` IS NULL)")
+                                    else:
+                                        where_clauses.append(range_sql)
+                
+                where_sql = " AND ".join(where_clauses)
+                
+                # Build aggregation query for each gain range
+                field_stats = {}
+                for field in fields:
+                    field_stats[field] = {
+                        'type': field_types.get(field, 'NUMERIC'),
+                        'ranges': {}
+                    }
+                
+                # Get stats per gain range
+                for gain_range in GAIN_RANGES:
+                    range_where = where_sql
+                    range_params = params.copy()
+                    
+                    # Add gain range condition
+                    if gain_range['min'] is not None and gain_range['max'] is not None:
+                        range_where += " AND potential_gains >= %s AND potential_gains < %s"
+                        range_params.extend([gain_range['min'], gain_range['max']])
+                    elif gain_range['min'] is not None:
+                        range_where += " AND potential_gains >= %s"
+                        range_params.append(gain_range['min'])
+                    elif gain_range['max'] is not None:
+                        range_where += " AND potential_gains < %s"
+                        range_params.append(gain_range['max'])
+                    
+                    # Build SELECT for all fields
+                    select_parts = ["COUNT(*) as trade_count"]
+                    for field in fields:
+                        db_col = f"{prefix}{field}"
+                        if field_types.get(field) == 'BOOLEAN':
+                            # For boolean: show percentage TRUE
+                            select_parts.append(f"AVG(CASE WHEN `{db_col}` = 1 THEN 100 ELSE 0 END) as `{field}`")
+                        else:
+                            select_parts.append(f"AVG(`{db_col}`) as `{field}`")
+                    
+                    query = f"SELECT {', '.join(select_parts)} FROM trail_data_flattened WHERE {range_where}"
+                    
+                    cursor.execute(query, range_params)
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        trade_count = result['trade_count'] or 0
+                        for field in fields:
+                            val = result.get(field)
+                            field_stats[field]['ranges'][gain_range['id']] = {
+                                'avg': float(val) if val is not None else None,
+                                'count': trade_count
+                            }
+                
+                # Get total trade count
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM trail_data_flattened WHERE {where_sql}", params)
+                total_result = cursor.fetchone()
+                total_trades = total_result['cnt'] if total_result else 0
+        
+        return jsonify({
+            'success': True,
+            'section': section,
+            'minute': minute,
+            'total_trades': total_trades,
+            'fields': fields,
+            'field_types': field_types,
+            'field_stats': field_stats,
+            'gain_ranges': GAIN_RANGES,
+            'active_filters': len(active_filters) if analyse_mode == 'passed' else 0
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'success': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/trail/gain_distribution', methods=['POST'])
+def get_trail_gain_distribution():
+    """
+    Get trade count distribution across gain ranges.
+    
+    Request JSON:
+    {
+        "project_id": 1,
+        "minute": 0,
+        "status": "all",
+        "hours": 6,
+        "apply_filters": true
+    }
+    """
+    try:
+        data = request.get_json() or {}
+        
+        project_id = data.get('project_id')
+        minute = data.get('minute', 0)
+        status = data.get('status', 'all')
+        hours = data.get('hours', 6)
+        apply_filters = data.get('apply_filters', False)
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                # Build base WHERE clause
+                where_clauses = ["minute = %s"]
+                params = [minute]
+                
+                where_clauses.append("followed_at >= NOW() - INTERVAL %s HOUR")
+                params.append(hours)
+                
+                if status != 'all':
+                    where_clauses.append("our_status = %s")
+                    params.append(status)
+                
+                base_where_sql = " AND ".join(where_clauses)
+                base_params = params.copy()
+                
+                # Get active filters if requested
+                active_filters = []
+                if apply_filters and project_id:
+                    cursor.execute("""
+                        SELECT * FROM pattern_config_filters 
+                        WHERE project_id = %s AND is_active = 1
+                    """, [project_id])
+                    active_filters = cursor.fetchall()
+                    
+                    # Apply filter conditions
+                    for idx, f in enumerate(active_filters):
+                        db_col = f['field_column'] or f['field_name']
+                        from_val = f['from_value']
+                        to_val = f['to_value']
+                        include_null = f.get('include_null', 0)
+                        exclude_mode = f.get('exclude_mode', 0)
+                        
+                        if db_col:
+                            if exclude_mode:
+                                excl_parts = []
+                                if from_val is not None:
+                                    excl_parts.append(f"`{db_col}` < %s")
+                                    params.append(float(from_val))
+                                if to_val is not None:
+                                    excl_parts.append(f"`{db_col}` > %s")
+                                    params.append(float(to_val))
+                                if include_null:
+                                    excl_parts.append(f"`{db_col}` IS NULL")
+                                if excl_parts:
+                                    where_clauses.append("(" + " OR ".join(excl_parts) + ")")
+                            else:
+                                range_parts = []
+                                if from_val is not None:
+                                    range_parts.append(f"`{db_col}` >= %s")
+                                    params.append(float(from_val))
+                                if to_val is not None:
+                                    range_parts.append(f"`{db_col}` <= %s")
+                                    params.append(float(to_val))
+                                if range_parts:
+                                    range_sql = " AND ".join(range_parts)
+                                    if include_null:
+                                        where_clauses.append(f"(({range_sql}) OR `{db_col}` IS NULL)")
+                                    else:
+                                        where_clauses.append(range_sql)
+                
+                filtered_where_sql = " AND ".join(where_clauses)
+                
+                # Get distribution for each gain range (both base and filtered)
+                distribution = []
+                total_base = 0
+                total_filtered = 0
+                sum_gains_base = 0
+                sum_gains_filtered = 0
+                
+                for gain_range in GAIN_RANGES:
+                    # Base count (without filters)
+                    base_range_where = base_where_sql
+                    base_range_params = base_params.copy()
+                    
+                    if gain_range['min'] is not None and gain_range['max'] is not None:
+                        base_range_where += " AND potential_gains >= %s AND potential_gains < %s"
+                        base_range_params.extend([gain_range['min'], gain_range['max']])
+                    elif gain_range['min'] is not None:
+                        base_range_where += " AND potential_gains >= %s"
+                        base_range_params.append(gain_range['min'])
+                    elif gain_range['max'] is not None:
+                        base_range_where += " AND potential_gains < %s"
+                        base_range_params.append(gain_range['max'])
+                    
+                    cursor.execute(f"""
+                        SELECT COUNT(*) as cnt, COALESCE(SUM(potential_gains), 0) as sum_gains
+                        FROM trail_data_flattened WHERE {base_range_where}
+                    """, base_range_params)
+                    base_result = cursor.fetchone()
+                    base_count = base_result['cnt'] or 0
+                    base_sum = float(base_result['sum_gains'] or 0)
+                    total_base += base_count
+                    sum_gains_base += base_sum
+                    
+                    # Filtered count
+                    filtered_count = base_count
+                    filtered_sum = base_sum
+                    
+                    if active_filters:
+                        filtered_range_where = filtered_where_sql
+                        filtered_range_params = params.copy()
+                        
+                        if gain_range['min'] is not None and gain_range['max'] is not None:
+                            filtered_range_where += " AND potential_gains >= %s AND potential_gains < %s"
+                            filtered_range_params.extend([gain_range['min'], gain_range['max']])
+                        elif gain_range['min'] is not None:
+                            filtered_range_where += " AND potential_gains >= %s"
+                            filtered_range_params.append(gain_range['min'])
+                        elif gain_range['max'] is not None:
+                            filtered_range_where += " AND potential_gains < %s"
+                            filtered_range_params.append(gain_range['max'])
+                        
+                        cursor.execute(f"""
+                            SELECT COUNT(*) as cnt, COALESCE(SUM(potential_gains), 0) as sum_gains
+                            FROM trail_data_flattened WHERE {filtered_range_where}
+                        """, filtered_range_params)
+                        filtered_result = cursor.fetchone()
+                        filtered_count = filtered_result['cnt'] or 0
+                        filtered_sum = float(filtered_result['sum_gains'] or 0)
+                    
+                    total_filtered += filtered_count
+                    sum_gains_filtered += filtered_sum
+                    
+                    distribution.append({
+                        'id': gain_range['id'],
+                        'label': gain_range['label'],
+                        'min': gain_range['min'],
+                        'max': gain_range['max'],
+                        'base_count': base_count,
+                        'filtered_count': filtered_count,
+                        'removed': base_count - filtered_count
+                    })
+        
+        return jsonify({
+            'success': True,
+            'distribution': distribution,
+            'totals': {
+                'base': total_base,
+                'filtered': total_filtered,
+                'removed': total_base - total_filtered
+            },
+            'gains': {
+                'base_sum': sum_gains_base,
+                'filtered_sum': sum_gains_filtered,
+                'base_avg': sum_gains_base / total_base if total_base > 0 else 0,
+                'filtered_avg': sum_gains_filtered / total_filtered if total_filtered > 0 else 0
+            },
+            'active_filters': len(active_filters)
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'success': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+# =============================================================================
 # GENERIC QUERY ENDPOINT
 # =============================================================================
 

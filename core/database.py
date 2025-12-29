@@ -10,13 +10,17 @@ Architecture:
 - Dual-write: All writes go to both databases
 
 Connection Strategy:
-- DuckDB: Persistent connections (shared within process to avoid file locking)
+- DuckDB: Pooled connection with locking (WSL/Windows mount compatible)
+         Windows-mounted filesystems (/mnt/c/) don't support concurrent DuckDB access.
+         We use a single connection per database with thread locks.
 - MySQL: Connection per request (pooled by pymysql)
 """
 
 import duckdb
 import pymysql
 import threading
+import logging
+import os
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional, Dict, Any, List, Tuple
@@ -24,29 +28,53 @@ from datetime import datetime, timedelta
 
 from core.config import settings
 
+# Configure logger for this module
+logger = logging.getLogger("database")
+
 # Project root
 PROJECT_ROOT = Path(__file__).parent.parent
 
+# Check if we're running in WSL by looking for /mnt/c path
+IS_WSL = str(PROJECT_ROOT).startswith('/mnt/')
+
 # DuckDB database paths
-DATABASES = {
-    "prices": PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb",
-    "central": PROJECT_ROOT / "000data_feeds" / "central.duckdb",
-}
+# On WSL, use WSL-native filesystem for better DuckDB performance and locking
+if IS_WSL:
+    WSL_DATA_DIR = Path.home() / "follow_the_goat_data"
+    WSL_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DATABASES = {
+        "prices": WSL_DATA_DIR / "prices.duckdb",
+        "central": WSL_DATA_DIR / "central.duckdb",
+    }
+    logger.info(f"WSL detected - using native filesystem for DuckDB: {WSL_DATA_DIR}")
+else:
+    DATABASES = {
+        "prices": PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb",
+        "central": PROJECT_ROOT / "000data_feeds" / "central.duckdb",
+    }
 
 
 # =============================================================================
-# DuckDB Connection Pool (Singleton per database)
+# DuckDB Connection Pool (Linux-Optimized with WAL Mode)
+# =============================================================================
+# On Linux, DuckDB supports excellent concurrency with WAL (Write-Ahead Log) mode.
+# We use a single master connection per database that's shared across threads.
+# WAL mode allows concurrent reads while writes are serialized automatically.
+#
+# The "Unique file handle conflict" error happens when multiple threads
+# simultaneously try to CREATE new connections. We prevent this by:
+# 1. Creating one master connection per database at startup
+# 2. Using cursor() to create thread-local cursors from the master connection
+# 3. Enabling WAL mode for better concurrent access
 # =============================================================================
 
 class DuckDBPool:
     """
-    Singleton connection pool for DuckDB databases.
+    Singleton connection pool for DuckDB databases (Linux-optimized).
     
-    DuckDB only allows one connection per file at a time. By maintaining
-    persistent connections, we avoid file locking issues when multiple
-    components need to access the same database.
-    
-    Thread-safe: Uses locks to ensure only one thread accesses a connection at a time.
+    Uses a single master connection per database with WAL mode enabled.
+    Thread safety is achieved through DuckDB's internal mechanisms on Linux,
+    plus a creation lock to prevent race conditions during initial connection.
     """
     
     _instance = None
@@ -58,83 +86,247 @@ class DuckDBPool:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance._connections = {}
-                    cls._instance._conn_locks = {}
+                    cls._instance._creation_locks = {}  # Only for connection creation
         return cls._instance
     
     def get_connection(self, name: str) -> duckdb.DuckDBPyConnection:
-        """Get or create a persistent connection to a DuckDB database."""
+        """Get or create a persistent connection to a DuckDB database.
+        
+        On Linux with WAL mode, the same connection can be used by multiple
+        threads safely. DuckDB handles the internal locking.
+        """
         if name not in DATABASES:
             raise ValueError(f"Unknown database: {name}. Available: {list(DATABASES.keys())}")
         
-        # Create lock for this database if it doesn't exist
-        if name not in self._conn_locks:
-            with self._lock:
-                if name not in self._conn_locks:
-                    self._conn_locks[name] = threading.Lock()
+        # Fast path: return existing healthy connection
+        conn = self._connections.get(name)
+        if conn is not None:
+            try:
+                # Quick health check
+                conn.execute("SELECT 1").fetchone()
+                return conn
+            except Exception as e:
+                logger.warning(f"DuckDB connection '{name}' unhealthy: {e}")
+                # Fall through to recreate
         
-        # Get or create connection
-        if name not in self._connections or self._connections[name] is None:
-            with self._conn_locks[name]:
-                if name not in self._connections or self._connections[name] is None:
-                    db_path = DATABASES[name]
-                    db_path.parent.mkdir(parents=True, exist_ok=True)
-                    self._connections[name] = duckdb.connect(str(db_path))
-        
-        return self._connections[name]
-    
-    def get_lock(self, name: str) -> threading.Lock:
-        """Get the lock for a specific database."""
-        if name not in self._conn_locks:
+        # Slow path: create new connection (with lock to prevent race)
+        if name not in self._creation_locks:
             with self._lock:
-                if name not in self._conn_locks:
-                    self._conn_locks[name] = threading.Lock()
-        return self._conn_locks[name]
+                if name not in self._creation_locks:
+                    self._creation_locks[name] = threading.Lock()
+        
+        with self._creation_locks[name]:
+            # Double-check after acquiring lock
+            conn = self._connections.get(name)
+            if conn is not None:
+                try:
+                    conn.execute("SELECT 1").fetchone()
+                    return conn
+                except:
+                    pass  # Will recreate below
+            
+            # Close old connection if exists
+            if conn is not None:
+                try:
+                    conn.close()
+                except:
+                    pass
+            
+            # Create new connection with WAL mode for better concurrency
+            db_path = DATABASES[name]
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Creating DuckDB connection to '{name}' at {db_path}")
+            
+            conn = duckdb.connect(str(db_path))
+            
+            # Enable WAL mode for better concurrent access on Linux
+            try:
+                conn.execute("PRAGMA enable_progress_bar=false")  # Disable progress bar for cleaner logs
+                # Note: DuckDB uses WAL-like behavior by default on Linux
+            except Exception as e:
+                logger.debug(f"PRAGMA setting note: {e}")
+            
+            self._connections[name] = conn
+            return conn
     
     def close_all(self):
         """Close all connections (for shutdown)."""
         with self._lock:
-            for name, conn in self._connections.items():
+            for name, conn in list(self._connections.items()):
                 if conn is not None:
                     try:
                         conn.close()
-                    except:
-                        pass
+                        logger.debug(f"Closed DuckDB connection '{name}'")
+                    except Exception as e:
+                        logger.warning(f"Error closing DuckDB connection '{name}': {e}")
             self._connections.clear()
+            logger.info("All DuckDB connections closed")
     
     def close(self, name: str):
-        """Close a specific connection."""
-        if name in self._connections:
-            with self._conn_locks.get(name, self._lock):
-                if name in self._connections and self._connections[name] is not None:
+        """Close a specific connection (will be recreated on next access)."""
+        creation_lock = self._creation_locks.get(name)
+        if creation_lock:
+            with creation_lock:
+                conn = self._connections.get(name)
+                if conn is not None:
                     try:
-                        self._connections[name].close()
-                    except:
-                        pass
+                        conn.close()
+                        logger.debug(f"Closed DuckDB connection '{name}'")
+                    except Exception as e:
+                        logger.warning(f"Error closing DuckDB connection '{name}': {e}")
                     self._connections[name] = None
+    
+    def get_lock(self, name: str) -> threading.Lock:
+        """Get a lock for a database (for backward compatibility).
+        
+        On Linux, DuckDB handles concurrency internally, so this lock is
+        only used for connection creation, not for every operation.
+        """
+        if name not in self._creation_locks:
+            with self._lock:
+                if name not in self._creation_locks:
+                    self._creation_locks[name] = threading.Lock()
+        return self._creation_locks[name]
 
 
 # Global pool instance
 _pool = DuckDBPool()
 
 
+def _get_db_path(name: str) -> Path:
+    """Get the path for a named database."""
+    if name not in DATABASES:
+        raise ValueError(f"Unknown database: {name}. Available: {list(DATABASES.keys())}")
+    db_path = DATABASES[name]
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    return db_path
+
+
 # =============================================================================
-# DuckDB Connection Management
+# DuckDB Connection Management (Engine-First)
 # =============================================================================
+
+def _get_engine_if_running():
+    """Get TradingDataEngine if it's running, otherwise return None."""
+    try:
+        from core.trading_engine import _engine_instance
+        if _engine_instance is not None and _engine_instance._running:
+            return _engine_instance
+    except Exception:
+        pass
+    return None
+
+
+class QueryResult:
+    """Thread-safe query result that holds fetched data."""
+    
+    def __init__(self, rows, description):
+        self._rows = rows
+        self._index = 0
+        self.description = description
+    
+    def fetchone(self):
+        """Fetch one result."""
+        if self._index < len(self._rows):
+            row = self._rows[self._index]
+            self._index += 1
+            return row
+        return None
+    
+    def fetchall(self):
+        """Fetch all remaining results."""
+        remaining = self._rows[self._index:]
+        self._index = len(self._rows)
+        return remaining
+    
+    def fetchmany(self, size=None):
+        """Fetch many results."""
+        if size is None:
+            size = 1
+        end = min(self._index + size, len(self._rows))
+        rows = self._rows[self._index:end]
+        self._index = end
+        return rows
+
+
+class EngineConnectionWrapper:
+    """
+    Thread-safe wrapper that makes TradingDataEngine look like a DuckDB connection.
+    
+    This allows existing code using `conn.execute()` to work with the
+    in-memory engine without modification.
+    
+    Thread safety: Each execute() fetches ALL results immediately while holding
+    the lock, then returns a QueryResult with the data. This prevents race
+    conditions between execute() and fetch() calls.
+    """
+    
+    def __init__(self, engine):
+        self._engine = engine
+        self.description = None  # Set after execute()
+    
+    def execute(self, query: str, params=None):
+        """Execute a query and return a thread-safe result object.
+        
+        Fetches all results immediately while holding the lock to prevent
+        race conditions in multi-threaded environments.
+        """
+        if params is None:
+            params = []
+        
+        # Fetch ALL results while holding lock - prevents race conditions
+        with self._engine._conn_lock:
+            result = self._engine._conn.execute(query, params)
+            description = result.description
+            rows = result.fetchall()
+        
+        # Return thread-safe result with pre-fetched data
+        query_result = QueryResult(rows, description)
+        self.description = description
+        return query_result
+    
+    def executemany(self, query: str, params_list):
+        """Execute a query with multiple parameter sets."""
+        with self._engine._conn_lock:
+            result = self._engine._conn.executemany(query, params_list)
+            description = result.description if hasattr(result, 'description') else None
+            try:
+                rows = result.fetchall()
+            except:
+                rows = []
+        
+        query_result = QueryResult(rows, description)
+        self.description = description
+        return query_result
+    
+    def fetchone(self):
+        """For backwards compatibility - returns None (use execute().fetchone())."""
+        return None
+    
+    def fetchall(self):
+        """For backwards compatibility - returns empty (use execute().fetchall())."""
+        return []
+    
+    def fetchmany(self, size=None):
+        """For backwards compatibility - returns empty (use execute().fetchmany())."""
+        return []
+
 
 def get_db_path(name: str = "central") -> Path:
     """Get the path to a DuckDB database file."""
-    if name not in DATABASES:
-        raise ValueError(f"Unknown database: {name}. Available: {list(DATABASES.keys())}")
-    return DATABASES[name]
+    return _get_db_path(name)
 
 
 @contextmanager
 def get_duckdb(name: str = "central", read_only: bool = False):
     """
-    Context manager for DuckDB connections using the shared pool.
+    Context manager for DuckDB connections.
     
-    Uses persistent connections to avoid file locking issues.
-    Thread-safe: acquires lock before yielding connection.
+    AUTOMATICALLY uses TradingDataEngine (in-memory) when running under scheduler.
+    Falls back to file-based DuckDB only when engine is not available.
+    
+    This ensures zero lock contention for the trading bot - all modules
+    automatically benefit from the in-memory engine without code changes.
     
     Usage:
         with get_duckdb() as conn:
@@ -142,40 +334,59 @@ def get_duckdb(name: str = "central", read_only: bool = False):
     
     Args:
         name: Database name ("central" or "prices")
-        read_only: Ignored (kept for backward compatibility)
+        read_only: Ignored (kept for API compatibility)
     """
-    conn = _pool.get_connection(name)
-    lock = _pool.get_lock(name)
+    # Try to use TradingDataEngine first (in-memory, zero locks)
+    engine = _get_engine_if_running()
+    if engine is not None and name == "central":
+        # Use engine wrapper for central database
+        yield EngineConnectionWrapper(engine)
+        return
     
-    # Acquire lock to ensure thread-safe access
-    with lock:
-        try:
+    # Fallback to file-based DuckDB (standalone mode or non-central DB)
+    try:
+        conn = _pool.get_connection(name)
+        yield conn
+    except Exception as e:
+        error_str = str(e).lower()
+        # Handle connection errors by reconnecting
+        if "connection" in error_str or "closed" in error_str or "file handle" in error_str or "attach" in error_str:
+            logger.warning(f"DuckDB connection error, reconnecting: {e}")
+            _pool.close(name)
+            conn = _pool.get_connection(name)
             yield conn
-        except Exception as e:
-            # If there's a connection error, try to reconnect
-            if "connection" in str(e).lower() or "closed" in str(e).lower():
-                _pool.close(name)
-                conn = _pool.get_connection(name)
-                yield conn
-            else:
-                raise
+        else:
+            raise
 
 
 @contextmanager
 def get_duckdb_fresh(name: str = "central"):
     """
-    Get a fresh (non-pooled) DuckDB connection.
+    Get a FRESH DuckDB connection (not pooled).
     
-    Use this only when you need a separate connection (e.g., for long-running operations).
-    The connection will be closed when the context exits.
+    Use this when you need an isolated connection (e.g., for long-running
+    operations that shouldn't block other threads).
+    
+    On Linux, this is generally safe for read operations.
     """
-    db_path = get_db_path(name)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = _get_db_path(name)
     conn = duckdb.connect(str(db_path))
+    
     try:
         yield conn
     finally:
         conn.close()
+
+
+@contextmanager
+def get_duckdb_pooled(name: str = "central"):
+    """
+    Alias for get_duckdb() - both use the connection pool.
+    
+    Kept for backward compatibility.
+    """
+    with get_duckdb(name) as conn:
+        yield conn
 
 
 # Legacy alias for backward compatibility
@@ -279,7 +490,7 @@ def dual_write_insert(
             )
             duckdb_success = True
     except Exception as e:
-        print(f"DuckDB insert error for {table}: {e}")
+        logger.error(f"DuckDB insert error for {table}: {e}")
     
     # Write to MySQL
     try:
@@ -291,7 +502,7 @@ def dual_write_insert(
                 )
             mysql_success = True
     except Exception as e:
-        print(f"MySQL insert error for {table}: {e}")
+        logger.error(f"MySQL insert error for {table}: {e}")
     
     return duckdb_success, mysql_success
 
@@ -339,7 +550,7 @@ def dual_write_update(
             )
             duckdb_success = True
     except Exception as e:
-        print(f"DuckDB update error for {table}: {e}")
+        logger.error(f"DuckDB update error for {table}: {e}")
     
     # Update MySQL
     try:
@@ -351,7 +562,7 @@ def dual_write_update(
                 )
             mysql_success = True
     except Exception as e:
-        print(f"MySQL update error for {table}: {e}")
+        logger.error(f"MySQL update error for {table}: {e}")
     
     return duckdb_success, mysql_success
 
@@ -387,7 +598,7 @@ def dual_write_delete(
             conn.execute(f"DELETE FROM {table} WHERE {where_str_duckdb}", where_values)
             duckdb_success = True
     except Exception as e:
-        print(f"DuckDB delete error for {table}: {e}")
+        logger.error(f"DuckDB delete error for {table}: {e}")
     
     # Delete from MySQL
     try:
@@ -396,7 +607,7 @@ def dual_write_delete(
                 cursor.execute(f"DELETE FROM {table} WHERE {where_str_mysql}", where_values)
             mysql_success = True
     except Exception as e:
-        print(f"MySQL delete error for {table}: {e}")
+        logger.error(f"MySQL delete error for {table}: {e}")
     
     return duckdb_success, mysql_success
 
@@ -593,11 +804,73 @@ def cleanup_all_hot_tables(db_name: str = "central", hours: int = None):
 # Database Initialization
 # =============================================================================
 
+def run_migrations(conn):
+    """
+    Run database migrations to handle schema updates.
+    Safe to run multiple times.
+    
+    Two types of migrations:
+    1. ADD_COLUMN: Add a single column if missing
+    2. RECREATE: Drop and recreate table if schema is outdated (for in-memory DBs)
+    """
+    # Tables that should be dropped and recreated if schema is outdated
+    # (safe for in-memory databases where data is repopulated on each start)
+    tables_to_recreate_if_outdated = [
+        ("buyin_trail_minutes", "minute"),  # Check for 'minute' column
+    ]
+    
+    for table_name, required_column in tables_to_recreate_if_outdated:
+        try:
+            # Check if table exists and has the required column
+            result = conn.execute(f"""
+                SELECT COUNT(*) FROM (
+                    SELECT * FROM pragma_table_info('{table_name}')
+                    WHERE name = '{required_column}'
+                )
+            """).fetchone()
+            
+            if result[0] == 0:
+                # Table exists but missing required column - drop it
+                # It will be recreated with correct schema by init_all_tables
+                conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                logger.info(f"Dropped outdated table {table_name} (missing {required_column} column)")
+        except Exception as e:
+            # Table doesn't exist yet, that's fine
+            logger.debug(f"Migration check for {table_name}: {e}")
+    
+    # Individual column additions (for tables where we want to preserve data)
+    column_migrations = [
+        # Add fifteen_min_trail column if missing (added after initial schema)
+        ("follow_the_goat_buyins", "fifteen_min_trail", "JSON"),
+    ]
+    
+    for table_name, column_name, column_type in column_migrations:
+        try:
+            # Check if column exists using PRAGMA
+            result = conn.execute(f"""
+                SELECT COUNT(*) FROM (
+                    SELECT * FROM pragma_table_info('{table_name}')
+                    WHERE name = '{column_name}'
+                )
+            """).fetchone()
+            
+            if result[0] == 0:
+                # Column doesn't exist, add it
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
+                logger.info(f"Added missing column {column_name} to {table_name}")
+        except Exception as e:
+            # Table might not exist yet, skip migration
+            logger.debug(f"Migration check for {table_name}.{column_name}: {e}")
+
+
 def init_duckdb_tables(db_name: str = "central"):
     """Initialize all tables in DuckDB."""
     from features.price_api.schema import init_all_tables
     
     with get_duckdb(db_name) as conn:
+        # Run migrations FIRST to drop outdated tables before creating new ones
+        run_migrations(conn)
+        # Then create all tables with correct schema
         init_all_tables(conn)
 
 

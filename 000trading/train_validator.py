@@ -25,7 +25,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -33,20 +33,33 @@ from typing import Any, Dict, List, Optional
 
 import sys
 PROJECT_ROOT = Path(__file__).parent.parent
+MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, get_mysql, dual_write_insert, dual_write_update
+from core.database import get_duckdb, get_mysql
 
-# Import our modules
-from _000trading.trail_generator import generate_trail_payload, TrailError
-from _000trading.pattern_validator import (
+# Try to get TradingDataEngine for in-memory queries (when running under scheduler)
+def _get_engine_if_running():
+    """Get TradingDataEngine if it's running, otherwise return None."""
+    try:
+        from core.trading_engine import _engine_instance
+        if _engine_instance is not None and _engine_instance._running:
+            return _engine_instance
+    except Exception:
+        pass
+    return None
+
+# Import our modules (direct imports after adding module dir to path)
+from trail_generator import generate_trail_payload, TrailError
+from pattern_validator import (
     validate_buyin_signal,
     clear_schema_cache,
 )
 
 # Configuration
 PLAY_ID = int(os.getenv("TRAIN_VALIDATOR_PLAY_ID", "46"))
-TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "30"))
+TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "15"))
 TRAINING_ENABLED = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
 
 # Setup logging
@@ -192,89 +205,183 @@ class StepLogger:
 # =============================================================================
 
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch play configuration from database."""
+    """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
+    
+    Uses the in-memory engine for speed. Falls back to MySQL only if engine not running.
+    """
+    engine = _get_engine_if_running()
+    
     try:
-        with get_duckdb("central") as conn:
-            result = conn.execute("""
+        if engine is not None:
+            # Use TradingDataEngine (in-memory, zero locks)
+            result = engine.read_one("""
                 SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
                 FROM follow_the_goat_plays
                 WHERE id = ?
-            """, [play_id]).fetchone()
+            """, [play_id])
             
             if not result:
-                logger.error(f"Play #{play_id} not found in database")
+                logger.error(f"Play #{play_id} not found in TradingDataEngine")
                 return None
             
-            play = {
-                'id': result[0],
-                'name': result[1],
-                'pattern_validator_enable': result[2],
-                'pattern_validator': result[3],
-                'project_ids': result[4],
-            }
-            
-            # Parse pattern validator config
-            pattern_validator_raw = play.get('pattern_validator')
-            pattern_validator_config = None
-            
-            if pattern_validator_raw:
-                if isinstance(pattern_validator_raw, str):
-                    try:
-                        pattern_validator_config = json.loads(pattern_validator_raw)
-                    except json.JSONDecodeError:
-                        logger.error("Invalid JSON in pattern_validator field")
-                elif isinstance(pattern_validator_raw, dict):
-                    pattern_validator_config = pattern_validator_raw
-            
-            play['pattern_validator_config'] = pattern_validator_config
-            
-            # Coerce pattern_validator_enable
-            enable_flag = play.get('pattern_validator_enable')
-            play['pattern_validator_enable'] = int(enable_flag) if enable_flag else 0
-            
-            # Process project_ids
-            project_ids_raw = play.get('project_ids')
-            if project_ids_raw:
-                if isinstance(project_ids_raw, str):
-                    try:
-                        play['project_ids'] = json.loads(project_ids_raw)
-                    except json.JSONDecodeError:
-                        play['project_ids'] = []
-                elif isinstance(project_ids_raw, list):
-                    play['project_ids'] = project_ids_raw
-                else:
+            play = dict(result)
+        else:
+            # Fallback to MySQL if engine not running (standalone mode)
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
+                        FROM follow_the_goat_plays
+                        WHERE id = %s
+                    """, [play_id])
+                    result = cursor.fetchone()
+                
+                if not result:
+                    logger.error(f"Play #{play_id} not found")
+                    return None
+                
+                play = dict(result)
+        
+        # Parse pattern validator config
+        pattern_validator_raw = play.get('pattern_validator')
+        pattern_validator_config = None
+        
+        if pattern_validator_raw:
+            if isinstance(pattern_validator_raw, str):
+                try:
+                    pattern_validator_config = json.loads(pattern_validator_raw)
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON in pattern_validator field")
+            elif isinstance(pattern_validator_raw, dict):
+                pattern_validator_config = pattern_validator_raw
+        
+        play['pattern_validator_config'] = pattern_validator_config
+        
+        # Coerce pattern_validator_enable
+        enable_flag = play.get('pattern_validator_enable')
+        play['pattern_validator_enable'] = int(enable_flag) if enable_flag else 0
+        
+        # Process project_ids
+        project_ids_raw = play.get('project_ids')
+        if project_ids_raw:
+            if isinstance(project_ids_raw, str):
+                try:
+                    play['project_ids'] = json.loads(project_ids_raw)
+                except json.JSONDecodeError:
                     play['project_ids'] = []
+            elif isinstance(project_ids_raw, list):
+                play['project_ids'] = project_ids_raw
             else:
                 play['project_ids'] = []
-            
-            logger.info(f"Loaded play #{play_id}: {play.get('name')}")
-            logger.info(f"  Validator enabled: {play['pattern_validator_enable']}")
-            logger.info(f"  Has schema: {bool(pattern_validator_config)}")
-            logger.info(f"  Project IDs: {play.get('project_ids', [])}")
-            
-            return play
+        else:
+            play['project_ids'] = []
+        
+        logger.debug(f"Loaded play #{play_id}: {play.get('name')} (from DuckDB)")
+        
+        return play
             
     except Exception as e:
         logger.error(f"Error fetching play config: {e}")
         return None
 
 
-def get_current_market_price() -> Optional[float]:
-    """Get current SOL price from price_points table."""
+def check_data_readiness() -> tuple[bool, str]:
+    """Check if sufficient data exists to run a training cycle.
+    
+    Uses TradingDataEngine if running (under scheduler), otherwise file-based DuckDB.
+    
+    Note: TradingDataEngine uses 'prices' table internally (mapped to 'price_points' in MySQL).
+    
+    Returns:
+        Tuple of (is_ready, reason_if_not_ready)
+    """
+    engine = _get_engine_if_running()
+    
+    if engine is not None:
+        # Use TradingDataEngine (in-memory, no locking)
+        # Note: Engine uses 'prices' table, not 'price_points'
+        try:
+            # Check prices table (engine uses 'prices', maps to 'price_points' in MySQL)
+            result = engine.read("SELECT COUNT(*) as cnt FROM prices WHERE token = 'SOL'")
+            price_count = result[0]['cnt'] if result else 0
+            
+            if price_count < 10:
+                return False, f"Waiting for price data ({price_count}/10 points)"
+            
+            # Check order_book_features
+            try:
+                result = engine.read("SELECT COUNT(*) as cnt FROM order_book_features")
+                ob_count = result[0]['cnt'] if result else 0
+                
+                if ob_count < 5:
+                    return False, f"Waiting for order book data ({ob_count}/5 rows)"
+            except Exception:
+                return False, "Order book table not ready yet"
+            
+            return True, "Data ready (using TradingDataEngine)"
+            
+        except Exception as e:
+            return False, f"TradingDataEngine not ready: {e}"
+    
+    # Fallback to file-based DuckDB (standalone mode)
     try:
         with get_duckdb("central") as conn:
+            # Check price_points (need at least some price data)
             result = conn.execute("""
-                SELECT value
-                FROM price_points
-                WHERE coin_id = 5
+                SELECT COUNT(*) FROM price_points WHERE coin_id = 5
+            """).fetchone()
+            price_count = result[0] if result else 0
+            
+            if price_count < 10:
+                return False, f"Waiting for price data ({price_count}/10 points)"
+            
+            # Check order_book_features exists and has data
+            try:
+                result = conn.execute("""
+                    SELECT COUNT(*) FROM order_book_features
+                """).fetchone()
+                ob_count = result[0] if result else 0
+                
+                if ob_count < 5:
+                    return False, f"Waiting for order book data ({ob_count}/5 rows)"
+            except Exception:
+                return False, "Order book table not ready yet"
+            
+            return True, "Data ready (using file DuckDB)"
+            
+    except Exception as e:
+        return False, f"Database not ready: {e}"
+
+
+def get_current_market_price() -> Optional[float]:
+    """Get current SOL price from prices table (TradingDataEngine) or price_points (file DuckDB)."""
+    engine = _get_engine_if_running()
+    
+    try:
+        if engine is not None:
+            # TradingDataEngine uses 'prices' table with 'token' column and 'price' value
+            result = engine.read("""
+                SELECT price
+                FROM prices
+                WHERE token = 'SOL'
                 ORDER BY id DESC
                 LIMIT 1
-            """).fetchone()
-            
+            """)
             if result:
-                return float(result[0])
-            else:
-                logger.warning("No price data found in price_points")
+                return float(result[0]['price'])
+            return None
+        else:
+            # File-based DuckDB uses 'price_points' table with 'coin_id' column and 'value'
+            with get_duckdb("central") as conn:
+                result = conn.execute("""
+                    SELECT value
+                    FROM price_points
+                    WHERE coin_id = 5
+                    ORDER BY id DESC
+                    LIMIT 1
+                """).fetchone()
+                if result:
+                    return float(result[0])
                 return None
                 
     except Exception as e:
@@ -284,20 +391,27 @@ def get_current_market_price() -> Optional[float]:
 
 def get_current_price_cycle() -> Optional[int]:
     """Get current price_cycle ID from cycle_tracker table."""
+    engine = _get_engine_if_running()
+    
+    query = """
+        SELECT id
+        FROM cycle_tracker
+        WHERE threshold = 0.3
+        ORDER BY id DESC
+        LIMIT 1
+    """
+    
     try:
-        with get_duckdb("central") as conn:
-            result = conn.execute("""
-                SELECT id
-                FROM cycle_tracker
-                WHERE threshold = 0.3
-                ORDER BY id DESC
-                LIMIT 1
-            """).fetchone()
-            
+        if engine is not None:
+            result = engine.read(query)
             if result:
-                return result[0]
-            else:
-                logger.warning("No cycle data found in cycle_tracker")
+                return result[0]['id']
+            return None
+        else:
+            with get_duckdb("central") as conn:
+                result = conn.execute(query).fetchone()
+                if result:
+                    return result[0]
                 return None
                 
     except Exception as e:
@@ -311,11 +425,16 @@ def insert_synthetic_buyin(
     price_cycle: Optional[int],
     step_logger: StepLogger
 ) -> Optional[int]:
-    """Insert a synthetic buyin record for training."""
+    """Insert a synthetic buyin record for training.
+    
+    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    """
+    engine = _get_engine_if_running()
     timestamp = int(time.time())
     wallet_address = f"TRAINING_TEST_{timestamp}"
     signature = f"training_sig_{timestamp}"
     block_timestamp = datetime.now(timezone.utc)
+    block_timestamp_str = block_timestamp.strftime('%Y-%m-%d %H:%M:%S')
     
     pre_insert_log = json.dumps(step_logger.to_json())
     
@@ -329,32 +448,51 @@ def insert_synthetic_buyin(
         }
     )
     
+    buyin_id = None
+    
     try:
-        data = {
-            'play_id': play_id,
-            'wallet_address': wallet_address,
-            'original_trade_id': 0,
-            'trade_signature': signature,
-            'block_timestamp': block_timestamp.isoformat(),
-            'quote_amount': 100.0,
-            'base_amount': our_entry_price if our_entry_price else 0.0,
-            'price': our_entry_price,
-            'direction': 'buy',
-            'our_entry_price': our_entry_price,
-            'swap_response': None,
-            'live_trade': 0,
-            'price_cycle': price_cycle,
-            'entry_log': pre_insert_log,
-            'pattern_validator_log': None,
-            'our_status': 'validating',
-            'followed_at': block_timestamp.isoformat(),
-        }
+        # Insert into MySQL first (get the auto-increment ID)
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO follow_the_goat_buyins (
+                        play_id, wallet_address, original_trade_id, trade_signature,
+                        block_timestamp, quote_amount, base_amount, price, direction,
+                        our_entry_price, swap_response, live_trade, price_cycle,
+                        entry_log, pattern_validator_log, our_status, followed_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    play_id, wallet_address, 0, signature,
+                    block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
+                    our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
+                    pre_insert_log, None, 'validating', block_timestamp_str
+                ))
+                buyin_id = cursor.lastrowid
         
-        # Insert using dual-write
-        buyin_id = dual_write_insert(
-            table="follow_the_goat_buyins",
-            data=data
-        )
+        if not buyin_id:
+            raise Exception("Failed to get buyin_id after MySQL insert")
+        
+        logger.debug(f"MySQL insert successful, buyin_id={buyin_id}")
+        
+        # Insert into TradingDataEngine (in-memory) with the same ID
+        if engine is not None:
+            try:
+                engine.execute("""
+                    INSERT INTO follow_the_goat_buyins (
+                        id, play_id, wallet_address, original_trade_id, trade_signature,
+                        block_timestamp, quote_amount, base_amount, price, direction,
+                        our_entry_price, swap_response, live_trade, price_cycle,
+                        entry_log, pattern_validator_log, our_status, followed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    buyin_id, play_id, wallet_address, 0, signature,
+                    block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
+                    our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
+                    pre_insert_log, None, 'validating', block_timestamp_str
+                ])
+                logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
+            except Exception as engine_err:
+                logger.warning(f"Engine insert failed (MySQL succeeded): {engine_err}")
         
         step_logger.end(
             insert_token,
@@ -374,7 +512,10 @@ def insert_synthetic_buyin(
 
 
 def generate_trail(buyin_id: int, step_logger: StepLogger) -> bool:
-    """Generate 15-minute trail for the buyin."""
+    """Generate 15-minute trail for the buyin.
+    
+    Trail data is stored in the buyin_trail_minutes table (15 rows per buyin).
+    """
     trail_token = step_logger.start(
         'generate_15_minute_trail',
         'Generating 15-minute analytics trail',
@@ -383,17 +524,29 @@ def generate_trail(buyin_id: int, step_logger: StepLogger) -> bool:
     
     try:
         trail_payload = generate_trail_payload(buyin_id=buyin_id, persist=True)
+        
+        # Check if data was persisted to the table
+        persisted = trail_payload.get('persisted', False)
+        
         step_logger.end(
             trail_token,
             {
+                'persisted_to_table': persisted,
+                'table': 'buyin_trail_minutes',
+                'rows_inserted': 15 if persisted else 0,
                 'minute_spans': len(trail_payload.get('minute_spans', [])),
                 'order_book_rows': len(trail_payload.get('order_book_signals', [])),
                 'transaction_rows': len(trail_payload.get('transactions', [])),
                 'whale_rows': len(trail_payload.get('whale_activity', [])),
             }
         )
-        logger.info(f"✓ Generated 15-minute trail for buy-in #{buyin_id}")
-        return True
+        
+        if persisted:
+            logger.info(f"✓ Generated and persisted 15-minute trail for buy-in #{buyin_id} (15 rows)")
+        else:
+            logger.warning(f"⚠ Generated trail for buy-in #{buyin_id} but persistence failed")
+        
+        return persisted
         
     except TrailError as trail_err:
         step_logger.fail(trail_token, str(trail_err))
@@ -488,7 +641,11 @@ def update_validation_result(
     validation_result: Dict[str, Any],
     step_logger: StepLogger
 ) -> bool:
-    """Update the buyin record with validation results."""
+    """Update the buyin record with validation results.
+    
+    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    """
+    engine = _get_engine_if_running()
     decision = validation_result.get('decision', 'UNKNOWN')
     should_follow = decision == 'GO'
     
@@ -507,23 +664,58 @@ def update_validation_result(
     )
     
     try:
-        update_data = {
-            'pattern_validator_log': pattern_validator_log_json,
-            'our_status': new_status,
-        }
-        
-        # If transitioning to 'pending', update followed_at and fresh price
+        # Build update fields
+        followed_at = None
+        fresh_price = None
         if new_status == 'pending':
             fresh_price = get_current_market_price()
-            update_data['followed_at'] = datetime.now(timezone.utc).isoformat()
-            if fresh_price:
-                update_data['our_entry_price'] = fresh_price
+            followed_at = datetime.now(timezone.utc).isoformat()
         
-        dual_write_update(
-            table="follow_the_goat_buyins",
-            data=update_data,
-            where={"id": buyin_id}
-        )
+        # Update TradingDataEngine (in-memory)
+        if engine is not None:
+            if new_status == 'pending' and fresh_price:
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
+            elif new_status == 'pending':
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?, followed_at = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
+            else:
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, buyin_id])
+        
+        # Update MySQL (for persistence)
+        try:
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    if new_status == 'pending' and fresh_price:
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET pattern_validator_log = %s, our_status = %s, followed_at = %s, our_entry_price = %s
+                            WHERE id = %s
+                        """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
+                    elif new_status == 'pending':
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET pattern_validator_log = %s, our_status = %s, followed_at = %s
+                            WHERE id = %s
+                        """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
+                    else:
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET pattern_validator_log = %s, our_status = %s
+                            WHERE id = %s
+                        """, [pattern_validator_log_json, new_status, buyin_id])
+        except Exception as mysql_err:
+            logger.warning(f"MySQL update failed: {mysql_err}")
         
         step_logger.end(
             update_token,
@@ -540,16 +732,94 @@ def update_validation_result(
 
 
 def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
-    """Update the entry log with final step logger data."""
+    """Update the entry log with final step logger data.
+    
+    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    """
+    engine = _get_engine_if_running()
     try:
         final_log_json = json.dumps(step_logger.to_json())
-        dual_write_update(
-            table="follow_the_goat_buyins",
-            data={"entry_log": final_log_json},
-            where={"id": buyin_id}
-        )
+        
+        # Update TradingDataEngine (in-memory)
+        if engine is not None:
+            engine.execute("""
+                UPDATE follow_the_goat_buyins
+                SET entry_log = ?
+                WHERE id = ?
+            """, [final_log_json, buyin_id])
+        
+        # Update MySQL (for persistence)
+        try:
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET entry_log = %s
+                        WHERE id = %s
+                    """, [final_log_json, buyin_id])
+        except Exception as mysql_err:
+            logger.warning(f"MySQL update failed: {mysql_err}")
+            
     except Exception as e:
         logger.error(f"Error updating entry log for buy-in #{buyin_id}: {e}")
+
+
+def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[StepLogger] = None) -> None:
+    """Mark a buyin as 'error' status when validation pipeline fails.
+    
+    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    """
+    engine = _get_engine_if_running()
+    try:
+        error_log = json.dumps({
+            'decision': 'ERROR',
+            'error': error_reason,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+        
+        # Update entry_log if step_logger provided
+        entry_log = None
+        if step_logger:
+            entry_log = json.dumps(step_logger.to_json())
+        
+        # Update TradingDataEngine (in-memory)
+        if engine is not None:
+            if entry_log:
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
+                    WHERE id = ?
+                """, [error_log, entry_log, buyin_id])
+            else:
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET our_status = 'error', pattern_validator_log = ?
+                    WHERE id = ?
+                """, [error_log, buyin_id])
+        
+        # Update MySQL (for persistence)
+        try:
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    if entry_log:
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET our_status = 'error', pattern_validator_log = %s, entry_log = %s
+                            WHERE id = %s
+                        """, [error_log, entry_log, buyin_id])
+                    else:
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET our_status = 'error', pattern_validator_log = %s
+                            WHERE id = %s
+                        """, [error_log, buyin_id])
+        except Exception as mysql_err:
+            logger.warning(f"MySQL update failed: {mysql_err}")
+        
+        logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")
+        
+    except Exception as e:
+        logger.error(f"Failed to mark buyin #{buyin_id} as error: {e}")
 
 
 # =============================================================================
@@ -586,6 +856,89 @@ class TrainingStats:
 _stats = TrainingStats()
 
 
+def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
+    """Clean up trades stuck in 'validating' status for too long.
+    
+    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    
+    Args:
+        max_age_seconds: Max seconds a trade can be in 'validating' status (default: 2 minutes)
+        
+    Returns:
+        Number of trades cleaned up
+    """
+    engine = _get_engine_if_running()
+    try:
+        cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+        
+        # Find stuck trades using TradingDataEngine
+        if engine is not None:
+            result = engine.read("""
+                SELECT id, followed_at
+                FROM follow_the_goat_buyins
+                WHERE our_status = 'validating'
+                  AND followed_at < ?
+            """, [cutoff_time])
+            
+            if not result:
+                return 0
+            
+            stuck_ids = [row['id'] for row in result]
+        else:
+            # Fallback to MySQL
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, followed_at
+                        FROM follow_the_goat_buyins
+                        WHERE our_status = 'validating'
+                          AND followed_at < %s
+                    """, [cutoff_time])
+                    result = cursor.fetchall()
+                    
+                    if not result:
+                        return 0
+                    
+                    stuck_ids = [row['id'] for row in result]
+        
+        logger.warning(f"Found {len(stuck_ids)} trades stuck in 'validating' status: {stuck_ids}")
+        
+        error_log = json.dumps({
+            'decision': 'ERROR',
+            'error': f'Stuck in validating status for >{max_age_seconds}s - auto-cleaned',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        })
+        
+        # Update TradingDataEngine (in-memory)
+        if engine is not None:
+            for buyin_id in stuck_ids:
+                engine.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET our_status = 'error', pattern_validator_log = ?
+                    WHERE id = ?
+                """, [error_log, buyin_id])
+        
+        # Update MySQL (for persistence)
+        try:
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    for buyin_id in stuck_ids:
+                        cursor.execute("""
+                            UPDATE follow_the_goat_buyins
+                            SET our_status = 'error', pattern_validator_log = %s
+                            WHERE id = %s
+                        """, [error_log, buyin_id])
+        except Exception as mysql_err:
+            logger.warning(f"MySQL cleanup failed: {mysql_err}")
+        
+        logger.info(f"Cleaned up {len(stuck_ids)} stuck 'validating' trades")
+        return len(stuck_ids)
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up stuck validating trades: {e}")
+        return 0
+
+
 def run_training_cycle(play_id: Optional[int] = None) -> bool:
     """Execute one training cycle.
     
@@ -596,22 +949,27 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         True if cycle completed successfully, False otherwise
     """
     play_id = play_id or PLAY_ID
+    buyin_id = None  # Initialize so it's available in exception handler
     
-    logger.info("\n" + "="*80)
-    logger.info("STARTING TRAINING CYCLE")
-    logger.info("="*80)
+    # Clean up any stuck 'validating' trades from previous failed cycles
+    cleanup_stuck_validating_trades(max_age_seconds=120)
     
+    # Check if sufficient data exists before starting
+    is_ready, reason = check_data_readiness()
+    if not is_ready:
+        logger.info(f"Skipping training cycle: {reason}")
+        return False
+    
+    cycle_start = time.time()
     step_logger = StepLogger()
     cycle_token = step_logger.start('training_cycle', 'Complete training cycle execution')
     
     try:
         # Clear schema cache to get latest
         cache_result = clear_schema_cache(play_id=play_id)
-        logger.info(f"✓ Schema cache cleared: {cache_result.get('message', 'success')}")
         step_logger.add('clear_schema_cache', 'Cleared validator schema cache', cache_result)
         
-        # 1. Get play config
-        logger.info("Step 1: Fetching play configuration...")
+        # 1. Get play config (from DuckDB - fast)
         play_config = get_play_config(play_id)
         
         if not play_config:
@@ -624,14 +982,14 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         pattern_validator_enabled = (enable_flag == 1 or enable_flag is True)
         
         if not pattern_validator_enabled:
-            logger.error("Pattern validator not enabled for this play - aborting cycle")
+            logger.warning("Pattern validator not enabled for this play - aborting cycle")
             _stats.errors += 1
             return False
         
         # Allow validation if either schema OR project_ids is available
         project_ids = play_config.get('project_ids', [])
         if not play_config.get('pattern_validator_config') and not project_ids:
-            logger.error("Pattern validator schema missing and no project_ids configured - aborting cycle")
+            logger.warning("Pattern validator schema missing and no project_ids configured - aborting cycle")
             _stats.errors += 1
             return False
         
@@ -650,8 +1008,7 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
             })
         )
         
-        # 2. Get market price and price cycle
-        logger.info("Step 2: Fetching market data...")
+        # 2. Get market price and price cycle (from DuckDB - fast)
         market_price = get_current_market_price()
         price_cycle = get_current_price_cycle()
         
@@ -667,7 +1024,6 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         )
         
         # 3. Insert synthetic buyin
-        logger.info("Step 3: Inserting synthetic buyin...")
         buyin_id = insert_synthetic_buyin(play_id, market_price, price_cycle, step_logger)
         
         if not buyin_id:
@@ -678,29 +1034,29 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         _stats.trades_inserted += 1
         
         # 4. Generate trail
-        logger.info("Step 4: Generating 15-minute trail...")
         trail_success = generate_trail(buyin_id, step_logger)
         
         if not trail_success:
             logger.error("Trail generation failed - aborting cycle")
+            mark_buyin_as_error(buyin_id, "Trail generation failed", step_logger)
             _stats.errors += 1
             return False
         
         # 5. Run validation
-        logger.info("Step 5: Running pattern validation...")
         validation_result = run_validation(buyin_id, play_config, step_logger)
         
         if not validation_result:
             logger.error("Validation failed - aborting cycle")
+            mark_buyin_as_error(buyin_id, "Validation returned no result", step_logger)
             _stats.errors += 1
             return False
         
         # 6. Update validation result
-        logger.info("Step 6: Updating validation result...")
         update_success = update_validation_result(buyin_id, validation_result, step_logger)
         
         if not update_success:
             logger.error("Failed to update validation result")
+            mark_buyin_as_error(buyin_id, "Failed to update validation result", step_logger)
             _stats.errors += 1
             return False
         
@@ -717,11 +1073,9 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         else:
             _stats.validations_failed += 1
         
-        logger.info("="*80)
-        logger.info(f"✓ TRAINING CYCLE COMPLETED SUCCESSFULLY (buyin_id: {buyin_id})")
-        logger.info(f"  Decision: {decision}")
-        logger.info(f"  Status: {'pending' if decision == 'GO' else 'no_go'}")
-        logger.info("="*80 + "\n")
+        # Single-line summary (less verbose for 15s interval)
+        cycle_ms = round((time.time() - cycle_start) * 1000)
+        logger.info(f"✓ Training #{buyin_id}: {decision} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms]")
         
         return True
         
@@ -729,6 +1083,9 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         logger.error(f"Unexpected error in training cycle: {e}", exc_info=True)
         _stats.errors += 1
         step_logger.fail(cycle_token, str(e))
+        # Mark buyin as error if we have a buyin_id (insert succeeded but something else failed)
+        if buyin_id:
+            mark_buyin_as_error(buyin_id, f"Unexpected error: {str(e)}", step_logger)
         return False
 
 

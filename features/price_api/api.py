@@ -25,6 +25,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime, timedelta
 import json
+import logging
 
 from core.database import (
     get_duckdb, get_mysql, get_trading_engine,
@@ -37,8 +38,12 @@ from features.price_api.schema import HOT_TABLES, TIMESTAMP_COLUMNS
 app = Flask(__name__)
 CORS(app)
 
-# Database path for backward compatibility
-DB_PATH = PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb"
+# Configure logger
+logger = logging.getLogger("price_api")
+
+# Database path for backward compatibility (WSL-aware)
+from core.database import DATABASES
+DB_PATH = DATABASES.get("prices", PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb")
 
 
 # =============================================================================
@@ -137,6 +142,244 @@ def get_stats():
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
 
+@app.route('/trades_diagnostic', methods=['GET'])
+def trades_diagnostic():
+    """
+    Diagnostic endpoint to compare trade counts across all data sources.
+    
+    Sync Path (FAST): Webhook DuckDB → Python DuckDB (every 2s)
+    Fallback Path: MySQL → Python DuckDB (only if webhook unavailable)
+    
+    Data sources checked:
+    - .NET Webhook DuckDB (in-memory on quicknode.smz.dk) - SOURCE
+    - Python DuckDB sol_stablecoin_trades - LOCAL CACHE
+    - MySQL sol_stablecoin_trades - BACKUP
+    
+    Query params:
+    - minutes: Time window in minutes (default: 5)
+    """
+    import requests
+    import time as time_module
+    
+    minutes = int(request.args.get('minutes', 5))
+    
+    diagnostic = {
+        'time_window_minutes': minutes,
+        'timestamp': datetime.now().isoformat(),
+        'sync_mode': 'DuckDB→DuckDB (ultra-fast, every 500ms)',
+        'sources': {}
+    }
+    
+    # 1. Check .NET Webhook DuckDB (in-memory) - THE SOURCE OF TRUTH
+    try:
+        start_time = time_module.time()
+        webhook_response = requests.get(
+            f'http://quicknode.smz.dk/api/trades?limit=1000',
+            timeout=5
+        )
+        response_time_ms = (time_module.time() - start_time) * 1000
+        
+        if webhook_response.status_code == 200:
+            data = webhook_response.json()
+            if data.get('success'):
+                results = data.get('results', [])
+                # Filter by time window
+                now = datetime.now()
+                recent_count = 0
+                buy_count = 0
+                for trade in results:
+                    ts_str = trade.get('trade_timestamp', '')
+                    if ts_str:
+                        try:
+                            ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00').replace('+00:00', ''))
+                            if (now - ts).total_seconds() <= minutes * 60:
+                                recent_count += 1
+                                if trade.get('direction', '').lower() == 'buy':
+                                    buy_count += 1
+                        except:
+                            pass
+                
+                diagnostic['sources']['webhook_duckdb'] = {
+                    'status': 'ok',
+                    'role': 'SOURCE (real-time from QuickNode)',
+                    'total_in_hot': len(results),
+                    f'last_{minutes}m': recent_count,
+                    f'last_{minutes}m_buys': buy_count,
+                    'response_time_ms': round(response_time_ms, 1),
+                    'source': data.get('source', 'duckdb_inmemory')
+                }
+            else:
+                diagnostic['sources']['webhook_duckdb'] = {
+                    'status': 'error',
+                    'error': data.get('error', 'Unknown error')
+                }
+        else:
+            diagnostic['sources']['webhook_duckdb'] = {
+                'status': 'error',
+                'http_code': webhook_response.status_code
+            }
+    except requests.exceptions.RequestException as e:
+        diagnostic['sources']['webhook_duckdb'] = {
+            'status': 'unreachable',
+            'error': str(e),
+            'note': 'Sync will fallback to MySQL (slower)'
+        }
+    
+    # 2. Check MySQL sol_stablecoin_trades - BACKUP/ARCHIVE
+    try:
+        start_time = time_module.time()
+        with get_mysql() as mysql_conn:
+            with mysql_conn.cursor() as cursor:
+                # Total in last X minutes
+                cursor.execute(f"""
+                    SELECT COUNT(*) as cnt
+                    FROM sol_stablecoin_trades
+                    WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                """)
+                recent = cursor.fetchone()['cnt']
+                
+                # Buy count
+                cursor.execute(f"""
+                    SELECT COUNT(*) as cnt
+                    FROM sol_stablecoin_trades
+                    WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                    AND direction = 'buy'
+                """)
+                buy_count = cursor.fetchone()['cnt']
+                
+                # Total in table
+                cursor.execute("SELECT COUNT(*) as cnt FROM sol_stablecoin_trades")
+                total = cursor.fetchone()['cnt']
+        
+        query_time_ms = (time_module.time() - start_time) * 1000
+        
+        diagnostic['sources']['mysql'] = {
+            'status': 'ok',
+            'role': 'BACKUP (written by .NET webhook, used as fallback)',
+            'total_in_table': total,
+            f'last_{minutes}m': recent,
+            f'last_{minutes}m_buys': buy_count,
+            'query_time_ms': round(query_time_ms, 1)
+        }
+    except Exception as e:
+        diagnostic['sources']['mysql'] = {
+            'status': 'error',
+            'error': str(e)
+        }
+    
+    # 3. Check Python DuckDB sol_stablecoin_trades - LOCAL CACHE
+    try:
+        start_time = time_module.time()
+        with get_duckdb("central") as conn:
+            # Total in last X minutes
+            result = conn.execute(f"""
+                SELECT COUNT(*) as cnt
+                FROM sol_stablecoin_trades
+                WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+            """).fetchone()
+            recent = result[0] if result else 0
+            
+            # Buy count
+            result = conn.execute(f"""
+                SELECT COUNT(*) as cnt
+                FROM sol_stablecoin_trades
+                WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                AND direction = 'buy'
+            """).fetchone()
+            buy_count = result[0] if result else 0
+            
+            # Total in table
+            result = conn.execute("SELECT COUNT(*) FROM sol_stablecoin_trades").fetchone()
+            total = result[0] if result else 0
+        
+        query_time_ms = (time_module.time() - start_time) * 1000
+        
+        diagnostic['sources']['python_duckdb'] = {
+            'status': 'ok',
+            'role': 'LOCAL CACHE (synced every 500ms from Webhook)',
+            'total_in_table': total,
+            f'last_{minutes}m': recent,
+            f'last_{minutes}m_buys': buy_count,
+            'query_time_ms': round(query_time_ms, 1)
+        }
+    except Exception as e:
+        diagnostic['sources']['python_duckdb'] = {
+            'status': 'error',
+            'error': str(e)
+        }
+    
+    # 4. Check TradingDataEngine (in-memory)
+    try:
+        engine = get_trading_engine()
+        if engine._running:
+            result = engine.read(f"""
+                SELECT COUNT(*) as cnt
+                FROM sol_stablecoin_trades
+                WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+            """, [])
+            recent = result[0]['cnt'] if result else 0
+            
+            result = engine.read(f"""
+                SELECT COUNT(*) as cnt
+                FROM sol_stablecoin_trades
+                WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                AND direction = 'buy'
+            """, [])
+            buy_count = result[0]['cnt'] if result else 0
+            
+            result = engine.read("SELECT COUNT(*) as cnt FROM sol_stablecoin_trades", [])
+            total = result[0]['cnt'] if result else 0
+            
+            diagnostic['sources']['trading_engine'] = {
+                'status': 'ok',
+                'total_in_table': total,
+                f'last_{minutes}m': recent,
+                f'last_{minutes}m_buys': buy_count
+            }
+        else:
+            diagnostic['sources']['trading_engine'] = {
+                'status': 'not_running'
+            }
+    except Exception as e:
+        diagnostic['sources']['trading_engine'] = {
+            'status': 'error',
+            'error': str(e)
+        }
+    
+    # Summary / Comparison - Focus on Webhook→DuckDB sync (fast path)
+    webhook_recent = diagnostic['sources'].get('webhook_duckdb', {}).get(f'last_{minutes}m', 0)
+    duckdb_recent = diagnostic['sources'].get('python_duckdb', {}).get(f'last_{minutes}m', 0)
+    mysql_recent = diagnostic['sources'].get('mysql', {}).get(f'last_{minutes}m', 0)
+    
+    webhook_status = diagnostic['sources'].get('webhook_duckdb', {}).get('status', 'unknown')
+    
+    if webhook_status == 'ok' and webhook_recent is not None and duckdb_recent is not None:
+        sync_lag = webhook_recent - duckdb_recent
+        diagnostic['sync_status'] = {
+            'sync_path': 'Webhook DuckDB → Python DuckDB (ULTRA-FAST 500ms)',
+            'webhook_trades': webhook_recent,
+            'local_duckdb_trades': duckdb_recent,
+            'sync_lag': sync_lag,
+            'synced': sync_lag <= 1,  # Tight tolerance for 500ms sync
+            'message': 'Synced' if sync_lag <= 1 else f'Local DuckDB is {sync_lag} trades behind Webhook'
+        }
+    elif webhook_status != 'ok':
+        # Fallback mode - compare MySQL to DuckDB
+        if mysql_recent is not None and duckdb_recent is not None:
+            sync_lag = mysql_recent - duckdb_recent
+            diagnostic['sync_status'] = {
+                'sync_path': 'MySQL → Python DuckDB (FALLBACK - webhook unavailable)',
+                'mysql_trades': mysql_recent,
+                'local_duckdb_trades': duckdb_recent,
+                'sync_lag': sync_lag,
+                'synced': sync_lag <= 5,
+                'message': 'Synced (fallback mode)' if sync_lag <= 5 else f'Local DuckDB is {sync_lag} trades behind MySQL',
+                'warning': 'Webhook is unavailable - using slower MySQL fallback'
+            }
+    
+    return jsonify(diagnostic)
+
+
 @app.route('/scheduler_status', methods=['GET'])
 def get_scheduler_status():
     """
@@ -167,6 +410,103 @@ def get_scheduler_status():
             'jobs': {},
             'timestamp': datetime.now().isoformat()
         }), 500
+
+
+@app.route('/job_metrics', methods=['GET'])
+def get_job_metrics():
+    """
+    Get job execution metrics with execution time analysis.
+    
+    Query parameters:
+    - hours: Number of hours of history to analyze (default: 1)
+    
+    Returns per-job statistics:
+    - avg_duration_ms: Average execution duration
+    - max_duration_ms: Maximum execution duration  
+    - min_duration_ms: Minimum execution duration
+    - execution_count: Number of executions in time window
+    - error_count: Number of failed executions
+    - expected_interval_ms: Expected job interval
+    - is_slow: True if avg duration > 80% of expected interval
+    - recent_executions: Last 50 executions with timestamps and durations
+    
+    Query parameters:
+    - hours: Number of hours of history (default: 1, supports decimals like 0.083 for 5 min)
+    - minutes: Alternative to hours - number of minutes (takes precedence if provided)
+    """
+    # Support both minutes and hours parameters
+    minutes = request.args.get('minutes', type=int)
+    if minutes is not None:
+        # Convert minutes to hours (as decimal)
+        hours = max(5, min(1440, minutes)) / 60.0
+    else:
+        hours = request.args.get('hours', 1, type=float)
+        # Validate hours (0.083 = 5 min to 24 hours)
+        hours = max(0.083, min(24, hours))
+    
+    try:
+        from scheduler.status import get_job_metrics as fetch_metrics
+        metrics = fetch_metrics(hours=hours)
+        return jsonify(metrics)
+        
+    except ImportError as e:
+        # Scheduler module not running in same process
+        return jsonify({
+            'status': 'unavailable',
+            'message': f'Job metrics not available: {str(e)}',
+            'jobs': {},
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'jobs': {},
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+
+@app.route('/job_metrics_debug', methods=['GET'])
+def get_job_metrics_debug():
+    """Debug endpoint to check metrics table directly."""
+    try:
+        from core.database import get_duckdb
+        from scheduler.status import _metrics_table_initialized, _metrics_writer_running
+        
+        result = {
+            'metrics_table_initialized': _metrics_table_initialized,
+            'metrics_writer_running': _metrics_writer_running,
+        }
+        
+        try:
+            with get_duckdb("central") as conn:
+                # Check if table exists
+                tables = conn.execute("""
+                    SELECT table_name FROM information_schema.tables 
+                    WHERE table_name = 'job_execution_metrics'
+                """).fetchall()
+                result['table_exists'] = len(tables) > 0
+                
+                if result['table_exists']:
+                    count = conn.execute("SELECT COUNT(*) FROM job_execution_metrics").fetchone()
+                    result['row_count'] = count[0]
+                    
+                    # Get sample rows
+                    rows = conn.execute("""
+                        SELECT job_id, status, duration_ms, started_at 
+                        FROM job_execution_metrics 
+                        ORDER BY started_at DESC LIMIT 5
+                    """).fetchall()
+                    result['sample_rows'] = [
+                        {'job_id': r[0], 'status': r[1], 'duration_ms': r[2], 'started_at': str(r[3])}
+                        for r in rows
+                    ]
+        except Exception as db_error:
+            result['db_error'] = str(db_error)
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 # =============================================================================
@@ -469,19 +809,25 @@ def get_play_performance(play_id):
     
     Query params:
         hours: Time window (default: 'all', or number like 24, 12, 6, 2)
+    
+    Note: All trades are now in the live buyins table (no archive in new solution).
     """
     try:
         hours = request.args.get('hours', 'all')
         
-        # Build time filter
-        time_filter = ""
+        # Build time filters
+        time_filter_pending = ""
+        time_filter_no_go = ""
+        time_filter_sold = ""
         if hours != 'all':
             hours_int = int(hours)
-            time_filter = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
+            time_filter_pending = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
+            time_filter_no_go = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
+            time_filter_sold = f"AND our_exit_timestamp >= NOW() - INTERVAL {hours_int} HOUR"
         
         with get_mysql() as conn:
             with conn.cursor() as cursor:
-                # Get live trades stats (from DuckDB hot data via live table)
+                # Get active (pending) trades stats
                 cursor.execute(f"""
                     SELECT 
                         COUNT(*) as active_trades,
@@ -491,29 +837,36 @@ def get_play_performance(play_id):
                             ELSE NULL 
                         END) as active_avg_profit
                     FROM follow_the_goat_buyins
-                    WHERE play_id = %s AND our_status = 'pending' {time_filter}
+                    WHERE play_id = %s AND our_status = 'pending' {time_filter_pending}
                 """, [play_id])
                 live_stats = cursor.fetchone()
                 
-                # Get completed trades stats from archive
+                # Get no_go count from live table
+                cursor.execute(f"""
+                    SELECT COUNT(*) as no_go_count
+                    FROM follow_the_goat_buyins
+                    WHERE play_id = %s AND our_status = 'no_go' {time_filter_no_go}
+                """, [play_id])
+                no_go_result = cursor.fetchone()
+                
+                # Get sold/completed trades stats from live table
                 cursor.execute(f"""
                     SELECT 
                         SUM(our_profit_loss) as total_profit_loss,
                         COUNT(CASE WHEN our_profit_loss > 0 THEN 1 END) as winning_trades,
-                        COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades,
-                        COUNT(CASE WHEN our_status = 'no_go' THEN 1 END) as total_no_gos
-                    FROM follow_the_goat_buyins_archive
-                    WHERE play_id = %s {time_filter}
+                        COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades
+                    FROM follow_the_goat_buyins
+                    WHERE play_id = %s AND our_status IN ('sold', 'completed') {time_filter_sold}
                 """, [play_id])
-                archive_stats = cursor.fetchone()
+                sold_stats = cursor.fetchone()
         
         return jsonify({
             'success': True,
             'play_id': play_id,
-            'total_profit_loss': float(archive_stats['total_profit_loss'] or 0),
-            'winning_trades': archive_stats['winning_trades'] or 0,
-            'losing_trades': archive_stats['losing_trades'] or 0,
-            'total_no_gos': archive_stats['total_no_gos'] or 0,
+            'total_profit_loss': float(sold_stats['total_profit_loss'] or 0),
+            'winning_trades': sold_stats['winning_trades'] or 0,
+            'losing_trades': sold_stats['losing_trades'] or 0,
+            'total_no_gos': no_go_result['no_go_count'] or 0,
             'active_trades': live_stats['active_trades'] or 0,
             'active_avg_profit': float(live_stats['active_avg_profit']) if live_stats['active_avg_profit'] else None
         })
@@ -528,17 +881,23 @@ def get_all_plays_performance():
     
     Query params:
         hours: Time window (default: 'all', or number like 24, 12, 6, 2)
+    
+    Note: no_go trades live in the buyins table until cleanup, so we count them
+    from both the live buyins table AND the archive table for accurate totals.
     """
     try:
         hours = request.args.get('hours', 'all')
         
-        # Build time filter
-        time_filter = ""
-        time_filter_archive = ""
+        # Build time filters for different tables
+        time_filter_pending = ""  # For pending trades: use followed_at
+        time_filter_no_go = ""    # For no_go trades: use followed_at (set on insert)
+        time_filter_archive = ""  # For archived trades: use our_exit_timestamp
+        
         if hours != 'all':
             try:
                 hours_int = int(hours)
-                time_filter = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
+                time_filter_pending = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
+                time_filter_no_go = f"AND followed_at >= NOW() - INTERVAL {hours_int} HOUR"
                 time_filter_archive = f"AND our_exit_timestamp >= NOW() - INTERVAL {hours_int} HOUR"
             except ValueError:
                 pass  # Keep empty filters if hours is invalid
@@ -551,7 +910,7 @@ def get_all_plays_performance():
                 cursor.execute("SELECT id FROM follow_the_goat_plays ORDER BY id")
                 play_ids = [row['id'] for row in cursor.fetchall()]
                 
-                # Get live trades stats for all plays
+                # Get live trades stats for all plays (pending trades only)
                 cursor.execute(f"""
                     SELECT 
                         play_id,
@@ -562,36 +921,54 @@ def get_all_plays_performance():
                             ELSE NULL 
                         END) as active_avg_profit
                     FROM follow_the_goat_buyins
-                    WHERE our_status = 'pending' {time_filter}
+                    WHERE our_status = 'pending' {time_filter_pending}
                     GROUP BY play_id
                 """)
                 live_stats = {row['play_id']: row for row in cursor.fetchall()}
                 
-                # Get completed trades stats from archive for all plays
+                # Get no_go counts from live buyins table
+                cursor.execute(f"""
+                    SELECT 
+                        play_id,
+                        COUNT(*) as no_go_count
+                    FROM follow_the_goat_buyins
+                    WHERE our_status = 'no_go' {time_filter_no_go}
+                    GROUP BY play_id
+                """)
+                no_go_stats = {row['play_id']: row['no_go_count'] for row in cursor.fetchall()}
+                
+                # Get sold/completed trades stats from live table (archive is deprecated)
+                time_filter_sold = ""
+                if hours != 'all':
+                    try:
+                        hours_int = int(hours)
+                        time_filter_sold = f"AND our_exit_timestamp >= NOW() - INTERVAL {hours_int} HOUR"
+                    except ValueError:
+                        pass
+                        
                 cursor.execute(f"""
                     SELECT 
                         play_id,
                         SUM(our_profit_loss) as total_profit_loss,
                         COUNT(CASE WHEN our_profit_loss > 0 THEN 1 END) as winning_trades,
-                        COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades,
-                        COUNT(CASE WHEN our_status = 'no_go' THEN 1 END) as total_no_gos
-                    FROM follow_the_goat_buyins_archive
-                    WHERE 1=1 {time_filter_archive}
+                        COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades
+                    FROM follow_the_goat_buyins
+                    WHERE our_status IN ('sold', 'completed') {time_filter_sold}
                     GROUP BY play_id
                 """)
-                archive_stats = {row['play_id']: row for row in cursor.fetchall()}
+                sold_stats = {row['play_id']: row for row in cursor.fetchall()}
         
         # Combine stats for each play - use string keys for JavaScript compatibility
         for play_id in play_ids:
             live = live_stats.get(play_id, {})
-            archive = archive_stats.get(play_id, {})
+            sold = sold_stats.get(play_id, {})
             
             # Use string keys for consistent JavaScript access
             plays_data[str(play_id)] = {
-                'total_profit_loss': float(archive.get('total_profit_loss') or 0),
-                'winning_trades': int(archive.get('winning_trades') or 0),
-                'losing_trades': int(archive.get('losing_trades') or 0),
-                'total_no_gos': int(archive.get('total_no_gos') or 0),
+                'total_profit_loss': float(sold.get('total_profit_loss') or 0),
+                'winning_trades': int(sold.get('winning_trades') or 0),
+                'losing_trades': int(sold.get('losing_trades') or 0),
+                'total_no_gos': no_go_stats.get(play_id, 0),
                 'active_trades': int(live.get('active_trades') or 0),
                 'active_avg_profit': float(live.get('active_avg_profit')) if live.get('active_avg_profit') else None
             }
@@ -642,7 +1019,9 @@ def get_buyins():
             where_clauses.append("our_status = %s" if not use_duckdb else "our_status = ?")
             params.append(status)
         
-        if use_duckdb and hours_int:
+        if hours_int:
+            # Both DuckDB and MySQL support INTERVAL N HOUR syntax
+            # hours_int is validated as integer, so safe for string formatting
             where_clauses.append(f"followed_at >= NOW() - INTERVAL {hours_int} HOUR")
         
         where_str = " AND ".join(where_clauses) if where_clauses else "1=1"
@@ -741,15 +1120,12 @@ def update_buyin(buyin_id):
 
 @app.route('/buyins/<int:buyin_id>', methods=['GET'])
 def get_single_buyin(buyin_id):
-    """Get a single buyin/trade by ID."""
+    """Get a single buyin/trade by ID from the live table only."""
     try:
-        source = request.args.get('source', 'live')  # 'live' or 'archive'
-        
-        table = 'follow_the_goat_buyins' if source == 'live' else 'follow_the_goat_buyins_archive'
-        
+        # Always use live table (archive is deprecated)
         with get_mysql() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(f"SELECT * FROM {table} WHERE id = %s", [buyin_id])
+                cursor.execute("SELECT * FROM follow_the_goat_buyins WHERE id = %s", [buyin_id])
                 buyin = cursor.fetchone()
         
         if not buyin:
@@ -760,7 +1136,7 @@ def get_single_buyin(buyin_id):
             if buyin.get(key) and hasattr(buyin[key], 'strftime'):
                 buyin[key] = buyin[key].strftime('%Y-%m-%d %H:%M:%S')
         
-        return jsonify({'success': True, 'buyin': buyin, 'source': source})
+        return jsonify({'success': True, 'buyin': buyin, 'source': 'live'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
@@ -920,16 +1296,19 @@ def get_price_points():
             start_datetime = start_dt.strftime('%Y-%m-%d %H:%M:%S')
         
         prices = []
+        source = 'none'
         
         # Try TradingDataEngine first (in-memory, zero locks)
         try:
             engine = get_trading_engine()
             if engine._running:
+                # Use >= and <= for inclusive range (BETWEEN can be ambiguous with timezone)
                 results = engine.read("""
                     SELECT ts, price 
                     FROM prices 
                     WHERE token = ? 
-                      AND ts BETWEEN ? AND ?
+                      AND ts >= ? 
+                      AND ts <= ?
                     ORDER BY ts ASC
                 """, [token, start_datetime, end_datetime])
                 
@@ -937,13 +1316,15 @@ def get_price_points():
                     {'x': row['ts'].strftime('%Y-%m-%d %H:%M:%S'), 'y': float(row['price'])}
                     for row in results
                 ]
+                if prices:
+                    source = 'engine'
         except:
             pass
         
         # Fallback to file-based DuckDB if engine not available or returned no data
         if not prices:
             import duckdb
-            legacy_db = PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb"
+            legacy_db = DATABASES.get("prices")
             
             try:
                 with duckdb.connect(str(legacy_db), read_only=True) as conn:
@@ -959,12 +1340,51 @@ def get_price_points():
                     {'x': row[0].strftime('%Y-%m-%d %H:%M:%S'), 'y': float(row[1])}
                     for row in result
                 ]
+                if prices:
+                    source = 'duckdb'
             except:
+                pass
+        
+        # Fallback to MySQL for historical data (older than 24 hours)
+        if not prices:
+            try:
+                from core.database import get_mysql
+                
+                # Check if we're requesting historical data (more than 24h ago)
+                end_dt = datetime.strptime(end_datetime, '%Y-%m-%d %H:%M:%S')
+                cutoff = datetime.now() - timedelta(hours=24)
+                
+                # Map token to coin_id (SOL=5, BTC=6, ETH=7)
+                token_to_coin_id = {'SOL': 5, 'BTC': 6, 'ETH': 7}
+                coin_id = token_to_coin_id.get(token, 5)
+                
+                if end_dt < cutoff:
+                    # Historical data - fetch from MySQL
+                    with get_mysql() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                SELECT created_at, value
+                                FROM price_points
+                                WHERE coin_id = %s
+                                  AND created_at BETWEEN %s AND %s
+                                ORDER BY created_at ASC
+                            """, [coin_id, start_datetime, end_datetime])
+                            
+                            rows = cursor.fetchall()
+                            prices = [
+                                {'x': row['created_at'].strftime('%Y-%m-%d %H:%M:%S'), 'y': float(row['value'])}
+                                for row in rows
+                            ]
+                            if prices:
+                                source = 'mysql'
+            except Exception as e:
+                logger.debug(f"MySQL fallback failed: {e}")
                 pass
         
         return jsonify({
             'prices': prices,
-            'count': len(prices)
+            'count': len(prices),
+            'source': source
         })
     except Exception as e:
         return jsonify({
@@ -1008,7 +1428,7 @@ def get_latest_prices():
         # Fallback to file-based DuckDB
         if not prices:
             import duckdb
-            legacy_db = PROJECT_ROOT / "000data_feeds" / "1_jupiter_get_prices" / "prices.duckdb"
+            legacy_db = DATABASES.get("prices")
             
             with duckdb.connect(str(legacy_db), read_only=True) as conn:
                 result = conn.execute("""
@@ -1564,7 +1984,7 @@ def admin_sync_from_mysql():
                     try:
                         conn.execute(f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})", values)
                     except Exception as e:
-                        print(f"Error inserting row into {table}: {e}")
+                        logger.error(f"Error inserting row into {table}: {e}")
                 
                 results[table] = {'synced': len(rows)}
         
@@ -1687,7 +2107,7 @@ def create_pattern_project():
                     VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, [new_id, name, description])
         except Exception as e:
-            print(f"DuckDB write failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB write failed (MySQL succeeded): {e}")
         
         return jsonify({
             'success': True,
@@ -1700,12 +2120,13 @@ def create_pattern_project():
 
 @app.route('/patterns/projects/<int:project_id>', methods=['GET'])
 def get_pattern_project(project_id):
-    """Get a single pattern config project by ID."""
+    """Get a single pattern config project by ID with all its filters."""
     try:
         ensure_pattern_tables_mysql()
         
         with get_mysql() as conn:
             with conn.cursor() as cursor:
+                # Get project
                 cursor.execute("""
                     SELECT 
                         p.*,
@@ -1717,19 +2138,40 @@ def get_pattern_project(project_id):
                     GROUP BY p.id
                 """, [project_id])
                 project = cursor.fetchone()
+                
+                if not project:
+                    return jsonify({'success': False, 'error': 'Project not found'}), 404
+                
+                # Get all filters for this project
+                cursor.execute("""
+                    SELECT * FROM pattern_config_filters 
+                    WHERE project_id = %s
+                    ORDER BY created_at DESC
+                """, [project_id])
+                filters = cursor.fetchall()
         
-        if not project:
-            return jsonify({'success': False, 'error': 'Project not found'}), 404
-        
-        # Convert datetime objects
+        # Convert datetime objects for project
         if project.get('created_at'):
             project['created_at'] = project['created_at'].strftime('%Y-%m-%d %H:%M:%S')
         if project.get('updated_at'):
             project['updated_at'] = project['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
         
+        # Convert datetime objects for filters
+        for f in filters:
+            if f.get('created_at'):
+                f['created_at'] = f['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+            if f.get('updated_at'):
+                f['updated_at'] = f['updated_at'].strftime('%Y-%m-%d %H:%M:%S')
+            # Convert Decimal to float for JSON serialization
+            if f.get('from_value') is not None:
+                f['from_value'] = float(f['from_value'])
+            if f.get('to_value') is not None:
+                f['to_value'] = float(f['to_value'])
+        
         return jsonify({
             'success': True,
-            'project': project
+            'project': project,
+            'filters': filters
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1758,7 +2200,7 @@ def delete_pattern_project(project_id):
                 duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE project_id = ?", [project_id])
                 duckdb_conn.execute("DELETE FROM pattern_config_projects WHERE id = ?", [project_id])
         except Exception as e:
-            print(f"DuckDB delete failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB delete failed (MySQL succeeded): {e}")
         
         if project_deleted == 0:
             return jsonify({'success': False, 'error': 'Project not found'}), 404
@@ -1858,7 +2300,7 @@ def create_pattern_filter():
                 """, [new_id, project_id, name, section, minute, field_name, field_column,
                       from_value, to_value, include_null, play_id, is_active])
         except Exception as e:
-            print(f"DuckDB write failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB write failed (MySQL succeeded): {e}")
         
         return jsonify({
             'success': True,
@@ -1916,7 +2358,7 @@ def update_pattern_filter(filter_id):
                     duck_values
                 )
         except Exception as e:
-            print(f"DuckDB update failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB update failed (MySQL succeeded): {e}")
         
         if updated == 0:
             return jsonify({'success': False, 'error': 'Filter not found'}), 404
@@ -1943,7 +2385,7 @@ def delete_pattern_filter(filter_id):
             with get_duckdb("central") as duckdb_conn:
                 duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE id = ?", [filter_id])
         except Exception as e:
-            print(f"DuckDB delete failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB delete failed (MySQL succeeded): {e}")
         
         if deleted == 0:
             return jsonify({'success': False, 'error': 'Filter not found'}), 404
@@ -2405,6 +2847,342 @@ def get_trail_gain_distribution():
 
 
 # =============================================================================
+# FILTER ANALYSIS ENDPOINTS (Auto-filter suggestions dashboard)
+# =============================================================================
+
+# Section display names for filter analysis
+FILTER_SECTION_NAMES = {
+    'price_movements': 'Price Movements',
+    'order_book_signals': 'Order Book',
+    'transactions': 'Transactions',
+    'whale_activity': 'Whale Activity',
+    'patterns': 'Patterns',
+    'second_prices': 'Second Prices',
+}
+
+
+def ensure_filter_tables_mysql():
+    """Ensure filter analysis tables exist in MySQL."""
+    with get_mysql() as conn:
+        with conn.cursor() as cursor:
+            # Auto filter settings table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auto_filter_settings (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    setting_key VARCHAR(50) UNIQUE NOT NULL,
+                    setting_value VARCHAR(100) NOT NULL,
+                    description VARCHAR(255),
+                    setting_type ENUM('number', 'decimal', 'boolean') DEFAULT 'decimal',
+                    min_value DECIMAL(10,4) DEFAULT NULL,
+                    max_value DECIMAL(10,4) DEFAULT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_key (setting_key)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """)
+            
+            # Insert defaults if not exist
+            cursor.execute("""
+                INSERT IGNORE INTO auto_filter_settings (setting_key, setting_value, description, setting_type, min_value, max_value) VALUES
+                ('good_trade_threshold', '0.3', 'Minimum % gain for a trade to be considered good.', 'decimal', 0.1, 5.0),
+                ('analysis_hours', '24', 'Hours of historical trade data to analyze.', 'number', 1, 168),
+                ('min_filters_in_combo', '1', 'Minimum filters required in a combination.', 'number', 1, 10),
+                ('max_filters_in_combo', '6', 'Maximum filters to combine.', 'number', 2, 15),
+                ('min_good_trades_kept_pct', '50', 'Min % of good trades a single filter must keep.', 'number', 10, 100),
+                ('min_bad_trades_removed_pct', '10', 'Min % of bad trades a single filter must remove.', 'number', 5, 100),
+                ('combo_min_good_kept_pct', '25', 'Min % of good trades a combination must keep.', 'number', 5, 100),
+                ('combo_min_improvement', '1.0', 'Min % improvement to add another filter.', 'decimal', 0.1, 10.0)
+            """)
+        conn.commit()
+
+
+@app.route('/filter-analysis/dashboard', methods=['GET'])
+def get_filter_analysis_dashboard():
+    """Get all data for the filter analysis dashboard."""
+    try:
+        ensure_filter_tables_mysql()
+        
+        result = {
+            'success': True,
+            'summary': {},
+            'suggestions': [],
+            'combinations': [],
+            'minute_distribution': [],
+            'scheduler_runs': [],
+            'filter_consistency': [],
+            'trend_chart_data': [],
+            'scheduler_stats': {'runs_today': 0, 'last_run': None, 'avg_filters': 0},
+            'settings': [],
+            'rolling_avgs': {}
+        }
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                # Get auto filter settings
+                try:
+                    cursor.execute("SELECT * FROM auto_filter_settings ORDER BY id")
+                    result['settings'] = cursor.fetchall()
+                except:
+                    pass
+                
+                # Summary statistics
+                try:
+                    cursor.execute("""
+                        SELECT COUNT(*) as total_filters, 
+                            ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept,
+                            ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                            ROUND(MAX(bad_trades_removed_pct), 1) as best_bad_removed,
+                            MAX(good_trades_before) as total_good_trades, 
+                            MAX(bad_trades_before) as total_bad_trades,
+                            MAX(created_at) as last_updated, 
+                            MAX(analysis_hours) as analysis_hours
+                        FROM filter_reference_suggestions
+                    """)
+                    summary = cursor.fetchone()
+                    if summary:
+                        if summary.get('last_updated'):
+                            summary['last_updated'] = summary['last_updated'].strftime('%Y-%m-%d %H:%M:%S')
+                        result['summary'] = summary
+                except:
+                    pass
+                
+                # Minute distribution
+                try:
+                    cursor.execute("""
+                        SELECT minute_analyzed, COUNT(*) as filter_count, 
+                            ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                            ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept
+                        FROM filter_reference_suggestions 
+                        GROUP BY minute_analyzed 
+                        ORDER BY avg_bad_removed DESC
+                    """)
+                    result['minute_distribution'] = cursor.fetchall()
+                except:
+                    pass
+                
+                # All suggestions with field info
+                try:
+                    cursor.execute("""
+                        SELECT frs.*, ffc.section, ffc.field_name, ffc.value_type, ffc.description
+                        FROM filter_reference_suggestions frs 
+                        LEFT JOIN filter_fields_catalog ffc ON frs.filter_field_id = ffc.id
+                        ORDER BY bad_trades_removed_pct DESC
+                    """)
+                    suggestions = cursor.fetchall()
+                    for s in suggestions:
+                        if s.get('created_at'):
+                            s['created_at'] = s['created_at'].strftime('%Y-%m-%d %H:%M:%S')
+                        # Convert Decimal to float
+                        for key in ['from_value', 'to_value', 'good_trades_kept_pct', 'bad_trades_removed_pct']:
+                            if s.get(key) is not None:
+                                s[key] = float(s[key])
+                    result['suggestions'] = suggestions
+                except:
+                    pass
+                
+                # Filter combinations
+                try:
+                    cursor.execute("""
+                        SELECT *, COALESCE(minute_analyzed, 0) as minute_analyzed 
+                        FROM filter_combinations 
+                        ORDER BY bad_trades_removed_pct DESC
+                    """)
+                    combinations = cursor.fetchall()
+                    for combo in combinations:
+                        for key in ['good_trades_kept_pct', 'bad_trades_removed_pct']:
+                            if combo.get(key) is not None:
+                                combo[key] = float(combo[key])
+                        # Get filter details
+                        filter_ids = json.loads(combo.get('filter_ids', '[]') or '[]')
+                        if filter_ids:
+                            placeholders = ','.join(['%s'] * len(filter_ids))
+                            cursor.execute(f"""
+                                SELECT id, column_name, from_value, to_value 
+                                FROM filter_reference_suggestions 
+                                WHERE id IN ({placeholders})
+                            """, filter_ids)
+                            details = cursor.fetchall()
+                            combo['filter_details'] = {d['id']: d for d in details}
+                        else:
+                            combo['filter_details'] = {}
+                    result['combinations'] = combinations
+                except:
+                    pass
+                
+                # Recent scheduler runs
+                try:
+                    cursor.execute("""
+                        SELECT * FROM filter_scheduler_runs 
+                        ORDER BY run_timestamp DESC 
+                        LIMIT 20
+                    """)
+                    runs = cursor.fetchall()
+                    for run in runs:
+                        if run.get('run_timestamp'):
+                            run['run_timestamp'] = run['run_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+                        if run.get('completed_at'):
+                            run['completed_at'] = run['completed_at'].strftime('%Y-%m-%d %H:%M:%S')
+                        for key in ['best_bad_removed_pct', 'best_good_kept_pct']:
+                            if run.get(key) is not None:
+                                run[key] = float(run[key])
+                    result['scheduler_runs'] = runs
+                except:
+                    pass
+                
+                # Filter consistency (last 24 hours)
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            fph.filter_column,
+                            COUNT(*) as total_runs,
+                            SUM(fph.is_in_best_combination) as times_in_best_combo,
+                            ROUND(SUM(fph.is_in_best_combination) / COUNT(*) * 100, 1) as consistency_pct,
+                            ROUND(AVG(fph.bad_trades_removed_pct), 2) as avg_bad_removed,
+                            ROUND(AVG(fph.good_trades_kept_pct), 2) as avg_good_kept,
+                            ROUND(AVG(fph.effectiveness_score), 2) as avg_effectiveness,
+                            MAX(fph.run_timestamp) as last_seen,
+                            (SELECT minute_analyzed FROM filter_performance_history 
+                             WHERE filter_column = fph.filter_column 
+                             ORDER BY run_timestamp DESC LIMIT 1) as latest_minute,
+                            (SELECT from_value FROM filter_performance_history 
+                             WHERE filter_column = fph.filter_column 
+                             ORDER BY run_timestamp DESC LIMIT 1) as latest_from,
+                            (SELECT to_value FROM filter_performance_history 
+                             WHERE filter_column = fph.filter_column 
+                             ORDER BY run_timestamp DESC LIMIT 1) as latest_to
+                        FROM filter_performance_history fph
+                        WHERE fph.run_timestamp >= NOW() - INTERVAL 24 HOUR
+                        GROUP BY fph.filter_column
+                        HAVING total_runs >= 2
+                        ORDER BY consistency_pct DESC, avg_effectiveness DESC
+                        LIMIT 30
+                    """)
+                    consistency = cursor.fetchall()
+                    for c in consistency:
+                        if c.get('last_seen'):
+                            c['last_seen'] = c['last_seen'].strftime('%Y-%m-%d %H:%M:%S')
+                        for key in ['consistency_pct', 'avg_bad_removed', 'avg_good_kept', 'avg_effectiveness', 'latest_from', 'latest_to']:
+                            if c.get(key) is not None:
+                                c[key] = float(c[key])
+                    result['filter_consistency'] = consistency
+                except:
+                    pass
+                
+                # Trend chart data
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            DATE_FORMAT(run_timestamp, '%Y-%m-%d %H:%i') as time_bucket,
+                            ROUND(AVG(bad_trades_removed_pct), 2) as avg_bad_removed,
+                            ROUND(AVG(good_trades_kept_pct), 2) as avg_good_kept,
+                            ROUND(AVG(effectiveness_score), 2) as avg_effectiveness,
+                            COUNT(DISTINCT filter_column) as filter_count
+                        FROM filter_performance_history
+                        WHERE run_timestamp >= NOW() - INTERVAL 24 HOUR
+                        GROUP BY DATE_FORMAT(run_timestamp, '%Y-%m-%d %H:%i')
+                        ORDER BY time_bucket ASC
+                    """)
+                    trend_data = cursor.fetchall()
+                    for t in trend_data:
+                        for key in ['avg_bad_removed', 'avg_good_kept', 'avg_effectiveness']:
+                            if t.get(key) is not None:
+                                t[key] = float(t[key])
+                    result['trend_chart_data'] = trend_data
+                except:
+                    pass
+                
+                # Scheduler stats
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            COUNT(*) as runs_today,
+                            MAX(run_timestamp) as last_run,
+                            ROUND(AVG(total_filters_analyzed)) as avg_filters
+                        FROM filter_scheduler_runs
+                        WHERE DATE(run_timestamp) = CURDATE()
+                    """)
+                    stats = cursor.fetchone()
+                    if stats:
+                        if stats.get('last_run'):
+                            stats['last_run'] = stats['last_run'].strftime('%Y-%m-%d %H:%M:%S')
+                        result['scheduler_stats'] = stats
+                except:
+                    pass
+                
+                # Rolling averages
+                try:
+                    cursor.execute("""
+                        SELECT 
+                            filter_column,
+                            ROUND(AVG(bad_trades_removed_pct), 2) as rolling_avg
+                        FROM filter_performance_history
+                        WHERE run_timestamp >= NOW() - INTERVAL 6 HOUR
+                        GROUP BY filter_column
+                    """)
+                    for r in cursor.fetchall():
+                        result['rolling_avgs'][r['filter_column']] = float(r['rolling_avg']) if r['rolling_avg'] else 0
+                except:
+                    pass
+        
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'success': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+
+@app.route('/filter-analysis/settings', methods=['GET'])
+def get_filter_settings():
+    """Get auto filter settings."""
+    try:
+        ensure_filter_tables_mysql()
+        
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM auto_filter_settings ORDER BY id")
+                settings = cursor.fetchall()
+        
+        return jsonify({'success': True, 'settings': settings})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/filter-analysis/settings', methods=['POST'])
+def save_filter_settings():
+    """Save auto filter settings."""
+    try:
+        ensure_filter_tables_mysql()
+        data = request.get_json() or {}
+        settings = data.get('settings', {})
+        
+        errors = []
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                for key, value in settings.items():
+                    try:
+                        cursor.execute("""
+                            UPDATE auto_filter_settings 
+                            SET setting_value = %s 
+                            WHERE setting_key = %s
+                        """, [str(value), key])
+                    except Exception as e:
+                        errors.append(f"{key}: {str(e)}")
+            conn.commit()
+            
+            # Get updated settings
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT setting_key, setting_value FROM auto_filter_settings")
+                current = {r['setting_key']: r['setting_value'] for r in cursor.fetchall()}
+        
+        return jsonify({
+            'success': True,
+            'message': 'Settings saved',
+            'errors': errors,
+            'current_settings': current
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
 # GENERIC QUERY ENDPOINT
 # =============================================================================
 
@@ -2502,6 +3280,346 @@ def generic_query():
             'results': rows,
             'count': len(rows),
             'source': actual_source
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# TRAIL DATA FOR BUYIN
+# =============================================================================
+
+@app.route('/trail/buyin/<int:buyin_id>', methods=['GET'])
+def get_trail_for_buyin(buyin_id: int):
+    """
+    Get 15-minute trail data for a specific buyin.
+    
+    Returns 15 rows from buyin_trail_minutes table (one per minute).
+    
+    Query params:
+    - source: 'duckdb' or 'mysql' (default: duckdb)
+    """
+    source = request.args.get('source', 'duckdb')
+    
+    try:
+        if source == 'mysql':
+            with get_mysql() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT *
+                        FROM buyin_trail_minutes
+                        WHERE buyin_id = %s
+                        ORDER BY minute ASC
+                    """, [buyin_id])
+                    columns = [col[0] for col in cursor.description]
+                    rows = []
+                    for row in cursor.fetchall():
+                        rows.append(dict(zip(columns, row)))
+        else:
+            with get_duckdb('central') as conn:
+                result = conn.execute("""
+                    SELECT *
+                    FROM buyin_trail_minutes
+                    WHERE buyin_id = ?
+                    ORDER BY minute ASC
+                """, [buyin_id]).fetchall()
+                
+                if result:
+                    columns = [desc[0] for desc in conn.execute("DESCRIBE buyin_trail_minutes").fetchall()]
+                    # Get column names from the executed query
+                    desc_result = conn.execute("""
+                        SELECT * FROM buyin_trail_minutes WHERE buyin_id = ? LIMIT 1
+                    """, [buyin_id])
+                    columns = [col[0] for col in desc_result.description]
+                    rows = [dict(zip(columns, row)) for row in result]
+                else:
+                    rows = []
+        
+        return jsonify({
+            'success': True,
+            'buyin_id': buyin_id,
+            'trail_data': rows,
+            'row_count': len(rows),
+            'source': source
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'trace': traceback.format_exc()
+        }), 500
+
+
+# =============================================================================
+# RECENT TRADES (Live Feed)
+# =============================================================================
+
+@app.route('/recent_trades', methods=['GET'])
+def get_recent_trades():
+    """
+    Get recent buy trades from sol_stablecoin_trades.
+    Used for the live trade feed page.
+    
+    Query params:
+    - minutes: Time window in minutes (default: 5)
+    - limit: Max records (default: 100)
+    - direction: 'buy', 'sell', or 'all' (default: 'buy')
+    
+    Data sources (in order of preference):
+    1. TradingDataEngine (in-memory, fastest)
+    2. File-based DuckDB (fallback)
+    3. Webhook API directly (fallback when local is empty)
+    """
+    import requests as req
+    
+    try:
+        minutes = int(request.args.get('minutes', 5))
+        limit = int(request.args.get('limit', 100))
+        direction = request.args.get('direction', 'buy')
+        
+        # Build direction filter
+        direction_filter = ""
+        if direction in ('buy', 'sell'):
+            direction_filter = f"AND direction = '{direction}'"
+        
+        # Try TradingDataEngine first for zero-lock reads
+        trades = None
+        total_count = 0
+        source = 'duckdb'
+        
+        try:
+            engine = get_trading_engine()
+            if engine._running:
+                # Get total count first
+                count_query = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM sol_stablecoin_trades
+                    WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                    {direction_filter}
+                """
+                count_result = engine.read(count_query, [])
+                if count_result:
+                    total_count = count_result[0].get('cnt', 0)
+                
+                # Get limited trades
+                query = f"""
+                    SELECT id, wallet_address, signature, trade_timestamp,
+                           stablecoin_amount, sol_amount, price, direction, perp_direction
+                    FROM sol_stablecoin_trades
+                    WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                    {direction_filter}
+                    ORDER BY trade_timestamp DESC
+                    LIMIT {limit}
+                """
+                trades = engine.read(query, [])
+                source = 'engine'
+                
+                # If engine has trades, return them
+                if trades and len(trades) > 0:
+                    for trade in trades:
+                        if trade.get('trade_timestamp') and hasattr(trade['trade_timestamp'], 'isoformat'):
+                            trade['trade_timestamp'] = trade['trade_timestamp'].isoformat()
+                    
+                    return jsonify({
+                        'trades': trades,
+                        'count': len(trades),
+                        'total_count': total_count,
+                        'source': source,
+                        'timestamp': datetime.now().isoformat()
+                    })
+        except Exception as e:
+            logger.debug(f"Engine query failed: {e}")
+        
+        # Fallback to file-based DuckDB
+        if trades is None or len(trades) == 0:
+            try:
+                with get_duckdb("central") as conn:
+                    # Get total count
+                    count_result = conn.execute(f"""
+                        SELECT COUNT(*) as cnt
+                        FROM sol_stablecoin_trades
+                        WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                        {direction_filter}
+                    """).fetchone()
+                    total_count = count_result[0] if count_result else 0
+                    
+                    if total_count > 0:
+                        # Get limited trades
+                        result = conn.execute(f"""
+                            SELECT id, wallet_address, signature, trade_timestamp,
+                                   stablecoin_amount, sol_amount, price, direction, perp_direction
+                            FROM sol_stablecoin_trades
+                            WHERE trade_timestamp >= NOW() - INTERVAL {minutes} MINUTE
+                            {direction_filter}
+                            ORDER BY trade_timestamp DESC
+                            LIMIT {limit}
+                        """).fetchall()
+                        
+                        columns = ['id', 'wallet_address', 'signature', 'trade_timestamp',
+                                  'stablecoin_amount', 'sol_amount', 'price', 'direction', 'perp_direction']
+                        trades = [dict(zip(columns, row)) for row in result]
+                        source = 'file_duckdb'
+                        
+                        for trade in trades:
+                            if trade.get('trade_timestamp') and hasattr(trade['trade_timestamp'], 'isoformat'):
+                                trade['trade_timestamp'] = trade['trade_timestamp'].isoformat()
+                        
+                        return jsonify({
+                            'trades': trades,
+                            'count': len(trades),
+                            'total_count': total_count,
+                            'source': source,
+                            'timestamp': datetime.now().isoformat()
+                        })
+            except Exception as e:
+                logger.debug(f"File DuckDB query failed: {e}")
+        
+        # FINAL FALLBACK: Query webhook directly (same source as Transaction Flow)
+        # This ensures Trade Feed works even when local sync is behind
+        try:
+            logger.info("Local DuckDB empty, falling back to webhook API directly")
+            webhook_response = req.get(
+                'http://quicknode.smz.dk/api/trades',
+                params={'limit': limit * 2},  # Get more to filter by direction
+                timeout=5
+            )
+            
+            if webhook_response.status_code == 200:
+                data = webhook_response.json()
+                if data.get('success'):
+                    all_trades = data.get('results', [])
+                    
+                    # Filter by direction and time window
+                    now = datetime.now()
+                    filtered_trades = []
+                    for trade in all_trades:
+                        # Apply direction filter
+                        if direction != 'all':
+                            trade_direction = (trade.get('direction') or '').lower()
+                            if trade_direction != direction:
+                                continue
+                        
+                        # Apply time filter
+                        ts_str = trade.get('trade_timestamp', '')
+                        if ts_str:
+                            try:
+                                # Parse ISO timestamp
+                                ts_str = ts_str.replace('Z', '').replace('T', ' ')[:19]
+                                ts = datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                                if (now - ts).total_seconds() > minutes * 60:
+                                    continue
+                            except:
+                                pass
+                        
+                        filtered_trades.append({
+                            'id': trade.get('id'),
+                            'wallet_address': trade.get('wallet_address'),
+                            'signature': trade.get('signature'),
+                            'trade_timestamp': trade.get('trade_timestamp'),
+                            'stablecoin_amount': trade.get('stablecoin_amount'),
+                            'sol_amount': trade.get('sol_amount'),
+                            'price': trade.get('price'),
+                            'direction': trade.get('direction'),
+                            'perp_direction': trade.get('perp_direction')
+                        })
+                        
+                        if len(filtered_trades) >= limit:
+                            break
+                    
+                    return jsonify({
+                        'trades': filtered_trades,
+                        'count': len(filtered_trades),
+                        'total_count': len(filtered_trades),
+                        'source': 'webhook_direct',
+                        'timestamp': datetime.now().isoformat()
+                    })
+        except Exception as e:
+            logger.error(f"Webhook fallback failed: {e}")
+        
+        # If all sources fail, return empty
+        return jsonify({
+            'trades': [],
+            'count': 0,
+            'total_count': 0,
+            'source': 'none',
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tracked_wallets', methods=['GET'])
+def get_tracked_wallets():
+    """
+    Get all wallets being tracked by active plays.
+    Returns wallet addresses extracted from cashe_wallets_settings JSON field.
+    Also includes perp_mode for each play to match follow_the_goat.py trigger logic.
+    """
+    try:
+        wallets_by_play = {}
+        all_wallets = set()
+        
+        # Get active plays with cached wallet settings AND perp config
+        with get_mysql() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, name, cashe_wallets_settings, tricker_on_perp
+                    FROM follow_the_goat_plays
+                    WHERE is_active = 1
+                """)
+                plays = cursor.fetchall()
+        
+        for play in plays:
+            play_id = play['id']
+            play_name = play['name']
+            cache_settings = play.get('cashe_wallets_settings')
+            perp_config_raw = play.get('tricker_on_perp')
+            
+            # Parse perp_mode (matches follow_the_goat.py logic)
+            perp_mode = 'any'
+            if perp_config_raw:
+                perp_config = perp_config_raw
+                if isinstance(perp_config, str):
+                    try:
+                        perp_config = json.loads(perp_config)
+                    except json.JSONDecodeError:
+                        perp_config = None
+                
+                if isinstance(perp_config, dict):
+                    mode = perp_config.get('mode', 'any')
+                    if isinstance(mode, str) and mode.lower() in ('long_only', 'short_only', 'any'):
+                        perp_mode = mode.lower()
+            
+            wallets = []
+            if cache_settings:
+                # Parse JSON if string
+                if isinstance(cache_settings, str):
+                    try:
+                        cache_settings = json.loads(cache_settings)
+                    except json.JSONDecodeError:
+                        continue
+                
+                # Extract wallets from settings
+                if isinstance(cache_settings, dict):
+                    wallets = cache_settings.get('wallets', [])
+            
+            if wallets:
+                wallets_by_play[play_id] = {
+                    'play_id': play_id,
+                    'play_name': play_name,
+                    'wallets': wallets,
+                    'count': len(wallets),
+                    'perp_mode': perp_mode  # Include perp filter setting
+                }
+                all_wallets.update(wallets)
+        
+        return jsonify({
+            'plays': wallets_by_play,
+            'all_wallets': list(all_wallets),
+            'total_wallet_count': len(all_wallets),
+            'play_count': len(wallets_by_play),
+            'timestamp': datetime.now().isoformat()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500

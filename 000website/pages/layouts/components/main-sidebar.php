@@ -62,6 +62,14 @@
                             <li class="slide__category"><span class="category-name">Features</span></li>
                             <!-- End::slide__category -->
 
+                            <!-- Trades -->
+                            <li class="slide">
+                                <a href="/pages/features/trades/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><line x1="128" y1="24" x2="128" y2="48" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="128" y1="208" x2="128" y2="232" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="232" y1="128" x2="208" y2="128" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="48" y1="128" x2="24" y2="128" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><circle cx="128" cy="128" r="88" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="128" y1="128" x2="167.6" y2="88.4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="104" y1="128" x2="128" y2="128" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">Trades</span>
+                                </a>
+                            </li>
+
                             <!-- Patterns -->
                             <li class="slide">
                                 <a href="/pages/features/patterns/" class="side-menu__item">
@@ -70,6 +78,31 @@
                                 </a>
                             </li>
 
+                            <!-- Filter Analysis -->
+                            <li class="slide">
+                                <a href="/pages/features/filter-analysis/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><polygon points="40 56 216 56 136 152 136 208 120 216 120 152 40 56" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16" opacity="0.2"/><polygon points="40 56 216 56 136 152 136 208 120 216 120 152 40 56" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">Filter Analysis</span>
+                                </a>
+                            </li>
+
+                            <!-- Trade Feed -->
+                            <li class="slide">
+                                <a href="/pages/features/trade-feed/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><line x1="40" y1="128" x2="216" y2="128" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><polyline points="144 56 216 128 144 200" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="40" y1="56" x2="120" y2="56" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="40" y1="200" x2="120" y2="200" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">Trade Feed</span>
+                                    <span class="badge bg-success-transparent ms-auto">Live</span>
+                                </a>
+                            </li>
+
+                            <!-- Scheduler Metrics -->
+                            <li class="slide">
+                                <a href="/pages/features/scheduler-metrics/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><circle cx="128" cy="128" r="96" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16" opacity="0.2"/><circle cx="128" cy="128" r="96" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><polyline points="128 72 128 128 184 128" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">Scheduler Metrics</span>
+                                    <span class="badge bg-info-transparent ms-auto">New</span>
+                                </a>
+                            </li>
 
 
                               <!-- Start::slide__category -->

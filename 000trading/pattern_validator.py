@@ -26,12 +26,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import sys
 PROJECT_ROOT = Path(__file__).parent.parent
+MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(MODULE_DIR))
 
 from core.database import get_duckdb, get_mysql
 
-# Import trail generator
-from _000trading.trail_generator import (
+# Import trail generator (direct import after adding module dir to path)
+from trail_generator import (
     generate_trail_payload,
     TrailError,
     make_json_serializable,
@@ -101,6 +103,8 @@ SECTION_PREFIX_MAP = {
     "wh_": "whale_activity",
     "sp_": "second_prices",
     "pat_": "patterns",
+    "btc_": "btc_price_movements",
+    "eth_": "eth_price_movements",
 }
 
 
@@ -452,20 +456,23 @@ def evaluate_stage(
 # =============================================================================
 
 def _fetch_project_filters(project_id: int) -> List[Dict[str, Any]]:
-    """Fetch active filters for a pattern config project from the database."""
+    """Fetch active filters for a pattern config project from DuckDB (fast).
+    
+    Uses DuckDB for speed - MySQL is only for storage.
+    Filter data is synced from MySQL to DuckDB by the scheduler.
+    """
     try:
-        with get_mysql() as conn:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
+        with get_duckdb("central") as conn:
+            result = conn.execute("""
                 SELECT id, name, section, minute, field_name, field_column, 
                        from_value, to_value, is_active
                 FROM pattern_config_filters
-                WHERE project_id = %s AND is_active = 1
+                WHERE project_id = ? AND is_active = 1
                 ORDER BY id ASC
-            """, (project_id,))
-            filters = cursor.fetchall()
-            cursor.close()
-            return filters
+            """, [project_id])
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
     except Exception as e:
         logger.error("Failed to fetch project filters for project_id=%s: %s", project_id, e)
         return []

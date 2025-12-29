@@ -4,6 +4,9 @@
  * Migrated to use DuckDBClient API
  */
 
+// Set timezone to UTC (server time) - never use browser time
+date_default_timezone_set('UTC');
+
 // --- Load DuckDB Client ---
 require_once __DIR__ . '/../../../includes/DuckDBClient.php';
 // API Base URL - uses PHP proxy to reach Flask API on server
@@ -32,28 +35,17 @@ $api_available = $client->isAvailable();
 $trade = null;
 $play = null;
 $error_message = '';
-$trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
+$trade_table_name = 'follow_the_goat_buyins';  // Archive is deprecated
 
 if (!$api_available) {
     $error_message = 'API server is not available. Please ensure master.py is running.';
 } else {
-    // Fetch trade details via API
-    $buyin_result = $client->getSingleBuyin($trade_id, $source);
+    // Fetch trade details via API (always from live table)
+    $buyin_result = $client->getSingleBuyin($trade_id);
     
     if ($buyin_result && isset($buyin_result['buyin'])) {
         $trade = $buyin_result['buyin'];
-        $source = $buyin_result['source'] ?? $source;
-        $trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
-    } else {
-        // Try the other source
-        $alt_source = $source === 'live' ? 'archive' : 'live';
-        $buyin_result = $client->getSingleBuyin($trade_id, $alt_source);
-        
-        if ($buyin_result && isset($buyin_result['buyin'])) {
-            $trade = $buyin_result['buyin'];
-            $source = $buyin_result['source'] ?? $alt_source;
-            $trade_table_name = 'follow_the_goat_buyins' . ($source === 'archive' ? '_archive' : '');
-        }
+        $source = 'live';
     }
     
     if (!$trade) {
@@ -69,14 +61,149 @@ if (!$api_available) {
     // Fetch play details via API
     $play_result = $client->getPlay($play_id);
     $play = $play_result['play'] ?? null;
+    
+    // Fetch price checks from API (use 'all' to get all historical checks)
+    $price_checks_result = $client->getPriceChecks($trade_id, 'all', 1000);
+    $price_checks = [];
+    $price_checks_source = 'live';
+    
+    if ($price_checks_result && isset($price_checks_result['price_checks'])) {
+        $price_checks = $price_checks_result['price_checks'];
+        $price_checks_source = $price_checks_result['source'] ?? 'live';
+        
+        // Sort by checked_at ASC for chronological timeline display
+        usort($price_checks, function($a, $b) {
+            $timeA = strtotime($a['checked_at'] ?? '1970-01-01');
+            $timeB = strtotime($b['checked_at'] ?? '1970-01-01');
+            return $timeA <=> $timeB; // ASC order
+        });
+    }
 }
 
-// Price checks and filter results - would need API expansion
-// For now, use empty arrays (these features can be added later via API)
-$price_checks = [];
-$price_checks_source = 'live';
+// Filter validation results - parse from pattern_validator_log JSON field
 $filter_results = [];
 $filter_results_summary = [];
+$validation_status = 'unknown';
+$validation_message = '';
+$any_project_passed = false;
+
+// Cache for project names
+$project_name_cache = [];
+
+// Parse pattern_validator_log from trade data
+if ($trade && !empty($trade['pattern_validator_log'])) {
+    $validator_log_raw = $trade['pattern_validator_log'];
+    $validator_log = null;
+    
+    // Try to decode the JSON
+    if (is_string($validator_log_raw)) {
+        $validator_log = json_decode($validator_log_raw, true);
+        
+        // Handle double-encoded JSON
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $validator_log_raw = stripslashes($validator_log_raw);
+            $validator_log = json_decode($validator_log_raw, true);
+        }
+    } elseif (is_array($validator_log_raw)) {
+        $validator_log = $validator_log_raw;
+    }
+    
+    if ($validator_log && is_array($validator_log)) {
+        // Extract project_results for display
+        $project_results = $validator_log['project_results'] ?? [];
+        
+        if (!empty($project_results)) {
+            // Collect project IDs for name lookup
+            $project_ids = array_map(fn($pr) => $pr['project_id'] ?? 0, $project_results);
+            
+            // Try to fetch project names from API
+            foreach ($project_ids as $pid) {
+                if ($pid > 0 && !isset($project_name_cache[$pid]) && $api_available) {
+                    $project_data = $client->getPatternProject($pid);
+                    if ($project_data && isset($project_data['project']['name'])) {
+                        $project_name_cache[$pid] = $project_data['project']['name'];
+                    } else {
+                        $project_name_cache[$pid] = "Project #$pid";
+                    }
+                }
+            }
+            
+            foreach ($project_results as $pr) {
+                $project_id = $pr['project_id'] ?? 0;
+                $filters = $pr['filter_results'] ?? [];
+                $project_decision = $pr['decision'] ?? 'NO_GO';
+                
+                $passed_count = 0;
+                $failed_count = 0;
+                $formatted_filters = [];
+                
+                foreach ($filters as $f) {
+                    $is_passed = !empty($f['passed']);
+                    if ($is_passed) {
+                        $passed_count++;
+                    } else {
+                        $failed_count++;
+                    }
+                    
+                    $formatted_filters[] = [
+                        'filter_id' => $f['filter_id'] ?? 0,
+                        'filter_name' => $f['filter_name'] ?? 'Unknown Filter',
+                        'field_column' => $f['field'] ?? '',
+                        'section' => $f['section'] ?? '',
+                        'minute' => $f['minute'] ?? 0,
+                        'from_value' => $f['from_value'],
+                        'to_value' => $f['to_value'],
+                        'actual_value' => $f['actual_value'],
+                        'passed' => $is_passed,
+                        'error' => $f['error'] ?? null,
+                    ];
+                }
+                
+                $all_passed = ($failed_count === 0 && $passed_count > 0);
+                
+                // Get project name from cache or use default
+                $project_name = $project_name_cache[$project_id] ?? "Project #$project_id";
+                
+                $filter_results_summary[] = [
+                    'project_id' => $project_id,
+                    'project_name' => $project_name,
+                    'total' => count($filters),
+                    'passed' => $passed_count,
+                    'failed' => $failed_count,
+                    'all_passed' => $all_passed,
+                    'filters' => $formatted_filters,
+                ];
+                
+                if ($all_passed) {
+                    $any_project_passed = true;
+                }
+            }
+            
+            $validation_status = $any_project_passed ? 'passed' : 'failed';
+            $validation_message = $any_project_passed 
+                ? 'Trade PASSED filter validation (at least one project passed all filters)'
+                : 'Trade FAILED filter validation (no project had all filters pass)';
+        } else {
+            // Check for schema-based validation (stages)
+            $stages = $validator_log['stages'] ?? [];
+            if (!empty($stages)) {
+                $validation_status = ($validator_log['decision'] ?? '') === 'GO' ? 'passed' : 'failed';
+                $validation_message = ($validator_log['decision'] ?? '') === 'GO'
+                    ? 'Trade PASSED schema validation'
+                    : 'Trade FAILED schema validation';
+            } else {
+                $validation_status = 'no_data';
+                $validation_message = 'No filter validation results recorded for this trade';
+            }
+        }
+    } else {
+        $validation_status = 'no_data';
+        $validation_message = 'Could not parse validation log';
+    }
+} else {
+    $validation_status = 'no_data';
+    $validation_message = 'No filter validation results recorded for this trade';
+}
 
 $entry_log_pretty = null;
 $entry_log_raw = null;
@@ -124,8 +251,8 @@ if ($trade && $trade['followed_at']) {
     $status = strtolower($trade['our_status']);
     
     if ($status !== 'completed' && $status !== 'sold') {
-        // Use PHP's current time instead of MySQL query (DuckDB only)
-        $effective_exit_timestamp = date('Y-m-d H:i:s');
+        // Use PHP's current UTC time instead of MySQL query (DuckDB only)
+        $effective_exit_timestamp = gmdate('Y-m-d H:i:s');
         $effective_exit_ms = time();
         
         $price_movements = json_decode($trade['price_movements'] ?? '[]', true);
@@ -330,7 +457,14 @@ ob_start();
     <div class="trade-info-item">
         <div class="trade-info-label">Entry Time</div>
         <div class="trade-info-value">
-            <?php echo $trade['followed_at'] ? date('M d, Y H:i:s', strtotime($trade['followed_at'])) : '--'; ?>
+            <?php 
+            if ($trade['followed_at']) {
+                date_default_timezone_set('UTC');
+                echo gmdate('M d, Y H:i:s', strtotime($trade['followed_at'])) . ' UTC';
+            } else {
+                echo '--';
+            }
+            ?>
         </div>
     </div>
     <div class="trade-info-item">
@@ -339,15 +473,23 @@ ob_start();
             <span class="display-value">
                 <?php 
                 if ($effective_exit_timestamp) {
-                    $formatted_time = date('M d, Y H:i:s', strtotime($effective_exit_timestamp));
+                    date_default_timezone_set('UTC');
+                    $formatted_time = gmdate('M d, Y H:i:s', strtotime($effective_exit_timestamp));
                     $is_estimated = ($trade['our_status'] !== 'completed' && $trade['our_status'] !== 'sold');
-                    echo $formatted_time . ($is_estimated ? ' <small class="text-warning">(est)</small>' : '');
+                    echo $formatted_time . ' UTC' . ($is_estimated ? ' <small class="text-warning">(est)</small>' : '');
                 } else {
                     echo '--';
                 }
                 ?>
             </span>
-            <input type="datetime-local" value="<?php echo $trade['our_exit_timestamp'] ? date('Y-m-d\TH:i:s', strtotime($trade['our_exit_timestamp'])) : ''; ?>">
+            <input type="datetime-local" value="<?php 
+                if ($trade['our_exit_timestamp']) {
+                    date_default_timezone_set('UTC');
+                    echo gmdate('Y-m-d\TH:i:s', strtotime($trade['our_exit_timestamp']));
+                } else {
+                    echo '';
+                }
+            ?>">
         </div>
     </div>
     <div class="trade-info-item">
@@ -414,6 +556,145 @@ ob_start();
 
 </div>
 
+<!-- Filter Validation Status -->
+<?php
+$status_colors = [
+    'passed' => ['bg' => 'bg-success', 'border' => 'border-success', 'icon' => 'ri-checkbox-circle-fill'],
+    'failed' => ['bg' => 'bg-danger', 'border' => 'border-danger', 'icon' => 'ri-close-circle-fill'],
+    'error' => ['bg' => 'bg-warning', 'border' => 'border-warning', 'icon' => 'ri-error-warning-fill'],
+    'no_data' => ['bg' => 'bg-secondary', 'border' => 'border-secondary', 'icon' => 'ri-question-line'],
+    'unknown' => ['bg' => 'bg-secondary', 'border' => 'border-secondary', 'icon' => 'ri-question-line'],
+];
+$status_style = $status_colors[$validation_status] ?? $status_colors['unknown'];
+?>
+<div class="card custom-card mb-3 <?php echo $status_style['border']; ?>" style="border-width: 2px;">
+    <div class="card-header <?php echo $status_style['bg']; ?>-transparent py-2">
+        <div class="d-flex align-items-center justify-content-between w-100">
+            <div class="d-flex align-items-center">
+                <i class="<?php echo $status_style['icon']; ?> fs-20 me-2 <?php echo str_replace('bg-', 'text-', $status_style['bg']); ?>"></i>
+                <div>
+                    <h6 class="mb-0 fw-semibold">Filter Validation Status</h6>
+                    <small class="text-muted"><?php echo htmlspecialchars($validation_message); ?></small>
+                </div>
+            </div>
+            <div class="text-end">
+                <?php if (!empty($filter_results_summary)): ?>
+                    <span class="badge <?php echo $any_project_passed ? 'bg-success' : 'bg-danger'; ?> fs-12">
+                        <?php echo $any_project_passed ? 'PASSED' : 'FAILED'; ?>
+                    </span>
+                    <br>
+                    <small class="text-muted">
+                        <?php 
+                        $total_filters = array_sum(array_column($filter_results_summary, 'total'));
+                        echo $total_filters; ?> filters across <?php echo count($filter_results_summary); ?> project(s)
+                    </small>
+                <?php elseif ($validation_status === 'no_data'): ?>
+                    <span class="badge bg-secondary fs-11">NO VALIDATION DATA</span>
+                    <br>
+                    <small class="text-muted">Trade ID: <?php echo $trade_id; ?></small>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+    
+    <?php if ($validation_status === 'no_data'): ?>
+    <div class="card-body py-3">
+        <p class="mb-2 text-muted small">
+            <strong>Why might filter results be missing?</strong>
+        </p>
+        <ul class="mb-0 small text-muted ps-3">
+            <li>This trade may have been created before filter validation was enabled</li>
+            <li>The play may not have any projects/filters configured</li>
+            <li>The pattern validator may not have run for this trade</li>
+            <li>The trade may have been manually created or imported</li>
+        </ul>
+    </div>
+    <?php endif; ?>
+    
+    <?php if (!empty($filter_results_summary)): ?>
+    <!-- Detailed Filter Results (Expandable) -->
+    <div class="card-body border-top pt-3">
+        <p class="text-muted small mb-3">
+            <i class="ri-information-line me-1"></i>
+            <?php echo count($filter_results_summary); ?> project(s) evaluated. 
+            Trade passes if <strong>any</strong> project's filters <strong>all</strong> pass.
+        </p>
+        
+        <?php foreach ($filter_results_summary as $project): ?>
+        <div class="card mb-2" style="border: 2px solid <?php echo $project['all_passed'] ? 'rgba(38, 191, 148, 0.5)' : 'rgba(230, 83, 60, 0.5)'; ?>;">
+            <div class="card-header py-2" style="background: <?php echo $project['all_passed'] ? 'rgba(38, 191, 148, 0.15)' : 'rgba(230, 83, 60, 0.15)'; ?>;">
+                <div class="d-flex align-items-center justify-content-between w-100">
+                    <span class="fw-semibold">
+                        <i class="<?php echo $project['all_passed'] ? 'ri-checkbox-circle-fill text-success' : 'ri-close-circle-fill text-danger'; ?> me-1"></i>
+                        <?php echo htmlspecialchars($project['project_name']); ?>
+                        <span class="text-muted fs-11">(Project #<?php echo $project['project_id']; ?>)</span>
+                    </span>
+                    <span>
+                        <span class="badge <?php echo $project['all_passed'] ? 'bg-success' : 'bg-danger'; ?>">
+                            <?php echo $project['all_passed'] ? 'ALL PASSED' : 'FAILED'; ?>
+                        </span>
+                        <span class="badge bg-secondary-transparent ms-1">
+                            <?php echo $project['passed']; ?>/<?php echo $project['total']; ?> filters
+                        </span>
+                    </span>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-sm table-hover mb-0">
+                        <thead>
+                            <tr class="text-muted small" style="border-bottom: 1px solid var(--default-border);">
+                                <th style="width: 30px;"></th>
+                                <th>Filter</th>
+                                <th>Field Column</th>
+                                <th class="text-center">Min</th>
+                                <th class="text-center fw-bold">Actual</th>
+                                <th class="text-center">Max</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($project['filters'] as $filter): ?>
+                            <tr style="<?php echo $filter['passed'] ? '' : 'background: rgba(230, 83, 60, 0.1);'; ?>">
+                                <td class="text-center">
+                                    <?php if ($filter['passed']): ?>
+                                        <i class="ri-checkbox-circle-fill text-success fs-16"></i>
+                                    <?php else: ?>
+                                        <i class="ri-close-circle-fill text-danger fs-16"></i>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <span class="fw-medium"><?php echo htmlspecialchars($filter['filter_name'] ?? 'Filter #' . $filter['filter_id']); ?></span>
+                                    <?php if (!empty($filter['error'])): ?>
+                                        <br><small class="text-danger"><?php echo htmlspecialchars($filter['error']); ?></small>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <code class="text-info small"><?php echo htmlspecialchars($filter['field_column'] ?? '-'); ?></code>
+                                    <?php if (($filter['minute'] ?? 0) > 0): ?>
+                                        <span class="badge bg-purple-transparent small ms-1">M<?php echo $filter['minute']; ?></span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="text-center text-muted font-monospace">
+                                    <?php echo $filter['from_value'] !== null ? number_format($filter['from_value'], 4) : '-'; ?>
+                                </td>
+                                <td class="text-center fw-bold font-monospace <?php echo $filter['passed'] ? 'text-success' : 'text-danger'; ?>">
+                                    <?php echo $filter['actual_value'] !== null ? number_format($filter['actual_value'], 4) : 'NULL'; ?>
+                                </td>
+                                <td class="text-center text-muted font-monospace">
+                                    <?php echo $filter['to_value'] !== null ? number_format($filter['to_value'], 4) : '-'; ?>
+                                </td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+</div>
+
 <!-- Price Chart -->
 <div class="card custom-card mb-3">
     <div class="card-header">
@@ -453,18 +734,14 @@ ob_start();
 </div>
 
 <!-- Price Checks Timeline -->
-<?php if (!empty($price_checks) || $trade['price_movements']): ?>
+<?php if (!empty($price_checks) || !empty($trade['price_movements'])): ?>
 <div class="card custom-card mb-3">
     <div class="card-header">
         <div class="card-title">Price Checks Timeline</div>
         <div class="ms-auto">
             <?php if (!empty($price_checks)): ?>
                 <span class="badge bg-primary-transparent"><?php echo count($price_checks); ?> checks</span>
-                <?php if ($price_checks_source === 'archive'): ?>
-                    <span class="badge bg-secondary-transparent">from archive</span>
-                <?php else: ?>
-                    <span class="badge bg-success-transparent">from live</span>
-                <?php endif; ?>
+                <span class="badge bg-success-transparent">from <?php echo $price_checks_source === 'duckdb' ? 'DuckDB' : 'MySQL'; ?></span>
             <?php else: ?>
                 <span class="badge bg-warning-transparent">from legacy JSON</span>
             <?php endif; ?>
@@ -492,101 +769,6 @@ ob_start();
                 </tbody>
             </table>
         </div>
-    </div>
-</div>
-<?php endif; ?>
-
-<!-- Filter Validation Results -->
-<?php if (!empty($filter_results_summary)): ?>
-<div class="card custom-card mb-3">
-    <div class="card-header">
-        <div class="card-title">Filter Validation Results</div>
-        <?php 
-        $any_passed = false;
-        foreach ($filter_results_summary as $pg) {
-            if ($pg['all_passed']) { $any_passed = true; break; }
-        }
-        ?>
-        <span class="badge <?php echo $any_passed ? 'bg-success-transparent' : 'bg-danger-transparent'; ?> ms-auto">
-            <?php echo $any_passed ? 'PASSED' : 'FAILED'; ?>
-        </span>
-    </div>
-    <div class="card-body">
-        <p class="text-muted small mb-3">
-            <?php echo count($filter_results_summary); ?> project(s) evaluated. 
-            Trade passes if <strong>any</strong> project's filters <strong>all</strong> pass.
-        </p>
-        
-        <?php foreach ($filter_results_summary as $project): ?>
-        <div class="card custom-card mb-3" style="border: 1px solid <?php echo $project['all_passed'] ? 'rgba(38, 191, 148, 0.5)' : 'rgba(230, 83, 60, 0.5)'; ?>;">
-            <div class="card-header py-2" style="background: <?php echo $project['all_passed'] ? 'rgba(38, 191, 148, 0.1)' : 'rgba(230, 83, 60, 0.1)'; ?>;">
-                <div class="d-flex align-items-center justify-content-between w-100">
-                    <span class="fw-semibold">
-                        <?php echo htmlspecialchars($project['project_name']); ?>
-                        <span class="text-muted">(ID: <?php echo $project['project_id']; ?>)</span>
-                    </span>
-                    <span>
-                        <span class="badge <?php echo $project['all_passed'] ? 'bg-success' : 'bg-danger'; ?>">
-                            <?php echo $project['all_passed'] ? 'ALL PASSED' : 'FAILED'; ?>
-                        </span>
-                        <span class="badge bg-secondary-transparent ms-1">
-                            <?php echo $project['passed']; ?>/<?php echo $project['total']; ?> filters
-                        </span>
-                    </span>
-                </div>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-sm table-borderless mb-0">
-                        <thead>
-                            <tr class="text-muted small" style="border-bottom: 1px solid rgba(255,255,255,0.1);">
-                                <th style="width: 30px;"></th>
-                                <th>Filter</th>
-                                <th>Field</th>
-                                <th class="text-end">Min</th>
-                                <th class="text-center">Actual</th>
-                                <th>Max</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <?php foreach ($project['filters'] as $filter): ?>
-                            <tr style="<?php echo $filter['passed'] ? '' : 'background: rgba(230, 83, 60, 0.15);'; ?>">
-                                <td class="text-center">
-                                    <?php if ($filter['passed']): ?>
-                                        <i class="ri-checkbox-circle-fill text-success"></i>
-                                    <?php else: ?>
-                                        <i class="ri-close-circle-fill text-danger"></i>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <span class="fw-medium"><?php echo htmlspecialchars($filter['filter_name'] ?? 'Filter #' . $filter['filter_id']); ?></span>
-                                    <?php if ($filter['error']): ?>
-                                        <br><small class="text-danger"><?php echo htmlspecialchars($filter['error']); ?></small>
-                                    <?php endif; ?>
-                                </td>
-                                <td>
-                                    <code class="text-info small"><?php echo htmlspecialchars($filter['field_column'] ?? '-'); ?></code>
-                                    <?php if ($filter['minute'] > 0): ?>
-                                        <span class="badge bg-secondary-transparent small">min <?php echo $filter['minute']; ?></span>
-                                    <?php endif; ?>
-                                </td>
-                                <td class="text-end text-muted">
-                                    <?php echo $filter['from_value'] !== null ? number_format($filter['from_value'], 4) : '-'; ?>
-                                </td>
-                                <td class="text-center fw-semibold <?php echo $filter['passed'] ? 'text-success' : 'text-danger'; ?>">
-                                    <?php echo $filter['actual_value'] !== null ? number_format($filter['actual_value'], 4) : 'NULL'; ?>
-                                </td>
-                                <td class="text-muted">
-                                    <?php echo $filter['to_value'] !== null ? number_format($filter['to_value'], 4) : '-'; ?>
-                                </td>
-                            </tr>
-                            <?php endforeach; ?>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-        <?php endforeach; ?>
     </div>
 </div>
 <?php endif; ?>
@@ -622,18 +804,62 @@ ob_start();
 <script src="<?php echo $baseUrl; ?>/assets/libs/apexcharts/apexcharts.min.js"></script>
 
 <script>
+    // UTC Date Formatting Utilities (Server Time - Never Browser Time)
+    const formatUTC = {
+        // Format timestamp to UTC string: "Jan 15, 2024 12:33:45"
+        toUTCString: function(timestampMs) {
+            if (!timestampMs) return '--';
+            const d = new Date(timestampMs);
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const year = d.getUTCFullYear();
+            const month = months[d.getUTCMonth()];
+            const day = d.getUTCDate();
+            const hours = String(d.getUTCHours()).padStart(2, '0');
+            const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+            const seconds = String(d.getUTCSeconds()).padStart(2, '0');
+            return `${month} ${day}, ${year} ${hours}:${minutes}:${seconds}`;
+        },
+        
+        // Format timestamp to UTC time string: "12:33:45"
+        toUTCTimeString: function(timestampMs) {
+            if (!timestampMs) return '--';
+            const d = new Date(timestampMs);
+            const hours = String(d.getUTCHours()).padStart(2, '0');
+            const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+            const seconds = String(d.getUTCSeconds()).padStart(2, '0');
+            return `${hours}:${minutes}:${seconds}`;
+        },
+        
+        // Format timestamp to UTC date/time: "Jan 15, 12:33"
+        toUTCDateTime: function(timestampMs) {
+            if (!timestampMs) return '--';
+            const d = new Date(timestampMs);
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const month = months[d.getUTCMonth()];
+            const day = d.getUTCDate();
+            const hours = String(d.getUTCHours()).padStart(2, '0');
+            const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+            return `${month} ${day}, ${hours}:${minutes}`;
+        },
+        
+        // Format timestamp to UTC ISO string for debugging
+        toISOString: function(timestampMs) {
+            if (!timestampMs) return null;
+            return new Date(timestampMs).toISOString();
+        }
+    };
+    
     // Inject PHP data into JavaScript
     const jsData = <?php echo json_encode($js_data); ?>;
     const tradeData = jsData.trade;
     const returnUrl = <?php echo json_encode($return_url); ?>;
     
-    // Debug: Show raw values from PHP
-    console.log('=== DEBUG: Trade Timestamps ===');
+    // Debug: Show raw values from PHP (all in UTC)
+    console.log('=== DEBUG: Trade Timestamps (UTC) ===');
     console.log('Raw followed_at from DB:', tradeData.followed_at);
     console.log('Raw our_exit_timestamp from DB:', tradeData.our_exit_timestamp);
-    console.log('PHP followed_at_ms:', jsData.followed_at_ms, '→', jsData.followed_at_ms ? new Date(jsData.followed_at_ms).toISOString() : null);
-    console.log('PHP effective_exit_ms:', jsData.effective_exit_ms, '→', jsData.effective_exit_ms ? new Date(jsData.effective_exit_ms).toISOString() : null);
-    console.log('Browser timezone offset (minutes):', new Date().getTimezoneOffset());
+    console.log('PHP followed_at_ms:', jsData.followed_at_ms, '→ UTC:', formatUTC.toISOString(jsData.followed_at_ms));
+    console.log('PHP effective_exit_ms:', jsData.effective_exit_ms, '→ UTC:', formatUTC.toISOString(jsData.effective_exit_ms));
     
     // Store for manual analysis points
     let analysisPoints = [];
@@ -659,24 +885,48 @@ ob_start();
                 if (isNaN(exitPrice)) exitPrice = null;
             }
             
-            const bufferMs = 10 * 60 * 1000;
-            const startTimeMs = followedAtTime - bufferMs;
-            const endTimeMs = Math.max(exitTime, followedAtTime) + bufferMs;
+            // Use larger buffer to ensure we capture all price data
+            // Buffer: 30 minutes before entry, and ensure we go well past exit
+            const bufferBeforeMs = 30 * 60 * 1000; // 30 minutes before
+            const bufferAfterMs = 30 * 60 * 1000;  // 30 minutes after
+            
+            const startTimeMs = followedAtTime - bufferBeforeMs;
+            // Ensure end time covers the full trade period plus buffer
+            const tradeDurationMs = exitTime - followedAtTime;
+            const endTimeMs = exitTime + Math.max(bufferAfterMs, tradeDurationMs * 0.5); // At least 30min after, or 50% of trade duration
             
             const startTimeSec = Math.floor(startTimeMs / 1000);
             const endTimeSec = Math.floor(endTimeMs / 1000);
             
-            console.log('Trade Entry Time:', new Date(followedAtTime).toLocaleString());
-            console.log('Trade Exit Time:', new Date(exitTime).toLocaleString());
-            console.log('Fetching prices from:', new Date(startTimeMs).toLocaleString(), 'to:', new Date(endTimeMs).toLocaleString());
+            console.log('=== Trade Chart Debug (UTC) ===');
+            console.log('Trade Entry Time:', formatUTC.toUTCString(followedAtTime), `(${followedAtTime})`);
+            console.log('Trade Exit Time:', formatUTC.toUTCString(exitTime), `(${exitTime})`);
+            console.log('Trade Duration:', ((exitTime - followedAtTime) / 1000 / 60).toFixed(1), 'minutes');
+            console.log('Fetching prices from:', formatUTC.toUTCString(startTimeMs), 'to:', formatUTC.toUTCString(endTimeMs));
+            console.log('Time range:', ((endTimeMs - startTimeMs) / 1000 / 60).toFixed(1), 'minutes');
             
-            const response = await fetch(`/chart/plays/get_trade_prices.php?start=${startTimeSec}&end=${endTimeSec}`);
+            const apiUrl = `<?php echo $baseUrl; ?>/chart/plays/get_trade_prices.php?start=${startTimeSec}&end=${endTimeSec}`;
+            console.log('API URL:', apiUrl);
+            
+            const response = await fetch(apiUrl);
+            console.log('Response status:', response.status, response.statusText);
+            
             const data = await response.json();
             
             console.log('Price data received:', data.prices ? data.prices.length : 0, 'points');
+            if (data.debug) {
+                console.log('API Debug Info:', data.debug);
+            }
+            if (data.prices && data.prices.length > 0) {
+                const firstPrice = data.prices[0];
+                const lastPrice = data.prices[data.prices.length - 1];
+                console.log('First price point:', firstPrice.x, '$' + firstPrice.y);
+                console.log('Last price point:', lastPrice.x, '$' + lastPrice.y);
+            }
             
             if (!data.success) {
-                document.getElementById('tradeDetailChart').innerHTML = '<div class="text-center text-danger py-5">Error loading chart data</div>';
+                const errorMsg = data.error || 'Unknown error';
+                document.getElementById('tradeDetailChart').innerHTML = `<div class="text-center text-danger py-5">Error loading chart data: ${errorMsg}</div>`;
                 return;
             }
             
@@ -685,7 +935,7 @@ ob_start();
                 return;
             }
             
-            console.log('Rendering chart with entry:', new Date(followedAtTime).toLocaleString(), 'exit:', new Date(exitTime).toLocaleString());
+            console.log('Rendering chart with entry:', formatUTC.toUTCString(followedAtTime), 'exit:', formatUTC.toUTCString(exitTime));
             renderChart(data.prices, followedAtTime, exitTime, entryPrice, exitPrice);
             
         } catch (error) {
@@ -711,25 +961,29 @@ ob_start();
         
         allPricesData = allPrices;
         
-        // Debug: Compare price data range with entry/exit times
+        // Debug: Compare price data range with entry/exit times (all UTC)
         if (allPrices.length > 0) {
             const priceStart = allPrices[0].x;
             const priceEnd = allPrices[allPrices.length - 1].x;
-            console.log('Price data range:', new Date(priceStart).toLocaleString(), 'to', new Date(priceEnd).toLocaleString());
-            console.log('Entry time:', new Date(followedAtTime).toLocaleString(), '| Exit time:', new Date(exitTime).toLocaleString());
+            console.log('Price data range:', formatUTC.toUTCString(priceStart), 'to', formatUTC.toUTCString(priceEnd));
+            console.log('Entry time:', formatUTC.toUTCString(followedAtTime), '| Exit time:', formatUTC.toUTCString(exitTime));
             console.log('Entry within price range:', followedAtTime >= priceStart && followedAtTime <= priceEnd);
             console.log('Exit within price range:', exitTime >= priceStart && exitTime <= priceEnd);
         }
         
         // Calculate chart x-axis range to include entry/exit times with buffer
-        const bufferMs = 2 * 60 * 1000; // 2 minute buffer
+        // Ensure we show the full trade period even if price data doesn't extend that far
+        const bufferMs = 5 * 60 * 1000; // 5 minute buffer
         let xMin = followedAtTime - bufferMs;
         let xMax = (exitTime || followedAtTime) + bufferMs;
         
-        // Also include price data range
+        // Include price data range, but don't let it shrink the view if trade period is larger
         if (allPrices.length > 0) {
-            xMin = Math.min(xMin, allPrices[0].x);
-            xMax = Math.max(xMax, allPrices[allPrices.length - 1].x);
+            const priceDataMin = allPrices[0].x;
+            const priceDataMax = allPrices[allPrices.length - 1].x;
+            // Expand range to include both trade period and price data
+            xMin = Math.min(xMin, priceDataMin);
+            xMax = Math.max(xMax, priceDataMax);
         }
         
         // Build annotations
@@ -833,14 +1087,22 @@ ob_start();
                 min: xMin,
                 max: xMax,
                 labels: {
-                    datetimeUTC: true,
+                    datetimeUTC: true,  // Always use UTC (server time)
                     style: {
                         colors: '#9ca3af',
                         fontSize: '11px'
                     },
                     datetimeFormatter: {
-                        hour: 'HH:mm',
-                        minute: 'HH:mm:ss'
+                        hour: 'HH:mm UTC',
+                        minute: 'HH:mm:ss UTC',
+                        day: 'MMM dd HH:mm UTC'
+                    },
+                    formatter: function(value, timestamp) {
+                        // Format in UTC and append UTC label
+                        const d = new Date(timestamp);
+                        const hours = String(d.getUTCHours()).padStart(2, '0');
+                        const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+                        return hours + ':' + minutes + ' UTC';
                     }
                 }
             },
@@ -864,8 +1126,13 @@ ob_start();
                     
                     currentHoveredPoint = { timestamp, price };
                     
+                    // Format time in UTC (server time)
+                    const timeStr = formatUTC.toUTCTimeString(timestamp);
+                    const dateStr = formatUTC.toUTCDateTime(timestamp);
+                    
                     return '<div class="p-2">' +
-                        '<div class="mb-1"><strong>' + new Date(timestamp).toLocaleTimeString() + '</strong></div>' +
+                        '<div class="mb-1"><strong>' + dateStr + ' UTC</strong></div>' +
+                        '<div>Time: <span class="text-muted">' + timeStr + ' UTC</span></div>' +
                         '<div>Price: <span class="text-primary fw-semibold">$' + price.toFixed(6) + '</span></div>' +
                         '<div class="fs-11 text-muted mt-1">Click to record point</div>' +
                         '</div>';
@@ -920,10 +1187,8 @@ ob_start();
             tr.className = 'analysis-row';
             
             const pointNumber = i + 1;
-            const timeStr = new Date(point.timestamp).toLocaleString('en-US', {
-                month: 'short', day: 'numeric', year: 'numeric',
-                hour: '2-digit', minute: '2-digit', second: '2-digit'
-            });
+            // Format in UTC (server time)
+            const timeStr = formatUTC.toUTCString(point.timestamp);
             const priceStr = '$' + point.price.toFixed(6);
             
             let changeStr = '--';
@@ -986,12 +1251,17 @@ ob_start();
             if (priceChecks.length > 0) {
                 priceChecks.forEach((item, index) => {
                     const tr = document.createElement('tr');
-                    const sell = item.should_sell == 1;
-                    const isBackfill = item.is_backfill == 1;
+                    // Handle both boolean and integer values
+                    const sell = item.should_sell === true || item.should_sell == 1 || item.should_sell === '1';
+                    const isBackfill = item.is_backfill === true || item.is_backfill == 1 || item.is_backfill === '1';
                     
-                    const timeStr = item.checked_at ? new Date(item.checked_at.replace(' ', 'T')).toLocaleString('en-US', {
-                        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit'
-                    }) : '--';
+                    // Format in UTC (server time) - parse the datetime string and convert to UTC
+                    let timeStr = '--';
+                    if (item.checked_at) {
+                        // Parse the datetime string (assumes it's already in UTC from server)
+                        const dt = new Date(item.checked_at.replace(' ', 'T') + 'Z');
+                        timeStr = formatUTC.toUTCDateTime(dt.getTime());
+                    }
                     
                     const basisBadge = item.basis 
                         ? `<span class="badge ${item.basis === 'highest' ? 'bg-primary-transparent' : 'bg-warning-transparent'}">${item.basis}</span>`

@@ -1,0 +1,1 @@
+bash /mnt/c/0000websites/00phpsites/follow_the_goat/start_scheduler.sh

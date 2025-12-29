@@ -126,6 +126,7 @@ Live trades - last 24 hours only.
 | `our_profit_loss` | DECIMAL(20,8) | P/L percentage |
 | `our_status` | VARCHAR(20) | Status (pending, sold, no_go) |
 | `current_price` | DECIMAL(20,8) | Current price |
+| `potential_gains` | FLOAT | Potential gains % from cycle high |
 
 **Indexes:**
 - `idx_buyins_wallet` on `(wallet_address)`
@@ -490,6 +491,7 @@ The scheduler (`scheduler/master.py`) runs these jobs:
 | `cleanup_duckdb_hot_tables` | 1 hour | Remove data older than 24h from DuckDB |
 | `cleanup_wallet_profiles` | 1 hour | Clean up old profiles from BOTH DuckDB and MySQL |
 | `sync_plays_from_mysql` | 5 minutes | Sync plays table from MySQL |
+| `update_potential_gains` | 15 seconds | Calculate potential gains for completed cycles |
 
 ### Background Streams (Started Once at Startup)
 

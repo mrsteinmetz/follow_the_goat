@@ -29,7 +29,9 @@ except ImportError:
 @dataclass
 class MySQLSettings:
     """MySQL database connection settings."""
-    host: str = "116.202.51.115"
+    # Default to Windows host IP for WSL2 compatibility
+    # Set DB_HOST env var to override (start_scheduler.sh does this automatically)
+    host: str = "172.19.240.1"
     user: str = "solcatcher"
     password: str = "jjJH!la9823JKJsdfjk76jH"
     database: str = "solcatcher"
@@ -40,7 +42,7 @@ class MySQLSettings:
     def from_env(cls) -> "MySQLSettings":
         """Load MySQL settings from environment variables."""
         return cls(
-            host=os.getenv("DB_HOST", "116.202.51.115"),
+            host=os.getenv("DB_HOST", "172.19.240.1"),
             user=os.getenv("DB_USER", "solcatcher"),
             password=os.getenv("DB_PASSWORD", "jjJH!la9823JKJsdfjk76jH"),
             database=os.getenv("DB_DATABASE", "solcatcher"),

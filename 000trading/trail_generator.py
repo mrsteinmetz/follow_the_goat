@@ -6,12 +6,17 @@ Generate analytics trail data for buy-in signals using DuckDB.
 This module fetches order book, transactions, whale activity, and price data
 from DuckDB tables and computes derived metrics for pattern validation.
 
+Trail data is stored in the `buyin_trail_minutes` table (one row per minute,
+15 rows per buyin) for efficient querying and pattern validation.
+
 Usage:
-    from _000trading.trail_generator import generate_trail_payload
+    from trail_generator import generate_trail_payload
     
     payload = generate_trail_payload(buyin_id=123)
-    # payload contains order_book_signals, transactions, whale_activity, 
-    # price_movements, patterns, and minute_spans
+    # Automatically persists to buyin_trail_minutes table
+    
+    # To skip table persistence:
+    payload = generate_trail_payload(buyin_id=123, persist=False)
 """
 
 from __future__ import annotations
@@ -33,9 +38,71 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb, get_mysql, dual_write_update
+from core.database import get_duckdb, get_mysql
+from core.webhook_client import WebhookClient
+from trail_data import insert_trail_data
 
 logger = logging.getLogger(__name__)
+
+# Singleton webhook client for fetching trades/whale data from .NET webhook
+_webhook_client: Optional[WebhookClient] = None
+
+def _get_webhook_client() -> WebhookClient:
+    """Get or create the webhook client singleton."""
+    global _webhook_client
+    if _webhook_client is None:
+        _webhook_client = WebhookClient()
+    return _webhook_client
+
+# Try to get TradingDataEngine for in-memory queries (when running under scheduler)
+def _get_engine_if_running():
+    """Get TradingDataEngine if it's running, otherwise return None."""
+    try:
+        from core.trading_engine import _engine_instance
+        if _engine_instance is not None and _engine_instance._running:
+            return _engine_instance
+    except Exception:
+        pass
+    return None
+
+
+def _execute_query(query: str, params: list = None, as_dict: bool = True, graceful: bool = True):
+    """Execute a query using TradingDataEngine if available, otherwise file-based DuckDB.
+    
+    Args:
+        query: SQL query (use ? for placeholders - DuckDB format)
+        params: Query parameters
+        as_dict: If True, return list of dicts; if False, return list of tuples
+        graceful: If True, return empty list on table-not-found errors instead of raising
+    
+    Returns:
+        List of dicts (if as_dict=True) or list of tuples
+    """
+    engine = _get_engine_if_running()
+    
+    try:
+        if engine is not None:
+            # TradingDataEngine also uses DuckDB which uses ? placeholders
+            results = engine.read(query, params or [])
+            if as_dict:
+                return results
+            # Convert dicts back to tuples if needed
+            return [tuple(r.values()) for r in results] if results else []
+        else:
+            with get_duckdb("central") as conn:
+                result = conn.execute(query, params or [])
+                if as_dict:
+                    columns = [desc[0] for desc in result.description]
+                    rows = result.fetchall()
+                    return [dict(zip(columns, row)) for row in rows]
+                return result.fetchall()
+    except Exception as e:
+        error_msg = str(e).lower()
+        # Handle missing tables gracefully - return empty data
+        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
+            logger.debug(f"Table not found (graceful mode): {e}")
+            return []
+        raise
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
@@ -69,29 +136,53 @@ class TrailColumnMissingError(TrailError):
 # =============================================================================
 
 def fetch_buyin(buyin_id: int) -> Dict[str, Any]:
-    """Return buy-in metadata needed for the trail from DuckDB."""
-    with get_duckdb("central") as conn:
-        result = conn.execute("""
-            SELECT id, followed_at, fifteen_min_trail as existing_trail
-            FROM follow_the_goat_buyins
-            WHERE id = ?
-            LIMIT 1
-        """, [buyin_id]).fetchone()
-        
-        if not result:
-            raise BuyinNotFoundError(f"Buy-in #{buyin_id} not found")
-        
-        columns = ['id', 'followed_at', 'existing_trail']
-        row = dict(zip(columns, result))
-        
-        # Parse existing trail if it's a JSON string
-        if row.get("existing_trail") and isinstance(row["existing_trail"], str):
-            try:
-                row["existing_trail"] = json.loads(row["existing_trail"])
-            except json.JSONDecodeError:
-                logger.warning("Existing trail for buy-in %s is not valid JSON", buyin_id)
-        
-        return row
+    """Return buy-in metadata needed for the trail from DuckDB (fast).
+    
+    Uses DuckDB for speed - MySQL is only for storage.
+    DuckDB uses 'fifteen_min_trail' column name.
+    """
+    try:
+        with get_duckdb("central") as conn:
+            result = conn.execute("""
+                SELECT id, followed_at, fifteen_min_trail as existing_trail
+                FROM follow_the_goat_buyins
+                WHERE id = ?
+                LIMIT 1
+            """, [buyin_id]).fetchone()
+    except Exception as e:
+        raise TrailError(f"Failed to fetch buyin #{buyin_id}: {e}")
+    
+    if not result:
+        raise BuyinNotFoundError(f"Buy-in #{buyin_id} not found")
+    
+    # DuckDB returns tuple, convert to dict
+    row = {
+        'id': result[0],
+        'followed_at': result[1],
+        'existing_trail': result[2]
+    }
+    
+    # Parse followed_at if it's a string (handles ISO format from inserts)
+    followed_at = row.get("followed_at")
+    if followed_at and isinstance(followed_at, str):
+        try:
+            # Handle ISO format with timezone
+            if '+' in followed_at or followed_at.endswith('Z'):
+                row["followed_at"] = datetime.fromisoformat(followed_at.replace('Z', '+00:00'))
+            else:
+                row["followed_at"] = datetime.fromisoformat(followed_at)
+            logger.debug("Parsed followed_at string to datetime for buyin %s", buyin_id)
+        except ValueError as e:
+            logger.warning("Failed to parse followed_at for buy-in %s: %s", buyin_id, e)
+    
+    # Parse existing trail if it's a JSON string
+    if row.get("existing_trail") and isinstance(row["existing_trail"], str):
+        try:
+            row["existing_trail"] = json.loads(row["existing_trail"])
+        except json.JSONDecodeError:
+            logger.warning("Existing trail for buy-in %s is not valid JSON", buyin_id)
+    
+    return row
 
 
 def fetch_order_book_signals(
@@ -99,10 +190,9 @@ def fetch_order_book_signals(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch order book signals from DuckDB with computed metrics."""
-    with get_duckdb("central") as conn:
-        # DuckDB query for order book data with minute aggregation
-        query = """
+    """Fetch order book signals from DuckDB/TradingDataEngine with computed metrics."""
+    # DuckDB query for order book data with minute aggregation
+    query = """
         WITH minute_aggregates AS (
             SELECT 
                 DATE_TRUNC('minute', ts) AS minute_timestamp,
@@ -192,235 +282,427 @@ def fetch_order_book_signals(
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
         """
-        result = conn.execute(query, [symbol, start_time, end_time, symbol])
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
+    return _execute_query(query, [symbol, start_time, end_time, symbol])
 
 
 def fetch_transactions(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch transaction data from DuckDB with computed metrics."""
-    with get_duckdb("central") as conn:
-        query = """
-        WITH minute_aggregates AS (
-            SELECT 
-                DATE_TRUNC('minute', trade_timestamp) AS minute_timestamp,
-                SUM(sol_amount) AS total_sol_volume,
-                SUM(stablecoin_amount) AS total_usd_volume,
-                COUNT(*) AS trade_count,
-                SUM(stablecoin_amount) / NULLIF(SUM(sol_amount), 0) AS vwap,
-                SUM(CASE WHEN direction = 'buy' THEN sol_amount ELSE 0 END) AS buy_volume,
-                SUM(CASE WHEN direction = 'sell' THEN sol_amount ELSE 0 END) AS sell_volume,
-                SUM(CASE WHEN direction = 'buy' THEN stablecoin_amount ELSE 0 END) AS buy_usd_volume,
-                SUM(CASE WHEN direction = 'sell' THEN stablecoin_amount ELSE 0 END) AS sell_usd_volume,
-                SUM(CASE WHEN direction = 'buy' THEN 1 ELSE 0 END) AS buy_count,
-                SUM(CASE WHEN direction = 'sell' THEN 1 ELSE 0 END) AS sell_count,
-                SUM(CASE WHEN perp_direction = 'long' THEN sol_amount ELSE 0 END) AS long_volume,
-                SUM(CASE WHEN perp_direction = 'short' THEN sol_amount ELSE 0 END) AS short_volume,
-                SUM(CASE WHEN perp_direction = 'long' THEN stablecoin_amount ELSE 0 END) AS long_usd_volume,
-                SUM(CASE WHEN perp_direction = 'short' THEN stablecoin_amount ELSE 0 END) AS short_usd_volume,
-                SUM(CASE WHEN perp_direction = 'long' THEN 1 ELSE 0 END) AS long_count,
-                SUM(CASE WHEN perp_direction = 'short' THEN 1 ELSE 0 END) AS short_count,
-                SUM(CASE WHEN stablecoin_amount > 10000 THEN stablecoin_amount ELSE 0 END) AS large_trade_volume,
-                SUM(CASE WHEN stablecoin_amount > 10000 THEN 1 ELSE 0 END) AS large_trade_count,
-                SUM(CASE WHEN stablecoin_amount BETWEEN 1000 AND 10000 THEN stablecoin_amount ELSE 0 END) AS medium_trade_volume,
-                SUM(CASE WHEN stablecoin_amount < 1000 THEN stablecoin_amount ELSE 0 END) AS small_trade_volume,
-                AVG(stablecoin_amount) AS avg_trade_size,
-                MAX(stablecoin_amount) AS max_trade_size,
-                MIN(price) AS min_price,
-                MAX(price) AS max_price,
-                AVG(price) AS avg_price,
-                FIRST(price ORDER BY trade_timestamp ASC) AS open_price,
-                LAST(price ORDER BY trade_timestamp DESC) AS close_price
-            FROM sol_stablecoin_trades
-            WHERE trade_timestamp >= ?
-                AND trade_timestamp <= ?
-            GROUP BY DATE_TRUNC('minute', trade_timestamp)
-        ),
-        numbered_minutes AS (
-            SELECT *,
-                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-            FROM minute_aggregates
-        )
-        SELECT 
-            m0.minute_timestamp,
-            m0.row_num AS minute_number,
-            ROUND(((m0.buy_volume - m0.sell_volume) / NULLIF((m0.buy_volume + m0.sell_volume), 0)), 6) AS buy_sell_pressure,
-            ROUND((m0.buy_volume / NULLIF((m0.buy_volume + m0.sell_volume), 0) * 100), 6) AS buy_volume_pct,
-            ROUND((m0.sell_volume / NULLIF((m0.buy_volume + m0.sell_volume), 0) * 100), 6) AS sell_volume_pct,
-            ROUND((((m0.buy_volume - m0.sell_volume) / NULLIF((m0.buy_volume + m0.sell_volume), 0)) -
-                ((COALESCE(m1.buy_volume, m0.buy_volume) - COALESCE(m1.sell_volume, m0.sell_volume)) / 
-                 NULLIF((COALESCE(m1.buy_volume, m0.buy_volume) + COALESCE(m1.sell_volume, m0.sell_volume)), 0))), 6) AS pressure_shift_1m,
-            ROUND((m0.long_volume / NULLIF(m0.short_volume, 0)), 6) AS long_short_ratio,
-            ROUND((m0.long_volume / NULLIF((m0.long_volume + m0.short_volume), 0) * 100), 6) AS long_volume_pct,
-            ROUND((m0.short_volume / NULLIF((m0.long_volume + m0.short_volume), 0) * 100), 6) AS short_volume_pct,
-            ROUND(((m0.long_volume - m0.short_volume) / NULLIF((m0.long_volume + m0.short_volume), 0) * 100), 6) AS perp_position_skew_pct,
-            ROUND(((m0.long_volume / NULLIF(m0.short_volume, 0)) - 
-                (COALESCE(m1.long_volume, m0.long_volume) / NULLIF(COALESCE(m1.short_volume, m0.short_volume), 0))), 6) AS long_ratio_shift_1m,
-            ROUND(((m0.long_volume + m0.short_volume) / NULLIF(m0.total_sol_volume, 0) * 100), 6) AS perp_dominance_pct,
-            ROUND(m0.total_usd_volume, 2) AS total_volume_usd,
-            ROUND((m0.total_usd_volume / NULLIF(COALESCE(m1.total_usd_volume, m0.total_usd_volume), 0)), 6) AS volume_acceleration_ratio,
-            ROUND((m0.large_trade_volume / NULLIF(m0.total_usd_volume, 0) * 100), 6) AS whale_volume_pct,
-            ROUND(m0.avg_trade_size, 2) AS avg_trade_size,
-            ROUND(m0.trade_count / 60.0, 2) AS trades_per_second,
-            ROUND((m0.buy_count / NULLIF((m0.buy_count + m0.sell_count), 0) * 100), 6) AS buy_trade_pct,
-            ROUND(((m0.close_price - m0.open_price) / NULLIF(m0.open_price, 0) * 100), 6) AS price_change_1m,
-            ROUND(((m0.max_price - m0.min_price) / NULLIF(m0.avg_price, 0) * 100), 6) AS price_volatility_pct,
-            m0.trade_count,
-            m0.large_trade_count,
-            ROUND(m0.vwap, 2) AS vwap
-        FROM numbered_minutes m0
-        LEFT JOIN numbered_minutes m1 
-            ON m0.row_num > 1
-            AND m1.row_num = m0.row_num - 1
-        LEFT JOIN numbered_minutes m2
-            ON m0.row_num > 2
-            AND m2.row_num = m0.row_num - 2
-        LEFT JOIN numbered_minutes m5
-            ON m0.row_num > 5
-            AND m5.row_num = m0.row_num - 5
-        ORDER BY m0.minute_timestamp DESC
-        LIMIT 15
-        """
-        result = conn.execute(query, [start_time, end_time])
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
+    """Fetch transaction data from WebhookClient API and compute per-minute metrics.
+    
+    Data source: .NET Webhook's DuckDB in-memory (sol_stablecoin_trades table)
+    """
+    client = _get_webhook_client()
+    
+    # Fetch raw trades from webhook API
+    # No limit - get all trades in the time window
+    raw_trades = client.get_trades(start_time=start_time, end_time=end_time, limit=None)
+    
+    if not raw_trades:
+        logger.warning("No trades found in time range %s to %s", start_time, end_time)
+        return []
+    
+    logger.info("Fetched %d trades from webhook API for range %s to %s", len(raw_trades), start_time, end_time)
+    
+    # Convert to DataFrame for aggregation
+    df = pd.DataFrame(raw_trades)
+    
+    # Parse trade_timestamp if it's a string
+    if 'trade_timestamp' in df.columns:
+        df['trade_timestamp'] = pd.to_datetime(df['trade_timestamp'])
+    else:
+        logger.warning("No trade_timestamp column in trades data")
+        return []
+    
+    # Truncate to minute for grouping
+    df['minute_timestamp'] = df['trade_timestamp'].dt.floor('min')
+    
+    # Ensure numeric columns and sensible fallbacks
+    for col in ['sol_amount', 'stablecoin_amount', 'price']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # Fallback: if sol_amount missing but stablecoin_amount and price exist, derive sol_amount
+    if 'sol_amount' in df.columns and 'stablecoin_amount' in df.columns and 'price' in df.columns:
+        missing_sol = df['sol_amount'].fillna(0) == 0
+        df.loc[missing_sol, 'sol_amount'] = df.loc[missing_sol, 'stablecoin_amount'] / df.loc[missing_sol, 'price'].replace(0, np.nan)
+        df['sol_amount'] = df['sol_amount'].fillna(0)
+    
+    # Normalize direction strings
+    if 'direction' in df.columns:
+        df['direction'] = df['direction'].astype(str).str.lower()
+    if 'perp_direction' in df.columns:
+        df['perp_direction'] = df['perp_direction'].astype(str).str.lower()
+    
+    # Aggregate by minute
+    minute_agg = df.groupby('minute_timestamp').agg(
+        total_sol_volume=('sol_amount', 'sum'),
+        total_usd_volume=('stablecoin_amount', 'sum'),
+        trade_count=('sol_amount', 'count'),
+        buy_volume=('sol_amount', lambda x: x[df.loc[x.index, 'direction'] == 'buy'].sum()),
+        sell_volume=('sol_amount', lambda x: x[df.loc[x.index, 'direction'] == 'sell'].sum()),
+        buy_count=('direction', lambda x: (x == 'buy').sum()),
+        sell_count=('direction', lambda x: (x == 'sell').sum()),
+        long_volume=('sol_amount', lambda x: x[df.loc[x.index, 'perp_direction'] == 'long'].sum() if 'perp_direction' in df.columns else 0),
+        short_volume=('sol_amount', lambda x: x[df.loc[x.index, 'perp_direction'] == 'short'].sum() if 'perp_direction' in df.columns else 0),
+        large_trade_volume=('stablecoin_amount', lambda x: x[x > 10000].sum()),
+        large_trade_count=('stablecoin_amount', lambda x: (x > 10000).sum()),
+        avg_trade_size=('stablecoin_amount', 'mean'),
+        min_price=('price', 'min'),
+        max_price=('price', 'max'),
+        avg_price=('price', 'mean'),
+        open_price=('price', 'first'),
+        close_price=('price', 'last'),
+    ).reset_index()
+    
+    # Calculate VWAP
+    minute_agg['vwap'] = minute_agg['total_usd_volume'] / minute_agg['total_sol_volume'].replace(0, np.nan)
+    
+    # Sort by minute and add row numbers
+    minute_agg = minute_agg.sort_values('minute_timestamp').reset_index(drop=True)
+    minute_agg['row_num'] = range(1, len(minute_agg) + 1)
+    
+    # Compute derived metrics
+    results = []
+    for i, row in minute_agg.iterrows():
+        prev_row = minute_agg.iloc[i-1] if i > 0 else row
+        
+        buy_vol = row['buy_volume']
+        sell_vol = row['sell_volume']
+        total_vol = buy_vol + sell_vol
+        long_vol = row['long_volume']
+        short_vol = row['short_volume']
+        perp_total = long_vol + short_vol
+        
+        # Buy/sell pressure
+        buy_sell_pressure = (buy_vol - sell_vol) / total_vol if total_vol > 0 else 0
+        prev_buy_sell_pressure = (prev_row['buy_volume'] - prev_row['sell_volume']) / (prev_row['buy_volume'] + prev_row['sell_volume']) if (prev_row['buy_volume'] + prev_row['sell_volume']) > 0 else 0
+        
+        results.append({
+            'minute_timestamp': row['minute_timestamp'],
+            'minute_number': row['row_num'],
+            'buy_sell_pressure': round(buy_sell_pressure, 6),
+            'buy_volume_pct': round(buy_vol / total_vol * 100, 6) if total_vol > 0 else 0,
+            'sell_volume_pct': round(sell_vol / total_vol * 100, 6) if total_vol > 0 else 0,
+            'pressure_shift_1m': round(buy_sell_pressure - prev_buy_sell_pressure, 6),
+            'long_short_ratio': round(long_vol / short_vol, 6) if short_vol > 0 else 0,
+            'long_volume_pct': round(long_vol / perp_total * 100, 6) if perp_total > 0 else 0,
+            'short_volume_pct': round(short_vol / perp_total * 100, 6) if perp_total > 0 else 0,
+            'perp_position_skew_pct': round((long_vol - short_vol) / perp_total * 100, 6) if perp_total > 0 else 0,
+            'perp_dominance_pct': round(perp_total / row['total_sol_volume'] * 100, 6) if row['total_sol_volume'] > 0 else 0,
+            'total_volume_usd': round(row['total_usd_volume'], 2),
+            'volume_acceleration_ratio': round(row['total_usd_volume'] / prev_row['total_usd_volume'], 6) if prev_row['total_usd_volume'] > 0 else 1,
+            'whale_volume_pct': round(row['large_trade_volume'] / row['total_usd_volume'] * 100, 6) if row['total_usd_volume'] > 0 else 0,
+            'avg_trade_size': round(row['avg_trade_size'], 2),
+            'trades_per_second': round(row['trade_count'] / 60.0, 2),
+            'buy_trade_pct': round(row['buy_count'] / row['trade_count'] * 100, 6) if row['trade_count'] > 0 else 0,
+            'price_change_1m': round((row['close_price'] - row['open_price']) / row['open_price'] * 100, 6) if row['open_price'] > 0 else 0,
+            'price_volatility_pct': round((row['max_price'] - row['min_price']) / row['avg_price'] * 100, 6) if row['avg_price'] > 0 else 0,
+            'trade_count': int(row['trade_count']),
+            'large_trade_count': int(row['large_trade_count']),
+            'vwap': round(row['vwap'], 2) if pd.notna(row['vwap']) else 0,
+        })
+    
+    # Return latest 15 minutes, sorted descending
+    final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
+    logger.info("Aggregated transactions into %d minutes of data", len(final_results))
+    return final_results
 
 
 def fetch_whale_activity(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch whale movement data from DuckDB with computed metrics."""
-    with get_duckdb("central") as conn:
-        query = """
-        WITH minute_aggregates AS (
-            SELECT 
-                DATE_TRUNC('minute', timestamp) AS minute_timestamp,
-                SUM(CASE WHEN direction = 'in' THEN ABS(sol_change) ELSE 0 END) AS inflow_sol,
-                SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS inflow_count,
-                SUM(CASE WHEN direction = 'out' THEN ABS(sol_change) ELSE 0 END) AS outflow_sol,
-                SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS outflow_count,
-                SUM(CASE 
-                    WHEN direction = 'in' THEN ABS(sol_change)
-                    WHEN direction = 'out' THEN -ABS(sol_change)
-                    ELSE 0 
-                END) AS net_flow_sol,
-                SUM(ABS(sol_change)) AS total_sol_moved,
-                COUNT(*) AS total_movements,
-                SUM(CASE WHEN percentage_moved > 10 THEN ABS(sol_change) ELSE 0 END) AS massive_move_sol,
-                SUM(CASE WHEN percentage_moved > 10 THEN 1 ELSE 0 END) AS massive_move_count,
-                SUM(CASE WHEN percentage_moved BETWEEN 5 AND 10 THEN ABS(sol_change) ELSE 0 END) AS large_move_sol,
-                SUM(CASE WHEN percentage_moved BETWEEN 5 AND 10 THEN 1 ELSE 0 END) AS large_move_count,
-                SUM(CASE WHEN percentage_moved BETWEEN 2 AND 5 THEN ABS(sol_change) ELSE 0 END) AS medium_move_sol,
-                SUM(CASE WHEN percentage_moved BETWEEN 2 AND 5 THEN 1 ELSE 0 END) AS medium_move_count,
-                SUM(CASE 
-                    WHEN direction = 'in' AND percentage_moved > 5 THEN ABS(sol_change)
-                    ELSE 0 
-                END) AS strong_accumulation_sol,
-                SUM(CASE 
-                    WHEN direction = 'out' AND percentage_moved > 5 THEN ABS(sol_change)
-                    ELSE 0 
-                END) AS strong_distribution_sol,
-                AVG(ABS(sol_change)) AS avg_move_size,
-                MAX(ABS(sol_change)) AS max_move_size,
-                AVG(percentage_moved) AS avg_percentage_moved,
-                MAX(percentage_moved) AS max_percentage_moved
-            FROM whale_movements
-            WHERE timestamp >= ?
-                AND timestamp <= ?
-            GROUP BY DATE_TRUNC('minute', timestamp)
-        ),
-        numbered_minutes AS (
-            SELECT *,
-                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-            FROM minute_aggregates
-        )
-        SELECT 
-            m0.minute_timestamp,
-            m0.row_num AS minute_number,
-            ROUND(
-                CASE 
-                    WHEN (m0.inflow_sol + m0.outflow_sol) > 0 THEN
-                        m0.net_flow_sol / (m0.inflow_sol + m0.outflow_sol)
-                    WHEN m0.outflow_sol > 0 AND m0.inflow_sol = 0 THEN -1.0
-                    WHEN m0.inflow_sol > 0 AND m0.outflow_sol = 0 THEN 1.0
-                    ELSE 0
-                END,
-            6) AS net_flow_ratio,
-            ROUND(
-                CASE 
-                    WHEN m1.minute_timestamp IS NOT NULL AND (m0.inflow_sol + m0.outflow_sol) > 0 AND (m1.inflow_sol + m1.outflow_sol) > 0 THEN
-                        (m0.net_flow_sol / (m0.inflow_sol + m0.outflow_sol)) -
-                        (m1.net_flow_sol / (m1.inflow_sol + m1.outflow_sol))
-                    ELSE 0
-                END,
-            6) AS flow_shift_1m,
-            ROUND(
-                CASE
-                    WHEN m0.outflow_sol > 0 AND m0.inflow_sol > 0 THEN m0.inflow_sol / m0.outflow_sol
-                    WHEN m0.inflow_sol > 0 AND m0.outflow_sol = 0 THEN 999.0
-                    WHEN m0.outflow_sol > 0 AND m0.inflow_sol = 0 THEN 0.0
-                    ELSE 1.0
-                END,
-            6) AS accumulation_ratio,
-            ROUND(m0.strong_accumulation_sol, 2) AS strong_accumulation,
-            ROUND(m0.total_sol_moved, 2) AS total_sol_moved,
-            ROUND(m0.inflow_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS inflow_share_pct,
-            ROUND(m0.outflow_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS outflow_share_pct,
-            ROUND(m0.net_flow_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS net_flow_strength_pct,
-            ROUND(m0.strong_accumulation_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS strong_accumulation_pct,
-            ROUND(m0.strong_distribution_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS strong_distribution_pct,
-            m0.total_movements AS movement_count,
-            ROUND(m0.massive_move_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS massive_move_pct,
-            ROUND(m0.avg_percentage_moved, 6) AS avg_wallet_pct_moved,
-            ROUND(m0.strong_distribution_sol / NULLIF(m0.total_sol_moved, 0) * 100, 6) AS distribution_pressure_pct,
-            ROUND(
-                CASE
-                    WHEN m1.outflow_sol > 0 THEN (m0.outflow_sol - m1.outflow_sol) / m1.outflow_sol * 100
-                    WHEN m0.outflow_sol > 0 THEN 100.0
-                    ELSE 0
-                END,
-            6) AS outflow_surge_pct,
-            ROUND(
-                ABS(m0.inflow_count - m0.outflow_count) / 
-                NULLIF((m0.inflow_count + m0.outflow_count), 0) * 100,
-            6) AS movement_imbalance_pct,
-            ROUND(m0.inflow_sol, 2) AS inflow_sol,
-            ROUND(m0.outflow_sol, 2) AS outflow_sol,
-            ROUND(m0.net_flow_sol, 2) AS net_flow_sol,
-            m0.inflow_count,
-            m0.outflow_count,
-            m0.massive_move_count,
-            ROUND(m0.max_move_size, 2) AS max_move_size,
-            ROUND(m0.strong_distribution_sol, 2) AS strong_distribution
-        FROM numbered_minutes m0
-        LEFT JOIN numbered_minutes m1 
-            ON m0.row_num > 1
-            AND m1.row_num = m0.row_num - 1
-        ORDER BY m0.minute_timestamp DESC
-        LIMIT 15
-        """
-        result = conn.execute(query, [start_time, end_time])
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
+    """Fetch whale movement data from WebhookClient API and compute per-minute metrics.
+    
+    Data source: .NET Webhook's DuckDB in-memory (whale_movements table)
+    """
+    client = _get_webhook_client()
+    
+    # Fetch raw whale movements from webhook API
+    # No limit - get all movements in the time window
+    raw_whales = client.get_whale_movements(start_time=start_time, end_time=end_time, limit=None)
+    
+    if not raw_whales:
+        logger.warning("No whale movements found in time range %s to %s", start_time, end_time)
+        return []
+    
+    logger.info("Fetched %d whale movements from webhook API for range %s to %s", len(raw_whales), start_time, end_time)
+    
+    # Convert to DataFrame for aggregation
+    df = pd.DataFrame(raw_whales)
+    
+    # Parse timestamp if it's a string
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    else:
+        logger.warning("No timestamp column in whale data")
+        return []
+    
+    # Normalize direction; map webhook values to in/out
+    if 'direction' in df.columns:
+        df['direction'] = df['direction'].astype(str).str.lower()
+        df['direction'] = df['direction'].replace({
+            'sending': 'out',
+            'sent': 'out',
+            'outbound': 'out',
+            'receiving': 'in',
+            'received': 'in',
+            'inbound': 'in'
+        })
+    
+    # Truncate to minute for grouping
+    df['minute_timestamp'] = df['timestamp'].dt.floor('min')
+    
+    # Ensure numeric columns
+    for col in ['sol_change', 'abs_change', 'percentage_moved']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        else:
+            df[col] = 0
+    
+    # Prefer abs_change when non-zero; otherwise fall back to sol_change magnitude
+    df['abs_sol_change'] = np.where(
+        df['abs_change'].abs() > 0,
+        df['abs_change'].abs(),
+        df['sol_change'].abs()
+    )
+    
+    # Aggregate by minute
+    def agg_by_minute(group):
+        direction_col = 'direction' if 'direction' in group.columns else None
+        pct_col = 'percentage_moved' if 'percentage_moved' in group.columns else None
+        
+        inflow_mask = group[direction_col] == 'in' if direction_col else pd.Series([False] * len(group))
+        outflow_mask = group[direction_col] == 'out' if direction_col else pd.Series([False] * len(group))
+        
+        inflow_sol = group.loc[inflow_mask, 'abs_sol_change'].sum() if inflow_mask.any() else 0
+        outflow_sol = group.loc[outflow_mask, 'abs_sol_change'].sum() if outflow_mask.any() else 0
+        net_flow = inflow_sol - outflow_sol
+        total_moved = group['abs_sol_change'].sum()
+        
+        # Percentage-based categorization
+        if pct_col:
+            massive_mask = group[pct_col] > 10
+            large_mask = (group[pct_col] > 5) & (group[pct_col] <= 10)
+            strong_acc_mask = inflow_mask & (group[pct_col] > 5)
+            strong_dist_mask = outflow_mask & (group[pct_col] > 5)
+        else:
+            massive_mask = pd.Series([False] * len(group))
+            large_mask = pd.Series([False] * len(group))
+            strong_acc_mask = pd.Series([False] * len(group))
+            strong_dist_mask = pd.Series([False] * len(group))
+        
+        return pd.Series({
+            'inflow_sol': inflow_sol,
+            'inflow_count': inflow_mask.sum(),
+            'outflow_sol': outflow_sol,
+            'outflow_count': outflow_mask.sum(),
+            'net_flow_sol': net_flow,
+            'total_sol_moved': total_moved,
+            'total_movements': len(group),
+            'massive_move_sol': group.loc[massive_mask, 'abs_sol_change'].sum() if massive_mask.any() else 0,
+            'massive_move_count': massive_mask.sum(),
+            'strong_accumulation_sol': group.loc[strong_acc_mask, 'abs_sol_change'].sum() if strong_acc_mask.any() else 0,
+            'strong_distribution_sol': group.loc[strong_dist_mask, 'abs_sol_change'].sum() if strong_dist_mask.any() else 0,
+            'avg_move_size': group['abs_sol_change'].mean(),
+            'max_move_size': group['abs_sol_change'].max(),
+            'avg_percentage_moved': group[pct_col].mean() if pct_col else 0,
+        })
+    
+    minute_agg = df.groupby('minute_timestamp').apply(agg_by_minute, include_groups=False).reset_index()
+    
+    # Sort by minute and add row numbers
+    minute_agg = minute_agg.sort_values('minute_timestamp').reset_index(drop=True)
+    minute_agg['row_num'] = range(1, len(minute_agg) + 1)
+    
+    # Compute derived metrics
+    results = []
+    for i, row in minute_agg.iterrows():
+        prev_row = minute_agg.iloc[i-1] if i > 0 else row
+        
+        inflow = row['inflow_sol']
+        outflow = row['outflow_sol']
+        total_flow = inflow + outflow
+        net_flow = row['net_flow_sol']
+        total_moved = row['total_sol_moved']
+        
+        # Net flow ratio
+        if total_flow > 0:
+            net_flow_ratio = net_flow / total_flow
+        elif outflow > 0:
+            net_flow_ratio = -1.0
+        elif inflow > 0:
+            net_flow_ratio = 1.0
+        else:
+            net_flow_ratio = 0
+        
+        # Previous net flow ratio
+        prev_total_flow = prev_row['inflow_sol'] + prev_row['outflow_sol']
+        if prev_total_flow > 0:
+            prev_net_flow_ratio = prev_row['net_flow_sol'] / prev_total_flow
+        else:
+            prev_net_flow_ratio = 0
+        
+        # Accumulation ratio
+        if outflow > 0 and inflow > 0:
+            acc_ratio = inflow / outflow
+        elif inflow > 0:
+            acc_ratio = 999.0
+        elif outflow > 0:
+            acc_ratio = 0.0
+        else:
+            acc_ratio = 1.0
+        
+        # Outflow surge
+        if prev_row['outflow_sol'] > 0:
+            outflow_surge = (outflow - prev_row['outflow_sol']) / prev_row['outflow_sol'] * 100
+        elif outflow > 0:
+            outflow_surge = 100.0
+        else:
+            outflow_surge = 0
+        
+        results.append({
+            'minute_timestamp': row['minute_timestamp'],
+            'minute_number': int(row['row_num']),
+            'net_flow_ratio': round(net_flow_ratio, 6),
+            'flow_shift_1m': round(net_flow_ratio - prev_net_flow_ratio, 6),
+            'accumulation_ratio': round(acc_ratio, 6),
+            'strong_accumulation': round(row['strong_accumulation_sol'], 2),
+            'total_sol_moved': round(total_moved, 2),
+            'inflow_share_pct': round(inflow / total_moved * 100, 6) if total_moved > 0 else 0,
+            'outflow_share_pct': round(outflow / total_moved * 100, 6) if total_moved > 0 else 0,
+            'net_flow_strength_pct': round(net_flow / total_moved * 100, 6) if total_moved > 0 else 0,
+            'strong_accumulation_pct': round(row['strong_accumulation_sol'] / total_moved * 100, 6) if total_moved > 0 else 0,
+            'strong_distribution_pct': round(row['strong_distribution_sol'] / total_moved * 100, 6) if total_moved > 0 else 0,
+            'movement_count': int(row['total_movements']),
+            'massive_move_pct': round(row['massive_move_sol'] / total_moved * 100, 6) if total_moved > 0 else 0,
+            'avg_wallet_pct_moved': round(row['avg_percentage_moved'], 6),
+            'distribution_pressure_pct': round(row['strong_distribution_sol'] / total_moved * 100, 6) if total_moved > 0 else 0,
+            'outflow_surge_pct': round(outflow_surge, 6),
+            'movement_imbalance_pct': round(abs(row['inflow_count'] - row['outflow_count']) / (row['inflow_count'] + row['outflow_count']) * 100, 6) if (row['inflow_count'] + row['outflow_count']) > 0 else 0,
+            'inflow_sol': round(inflow, 2),
+            'outflow_sol': round(outflow, 2),
+            'net_flow_sol': round(net_flow, 2),
+            'inflow_count': int(row['inflow_count']),
+            'outflow_count': int(row['outflow_count']),
+            'massive_move_count': int(row['massive_move_count']),
+            'max_move_size': round(row['max_move_size'], 2),
+            'strong_distribution': round(row['strong_distribution_sol'], 2),
+        })
+    
+    # Return latest 15 minutes, sorted descending
+    final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
+    logger.info("Aggregated whale activity into %d minutes of data", len(final_results))
+    return final_results
 
 
 def fetch_price_movements(
     start_time: datetime,
-    end_time: datetime
+    end_time: datetime,
+    token: str = "SOL",
+    coin_id: int = 5
 ) -> List[Dict[str, Any]]:
-    """Fetch price movement data from DuckDB with computed metrics."""
-    with get_duckdb("central") as conn:
+    """Fetch price movement data with legacy-equivalent calculations.
+    
+    Prefers TradingDataEngine (prices table: ts, token, price). Falls back to MySQL price_points
+    (created_at/value/coin_id) if the engine is not running.
+    
+    Args:
+        start_time: Start of the time window
+        end_time: End of the time window
+        token: Token symbol for DuckDB (SOL, BTC, ETH)
+        coin_id: Coin ID for MySQL price_points (1=BTC, 2=ETH, 5=SOL)
+    """
+    engine = _get_engine_if_running()
+    
+    if engine is not None:
+        # TradingDataEngine path (prices table)
         query = """
+            WITH minute_aggregates AS (
+                SELECT 
+                    DATE_TRUNC('minute', ts) AS minute_timestamp,
+                    MIN(price) AS low_price,
+                    MAX(price) AS high_price,
+                    AVG(price) AS avg_price,
+                    FIRST(price ORDER BY ts ASC) AS true_open,
+                    LAST(price ORDER BY ts ASC) AS true_close,
+                    MAX(price) - MIN(price) AS price_range,
+                    STDDEV(price) AS price_stddev,
+                    COUNT(*) AS price_updates
+                FROM prices
+                WHERE ts >= ?
+                    AND ts <= ?
+                    AND token = ?
+                GROUP BY DATE_TRUNC('minute', ts)
+            ),
+            numbered_minutes AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
+                FROM minute_aggregates
+            )
+            SELECT 
+                m0.minute_timestamp,
+                m0.row_num AS minute_number,
+                ROUND((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100, 6) AS price_change_1m,
+                ROUND(
+                    ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100) /
+                    NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
+                6) AS momentum_volatility_ratio,
+                ROUND(
+                    CASE WHEN m1.true_close > 0 AND m1.true_open > 0 THEN
+                        ((m0.true_close - m0.true_open) / m0.true_open) -
+                        ((m1.true_close - m1.true_open) / m1.true_open)
+                    ELSE 0 END * 100,
+                6) AS momentum_acceleration_1m,
+                ROUND(CASE WHEN m5.true_close > 0 THEN
+                    (m0.true_close - m5.true_close) / m5.true_close * 100
+                ELSE 0 END, 6) AS price_change_5m,
+                ROUND(CASE WHEN m10.true_close > 0 THEN
+                    (m0.true_close - m10.true_close) / m10.true_close * 100
+                ELSE 0 END, 6) AS price_change_10m,
+                ROUND(m0.price_range / NULLIF(m0.avg_price, 0) * 100, 6) AS volatility_pct,
+                ROUND(
+                    (ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100) /
+                    NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
+                6) AS body_range_ratio,
+                ROUND(m0.price_stddev / NULLIF(m0.avg_price, 0) * 100, 6) AS price_stddev_pct,
+                ROUND(ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100, 6) AS candle_body_pct,
+                ROUND((m0.high_price - GREATEST(m0.true_open, m0.true_close)) / 
+                    NULLIF(m0.avg_price, 0) * 100, 6) AS upper_wick_pct,
+                ROUND((LEAST(m0.true_open, m0.true_close) - m0.low_price) / 
+                    NULLIF(m0.avg_price, 0) * 100, 6) AS lower_wick_pct,
+                ROUND(m0.true_open, 4) AS open_price,
+                ROUND(m0.high_price, 4) AS high_price,
+                ROUND(m0.low_price, 4) AS low_price,
+                ROUND(m0.true_close, 4) AS close_price,
+                ROUND(m0.avg_price, 4) AS avg_price,
+                m0.price_updates
+            FROM numbered_minutes m0
+            LEFT JOIN numbered_minutes m1 
+                ON m0.row_num > 1
+                AND m1.row_num = m0.row_num - 1
+            LEFT JOIN numbered_minutes m5
+                ON m0.row_num > 5
+                AND m5.row_num = m0.row_num - 5
+            LEFT JOIN numbered_minutes m10
+                ON m0.row_num > 10
+                AND m10.row_num = m0.row_num - 10
+            ORDER BY m0.minute_timestamp DESC
+            LIMIT 15
+        """
+        results = _execute_query(query, [start_time, end_time, token])
+        # Fallback to MySQL if engine is running but has no data for the window
+        if results:
+            return results
+    
+    # Fallback: file-based DuckDB price_points (fast)
+    # DuckDB uses strftime() for date formatting
+    query_duckdb = """
         WITH minute_aggregates AS (
             SELECT 
-                DATE_TRUNC('minute', created_at) AS minute_timestamp,
+                strftime(created_at, '%Y-%m-%d %H:%M:00') AS minute_timestamp,
                 MIN(value) AS low_price,
                 MAX(value) AS high_price,
                 AVG(value) AS avg_price,
@@ -432,8 +714,8 @@ def fetch_price_movements(
             FROM price_points
             WHERE created_at >= ?
                 AND created_at <= ?
-                AND coin_id = 5
-            GROUP BY DATE_TRUNC('minute', created_at)
+                AND coin_id = ?
+            GROUP BY strftime(created_at, '%Y-%m-%d %H:%M:00')
         ),
         numbered_minutes AS (
             SELECT *,
@@ -471,11 +753,11 @@ def fetch_price_movements(
                 NULLIF(m0.avg_price, 0) * 100, 6) AS upper_wick_pct,
             ROUND((LEAST(m0.true_open, m0.true_close) - m0.low_price) / 
                 NULLIF(m0.avg_price, 0) * 100, 6) AS lower_wick_pct,
-            ROUND(m0.true_open, 2) AS open_price,
-            ROUND(m0.high_price, 2) AS high_price,
-            ROUND(m0.low_price, 2) AS low_price,
-            ROUND(m0.true_close, 2) AS close_price,
-            ROUND(m0.avg_price, 2) AS avg_price,
+            ROUND(m0.true_open, 4) AS open_price,
+            ROUND(m0.high_price, 4) AS high_price,
+            ROUND(m0.low_price, 4) AS low_price,
+            ROUND(m0.true_close, 4) AS close_price,
+            ROUND(m0.avg_price, 4) AS avg_price,
             m0.price_updates
         FROM numbered_minutes m0
         LEFT JOIN numbered_minutes m1 
@@ -489,11 +771,16 @@ def fetch_price_movements(
             AND m10.row_num = m0.row_num - 10
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
-        """
-        result = conn.execute(query, [start_time, end_time])
-        columns = [desc[0] for desc in result.description]
-        rows = result.fetchall()
-        return [dict(zip(columns, row)) for row in rows]
+    """
+    try:
+        with get_duckdb("central") as conn:
+            result = conn.execute(query_duckdb, [start_time, end_time, coin_id])
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.error("DuckDB price_movements query failed for %s (coin_id=%s): %s", token, coin_id, e)
+        return []
 
 
 def fetch_second_prices(
@@ -501,25 +788,42 @@ def fetch_second_prices(
     end_time: datetime
 ) -> pd.DataFrame:
     """Fetch 1-second price data for pattern detection."""
-    with get_duckdb("central") as conn:
+    engine = _get_engine_if_running()
+    
+    if engine is not None:
         query = """
-            SELECT created_at AS ts, value AS price
-            FROM price_points
-            WHERE created_at >= ? AND created_at <= ?
-                AND coin_id = 5
-            ORDER BY created_at ASC
+            SELECT ts AS ts, price AS price
+            FROM prices
+            WHERE ts >= ? AND ts <= ? AND token = ?
+            ORDER BY ts ASC
         """
-        result = conn.execute(query, [start_time, end_time])
-        rows = result.fetchall()
-        
-        if not rows:
-            return pd.DataFrame(columns=["price"])
-        
-        df = pd.DataFrame(rows, columns=["ts", "price"])
-        df["ts"] = pd.to_datetime(df["ts"])
-        df = df.set_index("ts")
-        df["price"] = df["price"].astype(float)
-        return df
+        results = _execute_query(query, [start_time, end_time, "SOL"])
+    else:
+        # Fallback to file-based DuckDB price_points (fast)
+        try:
+            with get_duckdb("central") as conn:
+                result = conn.execute("""
+                    SELECT created_at AS ts, value AS price
+                    FROM price_points
+                    WHERE created_at >= ? AND created_at <= ?
+                        AND coin_id = 5
+                    ORDER BY created_at ASC
+                """, [start_time, end_time])
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+                results = [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            logger.error("DuckDB second_prices query failed: %s", e)
+            results = []
+    
+    if not results:
+        return pd.DataFrame(columns=["price"])
+    
+    df = pd.DataFrame(results)
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.set_index("ts")
+    df["price"] = df["price"].astype(float)
+    return df
 
 
 # =============================================================================
@@ -1002,8 +1306,36 @@ def make_json_serializable(obj: Any) -> Any:
     return obj
 
 
-def persist_trail(buyin_id: int, payload: Dict[str, Any]) -> None:
-    """Persist the generated trail JSON into the buy-in row."""
+def persist_trail(buyin_id: int, payload: Dict[str, Any]) -> bool:
+    """Persist the generated trail data to the buyin_trail_minutes table.
+    
+    This is the primary persistence method - stores one row per minute (15 rows total)
+    in the buyin_trail_minutes table for efficient querying.
+    
+    Args:
+        buyin_id: The ID of the buyin record
+        payload: The trail payload from generate_trail_payload()
+        
+    Returns:
+        True if persistence succeeded, False otherwise
+    """
+    # Insert into buyin_trail_minutes table (primary storage)
+    success = insert_trail_data(buyin_id, payload)
+    
+    if success:
+        logger.info(f"✓ Trail data persisted to table for buyin_id={buyin_id}")
+    else:
+        logger.warning(f"✗ Trail data persistence failed for buyin_id={buyin_id}")
+    
+    return success
+
+
+def persist_trail_json_legacy(buyin_id: int, payload: Dict[str, Any]) -> None:
+    """(Deprecated) Persist the generated trail JSON into the buy-in row.
+    
+    This is the legacy JSON persistence method. Use persist_trail() instead
+    for the new table-based storage.
+    """
     serializable_payload = make_json_serializable({
         key: value
         for key, value in payload.items()
@@ -1012,12 +1344,16 @@ def persist_trail(buyin_id: int, payload: Dict[str, Any]) -> None:
     
     trail_json = json.dumps(serializable_payload, ensure_ascii=True)
     
-    # Dual-write to both DuckDB and MySQL
-    dual_write_update(
-        table="follow_the_goat_buyins",
-        data={"fifteen_min_trail": trail_json},
-        where={"id": buyin_id}
-    )
+    # Write to DuckDB only (no MySQL)
+    try:
+        with get_duckdb("central") as conn:
+            conn.execute("""
+                UPDATE follow_the_goat_buyins
+                SET fifteen_min_trail = ?
+                WHERE id = ?
+            """, [trail_json, buyin_id])
+    except Exception as e:
+        logger.warning(f"DuckDB trail persist failed: {e}")
 
 
 # =============================================================================
@@ -1028,7 +1364,7 @@ def generate_trail_payload(
     buyin_id: int,
     symbol: Optional[str] = None,
     lookback_minutes: Optional[int] = None,
-    persist: bool = False,
+    persist: bool = True,
 ) -> Dict[str, Any]:
     """Generate the 15-minute trail payload for a buy-in.
 
@@ -1036,7 +1372,7 @@ def generate_trail_payload(
         buyin_id: Target identifier in follow_the_goat_buyins.
         symbol: Optional override for the order book symbol (default: SOLUSDT).
         lookback_minutes: Window size in minutes (default: 15).
-        persist: If True, store the JSON in the database.
+        persist: If True (default), store data in buyin_trail_minutes table.
 
     Returns:
         JSON-serializable dictionary containing order book and transaction data.
@@ -1062,7 +1398,14 @@ def generate_trail_payload(
         order_book_rows = fetch_order_book_signals(symbol_to_use, window_start, window_end)
         transaction_rows = fetch_transactions(window_start, window_end)
         whale_rows = fetch_whale_activity(window_start, window_end)
-        price_rows = fetch_price_movements(window_start, window_end)
+        
+        # Fetch SOL price movements (primary)
+        price_rows = fetch_price_movements(window_start, window_end, token="SOL", coin_id=5)
+        
+        # Fetch BTC and ETH price movements for cross-market analysis
+        btc_price_rows = fetch_price_movements(window_start, window_end, token="BTC", coin_id=6)
+        eth_price_rows = fetch_price_movements(window_start, window_end, token="ETH", coin_id=7)
+        
         second_prices = fetch_second_prices(window_start, window_end)
 
         # Run pattern detection
@@ -1081,6 +1424,8 @@ def generate_trail_payload(
         annotate_minute_spans(transaction_rows, window_end)
         annotate_minute_spans(whale_rows, window_end)
         annotate_minute_spans(price_rows, window_end)
+        annotate_minute_spans(btc_price_rows, window_end)
+        annotate_minute_spans(eth_price_rows, window_end)
 
         payload: Dict[str, Any] = {
             "buyin_id": buyin["id"],
@@ -1095,6 +1440,8 @@ def generate_trail_payload(
             "transactions": transaction_rows,
             "whale_activity": whale_rows,
             "price_movements": price_rows,
+            "btc_price_movements": btc_price_rows,
+            "eth_price_movements": eth_price_rows,
             "patterns": patterns,
             "second_prices": (
                 second_prices.reset_index().to_dict('records')
@@ -1110,8 +1457,8 @@ def generate_trail_payload(
             payload["existing_trail"] = buyin["existing_trail"]
 
         if persist:
-            persist_trail(buyin_id, payload)
-            payload["persisted"] = True
+            success = persist_trail(buyin_id, payload)
+            payload["persisted"] = success
 
         return make_json_serializable(payload)
 

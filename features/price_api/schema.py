@@ -6,12 +6,14 @@ Mirrors MySQL tables for 24-hour hot storage.
 
 Tables:
 - follow_the_goat_plays (full data, not time-based)
+- follow_the_goat_tracking (full data - tracks last processed trade per wallet)
 - follow_the_goat_buyins (24hr hot)
 - follow_the_goat_buyins_price_checks (24hr hot)
 - price_points (24hr hot)
 - price_analysis (24hr hot)
 - cycle_tracker (24hr hot)
 - wallet_profiles (24hr hot)
+- sol_stablecoin_trades (1hr hot - for fast trade detection)
 """
 
 # =============================================================================
@@ -77,13 +79,16 @@ CREATE TABLE IF NOT EXISTS follow_the_goat_buyins (
     current_price DECIMAL(20,8),
     entry_log JSON,
     fifteen_min_trail JSON,
-    pattern_validator_log JSON
+    pattern_validator_log JSON,
+    potential_gains FLOAT
 );
 
 CREATE INDEX IF NOT EXISTS idx_buyins_wallet ON follow_the_goat_buyins(wallet_address);
 CREATE INDEX IF NOT EXISTS idx_buyins_followed_at ON follow_the_goat_buyins(followed_at);
 CREATE INDEX IF NOT EXISTS idx_buyins_status ON follow_the_goat_buyins(our_status);
 CREATE INDEX IF NOT EXISTS idx_buyins_play_id ON follow_the_goat_buyins(play_id);
+-- Composite index for common query pattern (ORDER BY followed_at + filters)
+CREATE INDEX IF NOT EXISTS idx_buyins_query_opt ON follow_the_goat_buyins(followed_at DESC, our_status, play_id);
 """
 
 SCHEMA_FOLLOW_THE_GOAT_BUYINS_PRICE_CHECKS = """
@@ -235,6 +240,7 @@ CREATE TABLE IF NOT EXISTS pattern_config_filters (
     from_value DECIMAL(20,8),
     to_value DECIMAL(20,8),
     include_null TINYINT DEFAULT 0,
+    exclude_mode TINYINT DEFAULT 0,
     play_id INTEGER,
     is_active TINYINT DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -245,6 +251,264 @@ CREATE INDEX IF NOT EXISTS idx_pattern_filters_project_id ON pattern_config_filt
 CREATE INDEX IF NOT EXISTS idx_pattern_filters_section_minute ON pattern_config_filters(section, minute);
 CREATE INDEX IF NOT EXISTS idx_pattern_filters_is_active ON pattern_config_filters(is_active);
 """
+
+# =============================================================================
+# BUYIN TRAIL MINUTES - Flattened 15-minute trail data
+# =============================================================================
+
+SCHEMA_BUYIN_TRAIL_MINUTES = """
+CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
+    id BIGINT PRIMARY KEY,
+    buyin_id BIGINT NOT NULL,
+    minute TINYINT NOT NULL,
+    
+    -- Price Movements (pm_) - 22 columns
+    pm_price_change_1m DOUBLE,
+    pm_momentum_volatility_ratio DOUBLE,
+    pm_momentum_acceleration_1m DOUBLE,
+    pm_price_change_5m DOUBLE,
+    pm_price_change_10m DOUBLE,
+    pm_volatility_pct DOUBLE,
+    pm_body_range_ratio DOUBLE,
+    pm_volatility_surge_ratio DOUBLE,
+    pm_price_stddev_pct DOUBLE,
+    pm_trend_consistency_3m DOUBLE,
+    pm_cumulative_return_5m DOUBLE,
+    pm_candle_body_pct DOUBLE,
+    pm_upper_wick_pct DOUBLE,
+    pm_lower_wick_pct DOUBLE,
+    pm_wick_balance_ratio DOUBLE,
+    pm_price_vs_ma5_pct DOUBLE,
+    pm_breakout_strength_10m DOUBLE,
+    pm_open_price DOUBLE,
+    pm_high_price DOUBLE,
+    pm_low_price DOUBLE,
+    pm_close_price DOUBLE,
+    pm_avg_price DOUBLE,
+    
+    -- Order Book Signals (ob_) - 22 columns
+    ob_mid_price DOUBLE,
+    ob_price_change_1m DOUBLE,
+    ob_price_change_5m DOUBLE,
+    ob_price_change_10m DOUBLE,
+    ob_volume_imbalance DOUBLE,
+    ob_imbalance_shift_1m DOUBLE,
+    ob_imbalance_trend_3m DOUBLE,
+    ob_depth_imbalance_ratio DOUBLE,
+    ob_bid_liquidity_share_pct DOUBLE,
+    ob_ask_liquidity_share_pct DOUBLE,
+    ob_depth_imbalance_pct DOUBLE,
+    ob_total_liquidity DOUBLE,
+    ob_liquidity_change_3m DOUBLE,
+    ob_microprice_deviation DOUBLE,
+    ob_microprice_acceleration_2m DOUBLE,
+    ob_spread_bps DOUBLE,
+    ob_aggression_ratio DOUBLE,
+    ob_vwap_spread_bps DOUBLE,
+    ob_net_flow_5m DOUBLE,
+    ob_net_flow_to_liquidity_ratio DOUBLE,
+    ob_sample_count INTEGER,
+    ob_coverage_seconds INTEGER,
+    
+    -- Transactions (tx_) - 24 columns
+    tx_buy_sell_pressure DOUBLE,
+    tx_buy_volume_pct DOUBLE,
+    tx_sell_volume_pct DOUBLE,
+    tx_pressure_shift_1m DOUBLE,
+    tx_pressure_trend_3m DOUBLE,
+    tx_long_short_ratio DOUBLE,
+    tx_long_volume_pct DOUBLE,
+    tx_short_volume_pct DOUBLE,
+    tx_perp_position_skew_pct DOUBLE,
+    tx_long_ratio_shift_1m DOUBLE,
+    tx_perp_dominance_pct DOUBLE,
+    tx_total_volume_usd DOUBLE,
+    tx_volume_acceleration_ratio DOUBLE,
+    tx_volume_surge_ratio DOUBLE,
+    tx_whale_volume_pct DOUBLE,
+    tx_avg_trade_size DOUBLE,
+    tx_trades_per_second DOUBLE,
+    tx_buy_trade_pct DOUBLE,
+    tx_price_change_1m DOUBLE,
+    tx_price_volatility_pct DOUBLE,
+    tx_cumulative_buy_flow_5m DOUBLE,
+    tx_trade_count INTEGER,
+    tx_large_trade_count INTEGER,
+    tx_vwap DOUBLE,
+    
+    -- Whale Activity (wh_) - 28 columns
+    wh_net_flow_ratio DOUBLE,
+    wh_flow_shift_1m DOUBLE,
+    wh_flow_trend_3m DOUBLE,
+    wh_accumulation_ratio DOUBLE,
+    wh_strong_accumulation DOUBLE,
+    wh_cumulative_flow_5m DOUBLE,
+    wh_total_sol_moved DOUBLE,
+    wh_inflow_share_pct DOUBLE,
+    wh_outflow_share_pct DOUBLE,
+    wh_net_flow_strength_pct DOUBLE,
+    wh_strong_accumulation_pct DOUBLE,
+    wh_strong_distribution_pct DOUBLE,
+    wh_activity_surge_ratio DOUBLE,
+    wh_movement_count INTEGER,
+    wh_massive_move_pct DOUBLE,
+    wh_avg_wallet_pct_moved DOUBLE,
+    wh_largest_move_dominance DOUBLE,
+    wh_distribution_pressure_pct DOUBLE,
+    wh_outflow_surge_pct DOUBLE,
+    wh_movement_imbalance_pct DOUBLE,
+    wh_inflow_sol DOUBLE,
+    wh_outflow_sol DOUBLE,
+    wh_net_flow_sol DOUBLE,
+    wh_inflow_count INTEGER,
+    wh_outflow_count INTEGER,
+    wh_massive_move_count INTEGER,
+    wh_max_move_size DOUBLE,
+    wh_strong_distribution DOUBLE,
+    
+    -- Pattern Detection (pat_) - 25 columns
+    pat_breakout_score DOUBLE,
+    pat_detected_count INTEGER,
+    pat_detected_list VARCHAR(255),
+    pat_asc_tri_detected BOOLEAN,
+    pat_asc_tri_confidence DOUBLE,
+    pat_asc_tri_resistance_level DOUBLE,
+    pat_asc_tri_support_level DOUBLE,
+    pat_asc_tri_compression_ratio DOUBLE,
+    pat_bull_flag_detected BOOLEAN,
+    pat_bull_flag_confidence DOUBLE,
+    pat_bull_flag_pole_height_pct DOUBLE,
+    pat_bull_flag_retracement_pct DOUBLE,
+    pat_bull_pennant_detected BOOLEAN,
+    pat_bull_pennant_confidence DOUBLE,
+    pat_bull_pennant_compression_ratio DOUBLE,
+    pat_fall_wedge_detected BOOLEAN,
+    pat_fall_wedge_confidence DOUBLE,
+    pat_fall_wedge_contraction DOUBLE,
+    pat_cup_handle_detected BOOLEAN,
+    pat_cup_handle_confidence DOUBLE,
+    pat_cup_handle_depth_pct DOUBLE,
+    pat_inv_hs_detected BOOLEAN,
+    pat_inv_hs_confidence DOUBLE,
+    pat_inv_hs_neckline DOUBLE,
+    pat_swing_trend VARCHAR(20),
+    pat_swing_higher_lows BOOLEAN,
+    pat_swing_lower_highs BOOLEAN,
+    
+    -- Second Prices Summary (sp_) - 9 columns
+    sp_price_count INTEGER,
+    sp_min_price DOUBLE,
+    sp_max_price DOUBLE,
+    sp_start_price DOUBLE,
+    sp_end_price DOUBLE,
+    sp_price_range_pct DOUBLE,
+    sp_total_change_pct DOUBLE,
+    sp_volatility_pct DOUBLE,
+    sp_avg_price DOUBLE,
+    
+    -- BTC Price Movements (btc_) - 6 columns for cross-market correlation
+    btc_price_change_1m DOUBLE,
+    btc_price_change_5m DOUBLE,
+    btc_price_change_10m DOUBLE,
+    btc_volatility_pct DOUBLE,
+    btc_open_price DOUBLE,
+    btc_close_price DOUBLE,
+    
+    -- ETH Price Movements (eth_) - 6 columns for cross-market correlation
+    eth_price_change_1m DOUBLE,
+    eth_price_change_5m DOUBLE,
+    eth_price_change_10m DOUBLE,
+    eth_volatility_pct DOUBLE,
+    eth_open_price DOUBLE,
+    eth_close_price DOUBLE,
+    
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trail_buyin_minute ON buyin_trail_minutes(buyin_id, minute);
+CREATE INDEX IF NOT EXISTS idx_trail_buyin_id ON buyin_trail_minutes(buyin_id);
+CREATE INDEX IF NOT EXISTS idx_trail_minute ON buyin_trail_minutes(minute);
+CREATE INDEX IF NOT EXISTS idx_trail_created_at ON buyin_trail_minutes(created_at);
+CREATE INDEX IF NOT EXISTS idx_trail_breakout_score ON buyin_trail_minutes(pat_breakout_score);
+"""
+
+# =============================================================================
+# SOL STABLECOIN TRADES (for fast trade detection - 1hr hot storage)
+# =============================================================================
+
+SCHEMA_SOL_STABLECOIN_TRADES = """
+CREATE TABLE IF NOT EXISTS sol_stablecoin_trades (
+    id BIGINT PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL,
+    signature VARCHAR(255),
+    trade_timestamp TIMESTAMP NOT NULL,
+    stablecoin_amount DECIMAL(20,8),
+    sol_amount DECIMAL(20,8),
+    price DECIMAL(20,8),
+    direction VARCHAR(10),
+    perp_direction VARCHAR(10),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_wallet ON sol_stablecoin_trades(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON sol_stablecoin_trades(trade_timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_direction ON sol_stablecoin_trades(direction);
+CREATE INDEX IF NOT EXISTS idx_trades_wallet_id ON sol_stablecoin_trades(wallet_address, id);
+"""
+
+# =============================================================================
+# JOB EXECUTION METRICS (for scheduler monitoring - 24hr hot storage)
+# =============================================================================
+
+SCHEMA_JOB_EXECUTION_METRICS = """
+CREATE TABLE IF NOT EXISTS job_execution_metrics (
+    id BIGINT PRIMARY KEY,
+    job_id VARCHAR(100) NOT NULL,
+    started_at TIMESTAMP NOT NULL,
+    ended_at TIMESTAMP NOT NULL,
+    duration_ms DOUBLE NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    error_message VARCHAR(500),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_metrics_job_id ON job_execution_metrics(job_id);
+CREATE INDEX IF NOT EXISTS idx_job_metrics_started_at ON job_execution_metrics(started_at);
+CREATE INDEX IF NOT EXISTS idx_job_metrics_job_started ON job_execution_metrics(job_id, started_at);
+"""
+
+# =============================================================================
+# FOLLOW THE GOAT TRACKING (tracks last processed trade per wallet)
+# =============================================================================
+
+SCHEMA_FOLLOW_THE_GOAT_TRACKING = """
+CREATE TABLE IF NOT EXISTS follow_the_goat_tracking (
+    id INTEGER PRIMARY KEY,
+    wallet_address VARCHAR(255) NOT NULL UNIQUE,
+    last_trade_id BIGINT DEFAULT 0,
+    last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tracking_wallet ON follow_the_goat_tracking(wallet_address);
+"""
+
+# Expected intervals for each job (in milliseconds) - used to determine "slow" jobs
+JOB_EXPECTED_INTERVALS_MS = {
+    "fetch_jupiter_prices": 1000,           # 1 second (bundled 3 tokens = 60 req/min)
+    "sync_trades_from_webhook": 1000,       # 1 second (was 0.5s, but job takes longer)
+    "follow_the_goat": 1000,                # 1 second (was 0.5s, but job takes longer)
+    "trailing_stop_seller": 1000,           # 1 second (was 0.5s, but job takes longer)
+    "process_price_cycles": 15000,          # 15 seconds (increased - job takes ~11s)
+    "process_wallet_profiles": 10000,       # 10 seconds (increased - job takes ~8s)
+    "train_validator": 30000,               # 30 seconds
+    "update_potential_gains": 15000,        # 15 seconds
+    "sync_plays_from_mysql": 300000,        # 5 minutes
+    "sync_pattern_config_from_mysql": 300000,  # 5 minutes
+    "cleanup_jupiter_prices": 3600000,      # 1 hour
+    "cleanup_duckdb_hot_tables": 3600000,   # 1 hour
+    "cleanup_wallet_profiles": 3600000,     # 1 hour
+}
 
 # =============================================================================
 # ALL SCHEMAS COMBINED
@@ -260,6 +524,10 @@ ALL_SCHEMAS = [
     ("wallet_profiles", SCHEMA_WALLET_PROFILES),
     ("pattern_config_projects", SCHEMA_PATTERN_CONFIG_PROJECTS),
     ("pattern_config_filters", SCHEMA_PATTERN_CONFIG_FILTERS),
+    ("buyin_trail_minutes", SCHEMA_BUYIN_TRAIL_MINUTES),
+    ("sol_stablecoin_trades", SCHEMA_SOL_STABLECOIN_TRADES),
+    ("job_execution_metrics", SCHEMA_JOB_EXECUTION_METRICS),
+    ("follow_the_goat_tracking", SCHEMA_FOLLOW_THE_GOAT_TRACKING),
 ]
 
 # Tables that use 24-hour hot storage (time-based cleanup)
@@ -273,6 +541,9 @@ HOT_TABLES = [
     "price_analysis",
     "cycle_tracker",
     "wallet_profiles",
+    "buyin_trail_minutes",
+    "sol_stablecoin_trades",
+    "job_execution_metrics",
 ]
 
 # Tables that keep full data (no time-based cleanup)
@@ -280,6 +551,7 @@ FULL_DATA_TABLES = [
     "follow_the_goat_plays",
     "pattern_config_projects",
     "pattern_config_filters",
+    "follow_the_goat_tracking",
 ]
 
 # Timestamp column used for cleanup in each table
@@ -291,6 +563,9 @@ TIMESTAMP_COLUMNS = {
     "price_analysis": "created_at",
     "cycle_tracker": "cycle_end_time",  # Only completed cycles older than 24h are cleaned
     "wallet_profiles": "trade_timestamp",  # Profiles older than 24h are cleaned from both DuckDB and MySQL
+    "buyin_trail_minutes": "created_at",  # Trail data cleaned after 24h
+    "sol_stablecoin_trades": "trade_timestamp",  # Keep only 1 hour for fast lookup
+    "job_execution_metrics": "started_at",  # Metrics older than 24h are cleaned
 }
 
 
@@ -299,6 +574,13 @@ def init_all_tables(conn):
     for table_name, schema in ALL_SCHEMAS:
         print(f"Creating table: {table_name}")
         conn.execute(schema)
+    
+    # Additional optimization indexes
+    print("Creating optimization indexes...")
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_buyins_query_opt 
+        ON follow_the_goat_buyins(followed_at DESC, our_status, play_id)
+    """)
     print("All tables initialized successfully.")
 
 

@@ -1,0 +1,45 @@
+{
+  "good_trade_threshold": 0.3,
+  "analysis_hours": 24,
+  "min_filters_in_combo": 2,
+  "max_filters_in_combo": 6,
+  "min_good_trades_kept_pct": 50,
+  "min_bad_trades_removed_pct": 10,
+  "combo_min_good_kept_pct": 25,
+  "combo_min_improvement": 1.0,
+  "auto_project_name": "AutoFilters",
+  "percentile_low": 10,
+  "percentile_high": 90,
+  "skip_columns": [
+    "pm_open_price",
+    "pm_high_price",
+    "pm_low_price",
+    "pm_close_price",
+    "pm_avg_price",
+    "ob_mid_price",
+    "tx_vwap",
+    "sp_min_price",
+    "sp_max_price",
+    "sp_start_price",
+    "sp_end_price",
+    "sp_avg_price",
+    "pat_asc_tri_resistance_level",
+    "pat_asc_tri_support_level",
+    "pat_inv_hs_neckline",
+    "btc_open_price",
+    "btc_close_price",
+    "eth_open_price",
+    "eth_close_price"
+  ],
+  "section_prefixes": {
+    "pm_": "price_movements",
+    "tx_": "transactions",
+    "ob_": "order_book_signals",
+    "wh_": "whale_activity",
+    "sp_": "second_prices",
+    "pat_": "patterns",
+    "btc_": "btc_correlation",
+    "eth_": "eth_correlation"
+  }
+}
+

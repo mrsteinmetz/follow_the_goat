@@ -68,7 +68,12 @@ class DuckDBClient {
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $this->timeout,
             CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json'],
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/json', 
+                'Accept: application/json',
+                'Connection: keep-alive'  // Enable HTTP keep-alive for faster requests
+            ],
+            CURLOPT_TCP_KEEPALIVE => 1,  // Enable TCP keep-alive
         ]);
         
         if ($method === 'POST') {
@@ -140,6 +145,15 @@ class DuckDBClient {
      */
     public function getSchedulerStatus(): ?array {
         return $this->get('/scheduler_status');
+    }
+    
+    /**
+     * Get trades diagnostic - compare trade counts across all data sources
+     * 
+     * @param int $minutes Time window in minutes (default: 5)
+     */
+    public function getTradesDiagnostic(int $minutes = 5): ?array {
+        return $this->get('/trades_diagnostic', ['minutes' => $minutes]);
     }
     
     // =========================================================================
@@ -260,10 +274,9 @@ class DuckDBClient {
      * Get a single buyin/trade by ID
      * 
      * @param int $buyinId Buyin ID
-     * @param string $source 'live' for active trades, 'archive' for completed
      */
-    public function getSingleBuyin(int $buyinId, string $source = 'live'): ?array {
-        return $this->get("/buyins/{$buyinId}", ['source' => $source]);
+    public function getSingleBuyin(int $buyinId): ?array {
+        return $this->get("/buyins/{$buyinId}");
     }
     
     /**
@@ -546,6 +559,45 @@ class DuckDBClient {
         return $this->post('/trail/gain_distribution', $options);
     }
     
+    /**
+     * Get 15-minute trail data for a specific buyin
+     * 
+     * @param int $buyinId The buyin ID
+     * @param string $source Data source: 'duckdb' or 'mysql'
+     * @return array|null Trail data (15 rows, one per minute) or null on error
+     */
+    public function getTrailForBuyin(int $buyinId, string $source = 'duckdb'): ?array {
+        return $this->get("/trail/buyin/{$buyinId}", ['source' => $source]);
+    }
+    
+    // =========================================================================
+    // Filter Analysis (Auto-filter suggestions dashboard)
+    // =========================================================================
+    
+    /**
+     * Get complete filter analysis dashboard data
+     * Returns: summary, suggestions, combinations, scheduler runs, consistency data, etc.
+     */
+    public function getFilterAnalysisDashboard(): ?array {
+        return $this->get('/filter-analysis/dashboard');
+    }
+    
+    /**
+     * Get auto filter settings
+     */
+    public function getFilterSettings(): ?array {
+        return $this->get('/filter-analysis/settings');
+    }
+    
+    /**
+     * Save auto filter settings
+     * 
+     * @param array $settings Key-value pairs of settings to save
+     */
+    public function saveFilterSettings(array $settings): ?array {
+        return $this->post('/filter-analysis/settings', ['settings' => $settings]);
+    }
+    
     // =========================================================================
     // Admin Operations
     // =========================================================================
@@ -577,5 +629,56 @@ class DuckDBClient {
         
         $url = $this->apiBaseUrl . '/admin/sync_from_mysql?' . http_build_query($params);
         return $this->request($url, 'POST');
+    }
+    
+    // =========================================================================
+    // Live Trade Feed
+    // =========================================================================
+    
+    /**
+     * Get recent trades from sol_stablecoin_trades
+     * 
+     * @param int $limit Max number of trades to return
+     * @param int $minutes Time window in minutes
+     * @param string $direction Trade direction: 'buy', 'sell', or 'all'
+     * @return array|null Array with 'trades', 'count', 'source' or null on error
+     */
+    public function getRecentTrades(int $limit = 100, int $minutes = 5, string $direction = 'buy'): ?array {
+        return $this->get('/recent_trades', [
+            'limit' => $limit,
+            'minutes' => $minutes,
+            'direction' => $direction
+        ]);
+    }
+    
+    /**
+     * Get all wallets being tracked by active plays
+     * 
+     * Returns wallet addresses extracted from cashe_wallets_settings JSON field
+     * 
+     * @return array|null Array with 'plays', 'all_wallets', 'total_wallet_count' or null on error
+     */
+    public function getTrackedWallets(): ?array {
+        return $this->get('/tracked_wallets');
+    }
+    
+    /**
+     * Get job execution metrics with execution time analysis
+     * 
+     * Returns per-job statistics including:
+     * - avg_duration_ms: Average execution duration
+     * - max_duration_ms: Maximum execution duration
+     * - min_duration_ms: Minimum execution duration
+     * - execution_count: Number of executions in time window
+     * - error_count: Number of failed executions
+     * - expected_interval_ms: Expected job interval
+     * - is_slow: True if avg duration > 80% of expected interval
+     * - recent_executions: Last 50 executions with timestamps and durations
+     * 
+     * @param int $hours Number of hours of history to analyze (default: 1)
+     * @return array|null Array with 'jobs' containing metrics per job or null on error
+     */
+    public function getJobMetrics(float $hours = 1): ?array {
+        return $this->get('/job_metrics', ['hours' => $hours]);
     }
 }

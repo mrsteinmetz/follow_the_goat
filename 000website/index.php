@@ -202,7 +202,12 @@ $json_status_data = json_encode($status_data);
 $json_cycle_start_times = json_encode($cycle_start_times);
 $json_selected_cycle = json_encode($selected_cycle);
 $json_scheduler_jobs = json_encode($scheduler_jobs);
-$json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? null);
+// Validate scheduler_started is a valid date string before JSON encoding
+$scheduler_started_raw = $scheduler_status['scheduler_started'] ?? null;
+$json_scheduler_started = 'null';
+if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/\d{4}[-\/]\d{2}[-\/]\d{2}/', $scheduler_started_raw)) {
+    $json_scheduler_started = json_encode($scheduler_started_raw);
+}
 
 ?>
 
@@ -1114,48 +1119,66 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                 });
                 
                 // Update scheduler uptime (all times in UTC)
-                if (window.schedulerStarted) {
-                    const uptimeEl = document.getElementById('schedulerUptime');
-                    if (uptimeEl) {
-                        // Parse scheduler start time as UTC
-                        let startedUTC;
-                        const startedStr = window.schedulerStarted;
-                        if (startedStr.includes('T')) {
-                            startedUTC = startedStr.endsWith('Z') 
-                                ? new Date(startedStr).getTime()
-                                : new Date(startedStr + 'Z').getTime();
-                        } else {
-                            startedUTC = new Date(startedStr.replace(' ', 'T') + 'Z').getTime();
+                const uptimeEl = document.getElementById('schedulerUptime');
+                if (uptimeEl) {
+                    if (window.schedulerStarted && typeof window.schedulerStarted === 'string' && window.schedulerStarted.length > 0) {
+                        try {
+                            // Parse scheduler start time as UTC
+                            let startedUTC;
+                            const startedStr = window.schedulerStarted;
+                            if (startedStr.includes('T')) {
+                                startedUTC = startedStr.endsWith('Z') 
+                                    ? new Date(startedStr).getTime()
+                                    : new Date(startedStr + 'Z').getTime();
+                            } else {
+                                startedUTC = new Date(startedStr.replace(' ', 'T') + 'Z').getTime();
+                            }
+                            
+                            // Validate the parsed date
+                            if (isNaN(startedUTC)) {
+                                uptimeEl.textContent = 'Uptime: -';
+                                return;
+                            }
+                            
+                            // Get current UTC time
+                            const now = new Date();
+                            const nowUTC = Date.UTC(
+                                now.getUTCFullYear(),
+                                now.getUTCMonth(),
+                                now.getUTCDate(),
+                                now.getUTCHours(),
+                                now.getUTCMinutes(),
+                                now.getUTCSeconds()
+                            );
+                            
+                            const uptimeSeconds = Math.floor((nowUTC - startedUTC) / 1000);
+                            
+                            // Validate uptime is reasonable (not negative or NaN)
+                            if (isNaN(uptimeSeconds) || uptimeSeconds < 0) {
+                                uptimeEl.textContent = 'Uptime: -';
+                                return;
+                            }
+                            
+                            let uptimeText = 'Uptime: ';
+                            if (uptimeSeconds < 60) {
+                                uptimeText += uptimeSeconds + 's';
+                            } else if (uptimeSeconds < 3600) {
+                                uptimeText += Math.floor(uptimeSeconds / 60) + 'm ' + (uptimeSeconds % 60) + 's';
+                            } else if (uptimeSeconds < 86400) {
+                                const hours = Math.floor(uptimeSeconds / 3600);
+                                const mins = Math.floor((uptimeSeconds % 3600) / 60);
+                                uptimeText += hours + 'h ' + mins + 'm';
+                            } else {
+                                const days = Math.floor(uptimeSeconds / 86400);
+                                const hours = Math.floor((uptimeSeconds % 86400) / 3600);
+                                uptimeText += days + 'd ' + hours + 'h';
+                            }
+                            uptimeEl.textContent = uptimeText;
+                        } catch (e) {
+                            uptimeEl.textContent = 'Uptime: -';
                         }
-                        
-                        // Get current UTC time
-                        const now = new Date();
-                        const nowUTC = Date.UTC(
-                            now.getUTCFullYear(),
-                            now.getUTCMonth(),
-                            now.getUTCDate(),
-                            now.getUTCHours(),
-                            now.getUTCMinutes(),
-                            now.getUTCSeconds()
-                        );
-                        
-                        const uptimeSeconds = Math.floor((nowUTC - startedUTC) / 1000);
-                        
-                        let uptimeText = 'Uptime: ';
-                        if (uptimeSeconds < 60) {
-                            uptimeText += uptimeSeconds + 's';
-                        } else if (uptimeSeconds < 3600) {
-                            uptimeText += Math.floor(uptimeSeconds / 60) + 'm ' + (uptimeSeconds % 60) + 's';
-                        } else if (uptimeSeconds < 86400) {
-                            const hours = Math.floor(uptimeSeconds / 3600);
-                            const mins = Math.floor((uptimeSeconds % 3600) / 60);
-                            uptimeText += hours + 'h ' + mins + 'm';
-                        } else {
-                            const days = Math.floor(uptimeSeconds / 86400);
-                            const hours = Math.floor((uptimeSeconds % 86400) / 3600);
-                            uptimeText += days + 'd ' + hours + 'h';
-                        }
-                        uptimeEl.textContent = uptimeText;
+                    } else {
+                        uptimeEl.textContent = 'Uptime: -';
                     }
                 }
             }
@@ -1170,7 +1193,10 @@ $json_scheduler_started = json_encode($scheduler_status['scheduler_started'] ?? 
                     
                     if (data.status === 'ok' && data.jobs) {
                         window.schedulerJobs = data.jobs;
-                        window.schedulerStarted = data.scheduler_started;
+                        // Only set schedulerStarted if it's a valid non-empty string
+                        if (data.scheduler_started && typeof data.scheduler_started === 'string' && data.scheduler_started.length > 0) {
+                            window.schedulerStarted = data.scheduler_started;
+                        }
                         updateJobStatusUI(data.jobs);
                     }
                 } catch (error) {

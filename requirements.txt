@@ -3,6 +3,7 @@
 
 # Database
 duckdb>=1.0.0
+PyMySQL>=1.1.0
 
 # Scheduling (NO .bat files - use this instead)
 APScheduler>=3.10.0
@@ -10,6 +11,13 @@ APScheduler>=3.10.0
 # HTTP requests
 requests>=2.31.0
 httpx>=0.27.0
+
+# Web API (Flask for central API)
+Flask>=3.0.0
+flask-cors>=4.0.0
+
+# WebSocket (Binance order book stream)
+websocket-client>=1.7.0
 
 # Data processing
 pandas>=2.0.0

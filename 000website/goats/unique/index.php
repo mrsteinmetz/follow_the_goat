@@ -4,6 +4,9 @@
  * Migrated to use DuckDBClient API
  */
 
+// Set timezone to UTC (server time) - never use browser time
+date_default_timezone_set('UTC');
+
 // --- Timing for performance debugging ---
 $timing = [];
 $timing['script_start'] = microtime(true);
@@ -34,9 +37,8 @@ $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' 
 
 $play = null;
 $trades = [];
-$archived_trades = [];
-$live_total_count = 0;
-$archive_total_count = 0;
+$no_go_trades = [];
+$total_count = 0;
 $error_message = '';
 $success_message = '';
 $chart_data = [
@@ -55,7 +57,6 @@ if (isset($_GET['error'])) {
 // Handle AJAX Load More Request (DuckDB only)
 if (isset($_GET['ajax_load_more']) && $api_available) {
     $offset = (int)($_GET['offset'] ?? 0);
-    $table_type = $_GET['table'] ?? 'archive';
     
     // For AJAX load more, we call the API directly
     $hours = '168'; // Use 7-day window for trades (DuckDB only)
@@ -87,25 +88,38 @@ if (!$api_available) {
         exit;
     }
     
-    // Fetch trades from API (168h = 7 days DuckDB data)
+    // Fetch trades from API
+    // For play 46 (training validator), use shorter window (24h) due to high volume
+    // Other plays use 168h (7 days)
+    $hours_window = ($play_id === 46) ? '24' : '168';
     $timing['before_trades_query'] = microtime(true);
-    $buyins_result = $client->getBuyins($play_id, null, '168', 100);
+    $buyins_result = $client->getBuyins($play_id, null, $hours_window, 100);
     $timing['after_trades_query'] = microtime(true);
     
     if ($buyins_result && isset($buyins_result['buyins'])) {
-        // Split into live trades (non-no_go) and keep track
+        // Split into live trades (non-no_go) and no_go trades
         $all_buyins = $buyins_result['buyins'];
         $trades = array_filter($all_buyins, function($t) {
             return ($t['our_status'] ?? '') !== 'no_go';
         });
         $trades = array_values($trades); // Re-index
+        
+        // Separate no_go trades for display
+        $no_go_trades = array_filter($all_buyins, function($t) {
+            return ($t['our_status'] ?? '') === 'no_go';
+        });
+        $no_go_trades = array_values($no_go_trades); // Re-index
+        
         $live_total_count = $buyins_result['total'] ?? count($trades);
     }
     $timing['trades_count'] = count($trades);
     
-    // Get performance stats (using 168h = 7 days DuckDB window)
+    // Get performance stats
+    // For play 46 (training validator), use shorter window (24h) due to high volume
+    // Other plays use 168h (7 days)
+    $perf_hours = ($play_id === 46) ? '24' : '168';
     $timing['before_stats_query'] = microtime(true);
-    $perf_result = $client->getPlayPerformance($play_id, '168');
+    $perf_result = $client->getPlayPerformance($play_id, $perf_hours);
     $timing['after_stats_query'] = microtime(true);
 }
 
@@ -661,7 +675,7 @@ ob_start();
 <!-- Live Trades -->
 <div class="card custom-card mb-3">
     <div class="card-header">
-        <div class="card-title">Live Trades (7-Day DuckDB Data)</div>
+        <div class="card-title">Live Trades (<?php echo ($play_id === 46) ? '24-Hour' : '7-Day'; ?> DuckDB Data)</div>
         <div class="ms-auto d-flex gap-2 align-items-center">
             <span class="badge bg-info-transparent">Showing <?php echo count($trades); ?></span>
         </div>
@@ -704,17 +718,31 @@ ob_start();
                             ];
                         }
                     ?>
-                    <tr onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>, 'live')" style="cursor: pointer;">
+                    <tr onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer;">
                         <td>
                             <a href="https://solscan.io/token/<?php echo urlencode($trade['wallet_address'] ?? ''); ?>" target="_blank" rel="noopener" class="text-primary" title="<?php echo htmlspecialchars($trade['wallet_address'] ?? ''); ?>" onclick="event.stopPropagation();">
                                 <code><?php echo substr(htmlspecialchars($trade['wallet_address'] ?? ''), 0, 12); ?>...</code>
                             </a>
                         </td>
                         <td class="text-center">
-                            <?php echo !empty($trade['followed_at']) ? date('M d, H:i', strtotime($trade['followed_at'])) : '--'; ?>
+                            <?php 
+                            if (!empty($trade['followed_at'])) {
+                                date_default_timezone_set('UTC');
+                                echo gmdate('M d, H:i', strtotime($trade['followed_at'])) . ' UTC';
+                            } else {
+                                echo '--';
+                            }
+                            ?>
                         </td>
                         <td class="text-center">
-                            <?php echo !empty($trade['our_exit_timestamp']) ? date('M d, H:i', strtotime($trade['our_exit_timestamp'])) : '--'; ?>
+                            <?php 
+                            if (!empty($trade['our_exit_timestamp'])) {
+                                date_default_timezone_set('UTC');
+                                echo gmdate('M d, H:i', strtotime($trade['our_exit_timestamp'])) . ' UTC';
+                            } else {
+                                echo '--';
+                            }
+                            ?>
                         </td>
                         <td class="text-center">
                             <?php if (!empty($trade['our_entry_price'])): ?>
@@ -762,7 +790,7 @@ ob_start();
                             </span>
                         </td>
                         <td class="text-center">
-                            <button class="btn btn-sm btn-icon btn-primary-light" onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>, 'live'); event.stopPropagation();" title="View Details">
+                            <button class="btn btn-sm btn-icon btn-primary-light" onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>); event.stopPropagation();" title="View Details">
                                 <i class="ri-eye-line"></i>
                             </button>
                         </td>
@@ -774,6 +802,100 @@ ob_start();
         <?php endif; ?>
     </div>
 </div>
+
+<!-- No-Go Trades Section -->
+<?php if (!empty($no_go_trades)): ?>
+<div class="card custom-card mb-3">
+    <div class="card-header" style="background: rgba(var(--warning-rgb), 0.1); border-bottom-color: rgba(var(--warning-rgb), 0.3);">
+        <div class="card-title" style="color: rgb(var(--warning-rgb));">
+            <i class="ri-close-circle-line me-1"></i>No-Go Trades (Blocked by Validator)
+        </div>
+        <div class="ms-auto d-flex gap-2 align-items-center">
+            <span class="badge bg-warning-transparent text-warning"><?php echo count($no_go_trades); ?> trades</span>
+            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="toggleNoGoTrades()">
+                <i class="ri-arrow-down-s-line" id="noGoToggleIcon"></i>
+            </button>
+        </div>
+    </div>
+    <div class="card-body" id="noGoTradesBody">
+        <div class="table-responsive">
+            <table class="table table-bordered text-nowrap table-sm">
+                <thead>
+                    <tr>
+                        <th>Wallet Address</th>
+                        <th class="text-center">Timestamp</th>
+                        <th class="text-center">Entry Price</th>
+                        <th class="text-center">Trade Price</th>
+                        <th class="text-center">Reason</th>
+                        <th class="text-center">Details</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($no_go_trades as $trade): 
+                        // Try to extract reason from pattern_validator_log
+                        $reason = 'Validation Failed';
+                        if (!empty($trade['pattern_validator_log'])) {
+                            $log = is_string($trade['pattern_validator_log']) 
+                                ? json_decode($trade['pattern_validator_log'], true) 
+                                : $trade['pattern_validator_log'];
+                            if (isset($log['decision'])) {
+                                $reason = $log['decision'];
+                                if (isset($log['reason'])) {
+                                    $reason .= ': ' . $log['reason'];
+                                } elseif (isset($log['error'])) {
+                                    $reason .= ': ' . $log['error'];
+                                }
+                            }
+                        }
+                    ?>
+                    <tr onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer; opacity: 0.8;">
+                        <td>
+                            <a href="https://solscan.io/token/<?php echo urlencode($trade['wallet_address'] ?? ''); ?>" target="_blank" rel="noopener" class="text-muted" title="<?php echo htmlspecialchars($trade['wallet_address'] ?? ''); ?>" onclick="event.stopPropagation();">
+                                <code><?php echo substr(htmlspecialchars($trade['wallet_address'] ?? ''), 0, 12); ?>...</code>
+                            </a>
+                        </td>
+                        <td class="text-center text-muted">
+                            <?php 
+                            if (!empty($trade['followed_at'])) {
+                                date_default_timezone_set('UTC');
+                                echo gmdate('M d, H:i', strtotime($trade['followed_at'])) . ' UTC';
+                            } else {
+                                echo '--';
+                            }
+                            ?>
+                        </td>
+                        <td class="text-center">
+                            <?php if (!empty($trade['our_entry_price'])): ?>
+                                $<?php echo number_format($trade['our_entry_price'], 4); ?>
+                            <?php else: ?>
+                                <span class="text-muted">--</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="text-center">
+                            <?php if (!empty($trade['price'])): ?>
+                                $<?php echo number_format($trade['price'], 4); ?>
+                            <?php else: ?>
+                                <span class="text-muted">--</span>
+                            <?php endif; ?>
+                        </td>
+                        <td class="text-center">
+                            <span class="badge bg-warning-transparent text-warning" style="font-size: 0.7rem; max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="<?php echo htmlspecialchars($reason); ?>">
+                                <?php echo htmlspecialchars(strlen($reason) > 30 ? substr($reason, 0, 30) . '...' : $reason); ?>
+                            </span>
+                        </td>
+                        <td class="text-center">
+                            <button class="btn btn-sm btn-icon btn-warning-light" onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>); event.stopPropagation();" title="View Details">
+                                <i class="ri-eye-line"></i>
+                            </button>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
 
 <?php
 $content = ob_get_clean();
@@ -1072,16 +1194,28 @@ ob_start();
         });
     });
     
-    function viewTradeDetail(tradeId, playId, source = 'live') {
+    function viewTradeDetail(tradeId, playId, tradeType = 'live') {
         const params = new URLSearchParams({
             id: tradeId,
             play_id: playId,
             return_url: window.location.pathname + window.location.search
         });
-        if (source === 'archive') {
-            params.set('source', 'archive');
-        }
         window.location.href = `trade/?${params.toString()}`;
+    }
+    
+    function toggleNoGoTrades() {
+        const body = document.getElementById('noGoTradesBody');
+        const icon = document.getElementById('noGoToggleIcon');
+        
+        if (body.style.display === 'none') {
+            body.style.display = 'block';
+            icon.classList.remove('ri-arrow-right-s-line');
+            icon.classList.add('ri-arrow-down-s-line');
+        } else {
+            body.style.display = 'none';
+            icon.classList.remove('ri-arrow-down-s-line');
+            icon.classList.add('ri-arrow-right-s-line');
+        }
     }
 </script>
 <?php

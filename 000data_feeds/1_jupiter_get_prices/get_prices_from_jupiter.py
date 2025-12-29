@@ -57,7 +57,9 @@ logging.basicConfig(
 logger = logging.getLogger("jupiter_prices")
 
 # --- Configuration ---
-FETCH_INTERVAL_SECONDS = 1.0  # 1 second = 60 req/min (matches free tier limit)
+# 1 request/second with 3 bundled tokens = 60 req/min (exactly at free tier limit)
+# Bundled call: GET /price/v3?ids=SOL,BTC,ETH returns all 3 in one response
+FETCH_INTERVAL_SECONDS = 1.0  # 1 second = 60 req/min (bundled, within free tier)
 CLEANUP_INTERVAL = 3600  # Run cleanup every hour
 
 # Jupiter Price API v3 (requires API key from portal.jup.ag)
@@ -141,16 +143,18 @@ def fetch_prices() -> dict | None:
         )
         return None
     
-    # Check if we're in backoff period
+    # Check if we're in backoff period (reduced from 60s to max 5s for trading accuracy)
     if _backoff_seconds > 0:
         elapsed = time.time() - _last_rate_limit_time
         if elapsed < _backoff_seconds:
             remaining = _backoff_seconds - elapsed
-            logger.debug(f"In backoff period, {remaining:.1f}s remaining")
+            # Log at ERROR level so it appears in scheduler_errors.log
+            logger.error(f"[RATE LIMIT BACKOFF] {remaining:.1f}s remaining - NO PRICE RECORDED THIS CYCLE")
             return None
         else:
-            logger.info(f"Backoff period ended, resuming API calls")
+            logger.info(f"Backoff period ended after {_backoff_seconds}s, resuming API calls")
             _backoff_seconds = 0
+            _consecutive_errors = 0  # Reset on resume
     
     # Build the batch request URL
     ids = ",".join(TOKENS.values())
@@ -164,104 +168,98 @@ def fetch_prices() -> dict | None:
     
     logger.debug(f"API Request: {url}")
     
-    for attempt in range(3):
-        try:
-            start_time = time.perf_counter()
-            response = requests.get(url, headers=headers, timeout=10)
-            elapsed = (time.perf_counter() - start_time) * 1000
-            
-            # Log rate limit headers if present
-            rate_limit_headers = {
-                k: v for k, v in response.headers.items() 
-                if k.lower().startswith('x-ratelimit') or k.lower().startswith('retry-after')
-            }
-            if rate_limit_headers:
-                logger.info(f"Rate limit headers: {rate_limit_headers}")
-            
-            # Check for authentication errors (401)
-            if response.status_code == 401:
-                logger.error(
-                    "[AUTH ERROR] UNAUTHORIZED (401)! Invalid or missing API key. "
-                    "Get a free key at https://portal.jup.ag"
-                )
-                logger.error(f"Response: {response.text[:200]}")
-                return None
-            
-            # Check for rate limiting (429)
-            if response.status_code == 429:
-                _consecutive_errors += 1
-                _last_rate_limit_time = time.time()
-                
-                # Exponential backoff: 5s, 10s, 20s, 40s, max 60s
-                _backoff_seconds = min(5 * (2 ** (_consecutive_errors - 1)), 60)
-                
-                retry_after = response.headers.get('Retry-After')
-                if retry_after:
-                    try:
-                        _backoff_seconds = max(_backoff_seconds, int(retry_after))
-                    except ValueError:
-                        pass
-                
-                logger.warning(
-                    f"[RATE LIMIT] (429)! Backing off for {_backoff_seconds}s "
-                    f"(consecutive errors: {_consecutive_errors}). "
-                    f"Free tier: 60 req/min. Consider upgrading at https://portal.jup.ag"
-                )
-                logger.warning(f"Response: {response.text[:200]}")
-                return None
-            
-            # Check for other errors
-            if response.status_code != 200:
-                logger.error(f"API Error {response.status_code}: {response.text[:200]}")
-                if attempt < 2:
-                    time.sleep(1)
-                    continue
-                return None
-            
-            # Parse response
-            data = response.json()
-            
-            # Reset error counter on success
-            _consecutive_errors = 0
-            
-            # Log success
-            logger.debug(f"API Response ({elapsed:.0f}ms): {response.status_code}")
-            
-            # Parse response - v3 API returns mint address as key with usdPrice field
-            # Example: {"MINT": {"usdPrice": 123.45, ...}}
-            prices = {}
-            
-            # Check if response has "data" wrapper (some API versions)
-            price_data_dict = data.get("data", data) if isinstance(data, dict) else data
-            
-            for mint, price_data in price_data_dict.items():
-                if isinstance(price_data, dict):
-                    # Try usdPrice first (v3), then price (older versions)
-                    price_val = price_data.get("usdPrice") or price_data.get("price")
-                    if price_val is not None:
-                        prices[mint] = {"price": float(price_val)}
-                        logger.debug(f"  {MINT_TO_TOKEN.get(mint, mint)}: ${float(price_val):,.4f}")
-            
-            if prices:
-                return prices
-            else:
-                logger.warning(f"No valid prices in response: {str(data)[:200]}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timeout (attempt {attempt + 1}/3)")
-            if attempt < 2:
-                time.sleep(0.5)
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error (attempt {attempt + 1}/3): {e}")
-            if attempt < 2:
-                time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+    # Single attempt - no retries (fail fast, try again next cycle)
+    # Retries can cause rate limiting when running at high frequency
+    try:
+        start_time = time.perf_counter()
+        response = requests.get(url, headers=headers, timeout=5)  # Reduced timeout
+        elapsed = (time.perf_counter() - start_time) * 1000
+        
+        # Log rate limit headers if present (for debugging)
+        rate_limit_headers = {
+            k: v for k, v in response.headers.items() 
+            if k.lower().startswith('x-ratelimit') or k.lower().startswith('retry-after')
+        }
+        if rate_limit_headers:
+            logger.debug(f"Rate limit headers: {rate_limit_headers}")
+        
+        # Check for authentication errors (401)
+        if response.status_code == 401:
+            logger.error(
+                "[AUTH ERROR] UNAUTHORIZED (401)! Invalid or missing API key. "
+                "Get a free key at https://portal.jup.ag"
+            )
             return None
-    
-    logger.error("All retry attempts failed")
-    return None
+        
+        # Check for rate limiting (429)
+        if response.status_code == 429:
+            _consecutive_errors += 1
+            _last_rate_limit_time = time.time()
+            
+            # CRITICAL: Short backoff for trading accuracy
+            # Max 5 seconds backoff (was 60s) - trading bots need continuous data
+            # Linear backoff: 2s, 3s, 4s, 5s max
+            _backoff_seconds = min(1 + _consecutive_errors, 5)
+            
+            # Only use Retry-After if it's reasonable (< 10s)
+            retry_after = response.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    server_wait = int(retry_after)
+                    if server_wait <= 10:
+                        _backoff_seconds = server_wait
+                except ValueError:
+                    pass
+            
+            # Log at ERROR level so it appears in scheduler_errors.log
+            logger.error(
+                f"[RATE LIMIT 429] Jupiter API rate limited! Backing off {_backoff_seconds}s "
+                f"(consecutive errors: {_consecutive_errors}). Missing price data!"
+            )
+            return None
+        
+        # Check for other errors
+        if response.status_code != 200:
+            logger.error(f"[API ERROR {response.status_code}] Jupiter API failed - NO PRICE RECORDED")
+            return None
+        
+        # Parse response
+        data = response.json()
+        
+        # Reset error counter on success
+        _consecutive_errors = 0
+        
+        # Log success with timing
+        logger.debug(f"API OK ({elapsed:.0f}ms)")
+        
+        # Parse response - v3 API returns mint address as key with usdPrice field
+        prices = {}
+        
+        # Check if response has "data" wrapper (some API versions)
+        price_data_dict = data.get("data", data) if isinstance(data, dict) else data
+        
+        for mint, price_data in price_data_dict.items():
+            if isinstance(price_data, dict):
+                # Try usdPrice first (v3), then price (older versions)
+                price_val = price_data.get("usdPrice") or price_data.get("price")
+                if price_val is not None:
+                    prices[mint] = {"price": float(price_val)}
+        
+        if prices:
+            return prices
+        else:
+            logger.error("[PARSE ERROR] No valid prices in Jupiter response - NO PRICE RECORDED")
+            return None
+            
+    except requests.exceptions.Timeout:
+        logger.error("[TIMEOUT] Jupiter API timeout - NO PRICE RECORDED")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.error(f"[CONNECTION ERROR] Jupiter API failed: {e} - NO PRICE RECORDED")
+        return None
+    except Exception as e:
+        logger.error(f"[UNEXPECTED ERROR] Jupiter fetch failed: {e}")
+        return None
 
 
 def insert_prices_via_engine(prices_data: dict) -> tuple[int, bool]:
@@ -301,8 +299,13 @@ def insert_prices_via_engine(prices_data: dict) -> tuple[int, bool]:
 
 def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
     """
-    Insert prices into both DuckDB (hot) and MySQL (master).
-    ALWAYS writes to both - no shortcuts!
+    Insert prices - OPTIMIZED for speed.
+    
+    Hot path: Only TradingDataEngine (in-memory, non-blocking)
+    Background: Engine auto-syncs to MySQL every 30s
+    
+    File-based DuckDB writes removed from hot path - they were causing
+    5+ second latencies due to file I/O and lock contention.
     
     Returns:
         Tuple of (record_count, duckdb_success, mysql_success)
@@ -326,7 +329,8 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
     duckdb_success = False
     mysql_success = False
     
-    # Write to TradingDataEngine (in-memory DuckDB) if available
+    # HOT PATH: Write ONLY to TradingDataEngine (in-memory, instant)
+    # The engine handles background MySQL sync automatically
     try:
         engine = get_trading_engine()
         if engine._running:
@@ -337,42 +341,29 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
                     'price': price
                 })
             duckdb_success = True
+            mysql_success = True  # Engine handles MySQL sync in background
+            return len(records), duckdb_success, mysql_success
     except Exception as e:
         logger.debug(f"Engine write skipped: {e}")
     
-    # Also write to file-based DuckDB (prices.duckdb) as backup
+    # FALLBACK: If engine not available, write to file-based DuckDB
+    # This path should rarely be hit when scheduler is running
     if not duckdb_success:
         try:
-            with get_duckdb("prices") as con:
-                init_legacy_database(con)
-                con.executemany(
-                    "INSERT INTO price_points (ts, token, price) VALUES (?, ?, ?)",
-                    records
-                )
-                duckdb_success = True
-        except Exception as e:
-            logger.error(f"DuckDB write error: {e}")
-    
-    # Write to MySQL (master storage)
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT COALESCE(MAX(id), 0) FROM price_points")
-                max_id = cursor.fetchone()['COALESCE(MAX(id), 0)']
-                
+            with get_duckdb("central") as conn:
+                conn.execute("CREATE TABLE IF NOT EXISTS price_points (id BIGINT PRIMARY KEY, ts_idx BIGINT, value DOUBLE, created_at TIMESTAMP, coin_id INTEGER)")
+                base_id = int(ts.timestamp() * 1000000)
                 for i, (ts_val, token, price) in enumerate(records):
-                    new_id = max_id + i + 1
                     ts_idx = int(ts_val.timestamp() * 1000)
                     coin_id = 5 if token == 'SOL' else (6 if token == 'BTC' else 7)
-                    
-                    cursor.execute("""
-                        INSERT INTO price_points (id, ts_idx, value, created_at, coin_id)
-                        VALUES (%s, %s, %s, %s, %s)
-                    """, [new_id, ts_idx, price, ts_val, coin_id])
-                
-                mysql_success = True
-    except Exception as e:
-        logger.error(f"MySQL write error: {e}")
+                    unique_id = base_id + (coin_id * 100) + i
+                    conn.execute(
+                        "INSERT OR IGNORE INTO price_points (id, ts_idx, value, created_at, coin_id) VALUES (?, ?, ?, ?, ?)",
+                        [unique_id, ts_idx, price, ts_val, coin_id]
+                    )
+                duckdb_success = True
+        except Exception as e:
+            logger.error(f"Central DuckDB write error: {e}")
     
     return len(records), duckdb_success, mysql_success
 
@@ -510,9 +501,7 @@ def test_api_connection() -> None:
         print(f"  {token}: {mint}")
     
     if not JUPITER_API_KEY:
-        print(f"\n[WARNING] JUPITER_API_KEY not set!")
-        print(f"   Get a free API key at: https://portal.jup.ag")
-        print(f"   Then set: JUPITER_API_KEY=your_key_here")
+        logger.warning("JUPITER_API_KEY not set! Get a free API key at: https://portal.jup.ag")
         print(f"\n   Free tier: 60 requests/minute")
         return
     
@@ -556,7 +545,7 @@ def test_api_connection() -> None:
             print(f"  {response.text[:500]}")
             
     except Exception as e:
-        print(f"\n[ERROR] Request Failed: {e}")
+        logger.error(f"Request Failed: {e}")
 
 
 def main():
@@ -650,7 +639,7 @@ if __name__ == "__main__":
                     hot = con.execute("SELECT COUNT(*) FROM price_points").fetchone()[0]
                     print(f"  DuckDB Hot (24h): {hot:,} records")
             except Exception as e:
-                print(f"  DuckDB error: {e}")
+                logger.error(f"DuckDB error: {e}")
             
             try:
                 with get_mysql() as conn:
@@ -659,7 +648,7 @@ if __name__ == "__main__":
                         mysql_count = cursor.fetchone()['cnt']
                         print(f"  MySQL:            {mysql_count:,} records")
             except Exception as e:
-                print(f"  MySQL error: {e}")
+                logger.error(f"MySQL error: {e}")
             
             latest = get_latest_prices()
             if latest:

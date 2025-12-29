@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SolWebhook")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+aa5b6b6d1f405d3154b7417886b1164d7285fe3e")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+f07df7b62cefa45bb85cb18edbba7fbe0b121bd4")]
 [assembly: System.Reflection.AssemblyProductAttribute("SolWebhook")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SolWebhook")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

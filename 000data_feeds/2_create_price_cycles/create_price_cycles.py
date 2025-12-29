@@ -25,7 +25,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_mysql, get_trading_engine
+from core.database import get_trading_engine
 from core.config import settings
 
 # Configure logging
@@ -38,79 +38,14 @@ BATCH_SIZE = 100  # Process up to 100 price points per run
 
 
 # =============================================================================
-# MySQL Table Initialization
+# Table Initialization (Tables are created by TradingDataEngine)
 # =============================================================================
 
 def ensure_mysql_tables():
-    """Ensure MySQL tables exist for price_analysis and cycle_tracker."""
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                # Create price_analysis table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS price_analysis (
-                        id INT AUTO_INCREMENT PRIMARY KEY,
-                        coin_id INT NOT NULL,
-                        price_point_id BIGINT NOT NULL,
-                        sequence_start_id BIGINT NOT NULL,
-                        sequence_start_price DECIMAL(20, 8) NOT NULL,
-                        current_price DECIMAL(20, 8) NOT NULL,
-                        percent_threshold DECIMAL(5, 2) NOT NULL DEFAULT 0.1,
-                        percent_increase DECIMAL(10, 4) NOT NULL,
-                        highest_price_recorded DECIMAL(20, 8) NOT NULL,
-                        lowest_price_recorded DECIMAL(20, 8) NOT NULL,
-                        procent_change_from_highest_price_recorded DECIMAL(10, 4) NOT NULL DEFAULT 0.0,
-                        percent_increase_from_lowest DECIMAL(10, 4) NOT NULL DEFAULT 0.0,
-                        price_cycle BIGINT NOT NULL,
-                        created_at DATETIME NOT NULL,
-                        processed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        highest_climb FLOAT NULL,
-                        INDEX idx_price_point_id (price_point_id),
-                        INDEX idx_price_cycle (price_cycle),
-                        INDEX idx_created_at (created_at),
-                        INDEX idx_coin_threshold_id (coin_id, percent_threshold, id)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                
-                # Alter existing table if sequence_start_id is INT (migration)
-                try:
-                    cursor.execute("ALTER TABLE price_analysis MODIFY COLUMN sequence_start_id BIGINT NOT NULL")
-                    cursor.execute("ALTER TABLE price_analysis MODIFY COLUMN price_point_id BIGINT NOT NULL")
-                except:
-                    pass  # Column already correct type
-                
-                # Create cycle_tracker table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS cycle_tracker (
-                        id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                        coin_id INT NOT NULL,
-                        threshold DECIMAL(5, 2) NOT NULL,
-                        cycle_start_time DATETIME NOT NULL,
-                        cycle_end_time DATETIME NULL,
-                        sequence_start_id BIGINT NOT NULL,
-                        sequence_start_price DECIMAL(20, 8) NOT NULL,
-                        highest_price_reached DECIMAL(20, 8) NOT NULL,
-                        lowest_price_reached DECIMAL(20, 8) NOT NULL,
-                        max_percent_increase DECIMAL(10, 4) NOT NULL,
-                        max_percent_increase_from_lowest DECIMAL(10, 4) NOT NULL,
-                        total_data_points INT NOT NULL DEFAULT 0,
-                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                        INDEX idx_coin_threshold (coin_id, threshold),
-                        INDEX idx_cycle_start (cycle_start_time)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """)
-                
-                # Alter existing table if sequence_start_id is INT (migration)
-                try:
-                    cursor.execute("ALTER TABLE cycle_tracker MODIFY COLUMN sequence_start_id BIGINT NOT NULL")
-                except:
-                    pass  # Column already correct type
-                
-                logger.debug("MySQL tables verified/created")
-                return True
-    except Exception as e:
-        logger.error(f"Failed to ensure MySQL tables: {e}")
-        return False
+    """No-op: Tables are created by TradingDataEngine on startup."""
+    # TradingDataEngine creates price_analysis and cycle_tracker tables in-memory
+    logger.debug("Using TradingDataEngine tables (in-memory)")
+    return True
 
 
 # =============================================================================
@@ -122,77 +57,58 @@ def get_last_processed_ts() -> Optional[datetime]:
     try:
         engine = get_trading_engine()
         if not engine._running:
-            # Fall back to MySQL if engine not running
-            return get_last_processed_ts_mysql()
+            return None
         
         result = engine.read_one("""
             SELECT MAX(created_at) as max_ts FROM price_analysis WHERE coin_id = ?
         """, [COIN_ID])
         return result['max_ts'] if result and result['max_ts'] else None
     except Exception as e:
-        logger.debug(f"No previous data found in engine, trying MySQL: {e}")
-        return get_last_processed_ts_mysql()
-
-
-def get_last_processed_ts_mysql() -> Optional[datetime]:
-    """Fallback: Get the timestamp of the last processed price point from MySQL."""
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT MAX(created_at) as max_ts FROM price_analysis WHERE coin_id = %s
-                """, [COIN_ID])
-                result = cursor.fetchone()
-                return result['max_ts'] if result and result.get('max_ts') else None
-    except Exception as e:
-        logger.debug(f"No previous data found in MySQL: {e}")
+        logger.debug(f"No previous data found in engine: {e}")
         return None
 
 
 def get_new_price_points(last_ts: Optional[datetime], limit: int = BATCH_SIZE) -> List[Dict]:
-    """Get new price points from MySQL.
+    """Get new price points from TradingDataEngine (in-memory).
     
-    We read from MySQL because:
-    1. MySQL handles multi-process access well
-    2. The Jupiter fetcher writes to MySQL (dual-write with TradingEngine)
-    3. MySQL is the master source of truth for historical data
-    
-    IMPORTANT: When starting fresh (no last_ts), we only process recent data
-    (last 1 hour) to avoid processing months of historical data.
+    Reads from in-memory DuckDB for fast access.
     """
     from datetime import timedelta
     
     try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                if last_ts:
-                    # Continue from where we left off
-                    cursor.execute("""
-                        SELECT id, created_at, 'SOL' as token, value
-                        FROM price_points
-                        WHERE coin_id = %s AND created_at > %s
-                        ORDER BY created_at ASC
-                        LIMIT %s
-                    """, [COIN_ID, last_ts, limit])
-                else:
-                    # FRESH START: Only process data from the last 1 hour
-                    # This prevents processing months of historical data
-                    logger.info("Fresh start detected - only processing last 1 hour of price data")
-                    cursor.execute("""
-                        SELECT id, created_at, 'SOL' as token, value
-                        FROM price_points
-                        WHERE coin_id = %s AND created_at >= NOW() - INTERVAL 1 HOUR
-                        ORDER BY created_at ASC
-                        LIMIT %s
-                    """, [COIN_ID, limit])
-                
-                rows = cursor.fetchall()
-                return [
-                    {'id': row['id'], 'ts': row['created_at'], 'token': row['token'], 'price': float(row['value'])}
-                    for row in rows
-                ]
+        engine = get_trading_engine()
+        if not engine._running:
+            logger.warning("TradingEngine not running - cannot get price points")
+            return []
+        
+        if last_ts:
+            # Continue from where we left off
+            results = engine.read("""
+                SELECT ts as created_at, token, price as value
+                FROM prices
+                WHERE token = 'SOL' AND ts > ?
+                ORDER BY ts ASC
+                LIMIT ?
+            """, [last_ts, limit])
+        else:
+            # FRESH START: Only process data from the last 1 hour
+            logger.info("Fresh start detected - only processing last 1 hour of price data")
+            results = engine.read("""
+                SELECT ts as created_at, token, price as value
+                FROM prices
+                WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 1 HOUR
+                ORDER BY ts ASC
+                LIMIT ?
+            """, [limit])
+        
+        # Convert to list and add sequential IDs
+        rows = list(results)
+        return [
+            {'id': i, 'ts': row['created_at'], 'token': row['token'], 'price': float(row['value'])}
+            for i, row in enumerate(rows)
+        ]
     except Exception as e:
-        logger.error(f"Failed to get price points from MySQL: {e}")
+        logger.error(f"Failed to get price points from engine: {e}")
         return []
 
 
@@ -202,7 +118,8 @@ def get_threshold_states() -> Dict[float, Dict]:
     try:
         engine = get_trading_engine()
         if not engine._running:
-            return get_threshold_states_mysql()
+            logger.warning("TradingEngine not running - starting fresh")
+            return states
         
         for threshold in THRESHOLDS:
             result = engine.read_one("""
@@ -226,49 +143,9 @@ def get_threshold_states() -> Dict[float, Dict]:
                     'lowest_price_recorded': float(result['lowest_price_recorded']),
                     'price_cycle': result['price_cycle']
                 }
-        
-        # If engine returned no states, fall back to MySQL
-        if not states:
-            return get_threshold_states_mysql()
             
     except Exception as e:
-        logger.error(f"Failed to load threshold states from engine, trying MySQL: {e}")
-        return get_threshold_states_mysql()
-    
-    return states
-
-
-def get_threshold_states_mysql() -> Dict[float, Dict]:
-    """Fallback: Load current state for each threshold from MySQL."""
-    states = {}
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                for threshold in THRESHOLDS:
-                    cursor.execute("""
-                        SELECT 
-                            sequence_start_id,
-                            sequence_start_price,
-                            highest_price_recorded,
-                            lowest_price_recorded,
-                            price_cycle
-                        FROM price_analysis 
-                        WHERE coin_id = %s AND percent_threshold = %s
-                        ORDER BY id DESC
-                        LIMIT 1
-                    """, [COIN_ID, threshold])
-                    result = cursor.fetchone()
-                    
-                    if result:
-                        states[threshold] = {
-                            'sequence_start_id': result['sequence_start_id'],
-                            'sequence_start_price': float(result['sequence_start_price']),
-                            'highest_price_recorded': float(result['highest_price_recorded']),
-                            'lowest_price_recorded': float(result['lowest_price_recorded']),
-                            'price_cycle': result['price_cycle']
-                        }
-    except Exception as e:
-        logger.error(f"Failed to load threshold states from MySQL: {e}")
+        logger.error(f"Failed to load threshold states from engine: {e}")
     
     return states
 
@@ -278,27 +155,15 @@ def get_threshold_states_mysql() -> Dict[float, Dict]:
 # =============================================================================
 
 def get_next_cycle_id() -> int:
-    """Get the next available cycle ID."""
+    """Get the next available cycle ID from TradingDataEngine."""
     max_id = 0
     
-    # Check TradingDataEngine first
     try:
         engine = get_trading_engine()
         if engine._running:
             result = engine.read_one("SELECT MAX(id) as max_id FROM cycle_tracker", [])
             if result and result['max_id']:
-                max_id = max(max_id, result['max_id'])
-    except:
-        pass
-    
-    # Check MySQL (master source)
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT MAX(id) as max_id FROM cycle_tracker")
-                result = cursor.fetchone()
-                if result and result.get('max_id'):
-                    max_id = max(max_id, result['max_id'])
+                max_id = result['max_id']
     except:
         pass
     
@@ -306,27 +171,15 @@ def get_next_cycle_id() -> int:
 
 
 def get_next_analysis_id() -> int:
-    """Get the next available price_analysis ID."""
+    """Get the next available price_analysis ID from TradingDataEngine."""
     max_id = 0
     
-    # Check TradingDataEngine first
     try:
         engine = get_trading_engine()
         if engine._running:
             result = engine.read_one("SELECT MAX(id) as max_id FROM price_analysis", [])
             if result and result['max_id']:
-                max_id = max(max_id, result['max_id'])
-    except:
-        pass
-    
-    # Check MySQL (master source)
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT MAX(id) as max_id FROM price_analysis")
-                result = cursor.fetchone()
-                if result and result.get('max_id'):
-                    max_id = max(max_id, result['max_id'])
+                max_id = result['max_id']
     except:
         pass
     
@@ -368,24 +221,9 @@ def create_new_cycle(
     except Exception as e:
         logger.error(f"TradingEngine cycle insert failed: {e}")
     
-    # Write to MySQL
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO cycle_tracker 
-                    (id, coin_id, threshold, cycle_start_time, sequence_start_id,
-                     sequence_start_price, highest_price_reached, lowest_price_reached,
-                     max_percent_increase, max_percent_increase_from_lowest, total_data_points)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0, 0, 1)
-                """, [cycle_id, COIN_ID, threshold, start_time, sequence_start_id,
-                      start_price, start_price, start_price])
-                mysql_ok = True
-    except Exception as e:
-        logger.error(f"MySQL cycle insert failed: {e}")
-    
-    if engine_ok or mysql_ok:
-        logger.info(f"Created cycle #{cycle_id} for threshold {threshold}% (Engine: {engine_ok}, MySQL: {mysql_ok})")
+    # DuckDB only - no MySQL writes
+    if engine_ok:
+        logger.info(f"Created cycle #{cycle_id} for threshold {threshold}%")
         return cycle_id
     
     return None
@@ -393,7 +231,7 @@ def create_new_cycle(
 
 def close_cycle(cycle_id: int, end_time: datetime):
     """Close a cycle by setting its end time."""
-    # Update TradingDataEngine
+    # Update TradingDataEngine only - no MySQL
     try:
         engine = get_trading_engine()
         if engine._running:
@@ -402,16 +240,6 @@ def close_cycle(cycle_id: int, end_time: datetime):
             """, [end_time, cycle_id])
     except Exception as e:
         logger.error(f"TradingEngine cycle close failed: {e}")
-    
-    # Update MySQL
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE cycle_tracker SET cycle_end_time = %s WHERE id = %s
-                """, [end_time, cycle_id])
-    except Exception as e:
-        logger.error(f"MySQL cycle close failed: {e}")
     
     logger.debug(f"Closed cycle #{cycle_id}")
 
@@ -424,7 +252,7 @@ def update_cycle_stats(
     max_from_lowest: float
 ):
     """Update cycle statistics."""
-    # Update TradingDataEngine
+    # Update TradingDataEngine only - no MySQL
     try:
         engine = get_trading_engine()
         if engine._running:
@@ -439,22 +267,6 @@ def update_cycle_stats(
             """, [highest_price, lowest_price, max_increase, max_from_lowest, cycle_id])
     except Exception as e:
         logger.debug(f"TradingEngine cycle stats update skipped: {e}")
-    
-    # Update MySQL
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE cycle_tracker SET
-                        total_data_points = total_data_points + 1,
-                        highest_price_reached = GREATEST(highest_price_reached, %s),
-                        lowest_price_reached = LEAST(lowest_price_reached, %s),
-                        max_percent_increase = GREATEST(max_percent_increase, %s),
-                        max_percent_increase_from_lowest = GREATEST(max_percent_increase_from_lowest, %s)
-                    WHERE id = %s
-                """, [highest_price, lowest_price, max_increase, max_from_lowest, cycle_id])
-    except Exception as e:
-        logger.error(f"MySQL cycle stats update failed: {e}")
 
 
 # =============================================================================
@@ -462,14 +274,11 @@ def update_cycle_stats(
 # =============================================================================
 
 def insert_price_analysis_batch(records: List[tuple]) -> bool:
-    """Batch insert price analysis records with dual-write."""
+    """Batch insert price analysis records to TradingEngine (in-memory DuckDB only)."""
     if not records:
         return True
     
-    engine_ok = False
-    mysql_ok = False
-    
-    # Write to TradingDataEngine (in-memory DuckDB)
+    # Write to TradingDataEngine only - no MySQL
     try:
         engine = get_trading_engine()
         if engine._running:
@@ -491,27 +300,11 @@ def insert_price_analysis_batch(records: List[tuple]) -> bool:
                     'price_cycle': record[12],
                     'created_at': record[13]
                 })
-            engine_ok = True
+            return True
     except Exception as e:
         logger.error(f"TradingEngine price_analysis insert failed: {e}")
     
-    # Write to MySQL
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.executemany("""
-                    INSERT INTO price_analysis 
-                    (id, coin_id, price_point_id, sequence_start_id, sequence_start_price,
-                     current_price, percent_threshold, percent_increase, highest_price_recorded,
-                     lowest_price_recorded, procent_change_from_highest_price_recorded,
-                     percent_increase_from_lowest, price_cycle, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, records)
-                mysql_ok = True
-    except Exception as e:
-        logger.error(f"MySQL price_analysis insert failed: {e}")
-    
-    return engine_ok or mysql_ok
+    return False
 
 
 def process_price_point(

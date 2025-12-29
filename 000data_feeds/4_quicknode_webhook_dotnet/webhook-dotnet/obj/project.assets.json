@@ -105,92 +105,6 @@
           }
         }
       }
-    },
-    "net8.0/win-x64": {
-      "DuckDB.NET.Bindings.Full/1.4.3": {
-        "type": "package",
-        "compile": {
-          "lib/net8.0/DuckDB.NET.Bindings.dll": {
-            "related": ".pdb"
-          }
-        },
-        "runtime": {
-          "lib/net8.0/DuckDB.NET.Bindings.dll": {
-            "related": ".pdb"
-          }
-        },
-        "native": {
-          "runtimes/win-x64/native/duckdb.dll": {}
-        }
-      },
-      "DuckDB.NET.Data.Full/1.4.3": {
-        "type": "package",
-        "dependencies": {
-          "DuckDB.NET.Bindings.Full": "1.4.3"
-        },
-        "compile": {
-          "lib/net8.0/DuckDB.NET.Data.dll": {
-            "related": ".pdb"
-          }
-        },
-        "runtime": {
-          "lib/net8.0/DuckDB.NET.Data.dll": {
-            "related": ".pdb"
-          }
-        }
-      },
-      "Microsoft.Extensions.DependencyInjection.Abstractions/8.0.2": {
-        "type": "package",
-        "compile": {
-          "lib/net8.0/Microsoft.Extensions.DependencyInjection.Abstractions.dll": {
-            "related": ".xml"
-          }
-        },
-        "runtime": {
-          "lib/net8.0/Microsoft.Extensions.DependencyInjection.Abstractions.dll": {
-            "related": ".xml"
-          }
-        },
-        "build": {
-          "buildTransitive/net6.0/_._": {}
-        }
-      },
-      "Microsoft.Extensions.Logging.Abstractions/8.0.2": {
-        "type": "package",
-        "dependencies": {
-          "Microsoft.Extensions.DependencyInjection.Abstractions": "8.0.2"
-        },
-        "compile": {
-          "lib/net8.0/Microsoft.Extensions.Logging.Abstractions.dll": {
-            "related": ".xml"
-          }
-        },
-        "runtime": {
-          "lib/net8.0/Microsoft.Extensions.Logging.Abstractions.dll": {
-            "related": ".xml"
-          }
-        },
-        "build": {
-          "buildTransitive/net6.0/Microsoft.Extensions.Logging.Abstractions.targets": {}
-        }
-      },
-      "MySqlConnector/2.4.0": {
-        "type": "package",
-        "dependencies": {
-          "Microsoft.Extensions.DependencyInjection.Abstractions": "8.0.2",
-          "Microsoft.Extensions.Logging.Abstractions": "8.0.2"
-        },
-        "compile": {
-          "lib/net8.0/MySqlConnector.dll": {
-            "related": ".xml"
-          }
-        },
-        "runtime": {
-          "lib/net8.0/MySqlConnector.dll": {
-            "related": ".xml"
-          }
-        }
-      }
     }
   },
   "libraries": {
@@ -445,20 +359,6 @@
         ],
         "assetTargetFallback": true,
         "warn": true,
-        "downloadDependencies": [
-          {
-            "name": "Microsoft.AspNetCore.App.Runtime.win-x64",
-            "version": "[8.0.21, 8.0.21]"
-          },
-          {
-            "name": "Microsoft.NETCore.App.Runtime.win-x64",
-            "version": "[8.0.21, 8.0.21]"
-          },
-          {
-            "name": "Microsoft.WindowsDesktop.App.Runtime.win-x64",
-            "version": "[8.0.21, 8.0.21]"
-          }
-        ],
         "frameworkReferences": {
           "Microsoft.AspNetCore.App": {
             "privateAssets": "none"
@@ -468,11 +368,6 @@
           }
         },
         "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.100-rc.2.25502.107/PortableRuntimeIdentifierGraph.json"
-      }
-    },
-    "runtimes": {
-      "win-x64": {
-        "#import": []
       }
     }
   }

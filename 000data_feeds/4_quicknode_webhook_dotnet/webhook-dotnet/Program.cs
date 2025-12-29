@@ -366,16 +366,32 @@ app.MapGet("/health", async () =>
 // =============================================================================
 
 // GET /api/whale-movements - Fetch whale movements from DuckDB
-app.MapGet("/api/whale-movements", (int? limit) =>
+// Supports time-range filtering with start/end parameters (ISO 8601 format)
+app.MapGet("/api/whale-movements", (int? limit, DateTime? start, DateTime? end) =>
 {
     try
     {
-        var maxLimit = Math.Min(limit ?? 100, 500);
+        // When time-range is specified, allow up to 10000 records; otherwise cap at 500
+        var maxLimit = (start.HasValue || end.HasValue) 
+            ? Math.Min(limit ?? 10000, 10000) 
+            : Math.Min(limit ?? 100, 500);
         var results = new List<object>();
         
         lock (duckDbLock)
         {
             using var cmd = duckDbConnection.CreateCommand();
+            
+            // Build WHERE clause for time filtering
+            var whereClauses = new List<string>();
+            if (start.HasValue)
+                whereClauses.Add($"timestamp >= '{start.Value:yyyy-MM-dd HH:mm:ss}'");
+            if (end.HasValue)
+                whereClauses.Add($"timestamp <= '{end.Value:yyyy-MM-dd HH:mm:ss}'");
+            
+            var whereClause = whereClauses.Count > 0 
+                ? "WHERE " + string.Join(" AND ", whereClauses) 
+                : "";
+            
             cmd.CommandText = $@"
                 SELECT id, signature, wallet_address, whale_type, current_balance, 
                        sol_change, abs_change, percentage_moved, direction, action,
@@ -384,7 +400,8 @@ app.MapGet("/api/whale-movements", (int? limit) =>
                        perp_direction, perp_size, perp_leverage, perp_entry_price,
                        created_at
                 FROM whale_movements 
-                ORDER BY id DESC 
+                {whereClause}
+                ORDER BY timestamp DESC 
                 LIMIT {maxLimit}";
             
             using var reader = cmd.ExecuteReader();
@@ -443,31 +460,65 @@ app.MapGet("/api/whale-movements", (int? limit) =>
 });
 
 // GET /api/trades - Fetch trades from DuckDB
-app.MapGet("/api/trades", (int? limit) =>
+// Supports:
+//   - after_id: Incremental sync - only return trades with id > after_id (FAST, preferred)
+//   - start/end: Time-range filtering with ISO 8601 format (legacy)
+//   - limit: Max records to return
+app.MapGet("/api/trades", (int? limit, long? after_id, DateTime? start, DateTime? end) =>
 {
     try
     {
-        var maxLimit = Math.Min(limit ?? 100, 500);
+        // For incremental sync (after_id), allow up to 5000 records per batch
+        // For time-range queries, allow up to 10000; otherwise cap at 500
+        var maxLimit = after_id.HasValue
+            ? Math.Min(limit ?? 5000, 5000)
+            : (start.HasValue || end.HasValue) 
+                ? Math.Min(limit ?? 10000, 10000) 
+                : Math.Min(limit ?? 100, 500);
+        
         var results = new List<object>();
+        long maxId = 0;
         
         lock (duckDbLock)
         {
             using var cmd = duckDbConnection.CreateCommand();
+            
+            // Build WHERE clause - prefer after_id for incremental sync
+            var whereClauses = new List<string>();
+            if (after_id.HasValue)
+                whereClauses.Add($"id > {after_id.Value}");
+            if (start.HasValue)
+                whereClauses.Add($"trade_timestamp >= '{start.Value:yyyy-MM-dd HH:mm:ss}'");
+            if (end.HasValue)
+                whereClauses.Add($"trade_timestamp <= '{end.Value:yyyy-MM-dd HH:mm:ss}'");
+            
+            var whereClause = whereClauses.Count > 0 
+                ? "WHERE " + string.Join(" AND ", whereClauses) 
+                : "";
+            
+            // For incremental sync, order by ID ASC to get oldest-first (proper ordering)
+            // For time queries, order by timestamp DESC (most recent first)
+            var orderBy = after_id.HasValue ? "ORDER BY id ASC" : "ORDER BY trade_timestamp DESC";
+            
             cmd.CommandText = $@"
                 SELECT id, signature, wallet_address, direction, sol_amount, stablecoin,
                        stablecoin_amount, price, block_height, slot, block_time, 
                        trade_timestamp, has_perp_position, perp_platform, perp_direction,
                        perp_size, perp_leverage, perp_entry_price, created_at
                 FROM sol_stablecoin_trades 
-                ORDER BY id DESC 
+                {whereClause}
+                {orderBy}
                 LIMIT {maxLimit}";
             
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
+                var id = reader.GetInt64(0);
+                if (id > maxId) maxId = id;
+                
                 results.Add(new
                 {
-                    id = reader.GetInt64(0),
+                    id = id,
                     signature = reader.GetString(1),
                     wallet_address = reader.GetString(2),
                     direction = reader.GetString(3),
@@ -495,6 +546,7 @@ app.MapGet("/api/trades", (int? limit) =>
             success = true,
             source = "duckdb_inmemory",
             count = results.Count,
+            max_id = maxId,  // Return max_id for incremental sync tracking
             results = results,
             timestamp = DateTime.UtcNow
         });
@@ -506,6 +558,7 @@ app.MapGet("/api/trades", (int? limit) =>
             success = false,
             source = "duckdb_inmemory",
             error = ex.Message,
+            max_id = 0,
             results = new List<object>(),
             timestamp = DateTime.UtcNow
         });
@@ -1041,6 +1094,12 @@ async Task ProcessWhaleMovements(List<WhaleMovementData> movements, string reque
                     Console.WriteLine($"[{requestId}] [WARNING] Failed to parse received_at '{movement.ReceivedAt}', using current time");
                 }
                 
+                // Normalize direction to in/out and fix abs_change if missing/zero
+                var dirNormalized = (movement.Direction ?? "").ToLower();
+                if (dirNormalized is "sending" or "sent" or "outbound") dirNormalized = "out";
+                else if (dirNormalized is "receiving" or "received" or "inbound") dirNormalized = "in";
+                var absChangeFixed = movement.AbsChange != 0 ? movement.AbsChange : Math.Abs(movement.SolChange);
+                
                 // =================================================================
                 // DUAL-WRITE: DuckDB (hot storage) - fire-and-forget, non-blocking
                 // =================================================================
@@ -1065,9 +1124,9 @@ async Task ProcessWhaleMovements(List<WhaleMovementData> movements, string reque
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = movement.WhaleType });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = (double)movement.CurrentBalance });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = (double)movement.SolChange });
-                        duckCmd.Parameters.Add(new DuckDBParameter { Value = (double)movement.AbsChange });
+                        duckCmd.Parameters.Add(new DuckDBParameter { Value = (double)absChangeFixed });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = (double)movement.PercentageMoved });
-                        duckCmd.Parameters.Add(new DuckDBParameter { Value = movement.Direction?.ToLower() ?? "" });
+                        duckCmd.Parameters.Add(new DuckDBParameter { Value = dirNormalized });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = movement.Action ?? "" });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = movement.MovementSignificance ?? "" });
                         duckCmd.Parameters.Add(new DuckDBParameter { Value = movement.PreviousBalance.HasValue ? (double)movement.PreviousBalance.Value : 0.0 });
@@ -1109,9 +1168,9 @@ async Task ProcessWhaleMovements(List<WhaleMovementData> movements, string reque
                 cmd.Parameters.AddWithValue("@whale_type", movement.WhaleType);
                 cmd.Parameters.AddWithValue("@current_balance", movement.CurrentBalance);
                 cmd.Parameters.AddWithValue("@sol_change", movement.SolChange);
-                cmd.Parameters.AddWithValue("@abs_change", movement.AbsChange);
+                cmd.Parameters.AddWithValue("@abs_change", absChangeFixed);
                 cmd.Parameters.AddWithValue("@percentage_moved", movement.PercentageMoved);
-                cmd.Parameters.AddWithValue("@direction", movement.Direction?.ToLower() ?? "");
+                cmd.Parameters.AddWithValue("@direction", dirNormalized);
                 cmd.Parameters.AddWithValue("@action", movement.Action ?? "");
                 cmd.Parameters.AddWithValue("@movement_significance", movement.MovementSignificance ?? "");
                 cmd.Parameters.AddWithValue("@previous_balance", movement.PreviousBalance ?? 0);

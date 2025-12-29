@@ -40,17 +40,6 @@ C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dot
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\obj\Release\net8.0\SolWebhook.pdb
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\obj\Release\net8.0\SolWebhook.genruntimeconfig.cache
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\obj\Release\net8.0\ref\SolWebhook.dll
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\web-selfcontained.config
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\web.config
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\appsettings.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\SolWebhook.deps.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\SolWebhook.runtimeconfig.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\SolWebhook.staticwebassets.endpoints.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\test_payload_example.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\test_payload_with_perp.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\test_raw_instructions.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\test_raw_instructions_missing_fields.json
-C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\publish-standalone\test_whale_payload_with_perp.json
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\runtimes\linux-arm64\native\libduckdb.so
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\runtimes\linux-x64\native\libduckdb.so
 C:\0000websites\00phpsites\follow_the_goat\000data_feeds\4_quicknode_webhook_dotnet\webhook-dotnet\bin\Release\net8.0\runtimes\osx\native\libduckdb.dylib

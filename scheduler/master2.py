@@ -417,6 +417,35 @@ def init_local_duckdb():
             is_backfill BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS whale_movements (
+            id BIGINT PRIMARY KEY,
+            signature VARCHAR(255),
+            wallet_address VARCHAR(255) NOT NULL,
+            whale_type VARCHAR(50),
+            current_balance DOUBLE,
+            sol_change DOUBLE,
+            abs_change DOUBLE,
+            percentage_moved DOUBLE,
+            direction VARCHAR(10),
+            action VARCHAR(50),
+            movement_significance VARCHAR(50),
+            previous_balance DOUBLE,
+            fee_paid DOUBLE,
+            block_time BIGINT,
+            timestamp TIMESTAMP,
+            received_at TIMESTAMP,
+            slot BIGINT,
+            has_perp_position BOOLEAN,
+            perp_platform VARCHAR(50),
+            perp_direction VARCHAR(10),
+            perp_size DOUBLE,
+            perp_leverage DOUBLE,
+            perp_entry_price DOUBLE,
+            raw_data_json VARCHAR,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         """
     ]
     
@@ -430,6 +459,7 @@ def init_local_duckdb():
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON sol_stablecoin_trades(trade_timestamp)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_price_analysis_threshold ON price_analysis(coin_id, percent_threshold)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_cycle_tracker_threshold ON cycle_tracker(threshold, cycle_end_time)")
+    _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_whale_timestamp ON whale_movements(timestamp)")
     
     # CRITICAL: Register this connection into the pool so that all modules
     # using get_duckdb("central") will use THIS in-memory DB with the data.
@@ -1026,9 +1056,9 @@ def create_local_api() -> FastAPI:
         if _local_duckdb is None:
             raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
         
-        # Basic security: only allow SELECT queries
+        # Basic security: only allow SELECT queries (including CTEs starting with WITH)
         sql_upper = request.sql.strip().upper()
-        if not sql_upper.startswith("SELECT"):
+        if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
             raise HTTPException(
                 status_code=400,
                 detail="Only SELECT queries are allowed."
@@ -1051,6 +1081,46 @@ def create_local_api() -> FastAPI:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+    
+    @app.post("/execute")
+    async def execute_write(request: QueryRequest):
+        """Execute INSERT/UPDATE/DELETE queries for trail data persistence."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        # Allow INSERT, UPDATE, DELETE for trail data management
+        sql_upper = request.sql.strip().upper()
+        allowed_ops = ["INSERT", "UPDATE", "DELETE"]
+        if not any(sql_upper.startswith(op) for op in allowed_ops):
+            raise HTTPException(
+                status_code=400,
+                detail="Only INSERT, UPDATE, DELETE queries are allowed."
+            )
+        
+        # Security: only allow operations on trail-related tables
+        allowed_tables = ["buyin_trail_minutes"]
+        table_check = sql_upper
+        if not any(table.upper() in table_check for table in allowed_tables):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only operations on {allowed_tables} are allowed."
+            )
+        
+        try:
+            with _local_duckdb_lock:
+                if request.params:
+                    _local_duckdb.execute(request.sql, request.params)
+                else:
+                    _local_duckdb.execute(request.sql)
+            
+            return {
+                "success": True,
+                "message": "Query executed successfully"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Execute failed: {e}")
     
     @app.get("/tables")
     async def list_tables():
@@ -1638,15 +1708,18 @@ def backfill_from_data_engine(hours: int = 2):
     # Tables to backfill from Data Engine API
     # =========================================================================
     # NOTE: follow_the_goat_plays is NOT included here - loaded from PostgreSQL above
+    # NOTE: cycle_tracker is NOT included - it's created from scratch by create_price_cycles.py
+    #       based on the prices data. Backfilling cycle_tracker would import old/duplicate cycles.
     tables_to_backfill = [
         ("prices", 10000),
         ("price_points", 10000),
-        ("cycle_tracker", 1000),
+        # ("cycle_tracker", 1000),  # REMOVED - cycles are COMPUTED, not backfilled
         ("follow_the_goat_buyins", 5000),
         ("sol_stablecoin_trades", 20000),
         ("wallet_profiles", 10000),
         ("buyin_trail_minutes", 10000),
         ("order_book_features", 50000),  # Higher limit for order book data
+        ("whale_movements", 10000),  # Whale activity data for trail generation
     ]
     
     total_loaded = 0
@@ -1714,7 +1787,8 @@ def sync_new_data_from_engine():
     
     # Tables to sync - ordered by priority for trading decisions
     # prices & order_book_features are most critical for trading signals
-    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "cycle_tracker"]
+    # NOTE: cycle_tracker is NOT synced - it's computed locally by create_price_cycles.py
+    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements"]
     
     for table in sync_tables:
         try:
@@ -1927,6 +2001,69 @@ def export_job_status_to_file():
         logger.error(f"Failed to export job status: {e}")
 
 
+def sync_cycles_to_engine():
+    """
+    Sync active cycles from local DuckDB to master.py's Data Engine.
+    
+    Syncs the MOST RECENT active cycle per threshold from local DuckDB.
+    The website_api filters duplicates on read, so we just sync our clean data.
+    """
+    global _local_duckdb, _local_duckdb_lock, _data_client
+    
+    if _data_client is None or not _data_client.is_available():
+        return
+    
+    try:
+        with _local_duckdb_lock:
+            # Get the MOST RECENT active cycle per threshold from local DuckDB
+            results = _local_duckdb.execute("""
+                WITH ranked_cycles AS (
+                    SELECT 
+                        id, coin_id, threshold, cycle_start_time, cycle_end_time,
+                        sequence_start_id, sequence_start_price, highest_price_reached,
+                        lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
+                        total_data_points, created_at,
+                        ROW_NUMBER() OVER (PARTITION BY threshold ORDER BY cycle_start_time DESC) as rn
+                    FROM cycle_tracker
+                    WHERE coin_id = 5 AND cycle_end_time IS NULL
+                )
+                SELECT 
+                    id, coin_id, threshold, cycle_start_time, cycle_end_time,
+                    sequence_start_id, sequence_start_price, highest_price_reached,
+                    lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
+                    total_data_points, created_at
+                FROM ranked_cycles
+                WHERE rn = 1
+                ORDER BY threshold ASC
+            """).fetchall()
+            
+            if not results:
+                return
+            
+            columns = [desc[0] for desc in _local_duckdb.description]
+            synced_count = 0
+            
+            for row in results:
+                cycle_dict = dict(zip(columns, row))
+                
+                # Serialize datetime objects for JSON
+                for key, value in cycle_dict.items():
+                    if hasattr(value, 'isoformat'):
+                        cycle_dict[key] = value.isoformat()
+                
+                try:
+                    _data_client.insert("cycle_tracker", cycle_dict)
+                    synced_count += 1
+                except Exception as e:
+                    logger.debug(f"Failed to sync cycle {cycle_dict.get('id')} to Data Engine: {e}")
+            
+            if synced_count > 0:
+                logger.debug(f"Synced {synced_count} active cycle(s) to Data Engine (website deduplicates on read)")
+                
+    except Exception as e:
+        logger.debug(f"Cycle sync error: {e}")
+
+
 @track_job("process_price_cycles", "Process price cycles (every 1s)")
 def run_process_price_cycles():
     """
@@ -1937,6 +2074,8 @@ def run_process_price_cycles():
     
     A cycle ends when price drops X% below the highest price reached in that cycle.
     There can only be 7 active cycles at any time (one per threshold).
+    
+    After processing, syncs cycles to master.py's Data Engine so the website can see them.
     """
     enabled = os.getenv("PRICE_CYCLES_ENABLED", "1") == "1"
     if not enabled:
@@ -1951,6 +2090,10 @@ def run_process_price_cycles():
         processed = process_price_cycles()
         if processed > 0:
             logger.debug(f"Price cycles: processed {processed} price points")
+        
+        # Sync cycles to master.py's Data Engine (so website can see them)
+        sync_cycles_to_engine()
+        
     except Exception as e:
         logger.error(f"Price cycles error: {e}")
 

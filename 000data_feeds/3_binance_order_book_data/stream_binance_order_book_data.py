@@ -278,7 +278,7 @@ class BinanceOrderBookCollector:
                 data = json.loads(message)
                 
                 orderbook = {
-                    'timestamp': datetime.now(),
+                    'timestamp': datetime.utcnow(),
                     'bids': [[float(bid[0]), float(bid[1])] for bid in data['bids']],
                     'asks': [[float(ask[0]), float(ask[1])] for ask in data['asks']],
                     'source': 'WEBSOCKET'

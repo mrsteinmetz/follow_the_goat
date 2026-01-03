@@ -81,7 +81,7 @@ fi
 
 # Test Webhook connectivity
 echo -e "${YELLOW}Testing Webhook connectivity...${NC}"
-if curl -s --max-time 3 http://quicknode.smz.dk/health > /dev/null 2>&1; then
+if curl -s --max-time 3 http://195.201.84.5/health > /dev/null 2>&1; then
     echo -e "${GREEN}✓ Webhook is reachable${NC}"
 else
     echo -e "${RED}✗ Webhook is NOT reachable - scheduler may have issues${NC}"

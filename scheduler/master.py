@@ -13,7 +13,10 @@ This script (DATA ENGINE - runs indefinitely):
 3. Starts the FastAPI webhook server (port 8001)
 4. Starts the PHP webserver (port 8000)
 5. Starts Binance order book stream
-6. Schedules data jobs: Jupiter prices, price cycles, wallet profiles, cleanup
+6. Schedules data jobs: Jupiter prices, trade sync, cleanup
+
+IMPORTANT: This is ONLY for RAW DATA ingestion.
+All computation (cycles, profiles, trading logic) is in master2.py.
 
 Trading logic is handled by master2.py which can be restarted independently.
 
@@ -253,7 +256,7 @@ _last_synced_trade_id = 0
 _last_sync_initialized = False
 
 # Webhook base URL for trade backfill/sync
-WEBHOOK_TRADES_URL = "http://quicknode.smz.dk/api/trades"
+WEBHOOK_TRADES_URL = "http://195.201.84.5/api/trades"
 
 
 def _get_last_synced_trade_id() -> int:
@@ -549,19 +552,22 @@ def run_startup_trade_backfill():
 
 
 # =============================================================================
-# JOBS MOVED TO master2.py
+# TRADING LOGIC MOVED TO master2.py
 # =============================================================================
-# The following jobs are now handled by master2.py:
-# - run_train_validator
-# - run_follow_the_goat
-# - run_trailing_stop_seller
-# - run_update_potential_gains
-# - run_create_new_patterns
-# - process_wallet_profiles (moved - uses local in-memory DuckDB)
-# - cleanup_wallet_profiles (moved - cleanup in master2.py's local DuckDB)
-# - process_price_cycles (moved - part of trading logic, uses synced data)
+# ALL trading computation is now handled by master2.py:
+# - Price cycle analysis (create_price_cycles.py)
+# - Wallet profile building
+# - Trade validation (train_validator)
+# - Trade following (follow_the_goat)
+# - Trailing stop monitoring
 #
-# This allows trading logic to be restarted without stopping data ingestion.
+# master.py handles ONLY raw data ingestion:
+# - Jupiter price fetching
+# - Trade sync from webhook
+# - Order book stream from Binance
+# - Data cleanup
+#
+# This separation allows trading logic to be restarted without stopping data feeds.
 # =============================================================================
 
 
@@ -803,21 +809,18 @@ def stop_webhook_api():
 
 def create_scheduler() -> BackgroundScheduler:
     """
-    Create and configure the scheduler with multiple executors for parallelism.
+    Create and configure the scheduler for DATA INGESTION only.
     
     Executors:
-    - 'realtime': ThreadPoolExecutor(10) - Fast jobs that must run on schedule
-                  (Jupiter prices, trailing stop, follow the goat, trade sync)
-    - 'heavy': ThreadPoolExecutor(4) - Slower jobs that can take longer
-               (wallet profiles, price cycles, validator training)
+    - 'realtime': ThreadPoolExecutor(10) - Fast jobs (Jupiter prices, trade sync)
     - 'maintenance': ThreadPoolExecutor(2) - Hourly cleanup jobs
     
-    This prevents slow jobs from blocking fast real-time jobs.
+    ALL trading computation (cycles, profiles, trading logic) runs in master2.py.
+    This scheduler handles ONLY raw data ingestion.
     """
     # Configure executors for parallel job execution
     executors = {
-        'realtime': ThreadPoolExecutor(max_workers=10),   # Fast jobs (prices, trading)
-        'heavy': ThreadPoolExecutor(max_workers=4),       # Slow jobs (profiles, cycles)
+        'realtime': ThreadPoolExecutor(max_workers=10),   # Fast jobs (prices, trades)
         'maintenance': ThreadPoolExecutor(max_workers=2), # Cleanup jobs
     }
     
@@ -839,21 +842,23 @@ def create_scheduler() -> BackgroundScheduler:
     scheduler.add_listener(apscheduler_missed_listener, EVENT_JOB_MISSED)
     
     # =====================================================
-    # JUPITER PRICE FETCHER (runs every 1 second) - REALTIME EXECUTOR
+    # JUPITER PRICE FETCHER (runs every 1 second)
     # =====================================================
     
-    # Fetch prices from Jupiter API every 1 second (bundled BTC+ETH+SOL in single call)
-    # Using v3 API: https://api.jup.ag/price/v3?ids=SOL,BTC,ETH
+    # Fetch prices from Jupiter API every 1 second (bundled BTC+ETH+SOL)
     # One bundled request = 3 prices = 60 req/min (exactly at free tier limit)
-    # Uses 'realtime' executor to avoid blocking by slow jobs
     scheduler.add_job(
         func=fetch_jupiter_prices,
         trigger=IntervalTrigger(seconds=1),
         id="fetch_jupiter_prices",
         name="Fetch Jupiter prices (every 1s)",
         replace_existing=True,
-        executor='realtime',  # Dedicated fast executor
+        executor='realtime',
     )
+    
+    # =====================================================
+    # DATA MAINTENANCE JOBS
+    # =====================================================
     
     # Clean up old Jupiter price data (every hour)
     scheduler.add_job(
@@ -862,35 +867,32 @@ def create_scheduler() -> BackgroundScheduler:
         id="cleanup_jupiter_prices",
         name="Clean up Jupiter DuckDB (24hr window)",
         replace_existing=True,
-        executor='maintenance',  # Cleanup executor
+        executor='maintenance',
     )
     
-    # =====================================================
-    # DUCKDB MAINTENANCE JOBS - MAINTENANCE EXECUTOR
-    # =====================================================
-    
     # Clean up DuckDB hot tables (every hour)
-    # Removes data older than 24 hours from DuckDB
-    # Data is preserved in MySQL (master storage)
+    # Removes data older than 24 hours from in-memory DuckDB
     scheduler.add_job(
         func=cleanup_duckdb_hot_tables,
         trigger=IntervalTrigger(hours=1),
         id="cleanup_duckdb_hot_tables",
-        name="Clean up central DuckDB hot tables (24hr window)",
+        name="Clean up DuckDB hot tables (24hr window)",
         replace_existing=True,
-        executor='maintenance',  # Cleanup executor
+        executor='maintenance',
     )
     
-    # Sync trades from Webhook DuckDB (every 0.5 seconds) - ULTRA FAST PATH
-    # Direct DuckDB→DuckDB sync, bypassing MySQL for real-time trading
-    # Uses 'realtime' executor - critical for trading detection
+    # =====================================================
+    # TRADE SYNC FROM WEBHOOK (runs every 1 second)
+    # =====================================================
+    
+    # Sync trades from Webhook DuckDB - direct DuckDB→DuckDB for speed
     scheduler.add_job(
         func=sync_trades_from_webhook,
         trigger=IntervalTrigger(seconds=1),
         id="sync_trades_from_webhook",
-        name="Sync trades from Webhook DuckDB (every 1s)",
+        name="Sync trades from Webhook (every 1s)",
         replace_existing=True,
-        executor='realtime',  # Fast executor - trading critical
+        executor='realtime',
     )
     
     # =====================================================
@@ -1116,7 +1118,6 @@ def main():
     # Log executor configuration
     logger.info("Executors configured for parallel job execution:")
     logger.info("  - realtime (10 threads): Jupiter prices, trade sync")
-    logger.info("  - heavy (4 threads): Wallet profiles, price cycles")
     logger.info("  - maintenance (2 threads): Hourly cleanup jobs")
     logger.info("")
     logger.info("Trading jobs run in master2.py (can restart independently)")

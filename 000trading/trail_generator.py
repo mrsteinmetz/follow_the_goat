@@ -67,7 +67,13 @@ def _get_engine_if_running():
 
 
 def _execute_query(query: str, params: list = None, as_dict: bool = True, graceful: bool = True):
-    """Execute a query using TradingDataEngine if available, otherwise file-based DuckDB.
+    """Execute a query using master2's DuckDB, HTTP API, TradingDataEngine, or file-based DuckDB.
+    
+    Priority:
+    1. master2's _local_duckdb (MAIN database with all data - when running in master2 process)
+    2. master2's HTTP API (port 5052 - when running standalone)
+    3. TradingDataEngine (master.py's in-memory DB)
+    4. File-based DuckDB (fallback - usually empty)
     
     Args:
         query: SQL query (use ? for placeholders - DuckDB format)
@@ -78,27 +84,84 @@ def _execute_query(query: str, params: list = None, as_dict: bool = True, gracef
     Returns:
         List of dicts (if as_dict=True) or list of tuples
     """
-    engine = _get_engine_if_running()
-    
+    # First, try to get master2's local DuckDB (the MAIN database)
     try:
-        if engine is not None:
-            # TradingDataEngine also uses DuckDB which uses ? placeholders
-            results = engine.read(query, params or [])
-            if as_dict:
-                return results
-            # Convert dicts back to tuples if needed
-            return [tuple(r.values()) for r in results] if results else []
-        else:
-            with get_duckdb("central") as conn:
-                result = conn.execute(query, params or [])
+        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
+        local_db = get_local_duckdb()
+        if local_db is not None:
+            with _local_duckdb_lock:
+                result = local_db.execute(query, params or [])
                 if as_dict:
                     columns = [desc[0] for desc in result.description]
                     rows = result.fetchall()
                     return [dict(zip(columns, row)) for row in rows]
                 return result.fetchall()
+    except (ImportError, AttributeError):
+        # master2 not available or not initialized yet
+        pass
     except Exception as e:
         error_msg = str(e).lower()
-        # Handle missing tables gracefully - return empty data
+        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
+            logger.debug(f"Table not found in master2 DB (graceful mode): {e}")
+            return []
+        # If it's a real error, log it but continue to fallback
+        logger.warning(f"Error querying master2 DB, will try HTTP API: {e}")
+    
+    # Second, try master2's HTTP API (for standalone execution)
+    try:
+        import requests
+        # Substitute params into query (simple replacement for ? placeholders)
+        formatted_query = query
+        if params:
+            for param in params:
+                if isinstance(param, str):
+                    formatted_query = formatted_query.replace('?', f"'{param}'", 1)
+                elif hasattr(param, 'isoformat'):  # datetime objects
+                    formatted_query = formatted_query.replace('?', f"'{param.isoformat()}'", 1)
+                else:
+                    formatted_query = formatted_query.replace('?', str(param), 1)
+        
+        resp = requests.post(
+            "http://127.0.0.1:5052/query",
+            json={"sql": formatted_query},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success"):
+                results = data.get("results", [])
+                if as_dict:
+                    return results
+                return [tuple(r.values()) for r in results] if results else []
+    except Exception as e:
+        logger.debug(f"master2 HTTP API query failed: {e}")
+    
+    # Third, try TradingDataEngine (master.py's in-memory DB)
+    engine = _get_engine_if_running()
+    try:
+        if engine is not None:
+            results = engine.read(query, params or [])
+            if as_dict:
+                return results
+            return [tuple(r.values()) for r in results] if results else []
+    except Exception as e:
+        error_msg = str(e).lower()
+        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
+            logger.debug(f"Table not found in engine (graceful mode): {e}")
+            return []
+        logger.warning(f"Error querying engine, will try file DB: {e}")
+    
+    # Finally, fallback to file-based DuckDB
+    try:
+        with get_duckdb("central") as conn:
+            result = conn.execute(query, params or [])
+            if as_dict:
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+                return [dict(zip(columns, row)) for row in rows]
+            return result.fetchall()
+    except Exception as e:
+        error_msg = str(e).lower()
         if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
             logger.debug(f"Table not found (graceful mode): {e}")
             return []
@@ -141,16 +204,56 @@ def fetch_buyin(buyin_id: int) -> Dict[str, Any]:
     Uses DuckDB for speed - MySQL is only for storage.
     DuckDB uses 'fifteen_min_trail' column name.
     """
+    result = None
+    
+    # PRIORITY 1: Try master2's local DuckDB
     try:
-        with get_duckdb("central") as conn:
-            result = conn.execute("""
-                SELECT id, followed_at, fifteen_min_trail as existing_trail
-                FROM follow_the_goat_buyins
-                WHERE id = ?
-                LIMIT 1
-            """, [buyin_id]).fetchone()
+        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
+        local_db = get_local_duckdb()
+        if local_db is not None:
+            with _local_duckdb_lock:
+                res = local_db.execute("""
+                    SELECT id, followed_at, fifteen_min_trail as existing_trail
+                    FROM follow_the_goat_buyins
+                    WHERE id = ?
+                    LIMIT 1
+                """, [buyin_id]).fetchone()
+                if res:
+                    result = res
+    except (ImportError, AttributeError):
+        pass
     except Exception as e:
-        raise TrailError(f"Failed to fetch buyin #{buyin_id}: {e}")
+        logger.debug(f"master2 DB fetch_buyin failed: {e}")
+    
+    # PRIORITY 2: Try HTTP API
+    if result is None:
+        try:
+            import requests
+            resp = requests.post(
+                "http://127.0.0.1:5052/query",
+                json={"sql": f"SELECT id, followed_at, fifteen_min_trail as existing_trail FROM follow_the_goat_buyins WHERE id = {buyin_id} LIMIT 1"},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success") and data.get("results"):
+                    row_data = data["results"][0]
+                    result = (row_data.get("id"), row_data.get("followed_at"), row_data.get("existing_trail"))
+        except Exception as e:
+            logger.debug(f"HTTP API fetch_buyin failed: {e}")
+    
+    # PRIORITY 3: Fallback to file-based DuckDB
+    if result is None:
+        try:
+            with get_duckdb("central") as conn:
+                result = conn.execute("""
+                    SELECT id, followed_at, fifteen_min_trail as existing_trail
+                    FROM follow_the_goat_buyins
+                    WHERE id = ?
+                    LIMIT 1
+                """, [buyin_id]).fetchone()
+        except Exception as e:
+            raise TrailError(f"Failed to fetch buyin #{buyin_id}: {e}")
     
     if not result:
         raise BuyinNotFoundError(f"Buy-in #{buyin_id} not found")
@@ -289,21 +392,41 @@ def fetch_transactions(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch transaction data from WebhookClient API and compute per-minute metrics.
+    """Fetch transaction data from local DuckDB and compute per-minute metrics.
     
-    Data source: .NET Webhook's DuckDB in-memory (sol_stablecoin_trades table)
+    Data source: master2's local DuckDB (sol_stablecoin_trades table)
+    Priority: master2 local DB > TradingDataEngine > file-based DuckDB
+    
+    Note: sol_stablecoin_trades timestamps are in local time (UTC+1),
+    while buyin followed_at is in UTC. We adjust the query time range.
     """
-    client = _get_webhook_client()
+    # Adjust for timezone: trades are stored in local time (UTC+1)
+    # Add 1 hour to convert UTC to local time
+    tz_offset = timedelta(hours=1)
+    local_start = start_time + tz_offset
+    local_end = end_time + tz_offset
     
-    # Fetch raw trades from webhook API
-    # No limit - get all trades in the time window
-    raw_trades = client.get_trades(start_time=start_time, end_time=end_time, limit=None)
+    # Query sol_stablecoin_trades from local DuckDB
+    query = """
+        SELECT 
+            trade_timestamp,
+            sol_amount,
+            stablecoin_amount,
+            price,
+            direction,
+            perp_direction
+        FROM sol_stablecoin_trades
+        WHERE trade_timestamp >= ?
+            AND trade_timestamp <= ?
+        ORDER BY trade_timestamp ASC
+    """
+    raw_trades = _execute_query(query, [local_start, local_end])
     
     if not raw_trades:
         logger.warning("No trades found in time range %s to %s", start_time, end_time)
         return []
     
-    logger.info("Fetched %d trades from webhook API for range %s to %s", len(raw_trades), start_time, end_time)
+    logger.info("Fetched %d trades from local DB for range %s to %s", len(raw_trades), start_time, end_time)
     
     # Convert to DataFrame for aggregation
     df = pd.DataFrame(raw_trades)
@@ -406,6 +529,14 @@ def fetch_transactions(
     
     # Return latest 15 minutes, sorted descending
     final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
+    
+    # Convert timestamps back to UTC (subtract the timezone offset we added earlier)
+    for result in final_results:
+        if isinstance(result.get('minute_timestamp'), datetime):
+            result['minute_timestamp'] = result['minute_timestamp'] - tz_offset
+        elif isinstance(result.get('minute_timestamp'), pd.Timestamp):
+            result['minute_timestamp'] = (result['minute_timestamp'] - tz_offset).to_pydatetime()
+    
     logger.info("Aggregated transactions into %d minutes of data", len(final_results))
     return final_results
 
@@ -414,21 +545,42 @@ def fetch_whale_activity(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch whale movement data from WebhookClient API and compute per-minute metrics.
+    """Fetch whale movement data from local DuckDB and compute per-minute metrics.
     
-    Data source: .NET Webhook's DuckDB in-memory (whale_movements table)
+    Data source: master2's local DuckDB or TradingDataEngine (whale_movements table)
+    Priority: master2 local DB > TradingDataEngine > file-based DuckDB
+    
+    Note: whale_movements timestamps are in local time (UTC+1),
+    while buyin followed_at is in UTC. We adjust the query time range.
     """
-    client = _get_webhook_client()
+    # Adjust for timezone: whale data is stored in local time (UTC+1)
+    # Add 1 hour to convert UTC to local time
+    tz_offset = timedelta(hours=1)
+    local_start = start_time + tz_offset
+    local_end = end_time + tz_offset
     
-    # Fetch raw whale movements from webhook API
-    # No limit - get all movements in the time window
-    raw_whales = client.get_whale_movements(start_time=start_time, end_time=end_time, limit=None)
+    # Query whale_movements from local DuckDB
+    query = """
+        SELECT 
+            timestamp,
+            sol_change,
+            abs_change,
+            percentage_moved,
+            direction,
+            whale_type,
+            movement_significance
+        FROM whale_movements
+        WHERE timestamp >= ?
+            AND timestamp <= ?
+        ORDER BY timestamp ASC
+    """
+    raw_whales = _execute_query(query, [local_start, local_end])
     
     if not raw_whales:
         logger.warning("No whale movements found in time range %s to %s", start_time, end_time)
         return []
     
-    logger.info("Fetched %d whale movements from webhook API for range %s to %s", len(raw_whales), start_time, end_time)
+    logger.info("Fetched %d whale movements from local DB for range %s to %s", len(raw_whales), start_time, end_time)
     
     # Convert to DataFrame for aggregation
     df = pd.DataFrame(raw_whales)
@@ -594,6 +746,14 @@ def fetch_whale_activity(
     
     # Return latest 15 minutes, sorted descending
     final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
+    
+    # Convert timestamps back to UTC (subtract the timezone offset we added earlier)
+    for result in final_results:
+        if isinstance(result.get('minute_timestamp'), datetime):
+            result['minute_timestamp'] = result['minute_timestamp'] - tz_offset
+        elif isinstance(result.get('minute_timestamp'), pd.Timestamp):
+            result['minute_timestamp'] = (result['minute_timestamp'] - tz_offset).to_pydatetime()
+    
     logger.info("Aggregated whale activity into %d minutes of data", len(final_results))
     return final_results
 
@@ -606,94 +766,139 @@ def fetch_price_movements(
 ) -> List[Dict[str, Any]]:
     """Fetch price movement data with legacy-equivalent calculations.
     
-    Prefers TradingDataEngine (prices table: ts, token, price). Falls back to MySQL price_points
-    (created_at/value/coin_id) if the engine is not running.
+    Priority order:
+    1. master2's local DuckDB (prices table with token column)
+    2. TradingDataEngine (master.py's in-memory prices table)
+    3. File-based DuckDB price_points table (legacy fallback)
     
     Args:
         start_time: Start of the time window
         end_time: End of the time window
         token: Token symbol for DuckDB (SOL, BTC, ETH)
-        coin_id: Coin ID for MySQL price_points (1=BTC, 2=ETH, 5=SOL)
+        coin_id: Coin ID for legacy price_points (1=BTC, 2=ETH, 5=SOL)
     """
-    engine = _get_engine_if_running()
-    
-    if engine is not None:
-        # TradingDataEngine path (prices table)
-        query = """
-            WITH minute_aggregates AS (
-                SELECT 
-                    DATE_TRUNC('minute', ts) AS minute_timestamp,
-                    MIN(price) AS low_price,
-                    MAX(price) AS high_price,
-                    AVG(price) AS avg_price,
-                    FIRST(price ORDER BY ts ASC) AS true_open,
-                    LAST(price ORDER BY ts ASC) AS true_close,
-                    MAX(price) - MIN(price) AS price_range,
-                    STDDEV(price) AS price_stddev,
-                    COUNT(*) AS price_updates
-                FROM prices
-                WHERE ts >= ?
-                    AND ts <= ?
-                    AND token = ?
-                GROUP BY DATE_TRUNC('minute', ts)
-            ),
-            numbered_minutes AS (
-                SELECT *,
-                    ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-                FROM minute_aggregates
-            )
+    # Query for prices table (modern format: ts, token, price)
+    query_prices = """
+        WITH minute_aggregates AS (
             SELECT 
-                m0.minute_timestamp,
-                m0.row_num AS minute_number,
-                ROUND((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100, 6) AS price_change_1m,
-                ROUND(
-                    ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100) /
-                    NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
-                6) AS momentum_volatility_ratio,
-                ROUND(
-                    CASE WHEN m1.true_close > 0 AND m1.true_open > 0 THEN
-                        ((m0.true_close - m0.true_open) / m0.true_open) -
-                        ((m1.true_close - m1.true_open) / m1.true_open)
-                    ELSE 0 END * 100,
-                6) AS momentum_acceleration_1m,
-                ROUND(CASE WHEN m5.true_close > 0 THEN
-                    (m0.true_close - m5.true_close) / m5.true_close * 100
-                ELSE 0 END, 6) AS price_change_5m,
-                ROUND(CASE WHEN m10.true_close > 0 THEN
-                    (m0.true_close - m10.true_close) / m10.true_close * 100
-                ELSE 0 END, 6) AS price_change_10m,
-                ROUND(m0.price_range / NULLIF(m0.avg_price, 0) * 100, 6) AS volatility_pct,
-                ROUND(
-                    (ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100) /
-                    NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
-                6) AS body_range_ratio,
-                ROUND(m0.price_stddev / NULLIF(m0.avg_price, 0) * 100, 6) AS price_stddev_pct,
-                ROUND(ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100, 6) AS candle_body_pct,
-                ROUND((m0.high_price - GREATEST(m0.true_open, m0.true_close)) / 
-                    NULLIF(m0.avg_price, 0) * 100, 6) AS upper_wick_pct,
-                ROUND((LEAST(m0.true_open, m0.true_close) - m0.low_price) / 
-                    NULLIF(m0.avg_price, 0) * 100, 6) AS lower_wick_pct,
-                ROUND(m0.true_open, 4) AS open_price,
-                ROUND(m0.high_price, 4) AS high_price,
-                ROUND(m0.low_price, 4) AS low_price,
-                ROUND(m0.true_close, 4) AS close_price,
-                ROUND(m0.avg_price, 4) AS avg_price,
-                m0.price_updates
-            FROM numbered_minutes m0
-            LEFT JOIN numbered_minutes m1 
-                ON m0.row_num > 1
-                AND m1.row_num = m0.row_num - 1
-            LEFT JOIN numbered_minutes m5
-                ON m0.row_num > 5
-                AND m5.row_num = m0.row_num - 5
-            LEFT JOIN numbered_minutes m10
-                ON m0.row_num > 10
-                AND m10.row_num = m0.row_num - 10
-            ORDER BY m0.minute_timestamp DESC
-            LIMIT 15
-        """
-        results = _execute_query(query, [start_time, end_time, token])
-        # Fallback to MySQL if engine is running but has no data for the window
+                DATE_TRUNC('minute', ts) AS minute_timestamp,
+                MIN(price) AS low_price,
+                MAX(price) AS high_price,
+                AVG(price) AS avg_price,
+                FIRST(price ORDER BY ts ASC) AS true_open,
+                LAST(price ORDER BY ts ASC) AS true_close,
+                MAX(price) - MIN(price) AS price_range,
+                STDDEV(price) AS price_stddev,
+                COUNT(*) AS price_updates
+            FROM prices
+            WHERE ts >= ?
+                AND ts <= ?
+                AND token = ?
+            GROUP BY DATE_TRUNC('minute', ts)
+        ),
+        numbered_minutes AS (
+            SELECT *,
+                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
+            FROM minute_aggregates
+        )
+        SELECT 
+            m0.minute_timestamp,
+            m0.row_num AS minute_number,
+            ROUND((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100, 6) AS price_change_1m,
+            ROUND(
+                ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100) /
+                NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
+            6) AS momentum_volatility_ratio,
+            ROUND(
+                CASE WHEN m1.true_close > 0 AND m1.true_open > 0 THEN
+                    ((m0.true_close - m0.true_open) / m0.true_open) -
+                    ((m1.true_close - m1.true_open) / m1.true_open)
+                ELSE 0 END * 100,
+            6) AS momentum_acceleration_1m,
+            ROUND(CASE WHEN m5.true_close > 0 THEN
+                (m0.true_close - m5.true_close) / m5.true_close * 100
+            ELSE 0 END, 6) AS price_change_5m,
+            ROUND(CASE WHEN m10.true_close > 0 THEN
+                (m0.true_close - m10.true_close) / m10.true_close * 100
+            ELSE 0 END, 6) AS price_change_10m,
+            ROUND(m0.price_range / NULLIF(m0.avg_price, 0) * 100, 6) AS volatility_pct,
+            ROUND(
+                (ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100) /
+                NULLIF((m0.price_range / NULLIF(m0.avg_price, 0) * 100), 0),
+            6) AS body_range_ratio,
+            ROUND(m0.price_stddev / NULLIF(m0.avg_price, 0) * 100, 6) AS price_stddev_pct,
+            ROUND(ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100, 6) AS candle_body_pct,
+            ROUND((m0.high_price - GREATEST(m0.true_open, m0.true_close)) / 
+                NULLIF(m0.avg_price, 0) * 100, 6) AS upper_wick_pct,
+            ROUND((LEAST(m0.true_open, m0.true_close) - m0.low_price) / 
+                NULLIF(m0.avg_price, 0) * 100, 6) AS lower_wick_pct,
+            ROUND(m0.true_open, 4) AS open_price,
+            ROUND(m0.high_price, 4) AS high_price,
+            ROUND(m0.low_price, 4) AS low_price,
+            ROUND(m0.true_close, 4) AS close_price,
+            ROUND(m0.avg_price, 4) AS avg_price,
+            m0.price_updates
+        FROM numbered_minutes m0
+        LEFT JOIN numbered_minutes m1 
+            ON m0.row_num > 1
+            AND m1.row_num = m0.row_num - 1
+        LEFT JOIN numbered_minutes m5
+            ON m0.row_num > 5
+            AND m5.row_num = m0.row_num - 5
+        LEFT JOIN numbered_minutes m10
+            ON m0.row_num > 10
+            AND m10.row_num = m0.row_num - 10
+        ORDER BY m0.minute_timestamp DESC
+        LIMIT 15
+    """
+    
+    # PRIORITY 1: Try master2's local DuckDB (has synced prices table with SOL, BTC, ETH)
+    try:
+        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
+        local_db = get_local_duckdb()
+        if local_db is not None:
+            with _local_duckdb_lock:
+                result = local_db.execute(query_prices, [start_time, end_time, token])
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+                if rows:
+                    logger.debug(f"Got {len(rows)} price movements from master2 local DB for {token}")
+                    return [dict(zip(columns, row)) for row in rows]
+    except (ImportError, AttributeError):
+        pass  # master2 not available
+    except Exception as e:
+        logger.debug(f"master2 DB query failed for {token}: {e}")
+    
+    # PRIORITY 2: Try master2's HTTP API (for standalone execution)
+    try:
+        import requests
+        # Format the query with parameters
+        formatted_query = query_prices
+        for param in [start_time, end_time, token]:
+            if isinstance(param, str):
+                formatted_query = formatted_query.replace('?', f"'{param}'", 1)
+            elif hasattr(param, 'isoformat'):  # datetime
+                formatted_query = formatted_query.replace('?', f"'{param.isoformat()}'", 1)
+            else:
+                formatted_query = formatted_query.replace('?', str(param), 1)
+        
+        resp = requests.post(
+            "http://127.0.0.1:5052/query",
+            json={"sql": formatted_query},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success") and data.get("results"):
+                logger.debug(f"Got {len(data['results'])} price movements from master2 HTTP API for {token}")
+                return data["results"]
+    except Exception as e:
+        logger.debug(f"master2 HTTP API query failed for {token}: {e}")
+    
+    # PRIORITY 3: Try TradingDataEngine (master.py's in-memory DB)
+    engine = _get_engine_if_running()
+    if engine is not None:
+        results = _execute_query(query_prices, [start_time, end_time, token])
         if results:
             return results
     
@@ -787,39 +992,48 @@ def fetch_second_prices(
     start_time: datetime,
     end_time: datetime
 ) -> pd.DataFrame:
-    """Fetch 1-second price data for pattern detection."""
-    engine = _get_engine_if_running()
+    """Fetch 1-second price data for pattern detection.
     
-    if engine is not None:
-        query = """
-            SELECT ts AS ts, price AS price
-            FROM prices
-            WHERE ts >= ? AND ts <= ? AND token = ?
-            ORDER BY ts ASC
-        """
-        results = _execute_query(query, [start_time, end_time, "SOL"])
-    else:
-        # Fallback to file-based DuckDB price_points (fast)
-        try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
-                    SELECT created_at AS ts, value AS price
-                    FROM price_points
-                    WHERE created_at >= ? AND created_at <= ?
-                        AND coin_id = 5
-                    ORDER BY created_at ASC
-                """, [start_time, end_time])
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-                results = [dict(zip(columns, row)) for row in rows]
-        except Exception as e:
-            logger.error("DuckDB second_prices query failed: %s", e)
-            results = []
+    Uses _execute_query which handles HTTP API fallback for standalone execution.
+    """
+    # First try the prices table (via _execute_query which handles HTTP API)
+    query = """
+        SELECT ts AS ts, price AS price
+        FROM prices
+        WHERE ts >= ? AND ts <= ? AND token = ?
+        ORDER BY ts ASC
+    """
+    results = _execute_query(query, [start_time, end_time, "SOL"])
     
-    if not results:
+    if results:
+        df = pd.DataFrame(results)
+        if not df.empty and "ts" in df.columns:
+            df["ts"] = pd.to_datetime(df["ts"])
+            df = df.set_index("ts")
+            df["price"] = df["price"].astype(float)
+            return df
+    
+    # Fallback to file-based DuckDB price_points if prices table returned no results
+    try:
+        with get_duckdb("central") as conn:
+            result = conn.execute("""
+                SELECT created_at AS ts, value AS price
+                FROM price_points
+                WHERE created_at >= ? AND created_at <= ?
+                    AND coin_id = 5
+                ORDER BY created_at ASC
+            """, [start_time, end_time])
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+            fallback_results = [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.error("DuckDB second_prices query failed: %s", e)
+        fallback_results = []
+    
+    if not fallback_results:
         return pd.DataFrame(columns=["price"])
     
-    df = pd.DataFrame(results)
+    df = pd.DataFrame(fallback_results)
     df["ts"] = pd.to_datetime(df["ts"])
     df = df.set_index("ts")
     df["price"] = df["price"].astype(float)
@@ -1231,14 +1445,26 @@ def annotate_minute_spans(rows: List[Dict[str, Any]], window_end: datetime) -> N
     """Augment each row with interval bounds relative to window_end."""
     for row in rows:
         minute_timestamp = row.get("minute_timestamp")
+        minute_dt = None
+        
         if isinstance(minute_timestamp, datetime):
             minute_dt = minute_timestamp
         elif isinstance(minute_timestamp, str):
-            try:
-                minute_dt = datetime.strptime(minute_timestamp, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                continue
-        else:
+            # Try multiple date formats
+            for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"]:
+                try:
+                    minute_dt = datetime.strptime(minute_timestamp, fmt)
+                    break
+                except ValueError:
+                    continue
+            # Also try ISO format parsing
+            if minute_dt is None:
+                try:
+                    minute_dt = datetime.fromisoformat(minute_timestamp.replace('Z', '+00:00').split('+')[0])
+                except (ValueError, AttributeError):
+                    continue
+        
+        if minute_dt is None:
             continue
 
         delta_minutes = (window_end - minute_dt).total_seconds() / 60.0

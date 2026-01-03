@@ -698,6 +698,11 @@ def _get_all_columns() -> List[str]:
 def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     """Insert trail rows into DuckDB.
     
+    Priority:
+    1. master2's local DuckDB (when running in master2 process)
+    2. HTTP API (when running standalone)
+    3. File-based DuckDB (fallback)
+    
     Args:
         buyin_id: The buyin ID (used for logging)
         rows: List of row dictionaries to insert
@@ -712,6 +717,88 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     col_list = ", ".join(["id"] + columns)
     placeholders = ", ".join(["?" for _ in (["id"] + columns)])
     
+    # PRIORITY 1: Try master2's local DuckDB
+    try:
+        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
+        local_db = get_local_duckdb()
+        if local_db is not None:
+            with _local_duckdb_lock:
+                # Delete existing rows for this buyin (in case of re-run)
+                local_db.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
+                
+                # Get the next available ID
+                result = local_db.execute("SELECT COALESCE(MAX(id), 0) FROM buyin_trail_minutes").fetchone()
+                next_id = result[0] + 1
+                
+                # Insert new rows with explicit IDs
+                for row in rows:
+                    values = [next_id] + [row.get(col) for col in columns]
+                    local_db.execute(
+                        f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
+                        values
+                    )
+                    next_id += 1
+            
+            logger.debug(f"Inserted {len(rows)} trail rows into master2 DuckDB for buyin_id={buyin_id}")
+            return True
+    except (ImportError, AttributeError):
+        pass  # master2 not available
+    except Exception as e:
+        logger.debug(f"master2 DB insert failed: {e}")
+    
+    # PRIORITY 2: Try HTTP API to master2
+    try:
+        import requests
+        
+        # First delete existing rows
+        delete_sql = f"DELETE FROM buyin_trail_minutes WHERE buyin_id = {buyin_id}"
+        requests.post("http://127.0.0.1:5052/execute", json={"sql": delete_sql}, timeout=10)
+        
+        # Get next ID
+        resp = requests.post(
+            "http://127.0.0.1:5052/query",
+            json={"sql": "SELECT COALESCE(MAX(id), 0) as max_id FROM buyin_trail_minutes"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("success") and data.get("results"):
+                next_id = data["results"][0].get("max_id", 0) + 1
+            else:
+                next_id = 1
+        else:
+            next_id = 1
+        
+        # Insert rows via HTTP
+        for row in rows:
+            values = [next_id] + [row.get(col) for col in columns]
+            # Build INSERT SQL with proper escaping
+            value_strs = []
+            for v in values:
+                if v is None:
+                    value_strs.append("NULL")
+                elif isinstance(v, bool):
+                    value_strs.append("TRUE" if v else "FALSE")
+                elif isinstance(v, (int, float)):
+                    value_strs.append(str(v))
+                elif isinstance(v, str):
+                    escaped = v.replace("'", "''")
+                    value_strs.append(f"'{escaped}'")
+                else:
+                    escaped = str(v).replace("'", "''")
+                    value_strs.append(f"'{escaped}'")
+            
+            insert_sql = f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({', '.join(value_strs)})"
+            resp = requests.post("http://127.0.0.1:5052/execute", json={"sql": insert_sql}, timeout=10)
+            next_id += 1
+        
+        logger.debug(f"Inserted {len(rows)} trail rows via HTTP API for buyin_id={buyin_id}")
+        return True
+        
+    except Exception as e:
+        logger.debug(f"HTTP API insert failed: {e}")
+    
+    # PRIORITY 3: Fallback to file-based DuckDB
     try:
         with get_duckdb("central") as conn:
             # Delete existing rows for this buyin (in case of re-run)
@@ -730,7 +817,7 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
                 )
                 next_id += 1
         
-        logger.debug(f"Inserted {len(rows)} trail rows into DuckDB for buyin_id={buyin_id}")
+        logger.debug(f"Inserted {len(rows)} trail rows into file DuckDB for buyin_id={buyin_id}")
         return True
         
     except Exception as e:

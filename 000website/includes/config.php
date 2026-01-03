@@ -18,5 +18,5 @@ define('WSL_HOST_IP', getenv('WSL_HOST_IP') ?: '172.19.254.84');
 define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
 
 // .NET Webhook API URL (running on Windows IIS)
-define('WEBHOOK_API_URL', 'http://quicknode.smz.dk');
+define('WEBHOOK_API_URL', 'http://195.201.84.5');
 

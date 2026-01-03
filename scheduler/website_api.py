@@ -367,22 +367,36 @@ def get_latest_prices():
 @app.route('/cycle_tracker', methods=['GET'])
 @engine_required
 def get_cycle_tracker():
-    """Get cycle tracker data."""
+    """
+    Get cycle tracker data.
+    
+    Returns all cycles (active and completed) based on filters.
+    Active cycles (cycle_end_time IS NULL) are always included regardless of start time.
+    """
     threshold = safe_float(request.args.get('threshold'), None)
     hours = request.args.get('hours', '24')
     limit = safe_int(request.args.get('limit', 100))
+    active_only = request.args.get('active_only', 'false').lower() == 'true'
     
     client = get_engine_client()
     
-    # Build query
+    # Build query conditions
     conditions = ["coin_id = 5"]  # SOL
     
     if threshold is not None:
         conditions.append(f"threshold = {threshold}")
     
-    if hours != 'all':
+    if active_only:
+        # Only return active cycles (regardless of start time)
+        conditions.append("cycle_end_time IS NULL")
+    elif hours != 'all':
+        # For time-windowed queries:
+        # - Include ALL active cycles (regardless of start time)
+        # - Include completed cycles within the time window
         hours_int = safe_int(hours, 24)
-        conditions.append(f"cycle_start_time >= NOW() - INTERVAL {hours_int} HOUR")
+        conditions.append(
+            f"(cycle_end_time IS NULL OR cycle_start_time >= NOW() - INTERVAL {hours_int} HOUR)"
+        )
     
     where_clause = " AND ".join(conditions)
     
@@ -741,40 +755,32 @@ def get_buyins():
 
 
 @app.route('/buyins/<int:buyin_id>', methods=['GET'])
+@engine_required
 def get_single_buyin(buyin_id):
     """
     Get a single buyin/trade by ID.
     
-    Queries MySQL directly to avoid lock contention with master2's jobs.
+    Queries DuckDB via the data engine.
     """
+    client = get_engine_client()
+    
     try:
-        from core.database import get_mysql
+        results = client.query(f"""
+            SELECT *
+            FROM follow_the_goat_buyins
+            WHERE id = {buyin_id}
+        """)
         
-        with get_mysql() as conn:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT *
-                FROM follow_the_goat_buyins
-                WHERE id = %s
-            """, (buyin_id,))
-            
-            buyin = cursor.fetchone()
-            
-            if buyin:
-                # Convert datetime objects to strings for JSON
-                for key, value in buyin.items():
-                    if hasattr(value, 'isoformat'):
-                        buyin[key] = value.isoformat()
-                
-                return jsonify({
-                    'status': 'ok',
-                    'buyin': buyin
-                })
-            else:
-                return jsonify({
-                    'status': 'error',
-                    'error': f'Buyin {buyin_id} not found'
-                }), 404
+        if results:
+            return jsonify({
+                'status': 'ok',
+                'buyin': results[0]
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'error': f'Buyin {buyin_id} not found'
+            }), 404
         
     except Exception as e:
         logger.error(f"Error fetching buyin {buyin_id}: {e}")
@@ -789,6 +795,7 @@ def get_single_buyin(buyin_id):
 # =============================================================================
 
 @app.route('/trail/buyin/<int:buyin_id>', methods=['GET'])
+@engine_required
 def get_trail_for_buyin(buyin_id):
     """
     Get 15-minute trail data for a specific buyin.
@@ -796,36 +803,26 @@ def get_trail_for_buyin(buyin_id):
     Query params:
         - source: 'duckdb' (default) or 'mysql'
     
-    Queries MySQL directly to avoid lock contention with master2's jobs.
+    Queries DuckDB via the data engine.
     """
-    source = request.args.get('source', 'mysql')
+    source = request.args.get('source', 'duckdb')
+    
+    client = get_engine_client()
     
     try:
-        from core.database import get_mysql
+        results = client.query(f"""
+            SELECT *
+            FROM buyin_trail_minutes
+            WHERE buyin_id = {buyin_id}
+            ORDER BY minute ASC
+        """)
         
-        with get_mysql() as conn:
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("""
-                SELECT *
-                FROM buyin_trail_minutes
-                WHERE buyin_id = %s
-                ORDER BY minute ASC
-            """, (buyin_id,))
-            
-            trail_data = cursor.fetchall()
-            
-            # Convert datetime objects to strings for JSON
-            for row in trail_data:
-                for key, value in row.items():
-                    if hasattr(value, 'isoformat'):
-                        row[key] = value.isoformat()
-            
-            return jsonify({
-                'status': 'ok',
-                'trail_data': trail_data,
-                'count': len(trail_data),
-                'source': 'mysql'
-            })
+        return jsonify({
+            'status': 'ok',
+            'trail_data': results,
+            'count': len(results),
+            'source': 'duckdb'
+        })
         
     except Exception as e:
         logger.error(f"Error fetching trail data for buyin {buyin_id}: {e}")

@@ -619,7 +619,7 @@ def get_mysql_connection():
 
 
 # =============================================================================
-# DuckDB-Only Write Operations (MySQL is archive-only)
+# DuckDB-Only Write Operations (PostgreSQL is archive-only)
 # =============================================================================
 
 def duckdb_insert(
@@ -773,7 +773,8 @@ def _archive_worker():
             if not rows:
                 continue
                 
-            archive_table = f"{table_name}_archive"
+            # Use same table name in PostgreSQL (no _archive suffix in V2)
+            archive_table = table_name
             
             # Try to archive - if it fails, just log and continue
             try:
@@ -850,7 +851,7 @@ def _archive_to_postgres_async(table_name: str, rows: List[Dict[str, Any]]):
     Trading speed is more important than historical archives.
     
     Args:
-        table_name: Source table name (archive table is {table_name}_archive)
+        table_name: Table name (same name used in both DuckDB and PostgreSQL)
         rows: List of row dictionaries to archive
     """
     if not rows:
@@ -865,7 +866,7 @@ def _archive_to_postgres_async(table_name: str, rows: List[Dict[str, Any]]):
     # Queue for background processing - non-blocking
     try:
         _archive_queue.put_nowait((table_name, rows_copy))
-        logger.debug(f"Queued {len(rows)} rows for async archive to {table_name}_archive")
+        logger.debug(f"Queued {len(rows)} rows for async archive to {table_name}")
     except:
         # Queue full - drop the archive (speed > archives)
         logger.debug(f"Archive queue full, dropping {len(rows)} rows for {table_name}")

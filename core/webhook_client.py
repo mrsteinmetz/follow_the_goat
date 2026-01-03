@@ -2,7 +2,7 @@
 Webhook Client - Fetch live data from .NET Webhook DuckDB In-Memory API
 
 This client reads from the .NET webhook's in-memory DuckDB (24hr hot storage).
-Data source: https://quicknode.smz.dk/api/
+Data source: http://195.201.84.5/api/
 
 Usage:
     from core.webhook_client import WebhookClient
@@ -34,14 +34,14 @@ class WebhookClient:
     """Client for reading live data from .NET Webhook DuckDB In-Memory API."""
     
     # Note: Webhook is on HTTP only (no SSL binding on server)
-    DEFAULT_URL = "http://quicknode.smz.dk"
+    DEFAULT_URL = "http://195.201.84.5"
     
     def __init__(self, base_url: str = None, timeout: int = 10):
         """
         Initialize the webhook client.
         
         Args:
-            base_url: Webhook API base URL (default: https://quicknode.smz.dk)
+            base_url: Webhook API base URL (default: http://195.201.84.5)
             timeout: Request timeout in seconds
         """
         self.base_url = (base_url or self.DEFAULT_URL).rstrip('/')

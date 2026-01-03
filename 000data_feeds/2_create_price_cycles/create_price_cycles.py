@@ -74,12 +74,13 @@ def get_new_price_points(last_ts: Optional[datetime], limit: int = BATCH_SIZE) -
                     LIMIT ?
                 """, [last_ts, limit]).fetchall()
             else:
-                # FRESH START: Only process data from the last 1 hour
-                logger.info("Fresh start detected - only processing last 1 hour of price data")
+                # FRESH START: Get the OLDEST unprocessed prices
+                # Start from the earliest available price in the table
+                logger.info("Fresh start detected - processing from oldest available price data")
                 results = conn.execute("""
                     SELECT ts as created_at, token, price as value
                     FROM prices
-                    WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 1 HOUR
+                    WHERE token = 'SOL'
                     ORDER BY ts ASC
                     LIMIT ?
                 """, [limit]).fetchall()
@@ -92,6 +93,23 @@ def get_new_price_points(last_ts: Optional[datetime], limit: int = BATCH_SIZE) -
     except Exception as e:
         logger.error(f"Failed to get price points: {e}")
         return []
+
+
+def get_current_price() -> Optional[float]:
+    """Get the current SOL price from DuckDB."""
+    try:
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute("""
+                SELECT price, ts
+                FROM prices
+                WHERE token = 'SOL'
+                ORDER BY ts DESC
+                LIMIT 1
+            """).fetchone()
+            return float(result[0]) if result and result[0] else None
+    except Exception as e:
+        logger.debug(f"Failed to get current price: {e}")
+        return None
 
 
 def get_threshold_states() -> Dict[float, Dict]:
@@ -401,6 +419,61 @@ def process_price_point(
 
 
 # =============================================================================
+# Cycle Initialization
+# =============================================================================
+
+def ensure_all_cycles_exist():
+    """
+    Ensure all 7 thresholds have active cycles.
+    
+    This is called even when there are no new price points to process,
+    ensuring that cycles are always initialized for all thresholds.
+    """
+    current_price = get_current_price()
+    if current_price is None:
+        logger.debug("Cannot ensure cycles exist - no current price available")
+        return
+    
+    current_time = datetime.now()
+    cycles_created = 0
+    
+    # Get the latest price_point_id to use as sequence_start_id
+    # This ensures we have a valid reference point
+    sequence_start_id = 1  # Default fallback
+    try:
+        with get_duckdb("central", read_only=True) as conn:
+            # Try to get the latest price_point ID from price_points table
+            result = conn.execute("""
+                SELECT MAX(id) as max_id FROM price_points WHERE coin_id = ?
+            """, [COIN_ID]).fetchone()
+            if result and result[0]:
+                sequence_start_id = result[0]
+            else:
+                # Fallback: use count from prices table as approximation
+                result = conn.execute("""
+                    SELECT COUNT(*) as cnt FROM prices WHERE token = 'SOL'
+                """).fetchone()
+                if result and result[0]:
+                    sequence_start_id = result[0]
+    except Exception as e:
+        logger.debug(f"Could not determine sequence_start_id: {e}, using default")
+    
+    for threshold in THRESHOLDS:
+        # Check if this threshold has an active cycle
+        active_cycle_id = get_active_cycle_for_threshold(threshold)
+        
+        if active_cycle_id is None:
+            # No active cycle exists - create one
+            cycle_id = create_new_cycle(threshold, current_time, sequence_start_id, current_price)
+            if cycle_id:
+                cycles_created += 1
+                logger.debug(f"Created missing cycle #{cycle_id} for threshold {threshold}%")
+    
+    if cycles_created > 0:
+        logger.info(f"Initialized {cycles_created} missing cycles (current price: ${current_price:.4f})")
+
+
+# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -409,9 +482,16 @@ def process_price_cycles() -> int:
     Main entry point for the scheduler.
     Process new price points and create price cycle analysis.
     
+    CRITICAL: Always ensures all 7 thresholds have active cycles,
+    even when there are no new price points to process.
+    
     Returns:
         Number of price points processed
     """
+    # CRITICAL: Ensure all 7 cycles exist FIRST (before processing new points)
+    # This guarantees that all thresholds always have active cycles
+    ensure_all_cycles_exist()
+    
     # Get last processed timestamp
     last_ts = get_last_processed_ts()
     

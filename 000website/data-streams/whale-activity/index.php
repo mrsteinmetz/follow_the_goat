@@ -3,7 +3,7 @@
  * Whale Activity Page - Live Whale Movements
  * Displays real-time whale wallet activity from .NET Webhook DuckDB In-Memory API.
  * 
- * Data Source: .NET Webhook at quicknode.smz.dk/api/whale-movements
+ * Data Source: .NET Webhook at 195.201.84.5/api/whale-movements
  * This reads from the in-memory DuckDB (24hr hot storage)
  */
 
@@ -574,12 +574,9 @@ $json_whale_data = json_encode($whale_data);
                         return;
                     }
                     
-                    // Parse timestamp as UTC (ensure it ends with Z for UTC)
-                    let utcTimestamp = timestamp;
-                    if (!timestamp.endsWith('Z') && !timestamp.includes('+')) {
-                        utcTimestamp = timestamp.includes('T') ? timestamp + 'Z' : timestamp.replace(' ', 'T') + 'Z';
-                    }
-                    const dataTime = new Date(utcTimestamp).getTime();
+                    // Parse timestamp - if no timezone specified, treat as local time (CET)
+                    // Don't force UTC by adding 'Z' - let browser parse as local time
+                    const dataTime = new Date(timestamp).getTime();
                     const diffMs = nowUtc - dataTime;
                     const diffSecs = Math.floor(diffMs / 1000);
                     const diffMins = Math.floor(diffMs / 60000);

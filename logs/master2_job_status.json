@@ -1,113 +1,101 @@
 {
-  "timestamp": "2026-01-03T08:33:15.832066+00:00",
+  "timestamp": "2026-01-03T22:46:55.588269+00:00",
   "jobs": {
     "sync_from_engine": {
       "job_id": "sync_from_engine",
       "description": "Sync data from Data Engine (every 5s)",
       "status": "running",
-      "last_start": "2026-01-03T08:32:40.773601+00:00",
+      "last_start": "2026-01-03T22:46:55.583840+00:00",
       "last_end": null,
-      "last_success": "2026-01-03T08:32:40.077767+00:00",
+      "last_success": "2026-01-03T22:46:54.805426+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 95,
-      "last_duration_ms": 53299.938917160034
+      "run_count": 74,
+      "last_duration_ms": 227.81991958618164
     },
     "follow_the_goat": {
       "job_id": "follow_the_goat",
       "description": "Wallet tracker cycle (every 1s)",
       "status": "success",
-      "last_start": "2026-01-03T08:33:15.819928+00:00",
-      "last_end": "2026-01-03T08:33:15.837897+00:00",
-      "last_success": "2026-01-03T08:33:15.837916+00:00",
+      "last_start": "2026-01-03T22:46:55.586841+00:00",
+      "last_end": "2026-01-03T22:46:55.588401+00:00",
+      "last_success": "2026-01-03T22:46:55.588412+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 287,
-      "last_duration_ms": 17.961502075195312
+      "run_count": 114,
+      "last_duration_ms": 1.5573501586914062
     },
     "trailing_stop_seller": {
       "job_id": "trailing_stop_seller",
       "description": "Trailing stop seller (every 1s)",
       "status": "running",
-      "last_start": "2026-01-03T08:33:15.823514+00:00",
+      "last_start": "2026-01-03T22:46:55.587779+00:00",
       "last_end": null,
-      "last_success": "2026-01-03T08:33:14.877687+00:00",
+      "last_success": "2026-01-03T22:46:54.635554+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 341,
-      "last_duration_ms": 40.574073791503906
+      "run_count": 104,
+      "last_duration_ms": 52.15263366699219
     },
     "process_price_cycles": {
       "job_id": "process_price_cycles",
       "description": "Process price cycles (every 1s)",
       "status": "running",
-      "last_start": "2026-01-03T08:33:12.823021+00:00",
+      "last_start": "2026-01-03T22:46:55.582471+00:00",
       "last_end": null,
-      "last_success": "2026-01-03T08:33:12.185028+00:00",
+      "last_success": "2026-01-03T22:46:54.749530+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 86,
-      "last_duration_ms": 6275.94518661499
+      "run_count": 43,
+      "last_duration_ms": 164.9458408355713
     },
     "create_wallet_profiles": {
       "job_id": "create_wallet_profiles",
       "description": "Build wallet profiles (every 2s)",
-      "status": "running",
-      "last_start": "2026-01-03T08:32:40.776830+00:00",
-      "last_end": null,
-      "last_success": "2026-01-03T08:32:39.452444+00:00",
+      "status": "success",
+      "last_start": "2026-01-03T22:46:54.581462+00:00",
+      "last_end": "2026-01-03T22:46:54.633978+00:00",
+      "last_success": "2026-01-03T22:46:54.633992+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 87,
-      "last_duration_ms": 52669.08669471741
+      "run_count": 57,
+      "last_duration_ms": 52.51264572143555
     },
     "export_job_status": {
       "job_id": "export_job_status",
       "description": "Export job status to file (every 5s)",
       "status": "running",
-      "last_start": "2026-01-03T08:33:15.831998+00:00",
+      "last_start": "2026-01-03T22:46:55.588238+00:00",
       "last_end": null,
-      "last_success": "2026-01-03T08:33:10.927815+00:00",
+      "last_success": "2026-01-03T22:46:50.576318+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 587,
-      "last_duration_ms": 70.8470344543457
+      "run_count": 23,
+      "last_duration_ms": 1.0828971862792969
     },
     "train_validator": {
       "job_id": "train_validator",
       "description": "Validator training cycle (every 15s)",
       "status": "success",
-      "last_start": "2026-01-03T08:33:05.804246+00:00",
-      "last_end": "2026-01-03T08:33:06.103783+00:00",
-      "last_success": "2026-01-03T08:33:06.103804+00:00",
+      "last_start": "2026-01-03T22:46:45.574397+00:00",
+      "last_end": "2026-01-03T22:46:46.648308+00:00",
+      "last_success": "2026-01-03T22:46:46.648315+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 52,
-      "last_duration_ms": 299.5321750640869
+      "run_count": 7,
+      "last_duration_ms": 1073.9085674285889
     },
     "update_potential_gains": {
       "job_id": "update_potential_gains",
       "description": "Update potential gains (every 15s)",
       "status": "success",
-      "last_start": "2026-01-03T08:33:05.939454+00:00",
-      "last_end": "2026-01-03T08:33:05.947165+00:00",
-      "last_success": "2026-01-03T08:33:05.947186+00:00",
+      "last_start": "2026-01-03T22:46:45.574840+00:00",
+      "last_end": "2026-01-03T22:46:45.632862+00:00",
+      "last_success": "2026-01-03T22:46:45.632870+00:00",
       "last_error": null,
       "error_message": null,
-      "run_count": 75,
-      "last_duration_ms": 7.706880569458008
-    },
-    "create_new_patterns": {
-      "job_id": "create_new_patterns",
-      "description": "Auto-generate filter patterns (every 15 min)",
-      "status": "success",
-      "last_start": "2026-01-03T08:29:20.798358+00:00",
-      "last_end": "2026-01-03T08:29:23.885340+00:00",
-      "last_success": "2026-01-03T08:29:23.885355+00:00",
-      "last_error": null,
-      "error_message": null,
-      "run_count": 1,
-      "last_duration_ms": 3087.012529373169
+      "run_count": 7,
+      "last_duration_ms": 58.01963806152344
     }
   }
 }

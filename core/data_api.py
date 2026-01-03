@@ -330,6 +330,7 @@ async def get_backfill_data(
         "buyin_trail_minutes": "created_at",
         "sol_stablecoin_trades": "trade_timestamp",
         "follow_the_goat_plays": "created_at",
+        "whale_movements": "timestamp",
     }
     
     ts_col = timestamp_columns.get(table)
@@ -339,24 +340,34 @@ async def get_backfill_data(
             detail=f"Unknown table '{table}' or no timestamp column defined"
         )
     
-    # Calculate cutoff time - prefer minutes for short intervals, default to 2 hours
+    # Calculate cutoff time - use UTC since all timestamps in DB are UTC
     if minutes is not None:
-        cutoff = datetime.now() - timedelta(minutes=minutes)
+        cutoff = datetime.utcnow() - timedelta(minutes=minutes)
         time_desc = f"{minutes} minutes"
     elif hours is not None:
-        cutoff = datetime.now() - timedelta(hours=hours)
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
         time_desc = f"{hours} hours"
     else:
         # Default to 2 hours if neither specified
-        cutoff = datetime.now() - timedelta(hours=2)
+        cutoff = datetime.utcnow() - timedelta(hours=2)
         time_desc = "2 hours (default)"
     
     try:
-        # Query with time filter
-        results = engine.read(
-            f"SELECT * FROM {table} WHERE {ts_col} >= ? ORDER BY {ts_col} DESC LIMIT ?",
-            [cutoff, limit]
-        )
+        # Special handling for cycle_tracker: include ALL active cycles
+        # Active cycles may have started > 2 hours ago but are still running
+        if table == "cycle_tracker":
+            results = engine.read(
+                f"""SELECT * FROM {table} 
+                    WHERE {ts_col} >= ? OR cycle_end_time IS NULL 
+                    ORDER BY {ts_col} DESC LIMIT ?""",
+                [cutoff, limit]
+            )
+        else:
+            # Query with time filter
+            results = engine.read(
+                f"SELECT * FROM {table} WHERE {ts_col} >= ? ORDER BY {ts_col} DESC LIMIT ?",
+                [cutoff, limit]
+            )
         serialized = [_serialize_row(row) for row in results]
         
         return {

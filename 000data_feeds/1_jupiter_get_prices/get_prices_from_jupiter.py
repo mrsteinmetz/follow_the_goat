@@ -95,17 +95,22 @@ _consecutive_errors = 0
 
 
 def init_legacy_database(con: duckdb.DuckDBPyConnection) -> None:
-    """Initialize DuckDB hot table (24hr fast storage)."""
+    """Initialize DuckDB hot table (24hr fast storage).
+    
+    Uses the standard schema: id, ts_idx, coin_id, value, created_at
+    This matches TradingDataEngine and master2.py schemas.
+    """
     con.execute("""
         CREATE TABLE IF NOT EXISTS price_points (
-            ts TIMESTAMP NOT NULL,
-            token VARCHAR(10) NOT NULL,
-            price DOUBLE NOT NULL
+            id BIGINT PRIMARY KEY,
+            ts_idx BIGINT,
+            coin_id INTEGER NOT NULL,
+            value DOUBLE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_ts ON price_points(ts)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_token ON price_points(token)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_token_ts ON price_points(token, ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_created_at ON price_points(created_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_coin_id ON price_points(coin_id)")
 
 
 def fetch_prices() -> dict | None:
@@ -272,7 +277,7 @@ def insert_prices_via_engine(prices_data: dict) -> tuple[int, bool]:
     if not prices_data:
         return 0, False
     
-    ts = datetime.now()
+    ts = datetime.utcnow()
     
     try:
         engine = get_trading_engine()
@@ -313,7 +318,7 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
     if not prices_data:
         return 0, False, False
     
-    ts = datetime.now()
+    ts = datetime.utcnow()
     records = []
     
     for mint, data in prices_data.items():

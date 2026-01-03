@@ -3,7 +3,7 @@ Central DuckDB API - Flask server with TradingDataEngine integration.
 
 This API serves as the central gateway for:
 - Reading from TradingDataEngine (in-memory 24hr hot data) with zero lock contention
-- Falling back to MySQL for historical data
+- Falling back to PostgreSQL for historical data (archive)
 - Writing to TradingDataEngine (non-blocking, queue-based)
 - Managing plays, trades, and price data
 
@@ -28,7 +28,7 @@ import json
 import logging
 
 from core.database import (
-    get_duckdb, get_mysql, get_trading_engine,
+    get_duckdb, get_postgres, get_trading_engine,
     duckdb_insert, duckdb_update, duckdb_query,
     init_duckdb_tables, cleanup_all_hot_tables
 )
@@ -61,11 +61,11 @@ def log_request_end(response):
 
 
 # =============================================================================
-# SAFE MYSQL WRAPPER - Returns empty results if MySQL unavailable (never blocks)
+# SAFE POSTGRES WRAPPER - Returns empty results if PostgreSQL unavailable (never blocks)
 # =============================================================================
 
-class SafeMySQLResult:
-    """Mock result object for when MySQL is not available."""
+class SafePostgresResult:
+    """Mock result object for when PostgreSQL is not available."""
     def __init__(self):
         self.data = []
     
@@ -80,13 +80,13 @@ class SafeMySQLResult:
         pass
 
 
-class SafeMySQLCursor:
-    """Mock cursor for when MySQL is not available."""
+class SafePostgresCursor:
+    """Mock cursor for when PostgreSQL is not available."""
     def __init__(self):
         pass
     
     def __enter__(self):
-        return SafeMySQLResult()
+        return SafePostgresResult()
     
     def __exit__(self, *args):
         pass
@@ -101,14 +101,14 @@ class SafeMySQLCursor:
         return []
 
 
-class SafeMySQLConnection:
+class SafePostgresConnection:
     """Wrapper that returns mock cursor if connection is None."""
     def __init__(self, conn):
         self._conn = conn
     
     def cursor(self):
         if self._conn is None:
-            return SafeMySQLCursor()
+            return SafePostgresCursor()
         return self._conn.cursor()
     
     def __bool__(self):
@@ -118,14 +118,17 @@ class SafeMySQLConnection:
 from contextlib import contextmanager
 
 @contextmanager  
-def safe_mysql():
-    """Safe MySQL context manager - ALWAYS returns mock connection.
+def safe_postgres():
+    """Safe PostgreSQL context manager - ALWAYS returns mock connection.
     
-    MySQL is archive-only now. All API reads use DuckDB.
+    PostgreSQL is archive-only now. All API reads use DuckDB.
     This stub exists for backward compatibility with endpoints not yet migrated.
     """
-    # Never call MySQL - always return mock (DuckDB is primary)
-    yield SafeMySQLConnection(None)
+    # Never call PostgreSQL - always return mock (DuckDB is primary)
+    yield SafePostgresConnection(None)
+
+# Legacy alias for backward compatibility
+safe_mysql = safe_postgres
 
 # Configure logger
 logger = logging.getLogger("price_api")
@@ -148,24 +151,24 @@ def health_check():
         if engine._running:
             engine_status = engine.health_check()
             duckdb_status = engine_status.get('duckdb', 'unknown')
-            mysql_status = engine_status.get('mysql', 'unknown')
+            postgres_status = engine_status.get('postgres', 'unknown')
             engine_running = True
         else:
             duckdb_status = "engine_not_running"
-            mysql_status = "engine_not_running"
+            postgres_status = "engine_not_running"
             engine_running = False
     except Exception as e:
         duckdb_status = f"error: {str(e)}"
-        mysql_status = "unknown"
+        postgres_status = "unknown"
         engine_running = False
     
-    # MySQL archive is optional - don't check it for status
+    # PostgreSQL archive is optional - don't check it for status
     # Main status depends only on DuckDB engine
     
     return jsonify({
         'status': 'ok' if duckdb_status == 'ok' else 'degraded',
         'duckdb': duckdb_status,
-        'mysql_archive': mysql_status,  # Informational only
+        'postgres_archive': postgres_status,  # Informational only
         'engine_running': engine_running,
         'timestamp': datetime.now().isoformat()
     })
@@ -203,20 +206,20 @@ def get_stats():
             except:
                 pass
         
-        # MySQL archive stats (optional - disabled, use DuckDB)
-        with safe_mysql() as mysql_conn:
-            if mysql_conn:
+        # PostgreSQL archive stats (optional - disabled, use DuckDB)
+        with safe_postgres() as pg_conn:
+            if pg_conn:
                 try:
-                    with mysql_conn.cursor() as cursor:
+                    with pg_conn.cursor() as cursor:
                         # Only check archive tables
                         archive_tables = [f"{t}_archive" for t in HOT_TABLES]
                         for table in archive_tables:
                             try:
                                 cursor.execute(f"SELECT COUNT(*) as cnt FROM {table}")
                                 result = cursor.fetchone()
-                                stats[f"mysql_{table}"] = result['cnt']
+                                stats[f"postgres_{table}"] = result['cnt']
                             except:
-                                stats[f"mysql_{table}"] = 0
+                                stats[f"postgres_{table}"] = 0
                 except:
                     pass
         
@@ -235,12 +238,12 @@ def trades_diagnostic():
     Diagnostic endpoint to compare trade counts across all data sources.
     
     Sync Path (FAST): Webhook DuckDB → Python DuckDB (every 2s)
-    Fallback Path: MySQL → Python DuckDB (only if webhook unavailable)
+    Fallback Path: PostgreSQL → Python DuckDB (only if webhook unavailable)
     
     Data sources checked:
-    - .NET Webhook DuckDB (in-memory on quicknode.smz.dk) - SOURCE
+    - .NET Webhook DuckDB (in-memory on 195.201.84.5) - SOURCE
     - Python DuckDB sol_stablecoin_trades - LOCAL CACHE
-    - MySQL sol_stablecoin_trades - BACKUP
+    - PostgreSQL sol_stablecoin_trades - BACKUP
     
     Query params:
     - minutes: Time window in minutes (default: 5)
@@ -261,7 +264,7 @@ def trades_diagnostic():
     try:
         start_time = time_module.time()
         webhook_response = requests.get(
-            f'http://quicknode.smz.dk/api/trades?limit=1000',
+            f'http://195.201.84.5/api/trades?limit=1000',
             timeout=5
         )
         response_time_ms = (time_module.time() - start_time) * 1000
@@ -309,14 +312,14 @@ def trades_diagnostic():
         diagnostic['sources']['webhook_duckdb'] = {
             'status': 'unreachable',
             'error': str(e),
-            'note': 'Sync will fallback to MySQL (slower)'
+            'note': 'Sync will fallback to PostgreSQL (slower)'
         }
     
-    # 2. Check MySQL sol_stablecoin_trades - DISABLED (DuckDB is primary)
+    # 2. Check PostgreSQL sol_stablecoin_trades - DISABLED (DuckDB is primary)
     try:
         start_time = time_module.time()
-        with safe_mysql() as mysql_conn:
-            with mysql_conn.cursor() as cursor:
+        with safe_postgres() as pg_conn:
+            with pg_conn.cursor() as cursor:
                 # Total in last X minutes
                 cursor.execute(f"""
                     SELECT COUNT(*) as cnt
@@ -340,7 +343,7 @@ def trades_diagnostic():
         
         query_time_ms = (time_module.time() - start_time) * 1000
         
-        diagnostic['sources']['mysql'] = {
+        diagnostic['sources']['postgres'] = {
             'status': 'ok',
             'role': 'BACKUP (written by .NET webhook, used as fallback)',
             'total_in_table': total,
@@ -349,7 +352,7 @@ def trades_diagnostic():
             'query_time_ms': round(query_time_ms, 1)
         }
     except Exception as e:
-        diagnostic['sources']['mysql'] = {
+        diagnostic['sources']['postgres'] = {
             'status': 'error',
             'error': str(e)
         }
@@ -436,7 +439,7 @@ def trades_diagnostic():
     # Summary / Comparison - Focus on Webhook→DuckDB sync (fast path)
     webhook_recent = diagnostic['sources'].get('webhook_duckdb', {}).get(f'last_{minutes}m', 0)
     duckdb_recent = diagnostic['sources'].get('python_duckdb', {}).get(f'last_{minutes}m', 0)
-    mysql_recent = diagnostic['sources'].get('mysql', {}).get(f'last_{minutes}m', 0)
+    postgres_recent = diagnostic['sources'].get('postgres', {}).get(f'last_{minutes}m', 0)
     
     webhook_status = diagnostic['sources'].get('webhook_duckdb', {}).get('status', 'unknown')
     
@@ -451,17 +454,17 @@ def trades_diagnostic():
             'message': 'Synced' if sync_lag <= 1 else f'Local DuckDB is {sync_lag} trades behind Webhook'
         }
     elif webhook_status != 'ok':
-        # Fallback mode - compare MySQL to DuckDB
-        if mysql_recent is not None and duckdb_recent is not None:
-            sync_lag = mysql_recent - duckdb_recent
+        # Fallback mode - compare PostgreSQL to DuckDB
+        if postgres_recent is not None and duckdb_recent is not None:
+            sync_lag = postgres_recent - duckdb_recent
             diagnostic['sync_status'] = {
-                'sync_path': 'MySQL → Python DuckDB (FALLBACK - webhook unavailable)',
-                'mysql_trades': mysql_recent,
+                'sync_path': 'PostgreSQL → Python DuckDB (FALLBACK - webhook unavailable)',
+                'postgres_trades': postgres_recent,
                 'local_duckdb_trades': duckdb_recent,
                 'sync_lag': sync_lag,
                 'synced': sync_lag <= 5,
-                'message': 'Synced (fallback mode)' if sync_lag <= 5 else f'Local DuckDB is {sync_lag} trades behind MySQL',
-                'warning': 'Webhook is unavailable - using slower MySQL fallback'
+                'message': 'Synced (fallback mode)' if sync_lag <= 5 else f'Local DuckDB is {sync_lag} trades behind PostgreSQL',
+                'warning': 'Webhook is unavailable - using slower PostgreSQL fallback'
             }
     
     return jsonify(diagnostic)
@@ -1124,7 +1127,7 @@ def get_buyins():
     Query params:
         play_id: Filter by play ID
         status: Filter by status (pending, sold, no_go, etc.)
-        hours: Limit to last N hours (default: 24, use 'all' for MySQL)
+        hours: Limit to last N hours (default: 24, use 'all' for PostgreSQL)
         limit: Max records (default: 100)
     """
     try:
@@ -1149,7 +1152,7 @@ def get_buyins():
             params.append(status)
         
         if hours_int:
-            # Both DuckDB and MySQL support INTERVAL N HOUR syntax
+            # Both DuckDB and PostgreSQL support INTERVAL N HOUR syntax
             # hours_int is validated as integer, so safe for string formatting
             where_clauses.append(f"followed_at >= NOW() - INTERVAL {hours_int} HOUR")
         
@@ -1165,7 +1168,7 @@ def get_buyins():
             LIMIT {limit}
         """
         
-        # Always use DuckDB (MySQL is archive-only now)
+        # Always use DuckDB (PostgreSQL is archive-only now)
         # Convert query for DuckDB if needed
         query_duckdb = query.replace('%s', '?').replace('NOW()', 'CURRENT_TIMESTAMP')
         
@@ -1210,9 +1213,8 @@ def create_buyin():
         success = duckdb_insert('follow_the_goat_buyins', data)
         
         return jsonify({
-            'success': duckdb_ok and mysql_ok,
-            'duckdb': duckdb_ok,
-            'mysql': mysql_ok
+            'success': success,
+            'duckdb': success
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1237,9 +1239,8 @@ def update_buyin(buyin_id):
         )
         
         return jsonify({
-            'success': duckdb_ok or mysql_ok,
-            'duckdb': duckdb_ok,
-            'mysql': mysql_ok
+            'success': success,
+            'duckdb': success
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1341,7 +1342,7 @@ def get_price_checks():
                 columns = [desc[0] for desc in conn.description]
                 checks = [dict(zip(columns, row)) for row in result]
         else:
-            with safe_mysql() as conn:
+            with safe_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(query, params)
                     checks = cursor.fetchall()
@@ -1349,7 +1350,7 @@ def get_price_checks():
         return jsonify({
             'price_checks': checks,
             'count': len(checks),
-            'source': 'duckdb' if use_duckdb else 'mysql'
+            'source': 'duckdb' if use_duckdb else 'postgres'
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1369,9 +1370,8 @@ def create_price_check():
         success = duckdb_insert('follow_the_goat_buyins_price_checks', data)
         
         return jsonify({
-            'success': duckdb_ok and mysql_ok,
-            'duckdb': duckdb_ok,
-            'mysql': mysql_ok
+            'success': success,
+            'duckdb': success
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1458,10 +1458,10 @@ def get_price_points():
             except:
                 pass
         
-        # Fallback to MySQL for historical data (older than 24 hours)
+        # Fallback to PostgreSQL for historical data (older than 24 hours)
         if not prices:
             try:
-                from core.database import get_mysql
+                from core.database import get_postgres
                 
                 # Check if we're requesting historical data (more than 24h ago)
                 end_dt = datetime.strptime(end_datetime, '%Y-%m-%d %H:%M:%S')
@@ -1472,8 +1472,8 @@ def get_price_points():
                 coin_id = token_to_coin_id.get(token, 5)
                 
                 if end_dt < cutoff:
-                    # Historical data - fetch from MySQL
-                    with safe_mysql() as conn:
+                    # Historical data - fetch from PostgreSQL
+                    with safe_postgres() as conn:
                         with conn.cursor() as cursor:
                             cursor.execute("""
                                 SELECT created_at, value
@@ -1489,9 +1489,9 @@ def get_price_points():
                                 for row in rows
                             ]
                             if prices:
-                                source = 'mysql'
+                                source = 'postgres'
             except Exception as e:
-                logger.debug(f"MySQL fallback failed: {e}")
+                logger.debug(f"PostgreSQL fallback failed: {e}")
                 pass
         
         return jsonify({
@@ -1610,9 +1610,9 @@ def get_price_analysis():
         except Exception as e:
             source = 'engine_error'
         
-        # Fallback to MySQL if engine not available or no data
+        # Fallback to PostgreSQL if engine not available or no data
         if not data:
-            source = 'mysql'
+            source = 'postgres'
             where_clauses = ["coin_id = %s"]
             params = [coin_id]
             
@@ -1629,7 +1629,7 @@ def get_price_analysis():
                 LIMIT {limit}
             """
             
-            with safe_mysql() as conn:
+            with safe_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(query, params)
                     data = cursor.fetchall()
@@ -1649,9 +1649,9 @@ def get_cycle_tracker():
     
     Architecture:
     - DuckDB Engine = Source of Truth (24-hour hot window)
-    - MySQL = Archive storage only (historical data > 24h)
+    - PostgreSQL = Archive storage only (historical data > 24h)
     
-    Always queries DuckDB first. Only falls back to MySQL for explicit
+    Always queries DuckDB first. Only falls back to PostgreSQL for explicit
     historical queries (hours > 24) or if engine is unavailable.
     """
     try:
@@ -1663,17 +1663,17 @@ def get_cycle_tracker():
         source = 'engine'
         
         # Determine if explicitly requesting historical data beyond 24h
-        # Only then do we need MySQL (archive storage)
-        use_mysql_archive = False
+        # Only then do we need PostgreSQL (archive storage)
+        use_postgres_archive = False
         hours_int = 24  # Default for 'all'
         if hours != 'all':
             hours_int = int(hours)
             if hours_int > 24:
-                # Requesting more than 24 hours - need MySQL archive
-                use_mysql_archive = True
+                # Requesting more than 24 hours - need PostgreSQL archive
+                use_postgres_archive = True
         
         # ALWAYS try DuckDB Engine first (source of truth for live data)
-        if not use_mysql_archive:
+        if not use_postgres_archive:
             try:
                 engine = get_trading_engine()
                 if engine._running:
@@ -1705,12 +1705,12 @@ def get_cycle_tracker():
                 logger.warning(f"Engine query failed: {e}")
                 source = 'engine_error'
         
-        # Only use MySQL for:
+        # Only use PostgreSQL for:
         # 1. Explicit historical queries (hours > 24)
         # 2. If engine is completely unavailable (fallback)
-        if use_mysql_archive or (not data and source == 'engine_error'):
+        if use_postgres_archive or (not data and source == 'engine_error'):
             try:
-                source = 'mysql'
+                source = 'postgres'
                 where_clauses = []
                 params = []
                 
@@ -1718,7 +1718,7 @@ def get_cycle_tracker():
                     where_clauses.append("threshold = %s")
                     params.append(threshold)
                 
-                # MySQL archive query
+                # PostgreSQL archive query
                 if hours != 'all':
                     where_clauses.append(f"created_at >= NOW() - INTERVAL {hours_int} HOUR")
                 
@@ -1731,12 +1731,12 @@ def get_cycle_tracker():
                     LIMIT {limit}
                 """
                 
-                with safe_mysql() as conn:
+                with safe_postgres() as conn:
                     with conn.cursor() as cursor:
                         cursor.execute(query, params)
                         data = cursor.fetchall()
             except Exception as e:
-                logger.warning(f"MySQL archive query failed: {e}")
+                logger.warning(f"PostgreSQL archive query failed: {e}")
                 # Return empty if both sources fail
                 data = []
         
@@ -1773,13 +1773,13 @@ def get_profiles():
         source = 'engine'
         
         # Determine if we need historical data (beyond 24 hours)
-        use_mysql_for_history = False
+        use_postgres_for_history = False
         if hours == 'all':
-            use_mysql_for_history = True
+            use_postgres_for_history = True
         elif hours != 'all':
             hours_int = int(hours)
             if hours_int > 24:
-                use_mysql_for_history = True
+                use_postgres_for_history = True
         
         # Build ORDER BY clause - always aggregate to get distinct wallets
         if order_by == 'trade_count':
@@ -1792,7 +1792,7 @@ def get_profiles():
         use_aggregation = True
         
         # Try TradingDataEngine first (in-memory, instant) - only for recent data (24h or less)
-        if not use_mysql_for_history:
+        if not use_postgres_for_history:
             try:
                 engine = get_trading_engine()
                 if engine._running:
@@ -1851,9 +1851,9 @@ def get_profiles():
             except Exception as e:
                 source = 'engine_error'
         
-        # Use MySQL for historical data (beyond 24h) or if engine not available/no data
-        if use_mysql_for_history or not data:
-            source = 'mysql'
+        # Use PostgreSQL for historical data (beyond 24h) or if engine not available/no data
+        if use_postgres_for_history or not data:
+            source = 'postgres'
             where_clauses = []
             params = []
             
@@ -1865,7 +1865,7 @@ def get_profiles():
                 where_clauses.append("wallet_address = %s")
                 params.append(wallet)
             
-            # MySQL can handle all historical data
+            # PostgreSQL can handle all historical data
             if hours != 'all':
                 hours_int = int(hours)
                 where_clauses.append(f"trade_timestamp >= NOW() - INTERVAL {hours_int} HOUR")
@@ -1901,7 +1901,7 @@ def get_profiles():
                     LIMIT {limit}
                 """
             
-            with safe_mysql() as conn:
+            with safe_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(query, params)
                     data = cursor.fetchall()
@@ -1981,8 +1981,8 @@ def get_profiles_stats():
         except Exception:
             pass
         
-        # Fall back to MySQL
-        with safe_mysql() as conn:
+        # Fall back to PostgreSQL
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(f"""
                     SELECT 
@@ -2001,7 +2001,7 @@ def get_profiles_stats():
         
         return jsonify({
             'stats': result,
-            'source': 'mysql'
+            'source': 'postgres'
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -2036,10 +2036,10 @@ def admin_cleanup():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/admin/sync_from_mysql', methods=['POST'])
-def admin_sync_from_mysql():
+@app.route('/admin/sync_from_postgres', methods=['POST'])
+def admin_sync_from_postgres():
     """
-    Sync last 24 hours of data from MySQL to DuckDB.
+    Sync last 24 hours of data from PostgreSQL to DuckDB.
     Use this for initial population or recovery.
     """
     try:
@@ -2055,9 +2055,9 @@ def admin_sync_from_mysql():
             
             ts_col = TIMESTAMP_COLUMNS.get(table, 'created_at')
             
-            # Get data from MySQL (disabled - this endpoint is deprecated)
-            with safe_mysql() as mysql_conn:
-                with mysql_conn.cursor() as cursor:
+            # Get data from PostgreSQL (disabled - this endpoint is deprecated)
+            with safe_postgres() as pg_conn:
+                with pg_conn.cursor() as cursor:
                     if table == 'follow_the_goat_plays':
                         cursor.execute(f"SELECT * FROM {table}")
                     else:
@@ -2116,9 +2116,9 @@ def admin_sync_from_mysql():
 # PATTERN CONFIG ENDPOINTS
 # =============================================================================
 
-def ensure_pattern_tables_mysql():
-    """Ensure pattern config tables exist in MySQL."""
-    with safe_mysql() as conn:
+def ensure_pattern_tables_postgres():
+    """Ensure pattern config tables exist in PostgreSQL."""
+    with safe_postgres() as conn:
         with conn.cursor() as cursor:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS `pattern_config_projects` (
@@ -2158,9 +2158,9 @@ def ensure_pattern_tables_mysql():
 def get_pattern_projects():
     """Get all pattern config projects with filter counts."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT 
@@ -2192,9 +2192,9 @@ def get_pattern_projects():
 
 @app.route('/patterns/projects', methods=['POST'])
 def create_pattern_project():
-    """Create a new pattern config project (dual-write to MySQL + DuckDB)."""
+    """Create a new pattern config project (dual-write to PostgreSQL + DuckDB)."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
         data = request.get_json()
         if not data:
@@ -2206,8 +2206,8 @@ def create_pattern_project():
         if not name:
             return jsonify({'success': False, 'error': 'Project name is required'}), 400
         
-        # Write to MySQL first to get the auto-generated ID
-        with safe_mysql() as conn:
+        # Write to PostgreSQL first to get the auto-generated ID
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO pattern_config_projects (name, description)
@@ -2223,7 +2223,7 @@ def create_pattern_project():
                     VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """, [new_id, name, description])
         except Exception as e:
-            logger.error(f"DuckDB write failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB write failed (PostgreSQL succeeded): {e}")
         
         return jsonify({
             'success': True,
@@ -2238,9 +2238,9 @@ def create_pattern_project():
 def get_pattern_project(project_id):
     """Get a single pattern config project by ID with all its filters."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # Get project
                 cursor.execute("""
@@ -2297,10 +2297,10 @@ def get_pattern_project(project_id):
 def delete_pattern_project(project_id):
     """Delete a pattern config project and all its filters (dual-write)."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
-        # Delete from MySQL
-        with safe_mysql() as conn:
+        # Delete from PostgreSQL
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # First delete associated filters
                 cursor.execute("DELETE FROM pattern_config_filters WHERE project_id = %s", [project_id])
@@ -2316,7 +2316,7 @@ def delete_pattern_project(project_id):
                 duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE project_id = ?", [project_id])
                 duckdb_conn.execute("DELETE FROM pattern_config_projects WHERE id = ?", [project_id])
         except Exception as e:
-            logger.error(f"DuckDB delete failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB delete failed (PostgreSQL succeeded): {e}")
         
         if project_deleted == 0:
             return jsonify({'success': False, 'error': 'Project not found'}), 404
@@ -2334,9 +2334,9 @@ def delete_pattern_project(project_id):
 def get_pattern_filters(project_id):
     """Get all filters for a pattern config project."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT * FROM pattern_config_filters
@@ -2367,9 +2367,9 @@ def get_pattern_filters(project_id):
 
 @app.route('/patterns/filters', methods=['POST'])
 def create_pattern_filter():
-    """Create a new pattern config filter (dual-write to MySQL + DuckDB)."""
+    """Create a new pattern config filter (dual-write to PostgreSQL + DuckDB)."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
         data = request.get_json()
         if not data:
@@ -2393,8 +2393,8 @@ def create_pattern_filter():
         play_id = data.get('play_id')
         is_active = data.get('is_active', 1)
         
-        # Write to MySQL first
-        with safe_mysql() as conn:
+        # Write to PostgreSQL first
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO pattern_config_filters 
@@ -2416,7 +2416,7 @@ def create_pattern_filter():
                 """, [new_id, project_id, name, section, minute, field_name, field_column,
                       from_value, to_value, include_null, play_id, is_active])
         except Exception as e:
-            logger.error(f"DuckDB write failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB write failed (PostgreSQL succeeded): {e}")
         
         return jsonify({
             'success': True,
@@ -2431,7 +2431,7 @@ def create_pattern_filter():
 def update_pattern_filter(filter_id):
     """Update a pattern config filter (dual-write)."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
         data = request.get_json()
         if not data:
@@ -2453,8 +2453,8 @@ def update_pattern_filter(filter_id):
         
         values.append(filter_id)
         
-        # Update MySQL
-        with safe_mysql() as conn:
+        # Update PostgreSQL
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
                     f"UPDATE pattern_config_filters SET {', '.join(updates)} WHERE id = %s",
@@ -2474,7 +2474,7 @@ def update_pattern_filter(filter_id):
                     duck_values
                 )
         except Exception as e:
-            logger.error(f"DuckDB update failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB update failed (PostgreSQL succeeded): {e}")
         
         if updated == 0:
             return jsonify({'success': False, 'error': 'Filter not found'}), 404
@@ -2488,10 +2488,10 @@ def update_pattern_filter(filter_id):
 def delete_pattern_filter(filter_id):
     """Delete a pattern config filter (dual-write)."""
     try:
-        ensure_pattern_tables_mysql()
+        ensure_pattern_tables_postgres()
         
-        # Delete from MySQL
-        with safe_mysql() as conn:
+        # Delete from PostgreSQL
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("DELETE FROM pattern_config_filters WHERE id = %s", [filter_id])
                 deleted = cursor.rowcount
@@ -2501,7 +2501,7 @@ def delete_pattern_filter(filter_id):
             with get_duckdb("central") as duckdb_conn:
                 duckdb_conn.execute("DELETE FROM pattern_config_filters WHERE id = ?", [filter_id])
         except Exception as e:
-            logger.error(f"DuckDB delete failed (MySQL succeeded): {e}")
+            logger.error(f"DuckDB delete failed (PostgreSQL succeeded): {e}")
         
         if deleted == 0:
             return jsonify({'success': False, 'error': 'Filter not found'}), 404
@@ -2566,7 +2566,7 @@ def get_trail_sections():
         fields = []
         field_types = {}
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # Get columns from trail_data_flattened table
                 cursor.execute("""
@@ -2635,7 +2635,7 @@ def get_trail_field_stats():
         fields = []
         field_types = {}
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # Get section fields
                 cursor.execute("""
@@ -2807,7 +2807,7 @@ def get_trail_gain_distribution():
         hours = data.get('hours', 6)
         apply_filters = data.get('apply_filters', False)
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # Build base WHERE clause
                 where_clauses = ["minute = %s"]
@@ -2977,9 +2977,9 @@ FILTER_SECTION_NAMES = {
 }
 
 
-def ensure_filter_tables_mysql():
-    """Ensure filter analysis tables exist in MySQL."""
-    with safe_mysql() as conn:
+def ensure_filter_tables_postgres():
+    """Ensure filter analysis tables exist in PostgreSQL."""
+    with safe_postgres() as conn:
         with conn.cursor() as cursor:
             # Auto filter settings table
             cursor.execute("""
@@ -3015,7 +3015,7 @@ def ensure_filter_tables_mysql():
 def get_filter_analysis_dashboard():
     """Get all data for the filter analysis dashboard."""
     try:
-        ensure_filter_tables_mysql()
+        ensure_filter_tables_postgres()
         
         result = {
             'success': True,
@@ -3031,7 +3031,7 @@ def get_filter_analysis_dashboard():
             'rolling_avgs': {}
         }
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 # Get auto filter settings
                 try:
@@ -3249,9 +3249,9 @@ def get_filter_analysis_dashboard():
 def get_filter_settings():
     """Get auto filter settings."""
     try:
-        ensure_filter_tables_mysql()
+        ensure_filter_tables_postgres()
         
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("SELECT * FROM auto_filter_settings ORDER BY id")
                 settings = cursor.fetchall()
@@ -3265,12 +3265,12 @@ def get_filter_settings():
 def save_filter_settings():
     """Save auto filter settings."""
     try:
-        ensure_filter_tables_mysql()
+        ensure_filter_tables_postgres()
         data = request.get_json() or {}
         settings = data.get('settings', {})
         
         errors = []
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 for key, value in settings.items():
                     try:
@@ -3314,7 +3314,7 @@ def generic_query():
         "where": {"play_id": 1},  // optional
         "order_by": "followed_at DESC",  // optional
         "limit": 100,  // optional
-        "source": "auto"  // "duckdb", "mysql", or "auto" (default)
+        "source": "auto"  // "duckdb", "postgres", or "auto" (default)
     }
     """
     try:
@@ -3344,7 +3344,7 @@ def generic_query():
         
         # Engine-only tables must query from TradingDataEngine
         use_engine_only = table in engine_only_tables
-        use_duckdb = source != 'mysql' and (table in HOT_TABLES or use_engine_only)
+        use_duckdb = source != 'postgres' and (table in HOT_TABLES or use_engine_only)
         
         if where:
             where_clauses = []
@@ -3386,8 +3386,8 @@ def generic_query():
             if rows is None:
                 rows = []
         else:
-            actual_source = 'mysql'
-            with safe_mysql() as conn:
+            actual_source = 'postgres'
+            with safe_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(query, params)
                     rows = cursor.fetchall()
@@ -3413,13 +3413,13 @@ def get_trail_for_buyin(buyin_id: int):
     Returns 15 rows from buyin_trail_minutes table (one per minute).
     
     Query params:
-    - source: 'duckdb' or 'mysql' (default: duckdb)
+    - source: 'duckdb' or 'postgres' (default: duckdb)
     """
     source = request.args.get('source', 'duckdb')
     
     try:
-        if source == 'mysql':
-            with safe_mysql() as conn:
+        if source == 'postgres':
+            with safe_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                         SELECT *
@@ -3596,7 +3596,7 @@ def get_recent_trades():
         try:
             logger.info("Local DuckDB empty, falling back to webhook API directly")
             webhook_response = req.get(
-                'http://quicknode.smz.dk/api/trades',
+                'http://195.201.84.5/api/trades',
                 params={'limit': limit * 2},  # Get more to filter by direction
                 timeout=5
             )
@@ -3677,7 +3677,7 @@ def get_tracked_wallets():
         all_wallets = set()
         
         # Get active plays with cached wallet settings AND perp config
-        with safe_mysql() as conn:
+        with safe_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT id, name, cashe_wallets_settings, tricker_on_perp
@@ -3766,6 +3766,6 @@ if __name__ == '__main__':
     
     print(f"Starting Central DuckDB API on http://{args.host}:{args.port}")
     print(f"Central Database: {settings.central_db_path}")
-    print(f"MySQL: {settings.mysql.host}/{settings.mysql.database}")
+    print(f"PostgreSQL: {settings.postgres.host}/{settings.postgres.database}")
     
     app.run(host=args.host, port=args.port, debug=args.debug)

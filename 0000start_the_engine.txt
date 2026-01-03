@@ -1,6 +1,11 @@
 # ================================================================
-# FOLLOW THE GOAT - COMPLETE STARTUP GUIDE
+# FOLLOW THE GOAT - COMPLETE STARTUP GUIDE (Ubuntu/Linux Native)
 # ================================================================
+#
+# Server: Ubuntu 24.04 LTS
+# Location: /root/follow_the_goat
+# Python Env: /root/follow_the_goat/venv
+# Website: http://195.201.84.5 (Nginx serving 000website/)
 #
 # Architecture Overview:
 # ----------------------
@@ -16,9 +21,10 @@
 #   master2.py (HTTP sync) -> Trading decisions
 #
 # Port Assignments:
+#   80   = Nginx Web Server (serving 000website/ to public)
 #   5050 = Data Engine API (master.py - in-memory DuckDB)
 #   5051 = Website API (website_api.py - HTTP proxy to 5050)
-#   8000 = PHP Website Server
+#   8000 = PHP Website Server (internal dev server - optional)
 #   8001 = Webhook Server (QuickNode)
 #
 # Services Started by master.py:
@@ -44,31 +50,85 @@
 # ================================================================
 
 # TERMINAL 1 - Start Data Engine (NEVER restart):
-wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/master.py"
+source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/master.py
 
 # TERMINAL 2 - Start Website API (CAN restart for website changes):
-wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/website_api.py"
+source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/website_api.py
 
 # TERMINAL 3 - Start Trading Logic (CAN restart for trading changes):
-wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/master2.py"
+source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/master2.py
 
 # ================================================================
 # STEP-BY-STEP STARTUP
 # ================================================================
 #
-# 1. Open PowerShell Terminal #1
+# NOTE: The website is already live on Nginx at http://195.201.84.5
+#       You only need to start the backend services (master.py, etc.)
+#
+# 1. Open Terminal #1 (or use screen/tmux)
 # 2. Run the master.py command above
 # 3. Wait for: "All systems running! Press Ctrl+C to stop cleanly."
 # 4. Verify at: http://127.0.0.1:5050/health
 #
-# 5. Open PowerShell Terminal #2
+# 5. Open Terminal #2
 # 6. Run the website_api.py command above
 # 7. Wait for: "Starting Website API Server"
 # 8. Verify at: http://127.0.0.1:5051/health
 #
-# 9. Open PowerShell Terminal #3
+# 9. Open Terminal #3
 # 10. Run the master2.py command above
 # 11. Wait for: "Trading logic running!"
+#
+# ================================================================
+# NGINX WEB SERVER (Already Configured)
+# ================================================================
+#
+# The 000website/ folder is served by Nginx on port 80
+# Configuration: /etc/nginx/sites-available/follow_the_goat
+#
+# Manage Nginx:
+systemctl status nginx        # Check status
+systemctl restart nginx       # Restart after config changes
+systemctl reload nginx        # Reload without downtime
+nginx -t                      # Test configuration
+tail -f /var/log/nginx/follow_the_goat_error.log  # View errors
+#
+# Website location: /root/follow_the_goat/000website/
+# Public URL: http://195.201.84.5
+
+# ================================================================
+# ADVANCED: RUNNING AS BACKGROUND SERVICES
+# ================================================================
+#
+# Option 1: Using screen (recommended for quick setup)
+# ------------------------------------------------------
+# Start master.py in background:
+screen -dmS master bash -c "source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/master.py"
+
+# Start website_api.py in background:
+screen -dmS website_api bash -c "source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/website_api.py"
+
+# Start master2.py in background:
+screen -dmS master2 bash -c "source /root/follow_the_goat/venv/bin/activate && cd /root/follow_the_goat && python scheduler/master2.py"
+
+# List running screens:
+screen -ls
+
+# Attach to a screen (to view logs):
+screen -r master        # Detach with Ctrl+A then D
+screen -r website_api   # Detach with Ctrl+A then D
+screen -r master2       # Detach with Ctrl+A then D
+
+# Kill a screen:
+screen -S master -X quit
+screen -S website_api -X quit
+screen -S master2 -X quit
+
+# Option 2: Using systemd (recommended for production)
+# ------------------------------------------------------
+# Create service files in /etc/systemd/system/
+# Then use: systemctl start/stop/restart service-name
+# (Service files can be created upon request)
 
 # ================================================================
 # RESTART GUIDE (What You Can Safely Restart)
@@ -97,29 +157,32 @@ wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000website
 # ================================================================
 
 # Check if master.py (Data Engine) is running:
-wsl bash -c "curl -s http://127.0.0.1:5050/health | python3 -m json.tool"
+curl -s http://127.0.0.1:5050/health | python3 -m json.tool
 
 # Check if website_api.py is running:
-wsl bash -c "curl -s http://127.0.0.1:5051/health | python3 -m json.tool"
+curl -s http://127.0.0.1:5051/health | python3 -m json.tool
 
 # Check table row counts:
-wsl bash -c "curl -s http://127.0.0.1:5051/stats | python3 -m json.tool"
+curl -s http://127.0.0.1:5051/stats | python3 -m json.tool
 
 # Check webhook server:
-wsl bash -c "curl -s http://127.0.0.1:8001/webhook/health"
+curl -s http://127.0.0.1:8001/webhook/health
 
-# Check PHP website:
-wsl bash -c "curl -s http://127.0.0.1:8000 | head -5"
+# Check PHP website (internal server):
+curl -s http://127.0.0.1:8000 | head -5
+
+# Check Nginx website (external):
+curl -s http://195.201.84.5 | head -5
 
 # ================================================================
 # KILL EVERYTHING
 # ================================================================
 
 # Stop all services gracefully:
-wsl bash -c "pkill -f 'scheduler/master.py'; pkill -f 'scheduler/master2.py'; pkill -f 'scheduler/website_api.py'; pkill -f 'php -S'"
+pkill -f 'scheduler/master.py'; pkill -f 'scheduler/master2.py'; pkill -f 'scheduler/website_api.py'; pkill -f 'php -S'
 
 # Force kill if needed:
-wsl bash -c "pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.py'; pkill -9 -f 'scheduler/website_api.py'; fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp 2>/dev/null"
+pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.py'; pkill -9 -f 'scheduler/website_api.py'; fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp 2>/dev/null
 
 # ================================================================
 # ENDPOINTS
@@ -147,14 +210,14 @@ wsl bash -c "pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.p
 #   http://127.0.0.1:8001/webhook/api/whale-movements - Whale activity
 #
 # PHP Website (port 8000):
-#   http://127.0.0.1:8000/                - Dashboard
+#   http://127.0.0.1:8000/                - Dashboard (internal PHP server)
 #   http://127.0.0.1:8000/goats/          - Goat plays
 #   http://127.0.0.1:8000/pages/cycles/   - Price cycles
 #
 # External Access (from internet):
-#   http://116.202.51.115:8000/           - PHP Website
-#   http://116.202.51.115:5051/health     - Website API
-#   http://116.202.51.115:8001/webhook/health - Webhook
+#   http://195.201.84.5/                  - PHP Website (Nginx - main access)
+#   http://195.201.84.5:5051/health       - Website API (if firewall open)
+#   http://195.201.84.5:8001/webhook/health - Webhook (if firewall open)
 
 # ================================================================
 # TROUBLESHOOTING
@@ -162,11 +225,11 @@ wsl bash -c "pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.p
 #
 # "ModuleNotFoundError: No module named 'X'"
 #   -> Install missing module:
-#      wsl bash -c "source ~/follow_the_goat_venv/bin/activate && pip install X"
+#      source /root/follow_the_goat/venv/bin/activate && pip install X
 #
 # "Address already in use"
 #   -> Kill existing processes:
-#      wsl bash -c "fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp"
+#      fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp
 #
 # Website shows "API not available":
 #   -> Make sure website_api.py is running on port 5051
@@ -177,8 +240,11 @@ wsl bash -c "pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.p
 #   -> Check: curl http://127.0.0.1:5050/health
 #
 # External access not working:
-#   -> Check Windows Firewall allows ports 5050, 5051, 8000, 8001
-#   -> Run as Admin: netsh advfirewall firewall add rule name="Port 5051" dir=in action=allow protocol=tcp localport=5051
+#   -> Check Ubuntu firewall (ufw) allows required ports
+#   -> Allow ports: sudo ufw allow 80/tcp
+#   -> Allow ports: sudo ufw allow 5051/tcp
+#   -> Allow ports: sudo ufw allow 8001/tcp
+#   -> Check status: sudo ufw status
 
 # ================================================================
 # LOG FILES

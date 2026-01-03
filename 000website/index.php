@@ -7,6 +7,9 @@
  * and shows price cycle analysis with configurable thresholds.
  */
 
+// Set timezone to match server
+date_default_timezone_set('Europe/Berlin');
+
 // --- DuckDB API Client ---
 // Port 5051 = Website API (can restart freely)
 // Port 5050 = Data Engine API (master.py, never restart)
@@ -29,8 +32,13 @@ $token = 'SOL';
 $coin_id = 5;
 
 // Use 24-hour interval from now
+// Note: Timestamps in database are stored in server local time (CET) 
+// So we need to use server time, not UTC
 $end_datetime = date('Y-m-d H:i:s');
 $start_datetime = date('Y-m-d H:i:s', strtotime('-24 hours'));
+
+// For new deployments, also try last 2 hours if 24h returns no data
+$fallback_start_datetime = date('Y-m-d H:i:s', strtotime('-2 hours'));
 
 // --- Chart Data ---
 $chart_data = [
@@ -94,6 +102,15 @@ if ($use_duckdb) {
     
     if ($price_response && isset($price_response['prices'])) {
         $chart_data['prices'] = $price_response['prices'];
+    }
+    
+    // If no data in 24h range (new deployment), try last hour
+    if (empty($chart_data['prices'])) {
+        $price_response = $duckdb->getPricePoints($token, $fallback_start_datetime, $end_datetime);
+        if ($price_response && isset($price_response['prices'])) {
+            $chart_data['prices'] = $price_response['prices'];
+            $start_datetime = $fallback_start_datetime; // Update for display
+        }
     }
 } else {
     $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";

@@ -8,7 +8,7 @@
 
 // --- DuckDB API Client ---
 require_once __DIR__ . '/../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5050');
+define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
 $duckdb = new DuckDBClient(DUCKDB_API_URL);
 $use_duckdb = $duckdb->isAvailable();
 
@@ -17,7 +17,7 @@ $baseUrl = '../..';
 
 // --- Parameters ---
 $threshold_filter = isset($_GET['threshold']) ? floatval($_GET['threshold']) : null;
-$hours = isset($_GET['hours']) ? $_GET['hours'] : 'all';
+$hours = isset($_GET['hours']) ? $_GET['hours'] : '24';  // Default to 24h (uses DuckDB engine)
 $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 50;
 $refresh_interval = isset($_GET['refresh']) ? intval($_GET['refresh']) : 30; // Default 30 seconds
 
@@ -474,8 +474,13 @@ foreach ($all_cycles_for_table as $cycle) {
                             </a>
                             <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=all&limit=<?php echo $limit; ?>" 
                                class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == 'all' ? 'active' : ''; ?>"
-                               title="<?php echo $actual_source == 'engine' ? 'All (24h max - DuckDB)' : 'All (Historical - MySQL)'; ?>">
-                                All<?php echo $actual_source == 'engine' ? ' (24h)' : ''; ?>
+                               title="All data in DuckDB (24h rolling window)">
+                                All
+                            </a>
+                            <a href="?<?php echo $threshold_filter !== null ? "threshold=$threshold_filter&" : ''; ?>hours=48&limit=<?php echo $limit; ?>" 
+                               class="btn btn-sm btn-outline-light filter-btn <?php echo $hours == '48' ? 'active' : ''; ?>"
+                               title="Historical data from MySQL archive">
+                                48h (Archive)
                             </a>
 
                                 <span class="ms-auto data-source-info" id="data-source">

@@ -8,7 +8,7 @@
 
 // --- DuckDB API Client ---
 require_once __DIR__ . '/../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5050');
+define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
 $duckdb = new DuckDBClient(DUCKDB_API_URL);
 $use_duckdb = $duckdb->isAvailable();
 

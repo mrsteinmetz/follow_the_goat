@@ -15,11 +15,11 @@ try:
     from dotenv import load_dotenv
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
-        # Try utf-16 first (common on Windows), fallback to utf-8
+        # Try utf-8 first, fallback to utf-16 (older Windows format)
         try:
-            load_dotenv(env_path, encoding='utf-16')
-        except:
             load_dotenv(env_path, encoding='utf-8')
+        except:
+            load_dotenv(env_path, encoding='utf-16')
     else:
         load_dotenv()
 except ImportError:
@@ -27,27 +27,28 @@ except ImportError:
 
 
 @dataclass
-class MySQLSettings:
-    """MySQL database connection settings."""
-    # Default to Windows host IP for WSL2 compatibility
-    # Set DB_HOST env var to override (start_scheduler.sh does this automatically)
-    host: str = "172.19.240.1"
-    user: str = "solcatcher"
-    password: str = "jjJH!la9823JKJsdfjk76jH"
-    database: str = "solcatcher"
-    port: int = 3306
-    charset: str = "utf8mb4"
+class PostgresSettings:
+    """PostgreSQL database connection settings for archive database.
+    
+    This connects to a LOCAL PostgreSQL for archiving old data.
+    The archive database stores data that has expired from DuckDB hot storage.
+    """
+    # Default to localhost for PostgreSQL
+    host: str = "127.0.0.1"
+    user: str = "ftg_user"
+    password: str = ""  # Set via DB_PASSWORD env var
+    database: str = "follow_the_goat_archive"
+    port: int = 5432
     
     @classmethod
-    def from_env(cls) -> "MySQLSettings":
-        """Load MySQL settings from environment variables."""
+    def from_env(cls) -> "PostgresSettings":
+        """Load PostgreSQL settings from environment variables."""
         return cls(
-            host=os.getenv("DB_HOST", "172.19.240.1"),
-            user=os.getenv("DB_USER", "solcatcher"),
-            password=os.getenv("DB_PASSWORD", "jjJH!la9823JKJsdfjk76jH"),
-            database=os.getenv("DB_DATABASE", "solcatcher"),
-            port=int(os.getenv("DB_PORT", "3306")),
-            charset=os.getenv("DB_CHARSET", "utf8mb4"),
+            host=os.getenv("DB_HOST", "127.0.0.1"),
+            user=os.getenv("DB_USER", "ftg_user"),
+            password=os.getenv("DB_PASSWORD", ""),
+            database=os.getenv("DB_DATABASE", "follow_the_goat_archive"),
+            port=int(os.getenv("DB_PORT", "5432")),
         )
 
 
@@ -70,8 +71,8 @@ class Settings:
     # Logging
     log_level: str = "INFO"
     
-    # MySQL settings
-    mysql: MySQLSettings = field(default_factory=MySQLSettings.from_env)
+    # PostgreSQL settings (for archive database)
+    postgres: PostgresSettings = field(default_factory=PostgresSettings.from_env)
     
     # Jupiter API key (required as of Jan 31, 2026)
     # Get free key at: https://portal.jup.ag
@@ -91,7 +92,7 @@ class Settings:
             trades_hot_storage_hours=int(os.getenv("TRADES_HOT_STORAGE_HOURS", "72")),
             scheduler_timezone=os.getenv("SCHEDULER_TZ", "UTC"),
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            mysql=MySQLSettings.from_env(),
+            postgres=PostgresSettings.from_env(),
             jupiter_api_key=os.getenv("JUPITER_API_KEY", "") or os.getenv("jupiter_api_key", ""),
         )
 

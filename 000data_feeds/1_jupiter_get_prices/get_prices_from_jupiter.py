@@ -32,7 +32,7 @@ try:
     from dotenv import load_dotenv
     env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
-        load_dotenv(env_path, encoding='utf-16')  # Windows often uses utf-16
+        load_dotenv(env_path, encoding='utf-8')
     else:
         load_dotenv()  # Try default locations
 except ImportError:
@@ -45,7 +45,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
-from core.database import get_duckdb, get_mysql, get_trading_engine
+from core.database import get_duckdb, get_trading_engine
 from core.config import settings
 
 # Configure logging
@@ -641,14 +641,7 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.error(f"DuckDB error: {e}")
             
-            try:
-                with get_mysql() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("SELECT COUNT(*) as cnt FROM price_points")
-                        mysql_count = cursor.fetchone()['cnt']
-                        print(f"  MySQL:            {mysql_count:,} records")
-            except Exception as e:
-                logger.error(f"MySQL error: {e}")
+            # MySQL archive stats not shown (archive is optional)
             
             latest = get_latest_prices()
             if latest:

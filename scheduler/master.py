@@ -1,16 +1,21 @@
 """
-Master Scheduler - APScheduler
+Master Scheduler - Data Engine
 ==============================
-Single entry point for all scheduled tasks.
+Data ingestion engine that runs continuously without restarts.
 NO .bat files - everything runs through here.
 
 Usage:
     python scheduler/master.py
 
-This script:
+This script (DATA ENGINE - runs indefinitely):
 1. Starts the TradingDataEngine (in-memory DuckDB with zero locks)
-2. Starts the Flask API server in a background thread
-3. Starts all scheduled jobs via APScheduler
+2. Starts the FastAPI data API server (port 5050)
+3. Starts the FastAPI webhook server (port 8001)
+4. Starts the PHP webserver (port 8000)
+5. Starts Binance order book stream
+6. Schedules data jobs: Jupiter prices, price cycles, wallet profiles, cleanup
+
+Trading logic is handled by master2.py which can be restarted independently.
 
 Shutdown:
     Press Ctrl+C to gracefully stop all services.
@@ -21,8 +26,9 @@ import os
 import signal
 import threading
 import atexit
+import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -48,8 +54,14 @@ _trading_engine = None
 # Global reference to Binance stream collector
 _binance_collector = None
 
-# Global reference to Flask server (for clean shutdown)
-_flask_server = None
+# Global reference to FastAPI data API server (port 5050)
+_data_api_server = None
+
+# Global reference to FastAPI webhook server (port 8001)
+_webhook_server = None
+
+# Global reference to PHP server process (port 8000)
+_php_server_process = None
 
 # Global reference to the scheduler (for clean shutdown)
 _scheduler = None
@@ -209,13 +221,20 @@ def cleanup_jupiter_prices():
 @track_job("cleanup_duckdb_hot_tables", "Clean up DuckDB hot tables (every hour)")
 def cleanup_duckdb_hot_tables():
     """
-    Clean up all DuckDB hot tables.
-    - Trades: 72 hours retention (settings.trades_hot_storage_hours)
-    - Other tables: 24 hours retention (settings.hot_storage_hours)
+    Clean up all DuckDB hot tables with archive to MySQL.
+    
+    Process:
+    1. Select data older than retention threshold
+    2. Archive to MySQL (if configured)
+    3. Delete from DuckDB
+    
+    Retention periods:
+    - Trades (buyins): 72 hours (settings.trades_hot_storage_hours)
+    - Other tables: 24 hours (settings.hot_storage_hours)
     """
-    logger.info(f"Running DuckDB hot table cleanup (trades: {settings.trades_hot_storage_hours}h, others: {settings.hot_storage_hours}h)...")
-    total_cleaned = cleanup_all_hot_tables("central")  # Uses per-table settings
-    logger.info(f"Cleanup complete: {total_cleaned} records removed")
+    logger.info(f"Running DuckDB hot table cleanup with archive (trades: {settings.trades_hot_storage_hours}h, others: {settings.hot_storage_hours}h)...")
+    total_cleaned = cleanup_all_hot_tables("central")  # Archives then deletes
+    logger.info(f"Cleanup complete: {total_cleaned} records archived and removed")
 
 
 # NOTE: archive_legacy_price_points was removed because:
@@ -224,18 +243,17 @@ def cleanup_duckdb_hot_tables():
 # 3. See get_prices_from_jupiter.py for the correct cleanup implementation
 
 
-@track_job("sync_plays_from_mysql", "Sync plays from MySQL (every 5 min)")
-def sync_plays_from_mysql():
-    """Sync plays table from MySQL to DuckDB (master data refresh)."""
-    logger.info("Syncing plays from MySQL...")
-    from features.price_api.sync_from_mysql import sync_table
-    synced = sync_table("follow_the_goat_plays", full_sync=True)
-    logger.info(f"Plays sync complete: {synced} records")
+# NOTE: sync_plays_from_mysql has been removed.
+# Plays are now loaded from config/plays_cache.json at startup.
+# No MySQL sync is performed during runtime.
 
 
 # Global state for incremental trade sync (tracks last synced ID)
 _last_synced_trade_id = 0
 _last_sync_initialized = False
+
+# Webhook base URL for trade backfill/sync
+WEBHOOK_TRADES_URL = "http://quicknode.smz.dk/api/trades"
 
 
 def _get_last_synced_trade_id() -> int:
@@ -279,430 +297,272 @@ def _get_last_synced_trade_id() -> int:
 
 @track_job("sync_trades_from_webhook", "Sync trades from Webhook DuckDB (every 1s)")
 def sync_trades_from_webhook():
-    """Sync new trades from .NET Webhook's DuckDB using incremental sync.
-    
-    CRITICAL FIX: Uses SYNCHRONOUS writes directly to DuckDB, bypassing the queue.
-    The queue-based writes were getting backed up with 200k+ items, causing trades
-    to never appear in reads (stuck behind order book data).
-    
-    - Tracks last_id and only fetches WHERE id > last_id (no duplicate fetching)
-    - Direct INSERT OR REPLACE for immediate availability
-    - Typically fetches 0-10 new trades per call
-    
-    Falls back to MySQL if webhook is unavailable.
-    """
-    global _last_synced_trade_id
-    import requests
-    from core.database import get_trading_engine
-    from datetime import datetime
-    
-    WEBHOOK_URL = "http://quicknode.smz.dk/api/trades"
-    
+    """No-op: trades are now pushed directly via FastAPI webhook (port 8000)."""
+    logger.debug("sync_trades_from_webhook skipped (push-based webhook)")
+
+
+# NOTE: _sync_trades_from_mysql_fallback has been removed.
+# Trades are sourced exclusively from the webhook (DuckDB-to-DuckDB).
+# MySQL is only used for archiving old data, not as a data source.
+
+
+def _normalize_trade_timestamp(ts_value):
+    """Convert webhook trade_timestamp to datetime."""
+    if ts_value is None:
+        return datetime.utcnow()
+    if isinstance(ts_value, datetime):
+        return ts_value
+    if isinstance(ts_value, str):
+        clean = ts_value.replace("T", " ").replace("Z", "")
+        try:
+            return datetime.strptime(clean[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        try:
+            return datetime.fromisoformat(clean)
+        except Exception:
+            return datetime.utcnow()
     try:
-        # Get last synced ID (initializes from engine on first call)
-        last_id = _get_last_synced_trade_id()
-        
-        # Fetch only NEW trades (id > last_id) - FAST incremental sync
-        response = requests.get(
-            WEBHOOK_URL,
-            params={'after_id': last_id, 'limit': 1000},
-            timeout=3
-        )
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('success'):
-                rows = data.get('results', [])
-                webhook_max_id = data.get('max_id', 0)
-                
-                if not rows:
-                    # No new trades - nothing to do
-                    return
-                
-                logger.debug(f"Webhook returned {len(rows)} trades (max_id={webhook_max_id}, after_id={last_id})")
-                
-                # Write DIRECTLY to TradingDataEngine (bypass queue for instant availability)
-                engine = get_trading_engine()
-                if not engine or not engine._running:
-                    logger.error("TradingDataEngine not running! Cannot sync trades.")
-                    return
-                
-                max_id = last_id
-                count = 0
-                
-                # Prepare batch data for bulk insert
-                batch_data = []
-                for row in rows:
-                    try:
-                        trade_id = row.get('id', 0)
-                        if trade_id > max_id:
-                            max_id = trade_id
-                        
-                        ts = row.get('trade_timestamp', '')
-                        if isinstance(ts, str) and ts:
-                            # Parse timestamp string
-                            ts = ts.replace('Z', '').replace('T', ' ')[:19]
-                            try:
-                                ts = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
-                            except:
-                                ts = datetime.now()
-                        
-                        batch_data.append((
-                            trade_id,
-                            row.get('wallet_address'),
-                            row.get('signature'),
-                            ts,
-                            row.get('stablecoin_amount'),
-                            row.get('sol_amount'),
-                            row.get('price'),
-                            row.get('direction'),
-                            row.get('perp_direction'),
-                            datetime.now()
-                        ))
-                        count += 1
-                    except Exception as e:
-                        logger.debug(f"Trade prep skip: {e}")
-                
-                # SYNCHRONOUS inserts - bypasses queue for immediate availability
-                # Each insert is done directly to ensure trades appear instantly in reads
-                inserted_count = 0
-                failed_count = 0
-                actual_max_id = last_id  # Only update to IDs we actually inserted
-                
-                if batch_data:
-                    for data in batch_data:
-                        trade_id = data[0]
-                        try:
-                            # Try INSERT first (most common case for new trades)
-                            engine.execute("""
-                                INSERT INTO sol_stablecoin_trades 
-                                (id, wallet_address, signature, trade_timestamp,
-                                 stablecoin_amount, sol_amount, price, direction, 
-                                 perp_direction, created_at)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """, list(data))
-                            inserted_count += 1
-                            if trade_id > actual_max_id:
-                                actual_max_id = trade_id
-                        except Exception as insert_err:
-                            err_str = str(insert_err).lower()
-                            # If duplicate key, try UPDATE instead
-                            if 'duplicate' in err_str or 'primary key' in err_str or 'constraint' in err_str:
-                                try:
-                                    engine.execute("""
-                                        UPDATE sol_stablecoin_trades 
-                                        SET wallet_address = ?, signature = ?, trade_timestamp = ?,
-                                            stablecoin_amount = ?, sol_amount = ?, price = ?,
-                                            direction = ?, perp_direction = ?, created_at = ?
-                                        WHERE id = ?
-                                    """, [data[1], data[2], data[3], data[4], data[5], 
-                                          data[6], data[7], data[8], data[9], data[0]])
-                                    inserted_count += 1
-                                    if trade_id > actual_max_id:
-                                        actual_max_id = trade_id
-                                except Exception as update_err:
-                                    failed_count += 1
-                                    logger.warning(f"Trade {trade_id} failed INSERT and UPDATE: {update_err}")
-                            else:
-                                failed_count += 1
-                                logger.error(f"Trade {trade_id} INSERT failed: {insert_err}")
-                
-                # Only update last synced ID if we actually inserted some trades
-                if inserted_count > 0:
-                    _last_synced_trade_id = actual_max_id
-                    logger.info(f"Synced {inserted_count} trades DIRECTLY to engine (id {last_id} -> {actual_max_id})")
-                elif failed_count > 0:
-                    logger.error(f"All {failed_count} trade inserts failed! Not updating last_synced_id")
-                
-                return
-        
-        # Fallback to MySQL if webhook is unavailable
-        logger.warning(f"Webhook unavailable (HTTP {response.status_code}), falling back to MySQL")
-        _sync_trades_from_mysql_fallback()
-        
-    except requests.exceptions.RequestException as e:
-        # Webhook connection failed, fallback to MySQL
-        logger.warning(f"Webhook connection failed: {e}, falling back to MySQL")
-        _sync_trades_from_mysql_fallback()
+        return datetime.fromtimestamp(ts_value)
+    except Exception:
+        return datetime.utcnow()
+
+
+def _has_recent_trades(hours: int = 24) -> bool:
+    """Check if DuckDB already has trades within the last N hours."""
+    try:
+        from core.database import get_duckdb
+        cutoff = datetime.utcnow() - timedelta(hours=hours)
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute(
+                "SELECT COUNT(*) FROM sol_stablecoin_trades WHERE trade_timestamp >= ?",
+                [cutoff],
+            ).fetchone()
+            return (result[0] if result else 0) > 0
     except Exception as e:
-        logger.error(f"Trade sync error: {e}")
+        logger.debug(f"Recent trade check failed: {e}")
+        return False
 
 
-def _sync_trades_from_mysql_fallback():
-    """Fallback: Sync from MySQL if webhook is unavailable.
-    Uses incremental sync based on last_id for efficiency.
-    """
-    global _last_synced_trade_id
-    from core.database import get_duckdb, get_mysql
-    from features.price_api.schema import SCHEMA_SOL_STABLECOIN_TRADES
-    
-    try:
-        last_id = _get_last_synced_trade_id()
-        
-        with get_mysql() as mysql_conn:
-            with mysql_conn.cursor() as cursor:
-                # Incremental sync: only fetch records with id > last_id
-                cursor.execute("""
-                    SELECT id, wallet_address, signature, trade_timestamp,
-                           stablecoin_amount, sol_amount, price, direction, perp_direction
-                    FROM sol_stablecoin_trades
-                    WHERE id > %s
-                    ORDER BY id ASC
-                    LIMIT 1000
-                """, [last_id])
-                rows = cursor.fetchall()
-        
-        if not rows:
-            return
-        
-        # Prepare batch data (outside DB connection)
-        batch_data = []
-        max_id = last_id
-        for row in rows:
+def fetch_trades_last_24h_from_webhook(hours: int = 24, limit: int = 5000):
+    """Page trades from webhook covering the last `hours`."""
+    import requests
+
+    start_time = datetime.utcnow() - timedelta(hours=hours)
+    after_id = 0
+    fetched = []
+
+    while True:
+        params = {
+            "start": start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "limit": limit,
+        }
+        if after_id > 0:
+            params["after_id"] = after_id
+
+        resp = requests.get(WEBHOOK_TRADES_URL, params=params, timeout=8)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Webhook HTTP {resp.status_code}")
+
+        payload = resp.json()
+        results = payload.get("results") or []
+        if not results:
+            break
+
+        fetched.extend(results)
+        max_id = payload.get("max_id")
+        if not max_id:
             try:
-                trade_id = row['id']
-                if trade_id > max_id:
-                    max_id = trade_id
-                
-                ts = row['trade_timestamp']
-                if hasattr(ts, 'strftime'):
-                    ts = ts.strftime('%Y-%m-%d %H:%M:%S')
-                
-                batch_data.append([
-                    trade_id, row['wallet_address'], row.get('signature'),
-                    ts, row.get('stablecoin_amount'), row.get('sol_amount'),
-                    row.get('price'), row.get('direction'), row.get('perp_direction')
-                ])
+                max_id = max(r.get("id", 0) for r in results)
             except Exception:
-                pass
-        
-        if not batch_data:
-            return
-        
-        # Batch insert into DuckDB (INSERT OR IGNORE since these are new records)
+                max_id = after_id
+
+        if not max_id or max_id <= after_id:
+            break
+
+        after_id = max_id
+        if len(results) < limit:
+            break
+
+    return fetched
+
+
+def _insert_trades_into_duckdb(trades) -> int:
+    """Insert trades into DuckDB hot storage with dedupe."""
+    if not trades:
+        return 0
+
+    from core.database import get_duckdb
+    from features.price_api.schema import SCHEMA_SOL_STABLECOIN_TRADES
+
+    try:
         with get_duckdb("central") as conn:
             conn.execute(SCHEMA_SOL_STABLECOIN_TRADES)
-            conn.executemany("""
+            batch = []
+            now_ts = datetime.utcnow()
+            for row in trades:
+                try:
+                    batch.append(
+                        [
+                            row.get("id"),
+                            row.get("wallet_address"),
+                            row.get("signature"),
+                            _normalize_trade_timestamp(row.get("trade_timestamp")),
+                            row.get("stablecoin_amount"),
+                            row.get("sol_amount"),
+                            row.get("price"),
+                            row.get("direction"),
+                            row.get("perp_direction"),
+                            now_ts,
+                        ]
+                    )
+                except Exception:
+                    continue
+
+            if not batch:
+                return 0
+
+            conn.executemany(
+                """
                 INSERT OR IGNORE INTO sol_stablecoin_trades
                 (id, wallet_address, signature, trade_timestamp,
-                 stablecoin_amount, sol_amount, price, direction, perp_direction)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, batch_data)
-        
-        # Update last synced ID
-        _last_synced_trade_id = max_id
-        
-        logger.debug(f"Synced {len(batch_data)} trades from MySQL fallback (id {last_id} -> {max_id})")
-            
+                 stablecoin_amount, sol_amount, price, direction,
+                 perp_direction, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch,
+            )
+            return len(batch)
     except Exception as e:
-        logger.error(f"MySQL fallback sync error: {e}")
+        logger.error(f"DuckDB backfill insert failed: {e}")
+        return 0
 
 
-@track_job("sync_pattern_config_from_mysql", "Sync pattern config from MySQL (every 5 min)")
-def sync_pattern_config_from_mysql():
-    """Sync pattern config tables from MySQL to DuckDB (full data, not time-based)."""
-    logger.info("Syncing pattern config from MySQL...")
-    from features.price_api.sync_from_mysql import sync_table
-    
-    # Sync projects
-    synced_projects = sync_table("pattern_config_projects", full_sync=True)
-    
-    # Sync filters  
-    synced_filters = sync_table("pattern_config_filters", full_sync=True)
-    
-    logger.info(f"Pattern config sync complete: {synced_projects} projects, {synced_filters} filters")
+def _insert_trades_into_engine(trades) -> int:
+    """Insert trades into TradingDataEngine (best-effort)."""
+    try:
+        from core.database import get_trading_engine
+
+        engine = get_trading_engine()
+        if not engine or not getattr(engine, "_running", False):
+            return 0
+    except Exception:
+        return 0
+
+    inserted = 0
+    now_ts = datetime.utcnow()
+    for row in trades:
+        try:
+            trade_id = row.get("id")
+            vals = [
+                trade_id,
+                row.get("wallet_address"),
+                row.get("signature"),
+                _normalize_trade_timestamp(row.get("trade_timestamp")),
+                row.get("stablecoin_amount"),
+                row.get("sol_amount"),
+                row.get("price"),
+                row.get("direction"),
+                row.get("perp_direction"),
+                now_ts,
+            ]
+            try:
+                engine.execute(
+                    """
+                    INSERT INTO sol_stablecoin_trades
+                    (id, wallet_address, signature, trade_timestamp,
+                     stablecoin_amount, sol_amount, price, direction,
+                     perp_direction, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    vals,
+                )
+                inserted += 1
+            except Exception as insert_err:
+                err_str = str(insert_err).lower()
+                if "duplicate" in err_str or "primary key" in err_str or "constraint" in err_str:
+                    engine.execute(
+                        """
+                        UPDATE sol_stablecoin_trades
+                        SET wallet_address = ?, signature = ?, trade_timestamp = ?,
+                            stablecoin_amount = ?, sol_amount = ?, price = ?,
+                            direction = ?, perp_direction = ?, created_at = ?
+                        WHERE id = ?
+                        """,
+                        [
+                            vals[1],
+                            vals[2],
+                            vals[3],
+                            vals[4],
+                            vals[5],
+                            vals[6],
+                            vals[7],
+                            vals[8],
+                            vals[9],
+                            trade_id,
+                        ],
+                    )
+                    inserted += 1
+                else:
+                    logger.debug(f"Engine insert failed for {trade_id}: {insert_err}")
+        except Exception as e:
+            logger.debug(f"Engine backfill skip: {e}")
+            continue
+
+    return inserted
 
 
-@track_job("process_price_cycles", "Process price cycles (every 15s)")
-def process_price_cycles():
-    """Process price points into price cycle analysis (dual-write to DuckDB + MySQL)."""
-    from pathlib import Path
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "000data_feeds" / "2_create_price_cycles"))
-    from create_price_cycles import process_price_cycles as run_price_cycles
-    
-    processed = run_price_cycles()
-    if processed > 0:
-        logger.debug(f"Price cycles: processed {processed} price points")
+def run_startup_trade_backfill():
+    """Fetch last 24h trades from webhook and seed DuckDB (and engine)."""
+    global _last_synced_trade_id, _last_sync_initialized
+
+    try:
+        if _has_recent_trades(hours=24):
+            logger.info("Startup backfill skipped: trades already within 24h window")
+            return
+
+        logger.info("Startup backfill: fetching trades from webhook (last 24h)...")
+        trades = fetch_trades_last_24h_from_webhook(hours=24)
+        if not trades:
+            logger.error("Startup backfill: webhook returned no trades")
+            return
+
+        duckdb_inserted = _insert_trades_into_duckdb(trades)
+        engine_inserted = _insert_trades_into_engine(trades)
+        max_id = max((t.get("id", 0) or 0) for t in trades)
+
+        if max_id > 0:
+            _last_synced_trade_id = max_id
+            _last_sync_initialized = True
+
+        logger.info(
+            f"Startup backfill complete: fetched={len(trades)}, "
+            f"duckdb_inserted={duckdb_inserted}, engine_inserted={engine_inserted}, "
+            f"max_id={max_id}"
+        )
+    except Exception as e:
+        logger.error(f"Startup backfill failed: {e}")
+
+# NOTE: sync_pattern_config_from_mysql has been removed.
+# Pattern config is managed locally in DuckDB only.
+# MySQL is used only for archiving expired data.
 
 
-@track_job("process_wallet_profiles", "Build wallet profiles (every 10s)")
-def process_wallet_profiles():
-    """Build wallet profiles from trades and price cycles (dual-write to DuckDB + MySQL)."""
-    from pathlib import Path
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "000data_feeds" / "5_create_profiles"))
-    from create_profiles import process_wallet_profiles as run_profiles
-    
-    processed = run_profiles()
-    if processed > 0:
-        logger.debug(f"Wallet profiles: processed {processed} profiles")
-
-
-@track_job("cleanup_wallet_profiles", "Clean up wallet profiles (every hour)")
-def cleanup_wallet_profiles():
-    """Clean up old wallet profiles from BOTH DuckDB and MySQL (24hr retention)."""
-    from pathlib import Path
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent.parent / "000data_feeds" / "5_create_profiles"))
-    from create_profiles import cleanup_old_profiles
-    
-    deleted = cleanup_old_profiles(hours=24)
-    if deleted > 0:
-        logger.info(f"Cleaned up {deleted} old wallet profiles")
-
-
-@track_job("train_validator", "Validator training cycle (every 30s)")
-def run_train_validator():
-    """Run a single validator training cycle.
-    
-    Creates a synthetic trade, generates a 15-minute trail, runs pattern 
-    validation, and updates the trade record with the validation result.
-    
-    Set TRAIN_VALIDATOR_ENABLED=0 in .env to disable.
-    """
-    import os
-    enabled = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Train validator disabled via TRAIN_VALIDATOR_ENABLED=0")
-        return
-    
-    # Add 000trading to path and import directly
-    import sys
-    from pathlib import Path
-    trading_path = Path(__file__).parent.parent / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from train_validator import run_training_cycle
-    success = run_training_cycle()
-    if not success:
-        logger.warning("Train validator cycle failed")
-
-
-@track_job("follow_the_goat", "Wallet tracker cycle (every 1s)")
-def run_follow_the_goat():
-    """Run a single wallet tracking cycle.
-    
-    Monitors target wallets for new buy transactions, generates 15-minute
-    trails, runs pattern validation, and creates buy-in records.
-    
-    Set FOLLOW_THE_GOAT_ENABLED=0 in .env to disable.
-    """
-    import os
-    enabled = os.getenv("FOLLOW_THE_GOAT_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Follow the goat disabled via FOLLOW_THE_GOAT_ENABLED=0")
-        return
-    
-    # Add 000trading to path and import directly
-    import sys
-    from pathlib import Path
-    trading_path = Path(__file__).parent.parent / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from follow_the_goat import run_single_cycle
-    
-    trades_found = run_single_cycle()
-    if trades_found:
-        logger.debug("Follow the goat: new trades processed")
-
-
-@track_job("update_potential_gains", "Update potential gains (every 15s)")
-def run_update_potential_gains():
-    """Update potential_gains for buyins with completed price cycles.
-    
-    Calculates: ((highest_price_reached - our_entry_price) / our_entry_price) * 100
-    Only updates records where cycle_end_time IS NOT NULL (completed cycles).
-    Uses threshold = 0.3 for cycle_tracker lookup.
-    
-    Set UPDATE_POTENTIAL_GAINS_ENABLED=0 in .env to disable.
-    """
-    import os
-    enabled = os.getenv("UPDATE_POTENTIAL_GAINS_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Update potential gains disabled via UPDATE_POTENTIAL_GAINS_ENABLED=0")
-        return
-    
-    # Add data feeds path and import
-    import sys
-    from pathlib import Path
-    data_feeds_path = Path(__file__).parent.parent / "000data_feeds" / "6_update_potential_gains"
-    if str(data_feeds_path) not in sys.path:
-        sys.path.insert(0, str(data_feeds_path))
-    from update_potential_gains import run as update_gains
-    
-    result = update_gains()
-    if result.get('updated', 0) > 0:
-        logger.debug(f"Potential gains: updated {result['updated']} records")
-
-
-@track_job("trailing_stop_seller", "Trailing stop seller (every 1s)")
-def run_trailing_stop_seller():
-    """Run a single trailing stop monitoring cycle.
-    
-    Monitors open positions for trailing stop conditions, tracks highest
-    prices, and marks positions as 'sold' when tolerance is exceeded.
-    
-    Set TRAILING_STOP_ENABLED=0 in .env to disable.
-    """
-    import os
-    enabled = os.getenv("TRAILING_STOP_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Trailing stop seller disabled via TRAILING_STOP_ENABLED=0")
-        return
-    
-    # Add 000trading to path and import directly
-    import sys
-    from pathlib import Path
-    trading_path = Path(__file__).parent.parent / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from sell_trailing_stop import run_single_cycle
-    
-    positions_checked = run_single_cycle()
-    if positions_checked > 0:
-        logger.debug(f"Trailing stop: checked {positions_checked} position(s)")
-
-
-@track_job("create_new_patterns", "Auto-generate filter patterns (every 15 min)")
-def run_create_new_patterns():
-    """Auto-generate filter patterns from trade data analysis.
-    
-    Analyzes the last 24 hours of trade data to find optimal filter combinations
-    that maximize bad trade removal while preserving good trades.
-    
-    This job:
-    1. Loads trade data from in-memory DuckDB (follow_the_goat_buyins + buyin_trail_minutes)
-    2. Analyzes each filter field to find optimal ranges
-    3. Generates filter combinations using a greedy algorithm
-    4. Syncs best filters to pattern_config_filters
-    5. Updates plays with pattern_update_by_ai=1
-    
-    Migrated from: 000old_code/solana_node/chart/build_pattern_config/auto_filter_scheduler.py
-    
-    Set CREATE_NEW_PATTERNS_ENABLED=0 in .env to disable.
-    """
-    import os
-    enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Create new patterns disabled via CREATE_NEW_PATTERNS_ENABLED=0")
-        return
-    
-    # Add data feeds path and import
-    import sys
-    from pathlib import Path
-    patterns_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns"
-    if str(patterns_path) not in sys.path:
-        sys.path.insert(0, str(patterns_path))
-    from create_new_paterns import run as run_pattern_generator
-    
-    result = run_pattern_generator()
-    if result.get('success'):
-        logger.info(f"Pattern generation: {result.get('suggestions_count', 0)} suggestions, "
-                    f"{result.get('combinations_count', 0)} combinations, "
-                    f"{result.get('filters_synced', 0)} filters synced")
-    else:
-        logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
+# =============================================================================
+# JOBS MOVED TO master2.py
+# =============================================================================
+# The following jobs are now handled by master2.py:
+# - run_train_validator
+# - run_follow_the_goat
+# - run_trailing_stop_seller
+# - run_update_potential_gains
+# - run_create_new_patterns
+# - process_wallet_profiles (moved - uses local in-memory DuckDB)
+# - cleanup_wallet_profiles (moved - cleanup in master2.py's local DuckDB)
+# - process_price_cycles (moved - part of trading logic, uses synced data)
+#
+# This allows trading logic to be restarted without stopping data ingestion.
+# =============================================================================
 
 
 # =============================================================================
@@ -768,65 +628,173 @@ def stop_binance_stream():
 # API SERVER (runs once at startup in background thread)
 # =============================================================================
 
-def start_api_server(host: str = "127.0.0.1", port: int = 5050):
+def start_data_api_server(host: str = "0.0.0.0", port: int = 5050):
     """
-    Start the DuckDB API server in a background thread.
-    This allows the entire project to be started with a single command.
+    Start the FastAPI Data Engine API server.
     
-    Note: Table initialization is skipped because TradingDataEngine handles
-    all data in-memory with zero lock contention.
+    This is a MINIMAL API that provides core data access for:
+    - master2.py to sync data from the engine
+    - Direct data queries via /query endpoint
+    
+    NOTE: The website should connect to the Flask API (port 5051) which runs separately.
+    This separation ensures master.py never needs to restart for website changes.
+    
+    Endpoints:
+    - POST /insert - Queue write to DuckDB
+    - POST /query - Execute SELECT query
+    - GET /backfill/{table} - Get historical data for startup
+    - GET /health - Health check
     """
-    global _flask_server
+    global _data_api_server
     
     try:
-        # Disable Flask's auto-loading of .env files (avoids encoding issues)
-        os.environ['FLASK_SKIP_DOTENV'] = '1'
+        from core.data_api import app as data_api_app
+        import uvicorn
         
-        # Suppress Flask/Werkzeug request logs (too noisy)
-        werkzeug_logger = logging.getLogger('werkzeug')
-        werkzeug_logger.setLevel(logging.WARNING)
-        
-        from features.price_api.api import app
-        from werkzeug.serving import make_server
-        
-        # Note: We skip init_duckdb_tables() because TradingDataEngine handles
-        # all tables in-memory. The API reads from the engine, not file-based DuckDB.
-        logger.info("Skipping file-based DuckDB init (using TradingDataEngine)")
-        
-        # Create server that can be shut down cleanly
-        logger.info(f"Starting DuckDB API server on http://{host}:{port}")
-        _flask_server = make_server(host, port, app, threaded=True)
-        _flask_server.serve_forever()
+        logger.info(f"Starting FastAPI Data Engine API on http://{host}:{port}")
+        config = uvicorn.Config(data_api_app, host=host, port=port, log_level="warning")
+        _data_api_server = uvicorn.Server(config)
+        _data_api_server.run()
         
     except Exception as e:
-        logger.error(f"Failed to start API server: {e}")
+        logger.error(f"Failed to start Data API server: {e}")
 
 
-def start_api_in_background(host: str = "127.0.0.1", port: int = 5050):
-    """Start the API server in a background thread."""
+def start_data_api_in_background(host: str = "0.0.0.0", port: int = 5050):
+    """Start the Data Engine API server in a background thread."""
     api_thread = threading.Thread(
-        target=start_api_server,
+        target=start_data_api_server,
         args=(host, port),
-        name="DuckDB-API-Server",
+        name="FastAPI-Data-Engine",
         daemon=True
     )
     api_thread.start()
-    logger.info(f"API server thread started")
+    logger.info(f"Data Engine API thread started on {host}:{port}")
     return api_thread
 
 
-def stop_api_server():
-    """Stop the Flask API server cleanly."""
-    global _flask_server
+def start_webhook_api_server(host: str = "0.0.0.0", port: int = 8001):
+    """
+    Start the FastAPI webhook server (QuickNode sink) in a background thread.
+    """
+    global _webhook_server
+
+    try:
+        from features.webhook.app import app as webhook_app
+        import uvicorn
+
+        config = uvicorn.Config(webhook_app, host=host, port=port, log_level="info")
+        _webhook_server = uvicorn.Server(config)
+        _webhook_server.run()
+    except Exception as e:
+        logger.error(f"Failed to start webhook API server: {e}")
+
+
+def start_webhook_api_in_background(host: str = "0.0.0.0", port: int = 8001):
+    """Start FastAPI webhook server in background."""
+    webhook_thread = threading.Thread(
+        target=start_webhook_api_server,
+        args=(host, port),
+        name="FastAPI-Webhook-Server",
+        daemon=True
+    )
+    webhook_thread.start()
+    logger.info(f"Webhook API server thread started on {host}:{port}")
+    return webhook_thread
+
+
+def stop_data_api_server():
+    """Stop the FastAPI Data Engine server cleanly."""
+    global _data_api_server
     
-    if _flask_server is not None:
+    if _data_api_server is not None:
         try:
-            logger.info("Stopping Flask API server...")
-            _flask_server.shutdown()
-            _flask_server = None
-            logger.info("Flask API server stopped")
+            logger.info("Stopping FastAPI Data Engine server...")
+            _data_api_server.should_exit = True
+            _data_api_server.force_exit = True
+            _data_api_server = None
+            logger.info("FastAPI Data Engine server stopped")
         except Exception as e:
-            logger.error(f"Error stopping API server: {e}")
+            logger.error(f"Error stopping Data API server: {e}")
+
+
+# =============================================================================
+# PHP SERVER (runs once at startup in background)
+# =============================================================================
+
+def start_php_server(host: str = "0.0.0.0", port: int = 8000):
+    """
+    Start PHP's built-in development server for the website.
+    
+    Runs: php -S 0.0.0.0:8000 -t 000website
+    """
+    global _php_server_process
+    import subprocess
+    
+    website_dir = PROJECT_ROOT / "000website"
+    
+    if not website_dir.exists():
+        logger.warning(f"Website directory not found: {website_dir}")
+        return None
+    
+    try:
+        # Check if PHP is available
+        result = subprocess.run(["php", "-v"], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            logger.warning("PHP not found or not working - skipping PHP server")
+            return None
+        
+        logger.info(f"Starting PHP server on http://{host}:{port}")
+        logger.info(f"  Document root: {website_dir}")
+        
+        # Start PHP built-in server
+        _php_server_process = subprocess.Popen(
+            ["php", "-S", f"{host}:{port}"],
+            cwd=str(website_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+        )
+        
+        logger.info(f"PHP server started (PID: {_php_server_process.pid})")
+        return _php_server_process
+        
+    except FileNotFoundError:
+        logger.warning("PHP not installed - skipping PHP server")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to start PHP server: {e}")
+        return None
+
+
+def stop_php_server():
+    """Stop the PHP server process."""
+    global _php_server_process
+    
+    if _php_server_process is not None:
+        try:
+            logger.info("Stopping PHP server...")
+            _php_server_process.terminate()
+            _php_server_process.wait(timeout=5)
+            _php_server_process = None
+            logger.info("PHP server stopped")
+        except Exception as e:
+            logger.error(f"Error stopping PHP server: {e}")
+            if _php_server_process:
+                _php_server_process.kill()
+
+
+def stop_webhook_api():
+    """Request shutdown of FastAPI webhook server."""
+    global _webhook_server
+    if _webhook_server is not None:
+        try:
+            _webhook_server.should_exit = True
+            _webhook_server.force_exit = True
+            _webhook_server = None
+            logger.info("Webhook API server stop requested")
+        except Exception as e:
+            logger.error(f"Error stopping webhook API server: {e}")
 
 
 # =============================================================================
@@ -913,17 +881,6 @@ def create_scheduler() -> BackgroundScheduler:
         executor='maintenance',  # Cleanup executor
     )
     
-    # Sync plays from MySQL (every 5 minutes)
-    # Keeps DuckDB plays table in sync with MySQL master
-    scheduler.add_job(
-        func=sync_plays_from_mysql,
-        trigger=IntervalTrigger(minutes=5),
-        id="sync_plays_from_mysql",
-        name="Sync plays table from MySQL to DuckDB",
-        replace_existing=True,
-        executor='maintenance',  # Cleanup executor
-    )
-    
     # Sync trades from Webhook DuckDB (every 0.5 seconds) - ULTRA FAST PATH
     # Direct DuckDB→DuckDB sync, bypassing MySQL for real-time trading
     # Uses 'realtime' executor - critical for trading detection
@@ -936,17 +893,6 @@ def create_scheduler() -> BackgroundScheduler:
         executor='realtime',  # Fast executor - trading critical
     )
     
-    # Sync pattern config from MySQL (every 5 minutes)
-    # Keeps DuckDB pattern_config_projects and pattern_config_filters in sync
-    scheduler.add_job(
-        func=sync_pattern_config_from_mysql,
-        trigger=IntervalTrigger(minutes=5),
-        id="sync_pattern_config_from_mysql",
-        name="Sync pattern config tables from MySQL to DuckDB",
-        replace_existing=True,
-        executor='maintenance',  # Cleanup executor
-    )
-    
     # =====================================================
     # LEGACY JOBS (for backward compatibility)
     # =====================================================
@@ -956,119 +902,30 @@ def create_scheduler() -> BackgroundScheduler:
     # which correctly uses the 'ts' column via get_prices_from_jupiter.cleanup_old_data()
     
     # =====================================================
-    # FEATURE JOBS - HEAVY EXECUTOR (can be slow, won't block realtime)
+    # FEATURE JOBS - MOVED TO master2.py
     # =====================================================
     
-    # Price Cycle Analysis (runs every 5 seconds)
-    # Processes price data into cycles at 5 thresholds (0.1-0.5%)
-    # Dual-writes to DuckDB (24hr hot) + MySQL (full history)
-    scheduler.add_job(
-        func=process_price_cycles,
-        trigger=IntervalTrigger(seconds=15),  # Increased from 5s - job takes ~11s
-        id="process_price_cycles",
-        name="Process price cycles (every 15s)",
-        replace_existing=True,
-        executor='heavy',  # Slow job - separate from realtime
-    )
+    # NOTE: Price Cycle Analysis moved to master2.py
+    # - process_price_cycles: Now runs in master2.py with synced price data
     
-    # Wallet Profile Builder (runs every 5 seconds)
-    # Builds profiles from trades + completed cycles at all thresholds
-    # Dual-writes to DuckDB (24hr hot) + MySQL (also 24hr - special case)
-    # WARNING: This job is very slow (97s avg) - runs in heavy executor
-    scheduler.add_job(
-        func=process_wallet_profiles,
-        trigger=IntervalTrigger(seconds=10),  # Increased from 5s - job can take 8s+
-        id="process_wallet_profiles",
-        name="Build wallet profiles (every 10s)",
-        replace_existing=True,
-        executor='heavy',  # VERY slow job - must not block realtime
-    )
-    
-    # Wallet Profile Cleanup (every hour)
-    # Cleans up profiles older than 24 hours from BOTH DuckDB and MySQL
-    # This is different from standard architecture - both databases only keep 24 hours
-    scheduler.add_job(
-        func=cleanup_wallet_profiles,
-        trigger=IntervalTrigger(hours=1),
-        id="cleanup_wallet_profiles",
-        name="Clean up wallet profiles (24hr window in both DuckDB and MySQL)",
-        replace_existing=True,
-        executor='maintenance',  # Cleanup executor
-    )
+    # NOTE: Wallet Profile jobs moved to master2.py
+    # - process_wallet_profiles: Now runs in master2.py with local in-memory DuckDB
+    # - cleanup_wallet_profiles: Now runs in master2.py
+    # This allows profiles to use synced data and be part of trading logic restarts.
     
     # =====================================================
-    # TRADING MODULE JOBS
+    # TRADING MODULE JOBS - MOVED TO master2.py
     # =====================================================
-    
-    # Validator Training (runs every 15 seconds)
-    # Creates synthetic trades and validates them against pattern schemas
-    # CRITICAL: Generates training data for AI pattern learning
-    # Enabled by default - set TRAIN_VALIDATOR_ENABLED=0 to disable
-    scheduler.add_job(
-        func=run_train_validator,
-        trigger=IntervalTrigger(seconds=15),
-        id="train_validator",
-        name="Validator training cycle (every 15s)",
-        replace_existing=True,
-        executor='heavy',  # Can be slow - separate from realtime
-    )
-    
-    # Follow The Goat - Wallet Tracker (runs every 0.5 seconds)
-    # Monitors target wallets for new buy transactions, generates trails,
-    # runs pattern validation, and creates buy-in records.
-    # CRITICAL: Must run every 0.5s for fastest trade detection
-    # Enabled by default - set FOLLOW_THE_GOAT_ENABLED=0 to disable
-    scheduler.add_job(
-        func=run_follow_the_goat,
-        trigger=IntervalTrigger(seconds=1),
-        id="follow_the_goat",
-        name="Wallet tracker cycle (every 1s)",
-        replace_existing=True,
-        executor='realtime',  # CRITICAL - fast trading detection
-    )
-    
-    # Trailing Stop Seller (runs every 0.5 seconds)
-    # Monitors open positions for trailing stop conditions, tracks highest
-    # prices, and marks positions as 'sold' when tolerance is exceeded.
-    # Uses price_points (coin_id=5) for SOL prices updated every 1s.
-    # Enabled by default - set TRAILING_STOP_ENABLED=0 to disable
-    scheduler.add_job(
-        func=run_trailing_stop_seller,
-        trigger=IntervalTrigger(seconds=1),
-        id="trailing_stop_seller",
-        name="Trailing stop seller (every 1s)",
-        replace_existing=True,
-        executor='realtime',  # CRITICAL - must sell on time
-    )
-    
-    # Update Potential Gains (runs every 15 seconds)
-    # Calculates potential_gains for buyins where price cycle has completed.
-    # Formula: ((highest_price_reached - our_entry_price) / our_entry_price) * 100
-    # Uses threshold = 0.3 for cycle_tracker lookup.
-    # Enabled by default - set UPDATE_POTENTIAL_GAINS_ENABLED=0 to disable
-    scheduler.add_job(
-        func=run_update_potential_gains,
-        trigger=IntervalTrigger(seconds=15),
-        id="update_potential_gains",
-        name="Update potential gains (every 15s)",
-        replace_existing=True,
-        executor='heavy',  # Can be slow - separate from realtime
-    )
-    
-    # Create New Patterns (runs every 15 minutes)
-    # Auto-generates filter patterns from trade data analysis.
-    # Analyzes last 24h of trades to find optimal filter combinations.
-    # Syncs best filters to pattern_config_filters and updates AI-enabled plays.
-    # Migrated from: 000old_code/solana_node/chart/build_pattern_config/auto_filter_scheduler.py
-    # Enabled by default - set CREATE_NEW_PATTERNS_ENABLED=0 to disable
-    scheduler.add_job(
-        func=run_create_new_patterns,
-        trigger=IntervalTrigger(minutes=15),
-        id="create_new_patterns",
-        name="Auto-generate filter patterns (every 15 min)",
-        replace_existing=True,
-        executor='heavy',  # Analysis is slow - runs in heavy executor
-    )
+    # The following jobs now run in master2.py (can be restarted independently):
+    # - train_validator
+    # - follow_the_goat
+    # - trailing_stop_seller
+    # - update_potential_gains
+    # - create_new_patterns
+    #
+    # This separation allows trading logic to be updated/restarted
+    # without interrupting data ingestion.
+    # =====================================================
     
     return scheduler
 
@@ -1096,13 +953,15 @@ def main():
         signal.signal(signal.SIGBREAK, handle_shutdown)
     
     logger.info("=" * 60)
-    logger.info("Starting Follow The Goat - Master Controller")
+    logger.info("Starting Follow The Goat - Data Engine")
     logger.info("=" * 60)
     logger.info(f"Timezone: {settings.scheduler_timezone}")
     logger.info(f"Hot storage: {settings.hot_storage_hours}h (general), {settings.trades_hot_storage_hours}h (trades)")
-    logger.info(f"MySQL: {settings.mysql.host}/{settings.mysql.database}")
+    logger.info(f"PostgreSQL Archive: {settings.postgres.host}/{settings.postgres.database}")
     logger.info(f"DuckDB Central: {settings.central_db_path}")
     logger.info(f"Error Log: {ERROR_LOG_FILE}")
+    logger.info("")
+    logger.info("NOTE: Trading jobs run in master2.py (can restart independently)")
     
     # Record scheduler start time
     set_scheduler_start_time()
@@ -1130,24 +989,63 @@ def main():
     )
     
     # =====================================================
-    # STEP 2: Start the DuckDB API server (background thread)
+    # STEP 2: Start the FastAPI Data Engine (background thread)
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 2: Starting DuckDB API Server...")
-    # Listen on all interfaces so Windows/PHP can connect to WSL Flask API
-    api_thread = start_api_in_background(host="0.0.0.0", port=5050)
+    logger.info("STEP 2: Starting FastAPI Data Engine API (port 5050)...")
+    # Listen on all interfaces so master2.py can connect
+    api_thread = start_data_api_in_background(host="0.0.0.0", port=5050)
     
     # Track API server status
     update_job_status(
-        'api_server',
+        'data_api_server',
         status='running',
-        description='DuckDB API Server (port 5050)',
+        description='FastAPI Data Engine API (port 5050)',
         is_service=True
     )
     
     # Give the API server a moment to start
     import time
     time.sleep(1)
+
+    # =====================================================
+    # STEP 2b: Start FastAPI Webhook Server (QuickNode sink)
+    # =====================================================
+    logger.info("-" * 60)
+    logger.info("STEP 2b: Starting FastAPI Webhook Server (port 8001)...")
+    start_webhook_api_in_background(host="0.0.0.0", port=8001)
+    
+    update_job_status(
+        'webhook_server',
+        status='running',
+        description='FastAPI Webhook Server (port 8001)',
+        is_service=True
+    )
+    
+    # Give the webhook server a moment to start
+    time.sleep(1)
+    
+    # =====================================================
+    # STEP 2c: Start PHP Built-in Server (website)
+    # =====================================================
+    logger.info("-" * 60)
+    logger.info("STEP 2c: Starting PHP Built-in Server (port 8000)...")
+    php_proc = start_php_server(host="0.0.0.0", port=8000)
+    
+    if php_proc:
+        update_job_status(
+            'php_server',
+            status='running',
+            description='PHP Built-in Server (port 8000)',
+            is_service=True
+        )
+    else:
+        update_job_status(
+            'php_server',
+            status='skipped',
+            description='PHP Server (not installed or failed)',
+            is_service=True
+        )
     
     # =====================================================
     # STEP 3: Start the Binance Order Book Stream
@@ -1188,30 +1086,23 @@ def main():
     except Exception as e:
         logger.error(f"Failed to initialize pattern config tables: {e}")
     
+    # Backfill last 24h of trades from webhook so profiles have data immediately
+    try:
+        run_startup_trade_backfill()
+    except Exception as e:
+        logger.error(f"Failed to run startup trade backfill: {e}")
+
     # NOTE: TradingDataEngine handles in-memory tables for prices, orderbook, etc.
     # File-based DuckDB tables are initialized above via init_duckdb_tables()
     logger.info("Tables initialized (file-based + TradingDataEngine in-memory)")
     
-    # NOW sync data from MySQL (tables are guaranteed to exist)
-    # Sync plays
-    try:
-        sync_plays_from_mysql()
-        logger.info("Plays sync complete")
-    except Exception as e:
-        logger.error(f"Failed to sync plays on startup: {e}")
-    
-    # Sync pattern config
-    try:
-        sync_pattern_config_from_mysql()
-        logger.info("Pattern config sync complete")
-    except Exception as e:
-        logger.error(f"Failed to sync pattern config on startup: {e}")
+    # MySQL sync skipped (DuckDB-only mode; plays/config must be pre-cached)
     
     # Sync trades (critical for follow_the_goat DuckDB-only operation)
     # Uses fast Webhook DuckDB→DuckDB path, falls back to MySQL
     try:
         sync_trades_from_webhook()
-        logger.info("Trades sync complete (DuckDB→DuckDB fast path)")
+        logger.info("Trades sync skipped (push-based FastAPI webhook)")
     except Exception as e:
         logger.error(f"Failed to sync trades on startup: {e}")
     
@@ -1224,9 +1115,11 @@ def main():
     
     # Log executor configuration
     logger.info("Executors configured for parallel job execution:")
-    logger.info("  - realtime (10 threads): Jupiter prices, trailing stop, follow_the_goat, trade sync")
-    logger.info("  - heavy (4 threads): Wallet profiles, price cycles, validator training")
+    logger.info("  - realtime (10 threads): Jupiter prices, trade sync")
+    logger.info("  - heavy (4 threads): Wallet profiles, price cycles")
     logger.info("  - maintenance (2 threads): Hourly cleanup jobs")
+    logger.info("")
+    logger.info("Trading jobs run in master2.py (can restart independently)")
     
     # Log all registered jobs grouped by executor
     jobs = _scheduler.get_jobs()
@@ -1262,7 +1155,7 @@ def shutdown_all():
     # 1. Stop the scheduler first (stops new jobs from running)
     if _scheduler is not None:
         try:
-            logger.info("[1/5] Stopping scheduler...")
+            logger.info("[1/7] Stopping scheduler...")
             _scheduler.shutdown(wait=False)
             _scheduler = None
             logger.info("      Scheduler stopped")
@@ -1270,30 +1163,38 @@ def shutdown_all():
             logger.error(f"      Error stopping scheduler: {e}")
     
     # 2. Stop metrics writer
-    logger.info("[2/5] Stopping metrics writer...")
+    logger.info("[2/7] Stopping metrics writer...")
     stop_metrics_writer()
     
-    # 3. Stop the API server
-    logger.info("[3/5] Stopping API server...")
-    stop_api_server()
+    # 3. Stop the Data API server
+    logger.info("[3/7] Stopping FastAPI Data Engine server...")
+    stop_data_api_server()
+
+    # 4. Stop webhook server
+    logger.info("[4/7] Stopping FastAPI webhook server...")
+    stop_webhook_api()
     
-    # 4. Stop Binance stream
+    # 5. Stop PHP server
+    logger.info("[5/7] Stopping PHP server...")
+    stop_php_server()
+    
+    # 6. Stop Binance stream
     if _binance_collector is not None:
-        logger.info("[4/5] Stopping Binance stream...")
+        logger.info("[6/7] Stopping Binance stream...")
         stop_binance_stream()
     else:
-        logger.info("[4/5] Binance stream not running")
+        logger.info("[6/7] Binance stream not running")
     
-    # 5. Stop the trading engine
+    # 7. Stop the trading engine
     if _trading_engine is not None:
-        logger.info("[5/5] Stopping TradingDataEngine...")
+        logger.info("[7/7] Stopping TradingDataEngine...")
         stop_trading_engine()
         _trading_engine = None
         logger.info("      TradingDataEngine stopped")
     else:
-        logger.info("[5/5] TradingDataEngine not running")
+        logger.info("[7/7] TradingDataEngine not running")
     
-    logger.info("Note: Plays were synced on startup and are preserved in MySQL")
+    logger.info("Note: Plays are preserved in config/plays_cache.json")
     
     logger.info("=" * 60)
     logger.info("SHUTDOWN COMPLETE - Goodbye!")

@@ -1,26 +1,28 @@
 """
-Wallet Profile Builder - DuckDB to DuckDB (Fast Version)
+Wallet Profile Builder - DuckDB In-Memory (Fast Version)
 =========================================================
 Migrated from: 000old_code/solana_node/analyze/profiles_v2/create_profiles.py
 
 Builds wallet profiles by joining:
 - sol_stablecoin_trades (buy trades from wallets) - FROM DUCKDB
 - cycle_tracker (completed price cycles) - FROM DUCKDB
-- price_points (to get trade entry price) - FROM DUCKDB
+- prices (to get trade entry price) - FROM DUCKDB (Jupiter prices)
 
 Writes results to:
-- DuckDB central.duckdb (for fast 24hr hot storage)
-- MySQL (also 24hr retention - cleaned up hourly)
+- In-memory DuckDB (via master2.py local instance or TradingDataEngine)
 
-PERFORMANCE: All reads from DuckDB (local, columnar, fast JOINs).
-             Previous version used MySQL which was 100x slower due to:
-             - Network latency to remote MySQL
-             - Row-based storage not optimized for analytical JOINs
-             - Large IN clauses (5000 wallets) are slow in MySQL
+PERFORMANCE: All reads from in-memory DuckDB (1000x faster than PostgreSQL).
+             - No network latency
+             - Columnar storage optimized for analytical JOINs
+             - All data in RAM for instant access
 
 Thresholds: All from cycle_tracker (0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5)
 
 IMPORTANT: Only processes trades within COMPLETED cycles (cycle_end_time IS NOT NULL)
+
+NOTE: This module can be used in two modes:
+1. With master.py's TradingDataEngine (via get_duckdb("central"))
+2. With master2.py's local DuckDB (via build_profiles_for_local_duckdb())
 """
 
 import sys
@@ -33,7 +35,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_mysql, get_duckdb
+from core.database import get_duckdb
 from core.config import settings
 from features.price_api.schema import (
     SCHEMA_SOL_STABLECOIN_TRADES,
@@ -46,9 +48,9 @@ from features.price_api.schema import (
 logger = logging.getLogger("wallet_profiles")
 
 # --- Configuration ---
-COIN_ID = 5  # SOL
 MIN_BUYS = 3  # Minimum buy trades to qualify a wallet
 BATCH_SIZE = 1000  # Process trades in batches (increased for DuckDB efficiency)
+PRICE_TOKEN = 'SOL'  # Token for price lookups in prices table
 
 # All thresholds from cycle_tracker (matching create_price_cycles.py)
 THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
@@ -163,7 +165,8 @@ def build_profiles_batch_duckdb(
     threshold: float,
     last_trade_id: int,
     latest_cycle_end: datetime,
-    batch_size: int = BATCH_SIZE
+    batch_size: int = BATCH_SIZE,
+    conn=None
 ) -> List[Dict]:
     """
     Build wallet profiles by joining trades with cycles entirely in DuckDB.
@@ -171,105 +174,122 @@ def build_profiles_batch_duckdb(
     This is the FAST path - single query that does:
     1. Filters eligible wallets (MIN_BUYS requirement)
     2. Joins trades with completed cycles
-    3. Gets entry price from price_points
+    3. Gets entry price from prices table (Jupiter SOL prices)
+    
+    Args:
+        threshold: Price cycle threshold (e.g., 0.3 for 0.3%)
+        last_trade_id: Last processed trade ID for incremental processing
+        latest_cycle_end: Latest completed cycle end time
+        batch_size: Number of trades to process in one batch
+        conn: Optional DuckDB connection (for master2.py local DuckDB)
     
     Returns list of profile dicts ready for insert.
     """
-    try:
-        with get_duckdb("central", read_only=True) as conn:
-            # Single efficient query that does all the work in DuckDB
-            # Uses a CTE for eligible wallets to avoid large IN clause
-            result = conn.execute("""
-                WITH eligible_wallets AS (
-                    SELECT wallet_address
-                    FROM sol_stablecoin_trades
-                    WHERE direction = 'buy'
-                    GROUP BY wallet_address
-                    HAVING COUNT(id) >= ?
-                ),
-                trades_with_cycles AS (
-                    SELECT 
-                        t.id as trade_id,
-                        t.wallet_address,
-                        t.trade_timestamp,
-                        t.price as trade_price,
-                        t.stablecoin_amount,
-                        t.perp_direction,
-                        c.id as cycle_id,
-                        c.cycle_start_time,
-                        c.cycle_end_time,
-                        c.sequence_start_price,
-                        c.highest_price_reached,
-                        c.lowest_price_reached
-                    FROM sol_stablecoin_trades t
-                    INNER JOIN eligible_wallets ew ON t.wallet_address = ew.wallet_address
-                    INNER JOIN cycle_tracker c ON (
-                        c.threshold = ?
-                        AND c.cycle_start_time <= t.trade_timestamp
-                        AND c.cycle_end_time >= t.trade_timestamp
-                        AND c.cycle_end_time IS NOT NULL
-                    )
-                    WHERE t.direction = 'buy'
-                    AND t.trade_timestamp <= ?
-                    AND t.id > ?
-                    ORDER BY t.id ASC
-                    LIMIT ?
-                ),
-                -- Get entry price: first price_point after trade_timestamp
-                trades_with_prices AS (
-                    SELECT 
-                        twc.*,
-                        (
-                            SELECT pp.value 
-                            FROM price_points pp 
-                            WHERE pp.created_at > twc.trade_timestamp 
-                            AND pp.coin_id = ?
-                            ORDER BY pp.created_at ASC 
-                            LIMIT 1
-                        ) as entry_price
-                    FROM trades_with_cycles twc
+    def _execute_query(connection):
+        # Single efficient query that does all the work in DuckDB
+        # Uses a CTE for eligible wallets to avoid large IN clause
+        # NOTE: Uses 'prices' table (not 'price_points') for Jupiter SOL prices
+        result = connection.execute("""
+            WITH eligible_wallets AS (
+                SELECT wallet_address
+                FROM sol_stablecoin_trades
+                WHERE direction = 'buy'
+                GROUP BY wallet_address
+                HAVING COUNT(id) >= ?
+            ),
+            trades_with_cycles AS (
+                SELECT 
+                    t.id as trade_id,
+                    t.wallet_address,
+                    t.trade_timestamp,
+                    t.price as trade_price,
+                    t.stablecoin_amount,
+                    t.perp_direction,
+                    c.id as cycle_id,
+                    c.cycle_start_time,
+                    c.cycle_end_time,
+                    c.sequence_start_price,
+                    c.highest_price_reached,
+                    c.lowest_price_reached
+                FROM sol_stablecoin_trades t
+                INNER JOIN eligible_wallets ew ON t.wallet_address = ew.wallet_address
+                INNER JOIN cycle_tracker c ON (
+                    c.threshold = ?
+                    AND c.cycle_start_time <= t.trade_timestamp
+                    AND c.cycle_end_time >= t.trade_timestamp
+                    AND c.cycle_end_time IS NOT NULL
                 )
-                SELECT *
-                FROM trades_with_prices
-                WHERE entry_price IS NOT NULL
-            """, [MIN_BUYS, threshold, latest_cycle_end, last_trade_id, batch_size, COIN_ID]).fetchall()
+                WHERE t.direction = 'buy'
+                AND t.trade_timestamp <= ?
+                AND t.id > ?
+                ORDER BY t.id ASC
+                LIMIT ?
+            ),
+            -- Get entry price: first price from 'prices' table after trade_timestamp
+            -- Uses Jupiter SOL prices (token = 'SOL', ts = timestamp, price = value)
+            trades_with_prices AS (
+                SELECT 
+                    twc.*,
+                    (
+                        SELECT p.price 
+                        FROM prices p 
+                        WHERE p.ts > twc.trade_timestamp 
+                        AND p.token = ?
+                        ORDER BY p.ts ASC 
+                        LIMIT 1
+                    ) as entry_price
+                FROM trades_with_cycles twc
+            )
+            SELECT *
+            FROM trades_with_prices
+            WHERE entry_price IS NOT NULL
+        """, [MIN_BUYS, threshold, latest_cycle_end, last_trade_id, batch_size, PRICE_TOKEN]).fetchall()
+        
+        # Get column names
+        columns = [desc[0] for desc in connection.description]
+        return result, columns
+    
+    try:
+        # Use provided connection or get from pool
+        if conn is not None:
+            result, columns = _execute_query(conn)
+        else:
+            with get_duckdb("central", read_only=True) as connection:
+                result, columns = _execute_query(connection)
+        
+        # Build profile records
+        profiles = []
+        for row in result:
+            record = dict(zip(columns, row))
             
-            # Get column names
-            columns = [desc[0] for desc in conn.description]
+            # Calculate short value based on perp_direction
+            perp_direction = record.get('perp_direction')
+            if perp_direction == 'long':
+                short_value = 0
+            elif perp_direction == 'short':
+                short_value = 1
+            else:
+                short_value = 2  # null or empty
             
-            # Build profile records
-            profiles = []
-            for row in result:
-                record = dict(zip(columns, row))
-                
-                # Calculate short value based on perp_direction
-                perp_direction = record.get('perp_direction')
-                if perp_direction == 'long':
-                    short_value = 0
-                elif perp_direction == 'short':
-                    short_value = 1
-                else:
-                    short_value = 2  # null or empty
-                
-                profiles.append({
-                    'wallet_address': record['wallet_address'],
-                    'threshold': threshold,
-                    'trade_id': record['trade_id'],
-                    'trade_timestamp': record['trade_timestamp'],
-                    'price_cycle': record['cycle_id'],
-                    'price_cycle_start_time': record['cycle_start_time'],
-                    'price_cycle_end_time': record['cycle_end_time'],
-                    'trade_entry_price_org': float(record['trade_price']) if record['trade_price'] else 0,
-                    'stablecoin_amount': record['stablecoin_amount'],
-                    'trade_entry_price': float(record['entry_price']),
-                    'sequence_start_price': float(record['sequence_start_price']),
-                    'highest_price_reached': float(record['highest_price_reached']),
-                    'lowest_price_reached': float(record['lowest_price_reached']),
-                    'long_short': perp_direction,
-                    'short': short_value
-                })
-            
-            return profiles
+            profiles.append({
+                'wallet_address': record['wallet_address'],
+                'threshold': threshold,
+                'trade_id': record['trade_id'],
+                'trade_timestamp': record['trade_timestamp'],
+                'price_cycle': record['cycle_id'],
+                'price_cycle_start_time': record['cycle_start_time'],
+                'price_cycle_end_time': record['cycle_end_time'],
+                'trade_entry_price_org': float(record['trade_price']) if record['trade_price'] else 0,
+                'stablecoin_amount': record['stablecoin_amount'],
+                'trade_entry_price': float(record['entry_price']),
+                'sequence_start_price': float(record['sequence_start_price']),
+                'highest_price_reached': float(record['highest_price_reached']),
+                'lowest_price_reached': float(record['lowest_price_reached']),
+                'long_short': perp_direction,
+                'short': short_value
+            })
+        
+        return profiles
     except Exception as e:
         logger.error(f"Failed to build profiles from DuckDB: {e}")
         return []
@@ -322,14 +342,13 @@ def build_profiles_for_threshold(threshold: float) -> int:
 
 def insert_profiles_batch(profiles: List[Dict]) -> int:
     """
-    Insert profiles with dual-write to DuckDB and MySQL.
+    Insert profiles into DuckDB.
     Returns number of records inserted.
     """
     if not profiles:
         return 0
     
     duckdb_ok = False
-    mysql_ok = False
     inserted_count = 0
     
     # Write to DuckDB (central.duckdb)
@@ -461,6 +480,240 @@ def run_continuous(interval_seconds: int = 5):
             time.sleep(interval_seconds)
     except KeyboardInterrupt:
         logger.info("Stopped by user")
+
+
+# =============================================================================
+# Master2.py Local DuckDB Support
+# =============================================================================
+# These functions allow profile building using master2.py's local in-memory
+# DuckDB instance, which is synced from master.py's Data Engine API.
+# =============================================================================
+
+def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> int:
+    """
+    Build wallet profiles using master2.py's local in-memory DuckDB.
+    
+    This is the entry point for master2.py scheduler to call.
+    Uses the local DuckDB connection directly instead of get_duckdb("central").
+    
+    IMPORTANT: Also pushes profiles to master.py's Data Engine API so the website
+    can access them (website reads from TradingDataEngine, not master2.py's local DB).
+    
+    Args:
+        local_conn: DuckDB connection from master2.py (_local_duckdb)
+        lock: Optional threading lock for the connection (_local_duckdb_lock)
+        data_client: Optional DataClient for pushing profiles to master.py's API
+    
+    Returns:
+        Total number of profiles inserted across all thresholds
+    """
+    total_inserted = 0
+    
+    # State tracking - use local table in the same connection
+    def _ensure_state_table(conn):
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                id INTEGER PRIMARY KEY,
+                threshold DOUBLE NOT NULL UNIQUE,
+                last_trade_id BIGINT NOT NULL DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    
+    def _get_last_id(conn, threshold):
+        try:
+            result = conn.execute(
+                "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = ?",
+                [threshold]
+            ).fetchone()
+            return result[0] if result else 0
+        except:
+            return 0
+    
+    def _update_last_id(conn, threshold, last_id):
+        try:
+            conn.execute("""
+                INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (threshold) DO UPDATE SET 
+                    last_trade_id = excluded.last_trade_id,
+                    last_updated = CURRENT_TIMESTAMP
+            """, [threshold, last_id])
+        except Exception as e:
+            logger.debug(f"State update failed: {e}")
+    
+    def _get_latest_cycle_end(conn, threshold):
+        try:
+            result = conn.execute("""
+                SELECT MAX(cycle_end_time) as max_end
+                FROM cycle_tracker
+                WHERE threshold = ? AND cycle_end_time IS NOT NULL
+            """, [threshold]).fetchone()
+            return result[0] if result and result[0] else None
+        except:
+            return None
+    
+    def _insert_profiles(conn, profiles):
+        if not profiles:
+            return 0
+        try:
+            # Generate IDs for new profiles
+            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM wallet_profiles").fetchone()
+            next_id = (max_id_result[0] or 0) + 1
+            
+            batch_data = []
+            for i, profile in enumerate(profiles):
+                batch_data.append([
+                    next_id + i,
+                    profile['wallet_address'],
+                    profile['threshold'],
+                    profile['trade_id'],
+                    profile['trade_timestamp'],
+                    profile['price_cycle'],
+                    profile['price_cycle_start_time'],
+                    profile['price_cycle_end_time'],
+                    profile['trade_entry_price_org'],
+                    profile['stablecoin_amount'],
+                    profile['trade_entry_price'],
+                    profile['sequence_start_price'],
+                    profile['highest_price_reached'],
+                    profile['lowest_price_reached'],
+                    profile['long_short'],
+                    profile['short'],
+                ])
+            
+            conn.executemany("""
+                INSERT OR IGNORE INTO wallet_profiles 
+                (id, wallet_address, threshold, trade_id, trade_timestamp, price_cycle,
+                 price_cycle_start_time, price_cycle_end_time, trade_entry_price_org,
+                 stablecoin_amount, trade_entry_price, sequence_start_price,
+                 highest_price_reached, lowest_price_reached, long_short, short)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, batch_data)
+            return len(batch_data)
+        except Exception as e:
+            logger.error(f"Local DuckDB insert failed: {e}")
+            return 0
+    
+    # Process all thresholds
+    try:
+        if lock:
+            lock.acquire()
+        
+        _ensure_state_table(local_conn)
+        
+        for threshold in THRESHOLDS:
+            try:
+                # Get latest completed cycle end time
+                latest_cycle_end = _get_latest_cycle_end(local_conn, threshold)
+                if not latest_cycle_end:
+                    continue
+                
+                # Get last processed trade ID
+                last_trade_id = _get_last_id(local_conn, threshold)
+                
+                # Build profiles using local connection
+                profiles = build_profiles_batch_duckdb(
+                    threshold, last_trade_id, latest_cycle_end, 
+                    batch_size=BATCH_SIZE, conn=local_conn
+                )
+                
+                if not profiles:
+                    continue
+                
+                # Insert profiles into local DuckDB
+                inserted = _insert_profiles(local_conn, profiles)
+                
+                # ALSO push profiles to master.py's Data Engine API
+                # This makes them visible to the website (which reads from TradingDataEngine)
+                if data_client and profiles:
+                    try:
+                        # Prepare profiles for API (serialize timestamps)
+                        api_profiles = []
+                        for p in profiles:
+                            api_profile = {
+                                'wallet_address': p['wallet_address'],
+                                'threshold': p['threshold'],
+                                'trade_id': p['trade_id'],
+                                'trade_timestamp': p['trade_timestamp'].isoformat() if hasattr(p['trade_timestamp'], 'isoformat') else str(p['trade_timestamp']),
+                                'price_cycle': p['price_cycle'],
+                                'price_cycle_start_time': p['price_cycle_start_time'].isoformat() if p['price_cycle_start_time'] and hasattr(p['price_cycle_start_time'], 'isoformat') else None,
+                                'price_cycle_end_time': p['price_cycle_end_time'].isoformat() if p['price_cycle_end_time'] and hasattr(p['price_cycle_end_time'], 'isoformat') else None,
+                                'trade_entry_price_org': p['trade_entry_price_org'],
+                                'stablecoin_amount': p['stablecoin_amount'],
+                                'trade_entry_price': p['trade_entry_price'],
+                                'sequence_start_price': p['sequence_start_price'],
+                                'highest_price_reached': p['highest_price_reached'],
+                                'lowest_price_reached': p['lowest_price_reached'],
+                                'long_short': p['long_short'],
+                                'short': p['short'],
+                            }
+                            api_profiles.append(api_profile)
+                        
+                        # Push to Data Engine API (batch insert)
+                        data_client.insert_batch('wallet_profiles', api_profiles)
+                        logger.debug(f"Pushed {len(api_profiles)} profiles to Data Engine API")
+                    except Exception as api_err:
+                        logger.warning(f"Failed to push profiles to API (non-critical): {api_err}")
+                
+                # Update state
+                if profiles:
+                    max_id = max(p['trade_id'] for p in profiles)
+                    _update_last_id(local_conn, threshold, max_id)
+                
+                total_inserted += inserted
+                if inserted > 0:
+                    logger.debug(f"Threshold {threshold}: inserted {inserted} profiles")
+                    
+            except Exception as e:
+                logger.error(f"Error processing threshold {threshold}: {e}")
+        
+        if total_inserted > 0:
+            logger.info(f"Inserted {total_inserted} profiles across all thresholds")
+            
+    finally:
+        if lock:
+            lock.release()
+    
+    return total_inserted
+
+
+def cleanup_old_profiles_local(local_conn, hours: int = 24, lock=None) -> int:
+    """
+    Delete old profile records from master2.py's local DuckDB.
+    
+    Args:
+        local_conn: DuckDB connection from master2.py
+        hours: Age threshold in hours (default 24)
+        lock: Optional threading lock
+    
+    Returns:
+        Number of records deleted
+    """
+    cutoff = datetime.now() - timedelta(hours=hours)
+    deleted = 0
+    
+    try:
+        if lock:
+            lock.acquire()
+        
+        result = local_conn.execute("""
+            DELETE FROM wallet_profiles
+            WHERE trade_timestamp < ?
+            RETURNING id
+        """, [cutoff]).fetchall()
+        deleted = len(result)
+        
+        if deleted > 0:
+            logger.debug(f"Cleaned up {deleted} old profiles from local DuckDB")
+            
+    except Exception as e:
+        logger.error(f"Local DuckDB cleanup failed: {e}")
+    finally:
+        if lock:
+            lock.release()
+    
+    return deleted
 
 
 if __name__ == "__main__":

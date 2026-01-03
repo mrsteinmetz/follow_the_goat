@@ -37,7 +37,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, get_mysql
+from core.database import get_duckdb
 
 # Try to get TradingDataEngine for in-memory queries (when running under scheduler)
 def _get_engine_if_running():
@@ -207,7 +207,7 @@ class StepLogger:
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
     """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
     
-    Uses the in-memory engine for speed. Falls back to MySQL only if engine not running.
+    Uses the in-memory engine for speed. No MySQL fallback.
     """
     engine = _get_engine_if_running()
     
@@ -226,21 +226,8 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
             
             play = dict(result)
         else:
-            # Fallback to MySQL if engine not running (standalone mode)
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
-                        FROM follow_the_goat_plays
-                        WHERE id = %s
-                    """, [play_id])
-                    result = cursor.fetchone()
-                
-                if not result:
-                    logger.error(f"Play #{play_id} not found")
-                    return None
-                
-                play = dict(result)
+            logger.error("TradingDataEngine is not running - cannot load play config")
+            return None
         
         # Parse pattern validator config
         pattern_validator_raw = play.get('pattern_validator')
@@ -451,33 +438,33 @@ def insert_synthetic_buyin(
     buyin_id = None
     
     try:
-        # Insert into MySQL first (get the auto-increment ID)
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    INSERT INTO follow_the_goat_buyins (
-                        play_id, wallet_address, original_trade_id, trade_signature,
-                        block_timestamp, quote_amount, base_amount, price, direction,
-                        our_entry_price, swap_response, live_trade, price_cycle,
-                        entry_log, pattern_validator_log, our_status, followed_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    play_id, wallet_address, 0, signature,
-                    block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
-                    our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
-                    pre_insert_log, None, 'validating', block_timestamp_str
-                ))
-                buyin_id = cursor.lastrowid
-        
-        if not buyin_id:
-            raise Exception("Failed to get buyin_id after MySQL insert")
-        
-        logger.debug(f"MySQL insert successful, buyin_id={buyin_id}")
-        
-        # Insert into TradingDataEngine (in-memory) with the same ID
+        # Insert into DuckDB (primary database) - generate ID first
         if engine is not None:
-            try:
-                engine.execute("""
+            # Get next ID from engine
+            result = engine.read_one("SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM follow_the_goat_buyins")
+            buyin_id = result['next_id'] if result else 1
+            
+            engine.execute("""
+                INSERT INTO follow_the_goat_buyins (
+                    id, play_id, wallet_address, original_trade_id, trade_signature,
+                    block_timestamp, quote_amount, base_amount, price, direction,
+                    our_entry_price, swap_response, live_trade, price_cycle,
+                    entry_log, pattern_validator_log, our_status, followed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                buyin_id, play_id, wallet_address, 0, signature,
+                block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
+                our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
+                pre_insert_log, None, 'validating', block_timestamp_str
+            ])
+            logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
+        else:
+            # Fallback to file-based DuckDB
+            with get_duckdb("central") as conn:
+                result = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM follow_the_goat_buyins").fetchone()
+                buyin_id = result[0] if result else 1
+                
+                conn.execute("""
                     INSERT INTO follow_the_goat_buyins (
                         id, play_id, wallet_address, original_trade_id, trade_signature,
                         block_timestamp, quote_amount, base_amount, price, direction,
@@ -490,9 +477,7 @@ def insert_synthetic_buyin(
                     our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
                     pre_insert_log, None, 'validating', block_timestamp_str
                 ])
-                logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
-            except Exception as engine_err:
-                logger.warning(f"Engine insert failed (MySQL succeeded): {engine_err}")
+                logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
         
         step_logger.end(
             insert_token,
@@ -692,31 +677,6 @@ def update_validation_result(
                     WHERE id = ?
                 """, [pattern_validator_log_json, new_status, buyin_id])
         
-        # Update MySQL (for persistence)
-        try:
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    if new_status == 'pending' and fresh_price:
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET pattern_validator_log = %s, our_status = %s, followed_at = %s, our_entry_price = %s
-                            WHERE id = %s
-                        """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
-                    elif new_status == 'pending':
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET pattern_validator_log = %s, our_status = %s, followed_at = %s
-                            WHERE id = %s
-                        """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
-                    else:
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET pattern_validator_log = %s, our_status = %s
-                            WHERE id = %s
-                        """, [pattern_validator_log_json, new_status, buyin_id])
-        except Exception as mysql_err:
-            logger.warning(f"MySQL update failed: {mysql_err}")
-        
         step_logger.end(
             update_token,
             {'new_status': new_status}
@@ -748,18 +708,6 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
                 WHERE id = ?
             """, [final_log_json, buyin_id])
         
-        # Update MySQL (for persistence)
-        try:
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET entry_log = %s
-                        WHERE id = %s
-                    """, [final_log_json, buyin_id])
-        except Exception as mysql_err:
-            logger.warning(f"MySQL update failed: {mysql_err}")
-            
     except Exception as e:
         logger.error(f"Error updating entry log for buy-in #{buyin_id}: {e}")
 
@@ -797,24 +745,6 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
                     WHERE id = ?
                 """, [error_log, buyin_id])
         
-        # Update MySQL (for persistence)
-        try:
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    if entry_log:
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET our_status = 'error', pattern_validator_log = %s, entry_log = %s
-                            WHERE id = %s
-                        """, [error_log, entry_log, buyin_id])
-                    else:
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET our_status = 'error', pattern_validator_log = %s
-                            WHERE id = %s
-                        """, [error_log, buyin_id])
-        except Exception as mysql_err:
-            logger.warning(f"MySQL update failed: {mysql_err}")
         
         logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")
         
@@ -885,21 +815,19 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
             
             stuck_ids = [row['id'] for row in result]
         else:
-            # Fallback to MySQL
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    cursor.execute("""
-                        SELECT id, followed_at
-                        FROM follow_the_goat_buyins
-                        WHERE our_status = 'validating'
-                          AND followed_at < %s
-                    """, [cutoff_time])
-                    result = cursor.fetchall()
-                    
-                    if not result:
-                        return 0
-                    
-                    stuck_ids = [row['id'] for row in result]
+            # Fallback to file-based DuckDB
+            with get_duckdb("central") as conn:
+                raw_result = conn.execute("""
+                    SELECT id, followed_at
+                    FROM follow_the_goat_buyins
+                    WHERE our_status = 'validating'
+                      AND followed_at < ?
+                """, [cutoff_time]).fetchall()
+                
+                if not raw_result:
+                    return 0
+                
+                stuck_ids = [row[0] for row in raw_result]
         
         logger.warning(f"Found {len(stuck_ids)} trades stuck in 'validating' status: {stuck_ids}")
         
@@ -917,19 +845,6 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
                     SET our_status = 'error', pattern_validator_log = ?
                     WHERE id = ?
                 """, [error_log, buyin_id])
-        
-        # Update MySQL (for persistence)
-        try:
-            with get_mysql() as conn:
-                with conn.cursor() as cursor:
-                    for buyin_id in stuck_ids:
-                        cursor.execute("""
-                            UPDATE follow_the_goat_buyins
-                            SET our_status = 'error', pattern_validator_log = %s
-                            WHERE id = %s
-                        """, [error_log, buyin_id])
-        except Exception as mysql_err:
-            logger.warning(f"MySQL cleanup failed: {mysql_err}")
         
         logger.info(f"Cleaned up {len(stuck_ids)} stuck 'validating' trades")
         return len(stuck_ids)

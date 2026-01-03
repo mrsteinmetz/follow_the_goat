@@ -54,7 +54,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, get_mysql, dual_write_insert, dual_write_update, get_trading_engine
+from core.database import get_duckdb, duckdb_insert, duckdb_update, get_trading_engine
 
 # Import our modules (direct imports after adding module dir to path)
 from trail_generator import generate_trail_payload, TrailError
@@ -573,11 +573,26 @@ class WalletFollower:
                     logger.error(f"Play #{play_id}: Missing 'query' in find_wallets_sql")
                     continue
                 
-                # Execute against MySQL (source of wallet trades)
-                with get_mysql() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(query)
-                        results = cursor.fetchall()
+                # Execute against DuckDB (source of wallet trades)
+                # Convert MySQL placeholders and table names to DuckDB format
+                query_duckdb = query.replace('%s', '?').replace('NOW()', 'CURRENT_TIMESTAMP')
+                # Map old MySQL table names to DuckDB equivalents
+                query_duckdb = query_duckdb.replace('solcatcher.sol_stablecoin_profiles', 'wallet_profiles')
+                query_duckdb = query_duckdb.replace('solcatcher.sol_stablecoin_trades', 'sol_stablecoin_trades')
+                
+                engine = get_trading_engine()
+                if engine and engine._running:
+                    # Use in-memory engine for fastest reads
+                    results = engine.read(query_duckdb)
+                else:
+                    # Fallback to file-based DuckDB
+                    with get_duckdb("central") as conn:
+                        raw_results = conn.execute(query_duckdb).fetchall()
+                        if raw_results:
+                            columns = [desc[0] for desc in conn.description]
+                            results = [dict(zip(columns, row)) for row in raw_results]
+                        else:
+                            results = []
                 
                 initial_wallet_addresses = [
                     r.get('wallet_address') for r in results if r.get('wallet_address')
@@ -1308,7 +1323,7 @@ class WalletFollower:
             update_data['followed_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            dual_write_update(
+            duckdb_update(
                 'follow_the_goat_buyins',
                 update_data,
                 {'id': buyin_id}
@@ -1325,7 +1340,7 @@ class WalletFollower:
             })
             
             entry_log = json.dumps(step_logger.to_json())
-            dual_write_update(
+            duckdb_update(
                 'follow_the_goat_buyins',
                 {'entry_log': entry_log},
                 {'id': buyin_id}

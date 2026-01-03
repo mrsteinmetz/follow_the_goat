@@ -38,7 +38,7 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb, get_mysql
+from core.database import get_duckdb
 from core.webhook_client import WebhookClient
 from trail_data import insert_trail_data
 

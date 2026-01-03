@@ -19,11 +19,6 @@ Once migration is complete, `000old_code/` will be deleted.
 - All database setup is documented in `duckdb/ARCHITECTURE.md`
 - Use the shared database connection pattern from `core/database.py`
 
-### 3. Hot/Cold Storage Pattern (24-Hour Window)
-Every data table follows this pattern:
-- **HOT table** (`table_name`): Last 24 hours only - optimized for speed
-- **COLD table** (`table_name_archive`): Historical data beyond 24 hours
-- Automatic archival runs via the scheduler
 
 ```python
 # Example: price_points (hot) + price_points_archive (cold)

@@ -7,8 +7,9 @@ Architecture:
 - In-memory DuckDB for 24h data window (instant reads, no file locks)
 - Queue-based batch writing (non-blocking writes)
 - Parquet files for local persistence (hourly flush)
-- MySQL only for plays config (with local JSON cache fallback)
+- Plays config loaded from JSON cache file (config/plays_cache.json)
 - Auto-cleanup of data older than 24h
+- OLD data is archived to MySQL (local Ubuntu) via scheduler cleanup jobs
 
 Usage:
     from core.trading_engine import get_engine
@@ -613,94 +614,44 @@ class TradingDataEngine:
         logger.info("In-memory DuckDB initialized")
     
     def _bootstrap_plays(self):
-        """Load plays from MySQL with local JSON cache fallback.
+        """Load plays into memory from cache only (no MySQL)."""
+        logger.info("Loading plays configuration from cache...")
         
-        Flow:
-        1. Try MySQL with 5-second timeout
-        2. On success: save to local JSON cache
-        3. On failure: load from cached JSON file
-        """
-        logger.info("Loading plays configuration...")
-        
-        # Ensure config directory exists
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         
-        plays_loaded = False
-        plays_data = []
+        if not PLAYS_CACHE_FILE.exists():
+            logger.error(f"No plays cache found at {PLAYS_CACHE_FILE}")
+            return
         
-        # Try MySQL first (with short timeout)
         try:
-            conn = self._get_mysql_connection(connect_timeout=5)
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM follow_the_goat_plays")
-            rows = cursor.fetchall()
-            
-            if rows:
-                # Convert to list of dicts for JSON serialization
-                plays_data = []
-                for row in rows:
-                    play_dict = {}
-                    for k, v in row.items():
-                        # Handle datetime serialization
-                        if isinstance(v, datetime):
-                            play_dict[k] = v.isoformat()
-                        else:
-                            play_dict[k] = v
-                    plays_data.append(play_dict)
-                
-                # Save to local cache
-                try:
-                    with open(PLAYS_CACHE_FILE, 'w') as f:
-                        json.dump(plays_data, f, indent=2, default=str)
-                    logger.info(f"Saved {len(plays_data)} plays to cache: {PLAYS_CACHE_FILE}")
-                except Exception as cache_err:
-                    logger.warning(f"Could not save plays cache: {cache_err}")
-                
-                plays_loaded = True
-                logger.info(f"Loaded {len(plays_data)} plays from MySQL")
-            
-            cursor.close()
-            conn.close()
-            
-        except Exception as e:
-            logger.warning(f"MySQL connection failed: {e}")
-            logger.info("Falling back to local plays cache...")
+            with open(PLAYS_CACHE_FILE, 'r') as f:
+                plays_data = json.load(f)
+            logger.info(f"Loaded {len(plays_data)} plays from cache: {PLAYS_CACHE_FILE}")
+        except Exception as cache_err:
+            logger.error(f"Could not load plays cache: {cache_err}")
+            return
         
-        # Fallback to local cache if MySQL failed
-        if not plays_loaded:
-            if PLAYS_CACHE_FILE.exists():
-                try:
-                    with open(PLAYS_CACHE_FILE, 'r') as f:
-                        plays_data = json.load(f)
-                    plays_loaded = True
-                    logger.info(f"Loaded {len(plays_data)} plays from cache: {PLAYS_CACHE_FILE}")
-                except Exception as cache_err:
-                    logger.error(f"Could not load plays cache: {cache_err}")
-            else:
-                logger.error(f"No plays cache found at {PLAYS_CACHE_FILE}")
+        if not plays_data:
+            logger.warning("Plays cache is empty - trading may not work correctly!")
+            return
         
-        # Insert plays into in-memory DuckDB
-        if plays_data:
-            with self._conn_lock:
-                for play in plays_data:
-                    columns = list(play.keys())
-                    placeholders = ", ".join(["?" for _ in columns])
-                    columns_str = ", ".join(columns)
-                    values = [play[c] for c in columns]
-                    
-                    try:
-                        self._conn.execute(f"""
-                            INSERT INTO follow_the_goat_plays ({columns_str})
-                            VALUES ({placeholders})
-                        """, values)
-                    except Exception as insert_err:
-                        logger.debug(f"Play insert error: {insert_err}")
-            
-            self._next_ids['follow_the_goat_plays'] = max(p['id'] for p in plays_data) + 1
-            logger.info(f"Loaded {len(plays_data)} plays into in-memory DuckDB")
-        else:
-            logger.warning("No plays loaded - trading may not work correctly!")
+        with self._conn_lock:
+            for play in plays_data:
+                columns = list(play.keys())
+                placeholders = ", ".join(["?" for _ in columns])
+                columns_str = ", ".join(columns)
+                values = [play[c] for c in columns]
+                
+                try:
+                    self._conn.execute(f"""
+                        INSERT INTO follow_the_goat_plays ({columns_str})
+                        VALUES ({placeholders})
+                    """, values)
+                except Exception as insert_err:
+                    logger.debug(f"Play insert error: {insert_err}")
+        
+        self._next_ids['follow_the_goat_plays'] = max(p['id'] for p in plays_data) + 1
+        logger.info(f"Loaded {len(plays_data)} plays into in-memory DuckDB")
     
     def _bootstrap_from_parquet(self):
         """Load today's data from Parquet files if they exist.
@@ -1096,29 +1047,6 @@ class TradingDataEngine:
             self._stats["cleanups"] += 1
     
     # =========================================================================
-    # MySQL Connection
-    # =========================================================================
-    
-    def _get_mysql_connection(self, connect_timeout: int = 10):
-        """Get a MySQL connection for sync operations.
-        
-        Args:
-            connect_timeout: Connection timeout in seconds (default: 10)
-        """
-        return pymysql.connect(
-            host=settings.mysql.host,
-            user=settings.mysql.user,
-            password=settings.mysql.password,
-            database=settings.mysql.database,
-            port=settings.mysql.port,
-            charset=settings.mysql.charset,
-            cursorclass=pymysql.cursors.DictCursor,
-            autocommit=False,
-            connect_timeout=connect_timeout,
-            read_timeout=connect_timeout,
-        )
-    
-    # =========================================================================
     # Statistics & Health
     # =========================================================================
     
@@ -1149,7 +1077,7 @@ class TradingDataEngine:
         """Check engine health."""
         status = {"engine": "ok"}
         
-        # Check DuckDB
+        # Check DuckDB (primary database)
         try:
             with self._conn_lock:
                 self._conn.execute("SELECT 1").fetchone()
@@ -1157,16 +1085,15 @@ class TradingDataEngine:
         except Exception as e:
             status["duckdb"] = f"error: {e}"
         
-        # Check MySQL
+        # PostgreSQL archive is optional - check but don't fail if unavailable
         try:
-            conn = self._get_mysql_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
-            conn.close()
-            status["mysql"] = "ok"
+            from core.database import _check_postgres_available
+            if _check_postgres_available():
+                status["postgres_archive"] = "ok"
+            else:
+                status["postgres_archive"] = "not configured"
         except Exception as e:
-            status["mysql"] = f"error: {e}"
+            status["postgres_archive"] = f"error: {e}"
         
         # Check threads
         status["batch_writer"] = "running" if self._batch_writer_thread and self._batch_writer_thread.is_alive() else "stopped"

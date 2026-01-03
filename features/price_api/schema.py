@@ -457,6 +457,45 @@ CREATE INDEX IF NOT EXISTS idx_trades_wallet_id ON sol_stablecoin_trades(wallet_
 """
 
 # =============================================================================
+# WHALE MOVEMENTS (24h hot storage)
+# =============================================================================
+
+SCHEMA_WHALE_MOVEMENTS = """
+CREATE TABLE IF NOT EXISTS whale_movements (
+    id BIGINT PRIMARY KEY,
+    signature VARCHAR(255),
+    wallet_address VARCHAR(255) NOT NULL,
+    whale_type VARCHAR(50),
+    current_balance DOUBLE,
+    sol_change DOUBLE,
+    abs_change DOUBLE,
+    percentage_moved DOUBLE,
+    direction VARCHAR(10),
+    action VARCHAR(50),
+    movement_significance VARCHAR(50),
+    previous_balance DOUBLE,
+    fee_paid DOUBLE,
+    block_time BIGINT,
+    timestamp TIMESTAMP,
+    received_at TIMESTAMP,
+    slot BIGINT,
+    has_perp_position BOOLEAN,
+    perp_platform VARCHAR(50),
+    perp_direction VARCHAR(10),
+    perp_size DOUBLE,
+    perp_leverage DOUBLE,
+    perp_entry_price DOUBLE,
+    raw_data_json VARCHAR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_whale_wallet ON whale_movements(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_whale_timestamp ON whale_movements(timestamp);
+CREATE INDEX IF NOT EXISTS idx_whale_signature ON whale_movements(signature);
+CREATE INDEX IF NOT EXISTS idx_whale_type ON whale_movements(whale_type);
+"""
+
+# =============================================================================
 # JOB EXECUTION METRICS (for scheduler monitoring - 24hr hot storage)
 # =============================================================================
 
@@ -526,6 +565,7 @@ ALL_SCHEMAS = [
     ("pattern_config_filters", SCHEMA_PATTERN_CONFIG_FILTERS),
     ("buyin_trail_minutes", SCHEMA_BUYIN_TRAIL_MINUTES),
     ("sol_stablecoin_trades", SCHEMA_SOL_STABLECOIN_TRADES),
+    ("whale_movements", SCHEMA_WHALE_MOVEMENTS),
     ("job_execution_metrics", SCHEMA_JOB_EXECUTION_METRICS),
     ("follow_the_goat_tracking", SCHEMA_FOLLOW_THE_GOAT_TRACKING),
 ]
@@ -543,6 +583,7 @@ HOT_TABLES = [
     "wallet_profiles",
     "buyin_trail_minutes",
     "sol_stablecoin_trades",
+    "whale_movements",
     "job_execution_metrics",
 ]
 
@@ -565,6 +606,7 @@ TIMESTAMP_COLUMNS = {
     "wallet_profiles": "trade_timestamp",  # Profiles older than 24h are cleaned from both DuckDB and MySQL
     "buyin_trail_minutes": "created_at",  # Trail data cleaned after 24h
     "sol_stablecoin_trades": "trade_timestamp",  # Keep only 1 hour for fast lookup
+    "whale_movements": "timestamp",
     "job_execution_metrics": "started_at",  # Metrics older than 24h are cleaned
 }
 

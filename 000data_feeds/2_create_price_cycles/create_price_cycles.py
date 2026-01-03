@@ -1,18 +1,21 @@
 """
-Price Cycle Analysis - Using TradingDataEngine (In-Memory DuckDB)
-=================================================================
+Price Cycle Analysis - Using DuckDB Connection Pool
+====================================================
 Migrated from: 000old_code/solana_node/analyze/00price_analysis/price_analysis_simple.py
 
-Reads price data from MySQL (master source) and tracks price cycles
-at multiple thresholds, writing results to:
-- TradingDataEngine (in-memory DuckDB for fast 24hr hot storage)
-- MySQL (historical persistence)
+Reads price data from DuckDB (via connection pool) and tracks price cycles
+at multiple thresholds, writing results to the same DuckDB instance.
+
+When run from master2.py: Uses master2.py's local in-memory DuckDB (registered as "central")
+When run standalone: Uses the default DuckDB connection
 
 Thresholds: 0.2%, 0.25%, 0.3%, 0.35%, 0.4%, 0.45%, 0.5%
 Coin: SOL only (coin_id = 5)
 
-IMPORTANT: This module uses the TradingDataEngine singleton which runs in-memory.
-No file locks, no contention - just fast reads and writes.
+CYCLE LOGIC:
+- A cycle tracks price movement from a start point
+- A cycle ENDS when price drops X% below the HIGHEST price reached in that cycle
+- There can only be 7 active cycles at any time (one per threshold)
 """
 
 import sys
@@ -25,7 +28,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_trading_engine
+from core.database import get_duckdb
 from core.config import settings
 
 # Configure logging
@@ -38,114 +41,89 @@ BATCH_SIZE = 100  # Process up to 100 price points per run
 
 
 # =============================================================================
-# Table Initialization (Tables are created by TradingDataEngine)
-# =============================================================================
-
-def ensure_mysql_tables():
-    """No-op: Tables are created by TradingDataEngine on startup."""
-    # TradingDataEngine creates price_analysis and cycle_tracker tables in-memory
-    logger.debug("Using TradingDataEngine tables (in-memory)")
-    return True
-
-
-# =============================================================================
-# Data Access Functions (Using TradingDataEngine for reads)
+# Data Access Functions (Using DuckDB connection pool)
 # =============================================================================
 
 def get_last_processed_ts() -> Optional[datetime]:
-    """Get the timestamp of the last processed price point from TradingDataEngine."""
+    """Get the timestamp of the last processed price point from DuckDB."""
     try:
-        engine = get_trading_engine()
-        if not engine._running:
-            return None
-        
-        result = engine.read_one("""
-            SELECT MAX(created_at) as max_ts FROM price_analysis WHERE coin_id = ?
-        """, [COIN_ID])
-        return result['max_ts'] if result and result['max_ts'] else None
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute("""
+                SELECT MAX(created_at) as max_ts FROM price_analysis WHERE coin_id = ?
+            """, [COIN_ID]).fetchone()
+            return result[0] if result and result[0] else None
     except Exception as e:
-        logger.debug(f"No previous data found in engine: {e}")
+        logger.debug(f"No previous data found: {e}")
         return None
 
 
 def get_new_price_points(last_ts: Optional[datetime], limit: int = BATCH_SIZE) -> List[Dict]:
-    """Get new price points from TradingDataEngine (in-memory).
+    """Get new price points from DuckDB.
     
-    Reads from in-memory DuckDB for fast access.
+    Reads from the prices table (synced from master.py).
     """
-    from datetime import timedelta
-    
     try:
-        engine = get_trading_engine()
-        if not engine._running:
-            logger.warning("TradingEngine not running - cannot get price points")
-            return []
-        
-        if last_ts:
-            # Continue from where we left off
-            results = engine.read("""
-                SELECT ts as created_at, token, price as value
-                FROM prices
-                WHERE token = 'SOL' AND ts > ?
-                ORDER BY ts ASC
-                LIMIT ?
-            """, [last_ts, limit])
-        else:
-            # FRESH START: Only process data from the last 1 hour
-            logger.info("Fresh start detected - only processing last 1 hour of price data")
-            results = engine.read("""
-                SELECT ts as created_at, token, price as value
-                FROM prices
-                WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 1 HOUR
-                ORDER BY ts ASC
-                LIMIT ?
-            """, [limit])
-        
-        # Convert to list and add sequential IDs
-        rows = list(results)
-        return [
-            {'id': i, 'ts': row['created_at'], 'token': row['token'], 'price': float(row['value'])}
-            for i, row in enumerate(rows)
-        ]
+        with get_duckdb("central", read_only=True) as conn:
+            if last_ts:
+                # Continue from where we left off
+                results = conn.execute("""
+                    SELECT ts as created_at, token, price as value
+                    FROM prices
+                    WHERE token = 'SOL' AND ts > ?
+                    ORDER BY ts ASC
+                    LIMIT ?
+                """, [last_ts, limit]).fetchall()
+            else:
+                # FRESH START: Only process data from the last 1 hour
+                logger.info("Fresh start detected - only processing last 1 hour of price data")
+                results = conn.execute("""
+                    SELECT ts as created_at, token, price as value
+                    FROM prices
+                    WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 1 HOUR
+                    ORDER BY ts ASC
+                    LIMIT ?
+                """, [limit]).fetchall()
+            
+            # Convert to list of dicts with sequential IDs
+            return [
+                {'id': i, 'ts': row[0], 'token': row[1], 'price': float(row[2])}
+                for i, row in enumerate(results)
+            ]
     except Exception as e:
-        logger.error(f"Failed to get price points from engine: {e}")
+        logger.error(f"Failed to get price points: {e}")
         return []
 
 
 def get_threshold_states() -> Dict[float, Dict]:
-    """Load current state for each threshold from TradingDataEngine."""
+    """Load current state for each threshold from DuckDB."""
     states = {}
     try:
-        engine = get_trading_engine()
-        if not engine._running:
-            logger.warning("TradingEngine not running - starting fresh")
-            return states
-        
-        for threshold in THRESHOLDS:
-            result = engine.read_one("""
-                SELECT 
-                    sequence_start_id,
-                    sequence_start_price,
-                    highest_price_recorded,
-                    lowest_price_recorded,
-                    price_cycle
-                FROM price_analysis 
-                WHERE coin_id = ? AND percent_threshold = ?
-                ORDER BY id DESC
-                LIMIT 1
-            """, [COIN_ID, threshold])
-            
-            if result:
-                states[threshold] = {
-                    'sequence_start_id': result['sequence_start_id'],
-                    'sequence_start_price': float(result['sequence_start_price']),
-                    'highest_price_recorded': float(result['highest_price_recorded']),
-                    'lowest_price_recorded': float(result['lowest_price_recorded']),
-                    'price_cycle': result['price_cycle']
-                }
-            
+        with get_duckdb("central", read_only=True) as conn:
+            for threshold in THRESHOLDS:
+                result = conn.execute("""
+                    SELECT 
+                        sequence_start_id,
+                        sequence_start_price,
+                        highest_price_recorded,
+                        lowest_price_recorded,
+                        price_cycle
+                    FROM price_analysis 
+                    WHERE coin_id = ? AND percent_threshold = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, [COIN_ID, threshold]).fetchone()
+                
+                if result:
+                    states[threshold] = {
+                        'sequence_start_id': result[0],
+                        'sequence_start_price': float(result[1]),
+                        'highest_price_recorded': float(result[2]),
+                        'lowest_price_recorded': float(result[3]),
+                        'price_cycle': result[4]
+                    }
+                
     except Exception as e:
-        logger.error(f"Failed to load threshold states from engine: {e}")
+        logger.error(f"Failed to load threshold states: {e}")
     
     return states
 
@@ -155,15 +133,14 @@ def get_threshold_states() -> Dict[float, Dict]:
 # =============================================================================
 
 def get_next_cycle_id() -> int:
-    """Get the next available cycle ID from TradingDataEngine."""
+    """Get the next available cycle ID from DuckDB."""
     max_id = 0
     
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            result = engine.read_one("SELECT MAX(id) as max_id FROM cycle_tracker", [])
-            if result and result['max_id']:
-                max_id = result['max_id']
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute("SELECT MAX(id) as max_id FROM cycle_tracker").fetchone()
+            if result and result[0]:
+                max_id = result[0]
     except:
         pass
     
@@ -171,19 +148,46 @@ def get_next_cycle_id() -> int:
 
 
 def get_next_analysis_id() -> int:
-    """Get the next available price_analysis ID from TradingDataEngine."""
+    """Get the next available price_analysis ID from DuckDB."""
     max_id = 0
     
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            result = engine.read_one("SELECT MAX(id) as max_id FROM price_analysis", [])
-            if result and result['max_id']:
-                max_id = result['max_id']
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute("SELECT MAX(id) as max_id FROM price_analysis").fetchone()
+            if result and result[0]:
+                max_id = result[0]
     except:
         pass
     
     return max_id + 1
+
+
+def get_active_cycle_for_threshold(threshold: float) -> Optional[int]:
+    """Get the active cycle ID for a threshold (if any)."""
+    try:
+        with get_duckdb("central", read_only=True) as conn:
+            result = conn.execute("""
+                SELECT id FROM cycle_tracker
+                WHERE coin_id = ? AND threshold = ? AND cycle_end_time IS NULL
+                ORDER BY cycle_start_time DESC
+                LIMIT 1
+            """, [COIN_ID, threshold]).fetchone()
+            return result[0] if result else None
+    except:
+        return None
+
+
+def close_all_active_cycles_for_threshold(threshold: float, end_time: datetime):
+    """Close ALL active cycles for a threshold (cleanup duplicates)."""
+    try:
+        with get_duckdb("central") as conn:
+            conn.execute("""
+                UPDATE cycle_tracker 
+                SET cycle_end_time = ?
+                WHERE coin_id = ? AND threshold = ? AND cycle_end_time IS NULL
+            """, [end_time, COIN_ID, threshold])
+    except Exception as e:
+        logger.debug(f"Failed to close active cycles for {threshold}%: {e}")
 
 
 def create_new_cycle(
@@ -192,56 +196,50 @@ def create_new_cycle(
     sequence_start_id: int,
     start_price: float
 ) -> Optional[int]:
-    """Create a new cycle with dual-write to TradingDataEngine and MySQL."""
+    """
+    Create a new cycle in DuckDB.
+    
+    IMPORTANT: First closes any existing active cycles for this threshold
+    to ensure only ONE active cycle per threshold at any time.
+    """
+    # Close any existing active cycles for this threshold first
+    # This prevents duplicate active cycles
+    close_all_active_cycles_for_threshold(threshold, start_time)
+    
     cycle_id = get_next_cycle_id()
     
-    engine_ok = False
-    mysql_ok = False
-    
-    # Write to TradingDataEngine (in-memory DuckDB)
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            engine.write('cycle_tracker', {
-                'id': cycle_id,
-                'coin_id': COIN_ID,
-                'threshold': threshold,
-                'cycle_start_time': start_time,
-                'cycle_end_time': None,
-                'sequence_start_id': sequence_start_id,
-                'sequence_start_price': start_price,
-                'highest_price_reached': start_price,
-                'lowest_price_reached': start_price,
-                'max_percent_increase': 0.0,
-                'max_percent_increase_from_lowest': 0.0,
-                'total_data_points': 1,
-                'created_at': datetime.now()
-            })
-            engine_ok = True
+        with get_duckdb("central") as conn:
+            conn.execute("""
+                INSERT INTO cycle_tracker (
+                    id, coin_id, threshold, cycle_start_time, cycle_end_time,
+                    sequence_start_id, sequence_start_price, highest_price_reached,
+                    lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
+                    total_data_points, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                cycle_id, COIN_ID, threshold, start_time, None,
+                sequence_start_id, start_price, start_price,
+                start_price, 0.0, 0.0,
+                1, datetime.now()
+            ])
+            logger.info(f"Created cycle #{cycle_id} for threshold {threshold}%")
+            return cycle_id
     except Exception as e:
-        logger.error(f"TradingEngine cycle insert failed: {e}")
-    
-    # DuckDB only - no MySQL writes
-    if engine_ok:
-        logger.info(f"Created cycle #{cycle_id} for threshold {threshold}%")
-        return cycle_id
-    
-    return None
+        logger.error(f"Cycle insert failed: {e}")
+        return None
 
 
 def close_cycle(cycle_id: int, end_time: datetime):
     """Close a cycle by setting its end time."""
-    # Update TradingDataEngine only - no MySQL
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            engine.execute("""
+        with get_duckdb("central") as conn:
+            conn.execute("""
                 UPDATE cycle_tracker SET cycle_end_time = ? WHERE id = ?
             """, [end_time, cycle_id])
+        logger.debug(f"Closed cycle #{cycle_id}")
     except Exception as e:
-        logger.error(f"TradingEngine cycle close failed: {e}")
-    
-    logger.debug(f"Closed cycle #{cycle_id}")
+        logger.error(f"Cycle close failed: {e}")
 
 
 def update_cycle_stats(
@@ -252,11 +250,9 @@ def update_cycle_stats(
     max_from_lowest: float
 ):
     """Update cycle statistics."""
-    # Update TradingDataEngine only - no MySQL
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            engine.execute("""
+        with get_duckdb("central") as conn:
+            conn.execute("""
                 UPDATE cycle_tracker SET
                     total_data_points = total_data_points + 1,
                     highest_price_reached = GREATEST(highest_price_reached, ?),
@@ -266,7 +262,7 @@ def update_cycle_stats(
                 WHERE id = ?
             """, [highest_price, lowest_price, max_increase, max_from_lowest, cycle_id])
     except Exception as e:
-        logger.debug(f"TradingEngine cycle stats update skipped: {e}")
+        logger.debug(f"Cycle stats update skipped: {e}")
 
 
 # =============================================================================
@@ -274,37 +270,25 @@ def update_cycle_stats(
 # =============================================================================
 
 def insert_price_analysis_batch(records: List[tuple]) -> bool:
-    """Batch insert price analysis records to TradingEngine (in-memory DuckDB only)."""
+    """Batch insert price analysis records to DuckDB."""
     if not records:
         return True
     
-    # Write to TradingDataEngine only - no MySQL
     try:
-        engine = get_trading_engine()
-        if engine._running:
+        with get_duckdb("central") as conn:
             for record in records:
-                # Convert tuple to dict for engine.write()
-                engine.write('price_analysis', {
-                    'id': record[0],
-                    'coin_id': record[1],
-                    'price_point_id': record[2],
-                    'sequence_start_id': record[3],
-                    'sequence_start_price': record[4],
-                    'current_price': record[5],
-                    'percent_threshold': record[6],
-                    'percent_increase': record[7],
-                    'highest_price_recorded': record[8],
-                    'lowest_price_recorded': record[9],
-                    'procent_change_from_highest_price_recorded': record[10],
-                    'percent_increase_from_lowest': record[11],
-                    'price_cycle': record[12],
-                    'created_at': record[13]
-                })
+                conn.execute("""
+                    INSERT INTO price_analysis (
+                        id, coin_id, price_point_id, sequence_start_id, sequence_start_price,
+                        current_price, percent_threshold, percent_increase, highest_price_recorded,
+                        lowest_price_recorded, procent_change_from_highest_price_recorded,
+                        percent_increase_from_lowest, price_cycle, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, list(record))
             return True
     except Exception as e:
-        logger.error(f"TradingEngine price_analysis insert failed: {e}")
-    
-    return False
+        logger.error(f"Price analysis insert failed: {e}")
+        return False
 
 
 def process_price_point(
@@ -337,13 +321,17 @@ def process_price_point(
             previous_lowest = state['lowest_price_recorded']
             price_cycle = state['price_cycle']
             
+            # Update highest/lowest FIRST (within current cycle)
+            current_highest = max(previous_highest, current_price)
+            current_lowest = min(previous_lowest, current_price)
+            
             # Check if we need to reset the cycle
+            # A cycle ends when price drops X% from the HIGHEST price reached in this cycle
             reset_cycle = False
-            if current_price < previous_highest:
-                drop_percentage = ((current_price - previous_highest) / previous_highest) * 100
-                if drop_percentage < -threshold:
-                    reset_cycle = True
-                    logger.debug(f"Cycle reset: {threshold}% threshold, drop {drop_percentage:.4f}%")
+            drop_percentage = ((current_price - current_highest) / current_highest) * 100
+            if drop_percentage <= -threshold:
+                reset_cycle = True
+                logger.debug(f"Cycle reset: {threshold}% threshold, price ${current_price:.4f} dropped {drop_percentage:.4f}% from highest ${current_highest:.4f}")
             
             if reset_cycle:
                 # Close the previous cycle
@@ -358,9 +346,9 @@ def process_price_point(
                 if price_cycle is None:
                     continue
             else:
-                # Continue current sequence
-                highest_price_recorded = max(previous_highest, current_price)
-                lowest_price_recorded = min(previous_lowest, current_price)
+                # Continue current cycle - use the updated highest/lowest
+                highest_price_recorded = current_highest
+                lowest_price_recorded = current_lowest
                 
                 # Update cycle stats
                 percent_increase = ((highest_price_recorded - sequence_start_price) / sequence_start_price) * 100 if sequence_start_price > 0 else 0.0
@@ -424,9 +412,6 @@ def process_price_cycles() -> int:
     Returns:
         Number of price points processed
     """
-    # Ensure MySQL tables exist (TradingDataEngine tables are created at engine startup)
-    ensure_mysql_tables()
-    
     # Get last processed timestamp
     last_ts = get_last_processed_ts()
     
@@ -468,7 +453,7 @@ def run_continuous(interval_seconds: int = 5):
     
     logger.info(f"Starting continuous processing (interval: {interval_seconds}s)")
     logger.info(f"Thresholds: {THRESHOLDS}")
-    logger.info(f"Reading from: MySQL price_points (coin_id={COIN_ID})")
+    logger.info(f"Reading from: DuckDB 'central' connection")
     
     try:
         while True:

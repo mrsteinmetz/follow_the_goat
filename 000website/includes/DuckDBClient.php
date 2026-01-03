@@ -12,7 +12,7 @@ class DuckDBClient {
     private string $apiBaseUrl;
     private int $timeout;
     
-    public function __construct(string $apiBaseUrl = 'http://127.0.0.1:5050', int $timeout = 30) {
+    public function __construct(string $apiBaseUrl = 'http://127.0.0.1:5051', int $timeout = 30) {
         $this->apiBaseUrl = rtrim($apiBaseUrl, '/');
         $this->timeout = $timeout;
     }

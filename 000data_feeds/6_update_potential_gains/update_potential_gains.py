@@ -23,7 +23,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb, get_mysql
+from core.database import get_duckdb
 
 # Configure logger
 logger = logging.getLogger("update_potential_gains")

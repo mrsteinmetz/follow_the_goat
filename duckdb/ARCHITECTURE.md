@@ -18,22 +18,26 @@
 │   └──────────────┘         └────────┬─────────┘         └────────────┘  │
 │                                     │                                    │
 │                          ┌──────────┴──────────┐                        │
-│                          │    DUAL WRITE       │                        │
+│                          │   DuckDB PRIMARY    │                        │
 │                          └──────────┬──────────┘                        │
 │                                     │                                    │
 │              ┌──────────────────────┼──────────────────────┐            │
 │              │                      │                      │            │
 │              ▼                      │                      ▼            │
-│   ┌──────────────────┐             │         ┌──────────────────┐      │
-│   │     DuckDB       │             │         │      MySQL       │      │
-│   │   (24hr Hot)     │◀────────────┘────────▶│  (Full History)  │      │
-│   │  central.duckdb  │                       │    solcatcher    │      │
-│   └──────────────────┘                       └──────────────────┘      │
+│   ┌──────────────────┐      (archive on         ┌──────────────────┐   │
+│   │     DuckDB       │        cleanup)          │  MySQL ARCHIVE   │   │
+│   │   (24hr Hot)     │──────────────────────────│  (Ubuntu local)  │   │
+│   │   In-Memory      │                          │  Historical only │   │
+│   └──────────────────┘                          └──────────────────┘   │
 │                                                                          │
-│   • Fast reads for                            • Master storage           │
-│     recent data                               • All historical data      │
-│   • Auto-cleanup                              • Never deleted            │
-│     after 24 hours                            • Source of truth          │
+│   • PRIMARY for all                             • Archive storage        │
+│     live operations                             • Old data preserved     │
+│   • Lightning fast                              • Optional (if MySQL     │
+│   • Auto-cleanup 24h                              configured)            │
+│                                                                          │
+│   ┌──────────────────┐                                                  │
+│   │ plays_cache.json │ ◀── Plays configuration (read at startup)       │
+│   └──────────────────┘                                                  │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -44,13 +48,14 @@
 
 | Database | Location | Purpose |
 |----------|----------|---------|
-| `central.duckdb` | `000data_feeds/` | Central DuckDB for all hot data (24hr) |
-| `prices.duckdb` | `000data_feeds/1_jupiter_get_prices/` | Jupiter price data (24hr hot, no archive) |
-| `solcatcher` | MySQL (116.202.51.115) | Master MySQL database (full history) |
+| `central.duckdb` | `~/follow_the_goat_data/` (WSL native) | Central DuckDB for all hot data (24hr) |
+| `prices.duckdb` | `~/follow_the_goat_data/` (WSL native) | Jupiter price data (24hr hot) |
+| `plays_cache.json` | `config/` | Plays configuration (read-only) |
+| `follow_the_goat_archive` | MySQL (127.0.0.1 - Ubuntu local) | Archive database for expired data |
 
 ---
 
-## Hot/Cold Storage Pattern
+## Hot/Cold Storage Pattern (Archive on Cleanup)
 
 Every time-series table follows this pattern:
 
@@ -61,25 +66,28 @@ Every time-series table follows this pattern:
                               │
                               ▼
                     ┌─────────────────┐
-                    │   DUAL WRITE    │
+                    │   DuckDB ONLY   │
+                    │   (Primary DB)  │
                     └────────┬────────┘
                              │
-              ┌──────────────┼──────────────┐
-              │              │              │
-              ▼              │              ▼
-┌─────────────────────┐      │   ┌─────────────────────┐
-│   DuckDB (HOT)      │      │   │   MySQL (MASTER)    │
-│   Last 24 hours     │      │   │   Full history      │
-│   Fast queries      │      │   │   Never deleted     │
-│   Auto-cleanup      │      │   │   Source of truth   │
-└─────────────────────┘      │   └─────────────────────┘
-                             │
-                    (hourly cleanup)
-                             │
                              ▼
-                    Data older than 24h
-                    deleted from DuckDB
-                    (kept in MySQL)
+              ┌─────────────────────────┐
+              │      DuckDB (HOT)       │
+              │    In-Memory Storage    │
+              │      24-72 hours        │
+              │     Fast queries        │
+              └───────────┬─────────────┘
+                          │
+                 (hourly cleanup job)
+                          │
+              ┌───────────┴─────────────┐
+              │                         │
+              ▼                         ▼
+┌───────────────────────┐   ┌───────────────────────┐
+│  1. Archive to MySQL  │   │  2. Delete from       │
+│     (if configured)   │   │     DuckDB            │
+│     _archive tables   │   │     (always)          │
+└───────────────────────┘   └───────────────────────┘
 ```
 
 ---

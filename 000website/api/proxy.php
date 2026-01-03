@@ -10,7 +10,7 @@
  */
 
 // Flask API URL (internal server address)
-define('FLASK_API_URL', 'http://127.0.0.1:5050');
+define('FLASK_API_URL', 'http://127.0.0.1:5051');
 
 // Set JSON content type for response
 header('Content-Type: application/json');

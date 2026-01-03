@@ -8,8 +8,10 @@
  */
 
 // --- DuckDB API Client ---
+// Port 5051 = Website API (can restart freely)
+// Port 5050 = Data Engine API (master.py, never restart)
 require_once __DIR__ . '/includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5050');
+define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
 $duckdb = new DuckDBClient(DUCKDB_API_URL);
 $use_duckdb = $duckdb->isAvailable();
 

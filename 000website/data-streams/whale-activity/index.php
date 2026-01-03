@@ -7,9 +7,8 @@
  * This reads from the in-memory DuckDB (24hr hot storage)
  */
 
-// --- .NET Webhook API URL ---
-// Note: Webhook is on HTTP only (no SSL binding)
-define('WEBHOOK_API_URL', 'http://quicknode.smz.dk');
+// --- Webhook API URL (FastAPI on 8001) ---
+define('WEBHOOK_API_URL', 'http://127.0.0.1:8001/webhook');
 
 // --- Base URL for template ---
 $baseUrl = '../..';

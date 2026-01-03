@@ -1,1 +1,223 @@
-bash /mnt/c/0000websites/00phpsites/follow_the_goat/start_scheduler.sh
+# ================================================================
+# FOLLOW THE GOAT - COMPLETE STARTUP GUIDE
+# ================================================================
+#
+# Architecture Overview:
+# ----------------------
+# master.py      = Data Engine (NEVER restart - collects all data)
+# website_api.py = Website API PROXY (CAN restart freely)
+# master2.py     = Trading Logic (CAN restart freely)
+#
+# Data Flow:
+#   master.py -> In-Memory DuckDB -> PostgreSQL (archive)
+#                    |
+#                    v
+#   website_api.py (HTTP proxy) -> Website (PHP)
+#   master2.py (HTTP sync) -> Trading decisions
+#
+# Port Assignments:
+#   5050 = Data Engine API (master.py - in-memory DuckDB)
+#   5051 = Website API (website_api.py - HTTP proxy to 5050)
+#   8000 = PHP Website Server
+#   8001 = Webhook Server (QuickNode)
+#
+# Services Started by master.py:
+#   - TradingDataEngine (in-memory DuckDB - NOT file-based!)
+#   - Binance Order Book Stream (SOLUSDT)
+#   - FastAPI Data Engine API (port 5050)
+#   - FastAPI Webhook Server (port 8001)
+#   - PHP Website Server (port 8000)
+#   - Scheduled jobs: Jupiter prices, price cycles, wallet profiles
+#
+# Services Started by website_api.py:
+#   - Flask Website API (port 5051)
+#   - PROXIES to master.py's API (port 5050) via HTTP
+#   - NO file-based DuckDB (avoids crash issues!)
+#
+# Services Started by master2.py:
+#   - Trading jobs: follow_the_goat, trailing_stop, train_validator
+#   - Own in-memory DuckDB for fast trading decisions
+#   - Syncs data from master.py API (port 5050)
+
+# ================================================================
+# QUICK START (Copy & Paste)
+# ================================================================
+
+# TERMINAL 1 - Start Data Engine (NEVER restart):
+wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/master.py"
+
+# TERMINAL 2 - Start Website API (CAN restart for website changes):
+wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/website_api.py"
+
+# TERMINAL 3 - Start Trading Logic (CAN restart for trading changes):
+wsl bash -c "source ~/follow_the_goat_venv/bin/activate && cd /mnt/c/0000websites/00phpsites/follow_the_goat && python scheduler/master2.py"
+
+# ================================================================
+# STEP-BY-STEP STARTUP
+# ================================================================
+#
+# 1. Open PowerShell Terminal #1
+# 2. Run the master.py command above
+# 3. Wait for: "All systems running! Press Ctrl+C to stop cleanly."
+# 4. Verify at: http://127.0.0.1:5050/health
+#
+# 5. Open PowerShell Terminal #2
+# 6. Run the website_api.py command above
+# 7. Wait for: "Starting Website API Server"
+# 8. Verify at: http://127.0.0.1:5051/health
+#
+# 9. Open PowerShell Terminal #3
+# 10. Run the master2.py command above
+# 11. Wait for: "Trading logic running!"
+
+# ================================================================
+# RESTART GUIDE (What You Can Safely Restart)
+# ================================================================
+#
+# ✅ SAFE TO RESTART (No data loss):
+#   - website_api.py - For any website/API changes
+#   - master2.py     - For trading logic changes
+#
+# ❌ AVOID RESTARTING:
+#   - master.py - This runs the data collection engine
+#     Only restart if absolutely necessary (config changes, bugs)
+#
+# To restart Website API:
+#   1. Press Ctrl+C in Terminal #2 (website_api.py)
+#   2. Edit your website files
+#   3. Run the website_api.py command again
+#
+# To restart Trading Logic:
+#   1. Press Ctrl+C in Terminal #3 (master2.py)
+#   2. Edit your trading files
+#   3. Run the master2.py command again
+
+# ================================================================
+# CHECK STATUS
+# ================================================================
+
+# Check if master.py (Data Engine) is running:
+wsl bash -c "curl -s http://127.0.0.1:5050/health | python3 -m json.tool"
+
+# Check if website_api.py is running:
+wsl bash -c "curl -s http://127.0.0.1:5051/health | python3 -m json.tool"
+
+# Check table row counts:
+wsl bash -c "curl -s http://127.0.0.1:5051/stats | python3 -m json.tool"
+
+# Check webhook server:
+wsl bash -c "curl -s http://127.0.0.1:8001/webhook/health"
+
+# Check PHP website:
+wsl bash -c "curl -s http://127.0.0.1:8000 | head -5"
+
+# ================================================================
+# KILL EVERYTHING
+# ================================================================
+
+# Stop all services gracefully:
+wsl bash -c "pkill -f 'scheduler/master.py'; pkill -f 'scheduler/master2.py'; pkill -f 'scheduler/website_api.py'; pkill -f 'php -S'"
+
+# Force kill if needed:
+wsl bash -c "pkill -9 -f 'scheduler/master.py'; pkill -9 -f 'scheduler/master2.py'; pkill -9 -f 'scheduler/website_api.py'; fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp 2>/dev/null"
+
+# ================================================================
+# ENDPOINTS
+# ================================================================
+#
+# Data Engine API (port 5050) - Minimal API for inter-process communication:
+#   http://127.0.0.1:5050/health          - System health
+#   http://127.0.0.1:5050/tables          - Table row counts
+#   http://127.0.0.1:5050/backfill/{table} - Get historical data
+#   http://127.0.0.1:5050/latest/{table}  - Get recent records
+#   http://127.0.0.1:5050/price/{token}   - Get token price
+#
+# Website API (port 5051) - Full API for website:
+#   http://127.0.0.1:5051/health          - API health
+#   http://127.0.0.1:5051/price_points    - Price data for charts
+#   http://127.0.0.1:5051/cycle_tracker   - Price cycles
+#   http://127.0.0.1:5051/scheduler_status - Job status
+#   http://127.0.0.1:5051/plays           - Trading plays
+#   http://127.0.0.1:5051/buyins          - Trade buyins
+#   http://127.0.0.1:5051/profiles        - Wallet profiles
+#
+# Webhook Server (port 8001):
+#   http://127.0.0.1:8001/webhook/health  - Webhook health
+#   http://127.0.0.1:8001/webhook/api/trades - Recent trades
+#   http://127.0.0.1:8001/webhook/api/whale-movements - Whale activity
+#
+# PHP Website (port 8000):
+#   http://127.0.0.1:8000/                - Dashboard
+#   http://127.0.0.1:8000/goats/          - Goat plays
+#   http://127.0.0.1:8000/pages/cycles/   - Price cycles
+#
+# External Access (from internet):
+#   http://116.202.51.115:8000/           - PHP Website
+#   http://116.202.51.115:5051/health     - Website API
+#   http://116.202.51.115:8001/webhook/health - Webhook
+
+# ================================================================
+# TROUBLESHOOTING
+# ================================================================
+#
+# "ModuleNotFoundError: No module named 'X'"
+#   -> Install missing module:
+#      wsl bash -c "source ~/follow_the_goat_venv/bin/activate && pip install X"
+#
+# "Address already in use"
+#   -> Kill existing processes:
+#      wsl bash -c "fuser -k 5050/tcp 5051/tcp 8000/tcp 8001/tcp"
+#
+# Website shows "API not available":
+#   -> Make sure website_api.py is running on port 5051
+#   -> Check: curl http://127.0.0.1:5051/health
+#
+# master2.py can't connect to Data Engine:
+#   -> Make sure master.py is running first
+#   -> Check: curl http://127.0.0.1:5050/health
+#
+# External access not working:
+#   -> Check Windows Firewall allows ports 5050, 5051, 8000, 8001
+#   -> Run as Admin: netsh advfirewall firewall add rule name="Port 5051" dir=in action=allow protocol=tcp localport=5051
+
+# ================================================================
+# LOG FILES
+# ================================================================
+#
+# Scheduler errors: logs/scheduler_errors.log.1
+# Trading logs:     000trading/logs/follow_the_goat.log.1
+# Trailing stop:    000trading/logs/sell_trailing_stop.log.1
+# Webhook logs:     features/logs/webhook.log.1
+
+# ================================================================
+# SCHEDULED JOBS (master.py)
+# ================================================================
+#
+# Every 1 second:
+#   - fetch_jupiter_prices    : Get SOL price from Jupiter
+#   - sync_trades_from_webhook: Pull new trades into DuckDB
+#
+# Every 10 seconds:
+#   - process_wallet_profiles : Build wallet analytics
+#
+# Every 15 seconds:
+#   - process_price_cycles    : Detect price cycles
+#
+# Hourly:
+#   - cleanup_duckdb_hot_tables: Remove data older than 24h
+#   - cleanup_wallet_profiles  : Archive old profiles
+
+# ================================================================
+# SCHEDULED JOBS (master2.py)
+# ================================================================
+#
+# Every 5 seconds:
+#   - follow_the_goat         : Check for buy signals
+#   - trailing_stop_seller    : Monitor and sell positions
+#
+# Every 30 seconds:
+#   - train_validator         : Update ML models
+#
+# Every 60 seconds:
+#   - update_potential_gains  : Calculate profit projections
+#   - create_new_patterns     : Generate new trading patterns

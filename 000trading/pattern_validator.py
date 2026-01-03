@@ -30,7 +30,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, get_mysql
+from core.database import get_duckdb
 
 # Import trail generator (direct import after adding module dir to path)
 from trail_generator import (
@@ -781,49 +781,65 @@ def save_filter_results_to_db(
     play_id: int,
     project_results: List[Dict[str, Any]]
 ) -> bool:
-    """Persist filter evaluation results to the trade_filter_results table."""
+    """Persist filter evaluation results to DuckDB (trade_filter_results table)."""
     try:
-        with get_mysql() as conn:
-            cursor = conn.cursor()
+        rows_to_insert = []
+        for project_result in project_results:
+            project_id = project_result.get('project_id')
+            filter_results = project_result.get('filter_results', [])
             
-            insert_sql = """
-                INSERT INTO trade_filter_results (
-                    buyin_id, play_id, project_id, filter_id, filter_name,
-                    field_column, section, minute, from_value, to_value,
-                    actual_value, passed, error
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            
-            rows_to_insert = []
-            for project_result in project_results:
-                project_id = project_result.get('project_id')
-                filter_results = project_result.get('filter_results', [])
+            for fr in filter_results:
+                rows_to_insert.append([
+                    buyin_id,
+                    play_id,
+                    project_id,
+                    fr.get('filter_id'),
+                    fr.get('filter_name'),
+                    fr.get('field'),
+                    fr.get('section'),
+                    fr.get('minute', 0),
+                    fr.get('from_value'),
+                    fr.get('to_value'),
+                    fr.get('actual_value'),
+                    1 if fr.get('passed') else 0,
+                    fr.get('error'),
+                ])
+        
+        if rows_to_insert:
+            with get_duckdb("central") as conn:
+                # Ensure table exists
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS trade_filter_results (
+                        id INTEGER PRIMARY KEY,
+                        buyin_id INTEGER,
+                        play_id INTEGER,
+                        project_id INTEGER,
+                        filter_id INTEGER,
+                        filter_name VARCHAR,
+                        field_column VARCHAR,
+                        section VARCHAR,
+                        minute INTEGER,
+                        from_value DOUBLE,
+                        to_value DOUBLE,
+                        actual_value DOUBLE,
+                        passed INTEGER,
+                        error VARCHAR,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
                 
-                for fr in filter_results:
-                    rows_to_insert.append((
-                        buyin_id,
-                        play_id,
-                        project_id,
-                        fr.get('filter_id'),
-                        fr.get('filter_name'),
-                        fr.get('field'),
-                        fr.get('section'),
-                        fr.get('minute', 0),
-                        fr.get('from_value'),
-                        fr.get('to_value'),
-                        fr.get('actual_value'),
-                        1 if fr.get('passed') else 0,
-                        fr.get('error'),
-                    ))
-            
-            if rows_to_insert:
-                cursor.executemany(insert_sql, rows_to_insert)
-                conn.commit()
-                logger.info("Saved %d filter results for buyin_id=%s", len(rows_to_insert), buyin_id)
-            
-            cursor.close()
-            return True
-            
+                conn.executemany("""
+                    INSERT INTO trade_filter_results (
+                        buyin_id, play_id, project_id, filter_id, filter_name,
+                        field_column, section, minute, from_value, to_value,
+                        actual_value, passed, error
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, rows_to_insert)
+                
+            logger.info("Saved %d filter results for buyin_id=%s", len(rows_to_insert), buyin_id)
+        
+        return True
+        
     except Exception as exc:
         logger.error("Failed to save filter results for buyin_id=%s: %s", buyin_id, exc)
         return False

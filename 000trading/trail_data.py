@@ -33,7 +33,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, get_mysql
+from core.database import get_duckdb
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -365,19 +365,14 @@ def ensure_trail_table_exists_mysql() -> None:
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """
     
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(create_sql)
-        logger.debug("Ensured buyin_trail_minutes table exists in MySQL")
-    except Exception as e:
-        logger.warning(f"MySQL table creation failed: {e}")
+    # MySQL table creation removed - DuckDB is the primary database
+    pass
 
 
 def ensure_trail_tables_exist() -> None:
-    """Ensure the buyin_trail_minutes table exists in both databases."""
+    """Ensure the buyin_trail_minutes table exists in DuckDB."""
     ensure_trail_table_exists_duckdb()
-    ensure_trail_table_exists_mysql()
+    # MySQL table creation removed
 
 
 # =============================================================================
@@ -756,34 +751,12 @@ def insert_trail_rows_mysql(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     if not rows:
         return False
     
-    columns = _get_all_columns()
-    col_list = ", ".join(columns)
-    placeholders = ", ".join(["%s" for _ in columns])
-    
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                # Delete existing rows for this buyin (in case of re-run)
-                cursor.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = %s", [buyin_id])
-                
-                # Insert new rows
-                for row in rows:
-                    values = [row.get(col) for col in columns]
-                    cursor.execute(
-                        f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
-                        values
-                    )
-        
-        logger.debug(f"Inserted {len(rows)} trail rows into MySQL for buyin_id={buyin_id}")
-        return True
-        
-    except Exception as e:
-        logger.warning(f"MySQL insert failed for buyin_id={buyin_id}: {e}")
-        return False
+    # MySQL insert removed - DuckDB is the primary database
+    return True
 
 
 def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
-    """Insert trail data for a buyin into both DuckDB and MySQL.
+    """Insert trail data for a buyin into DuckDB.
     
     This is the main entry point for persisting trail data.
     
@@ -792,7 +765,7 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
         trail_payload: The trail data payload from generate_trail_payload()
         
     Returns:
-        True if at least DuckDB insert succeeded, False otherwise
+        True if DuckDB insert succeeded, False otherwise
     """
     # Ensure tables exist
     ensure_trail_tables_exist()
@@ -804,14 +777,11 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
         logger.warning(f"No rows generated for buyin_id={buyin_id}")
         return False
     
-    # Insert into DuckDB (primary)
+    # Insert into DuckDB (primary and only database)
     duckdb_success = insert_trail_rows_duckdb(buyin_id, rows)
     
-    # Insert into MySQL (secondary)
-    mysql_success = insert_trail_rows_mysql(buyin_id, rows)
-    
     if duckdb_success:
-        logger.info(f"✓ Inserted {len(rows)} trail rows for buyin_id={buyin_id} (MySQL: {mysql_success})")
+        logger.info(f"✓ Inserted {len(rows)} trail rows for buyin_id={buyin_id}")
     else:
         logger.error(f"✗ Failed to insert trail rows for buyin_id={buyin_id}")
     
@@ -902,13 +872,5 @@ def delete_trail_for_buyin(buyin_id: int) -> bool:
     except Exception as e:
         logger.warning(f"DuckDB delete failed for buyin_id={buyin_id}: {e}")
     
-    try:
-        with get_mysql() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = %s", [buyin_id])
-        mysql_success = True
-    except Exception as e:
-        logger.warning(f"MySQL delete failed for buyin_id={buyin_id}: {e}")
-    
-    return duckdb_success or mysql_success
+    return duckdb_success
 

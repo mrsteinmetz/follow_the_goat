@@ -26,6 +26,7 @@ websocket-client>=1.7.0
 
 # Data processing
 pandas>=2.0.0
+pyarrow>=14.0.0  # Fast DuckDB insertion via zero-copy Arrow tables
 
 # Environment management
 python-dotenv>=1.0.0

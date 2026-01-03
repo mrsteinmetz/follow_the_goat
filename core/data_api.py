@@ -291,17 +291,20 @@ async def execute_query(request: QueryRequest):
 @app.get("/backfill/{table}")
 async def get_backfill_data(
     table: str,
-    hours: int = Query(default=2, ge=1, le=24, description="Hours of data to retrieve"),
+    hours: int = Query(default=None, ge=1, le=24, description="Hours of data to retrieve (use hours OR minutes)"),
+    minutes: int = Query(default=None, ge=1, le=60, description="Minutes of data to retrieve (for short intervals)"),
     limit: int = Query(default=10000, ge=1, le=100000, description="Maximum records to return")
 ):
     """
     Get historical data for backfill on startup.
     
     This endpoint is used by master2.py to load recent data when it starts.
+    Use 'hours' for initial backfill (1-24 hours) or 'minutes' for sync (1-60 minutes).
     
     Args:
         table: Table name to query
-        hours: Hours of data to retrieve (default: 2, max: 24)
+        hours: Hours of data to retrieve (default: 2, max: 24) - use for startup backfill
+        minutes: Minutes of data to retrieve (max: 60) - use for continuous sync
         limit: Maximum records to return (default: 10000, max: 100000)
     
     Returns:
@@ -336,7 +339,17 @@ async def get_backfill_data(
             detail=f"Unknown table '{table}' or no timestamp column defined"
         )
     
-    cutoff = datetime.now() - timedelta(hours=hours)
+    # Calculate cutoff time - prefer minutes for short intervals, default to 2 hours
+    if minutes is not None:
+        cutoff = datetime.now() - timedelta(minutes=minutes)
+        time_desc = f"{minutes} minutes"
+    elif hours is not None:
+        cutoff = datetime.now() - timedelta(hours=hours)
+        time_desc = f"{hours} hours"
+    else:
+        # Default to 2 hours if neither specified
+        cutoff = datetime.now() - timedelta(hours=2)
+        time_desc = "2 hours (default)"
     
     try:
         # Query with time filter
@@ -350,9 +363,9 @@ async def get_backfill_data(
             "success": True,
             "table": table,
             "count": len(serialized),
-            "results": serialized,
+            "records": serialized,  # Use 'records' for consistency with DataClient
             "cutoff_time": cutoff.isoformat(),
-            "hours": hours
+            "time_range": time_desc
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Backfill query failed: {e}")

@@ -28,7 +28,7 @@ import atexit
 import duckdb
 import time
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -43,8 +43,18 @@ import logging
 import traceback
 import pandas as pd
 
+# Try to import PyArrow for fast DuckDB insertion (zero-copy)
+try:
+    import pyarrow as pa
+    HAS_PYARROW = True
+except ImportError:
+    HAS_PYARROW = False
+
 from core.config import settings
 from core.data_client import DataClient, get_client
+
+# Import schemas
+from features.price_api.schema import SCHEMA_BUYIN_TRAIL_MINUTES
 
 # Import job status tracking from shared module
 from scheduler.status import track_job, update_job_status, set_scheduler_start_time, stop_metrics_writer
@@ -283,7 +293,8 @@ def init_local_duckdb():
             tolerance DOUBLE,
             potential_gains DOUBLE,
             our_profit_loss DOUBLE,
-            our_exit_timestamp TIMESTAMP
+            our_exit_timestamp TIMESTAMP,
+            fifteen_min_trail JSON
         )
         """,
         """
@@ -350,24 +361,7 @@ def init_local_duckdb():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """,
-        """
-        CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
-            id BIGINT PRIMARY KEY,
-            buyin_id BIGINT NOT NULL,
-            minute_offset INTEGER NOT NULL,
-            price_start DOUBLE,
-            price_end DOUBLE,
-            price_high DOUBLE,
-            price_low DOUBLE,
-            price_change_pct DOUBLE,
-            volume_imbalance DOUBLE,
-            bid_depth DOUBLE,
-            ask_depth DOUBLE,
-            spread_bps DOUBLE,
-            order_book_pressure DOUBLE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """,
+        SCHEMA_BUYIN_TRAIL_MINUTES,  # Use full schema from features/price_api/schema.py
         """
         CREATE TABLE IF NOT EXISTS order_book_features (
             id INTEGER PRIMARY KEY,
@@ -385,7 +379,21 @@ def init_local_duckdb():
             total_depth_10 DOUBLE NOT NULL,
             volume_imbalance DOUBLE NOT NULL,
             microprice DOUBLE,
-            source VARCHAR(20) NOT NULL
+            source VARCHAR(20) NOT NULL,
+            bid_depth_bps_5 DOUBLE,
+            bid_depth_bps_10 DOUBLE,
+            bid_depth_bps_25 DOUBLE,
+            ask_depth_bps_5 DOUBLE,
+            ask_depth_bps_10 DOUBLE,
+            ask_depth_bps_25 DOUBLE,
+            bid_vwap_10 DOUBLE,
+            ask_vwap_10 DOUBLE,
+            bid_slope DOUBLE,
+            ask_slope DOUBLE,
+            microprice_dev_bps DOUBLE,
+            net_liquidity_change_1s DOUBLE,
+            bids_json TEXT,
+            asks_json TEXT
         )
         """,
         """
@@ -1111,6 +1119,83 @@ def create_local_api() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
     
+    @app.get("/job_metrics")
+    async def get_job_metrics_endpoint(hours: float = Query(default=1.0)):
+        """
+        Get job execution metrics from master.py's TradingDataEngine.
+        
+        This queries the job_execution_metrics table in master.py's DuckDB
+        via the DataClient.
+        """
+        if _data_client is None:
+            raise HTTPException(status_code=503, detail="Data client not initialized")
+        
+        try:
+            minutes = int(hours * 60)
+            
+            # Query master.py's DuckDB for job execution metrics
+            results = _data_client.query(f"""
+                SELECT 
+                    job_id,
+                    COUNT(*) as execution_count,
+                    AVG(duration_ms) as avg_duration_ms,
+                    MAX(duration_ms) as max_duration_ms,
+                    MIN(duration_ms) as min_duration_ms,
+                    SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
+                    MAX(started_at) as last_execution
+                FROM job_execution_metrics
+                WHERE started_at >= NOW() - INTERVAL {minutes} MINUTE
+                GROUP BY job_id
+                ORDER BY job_id
+            """)
+            
+            # Import expected intervals for determining if jobs are slow
+            from features.price_api.schema import JOB_EXPECTED_INTERVALS_MS
+            
+            jobs = {}
+            for row in results:
+                job_id = row.get('job_id', 'unknown')
+                avg_ms = row.get('avg_duration_ms', 0) or 0
+                expected_interval = JOB_EXPECTED_INTERVALS_MS.get(job_id, 60000)
+                
+                jobs[job_id] = {
+                    'job_id': job_id,
+                    'execution_count': row.get('execution_count', 0),
+                    'avg_duration_ms': round(avg_ms, 2),
+                    'max_duration_ms': round(row.get('max_duration_ms', 0) or 0, 2),
+                    'min_duration_ms': round(row.get('min_duration_ms', 0) or 0, 2),
+                    'error_count': row.get('error_count', 0),
+                    'expected_interval_ms': expected_interval,
+                    'is_slow': avg_ms > expected_interval * 0.8,
+                    'last_execution': row.get('last_execution').isoformat() if row.get('last_execution') else None,
+                    'recent_executions': []  # Not implemented in this simplified version
+                }
+            
+            return {
+                "status": "ok",
+                "hours": hours,
+                "jobs": jobs,
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Failed to get job metrics: {e}")
+            return {
+                "status": "error",
+                "error": str(e),
+                "jobs": {},
+                "timestamp": datetime.now().isoformat()
+            }
+    
+    @app.get("/scheduler/status")
+    async def get_scheduler_status():
+        """
+        Get scheduler status including uptime and job statuses.
+        
+        This proxies to the status.py module which tracks job status in-memory.
+        """
+        from scheduler.status import get_job_status
+        return get_job_status()
+    
     return app
 
 
@@ -1126,7 +1211,13 @@ def start_local_api(port: int = 5052, host: str = "0.0.0.0"):
         logger.warning("Local API server already running")
         return
     
-    app = create_local_api()
+    try:
+        logger.debug(f"Creating Local API app...")
+        app = create_local_api()
+        logger.debug(f"Local API app created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create Local API app: {e}", exc_info=True)
+        return
     
     config = uvicorn.Config(
         app,
@@ -1140,9 +1231,11 @@ def start_local_api(port: int = 5052, host: str = "0.0.0.0"):
     def run_server():
         """Run uvicorn server in thread."""
         try:
+            logger.debug(f"Starting uvicorn server in thread...")
             server.run()
+            logger.debug(f"Uvicorn server stopped")
         except Exception as e:
-            logger.error(f"Local API server error: {e}")
+            logger.error(f"Local API server error: {e}", exc_info=True)
     
     _local_api_server = threading.Thread(
         target=run_server,
@@ -1152,7 +1245,7 @@ def start_local_api(port: int = 5052, host: str = "0.0.0.0"):
     _local_api_server.start()
     
     # Give the server a moment to start
-    time.sleep(0.5)
+    time.sleep(1.5)
     
     logger.info(f"Local API server started on http://{host}:{port}")
     logger.info(f"  Endpoints: /health, /cycle_tracker, /price_analysis, /profiles, /plays, /buyins, /query")
@@ -1191,11 +1284,12 @@ def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
     """
     Fast batch insert using DuckDB's native capabilities.
     
-    Optimizations:
-    - Uses a single INSERT with VALUES list (much faster than executemany)
-    - Avoids Python tuple conversion per-record
-    - Leverages DuckDB's bulk insert optimization
-    - Uses lock if provided (for shared in-memory connections)
+    Insertion priority (tries in order):
+    1. PyArrow zero-copy (fastest, ~1s for 50K records)
+    2. Pandas DataFrame (slower, ~30s for 50K records)
+    3. executemany (slowest, for small batches or fallback)
+    
+    Uses lock if provided (for shared in-memory connections).
     """
     if not records:
         return 0
@@ -1203,37 +1297,190 @@ def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
     def _do_insert():
         columns = list(records[0].keys())
         columns_str = ", ".join(columns)
+        num_records = len(records)
         
-        # For large batches, use temporary table approach (fastest)
-        if len(records) > 500:
+        # =================================================================
+        # METHOD 1: PyArrow zero-copy insertion (PRIMARY - fastest)
+        # =================================================================
+        # Use PyArrow for batches > 20 records (even small batches benefit)
+        if HAS_PYARROW and num_records > 20:
             try:
-                # DuckDB can efficiently insert from a list of dicts via relation
-                df = pd.DataFrame(records)
+                start_time = time.time()
                 
-                # Ensure column order matches
-                df = df[columns]
+                # Build columnar data for Arrow (more efficient than row-by-row)
+                col_data = {col: [r.get(col) for r in records] for col in columns}
                 
-                # Register as temp view and insert (avoids Python iteration entirely)
-                conn.register('_temp_import', df)
-                conn.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM _temp_import")
-                conn.unregister('_temp_import')
-                return len(records)
-            except Exception:
-                pass  # Fall through to executemany
+                # Build explicit schema to handle JSON strings and datetimes properly
+                # This prevents DuckDB from trying to cast JSON arrays to numeric types
+                schema_fields = []
+                for col in columns:
+                    sample_values = [v for v in col_data[col][:10] if v is not None]
+                    if not sample_values:
+                        # No non-null samples, default to string
+                        schema_fields.append(pa.field(col, pa.string()))
+                        continue
+                    
+                    sample = sample_values[0]
+                    
+                    # Check type of first non-null value
+                    if isinstance(sample, bool):
+                        schema_fields.append(pa.field(col, pa.bool_()))
+                    elif isinstance(sample, int):
+                        schema_fields.append(pa.field(col, pa.int64()))
+                    elif isinstance(sample, float):
+                        schema_fields.append(pa.field(col, pa.float64()))
+                    elif isinstance(sample, str):
+                        # Check if it's a JSON array/object (starts with [ or {)
+                        sample_stripped = sample.strip()
+                        if sample_stripped.startswith('[') or sample_stripped.startswith('{'):
+                            # JSON data - keep as string
+                            schema_fields.append(pa.field(col, pa.string()))
+                        elif len(sample) >= 10 and ('T' in sample or (sample.count('-') >= 2 and ':' in sample)):
+                            # Looks like a datetime string - convert to timestamp
+                            try:
+                                col_data[col] = pd.to_datetime(col_data[col], errors='coerce', format='ISO8601').values
+                                schema_fields.append(pa.field(col, pa.timestamp('us')))
+                            except Exception:
+                                schema_fields.append(pa.field(col, pa.string()))
+                        else:
+                            # Regular string
+                            schema_fields.append(pa.field(col, pa.string()))
+                    else:
+                        # Unknown type - let Arrow infer
+                        schema_fields.append(pa.field(col, pa.string()))
+                
+                # Create PyArrow table with explicit schema
+                schema = pa.schema(schema_fields)
+                arrow_table = pa.Table.from_pydict(col_data, schema=schema)
+                
+                # Register Arrow table with DuckDB (zero-copy) and insert
+                # Use explicit column names to avoid column order mismatch issues
+                conn.register('_temp_arrow', arrow_table)
+                conn.execute(f"INSERT OR IGNORE INTO {table} ({columns_str}) SELECT {columns_str} FROM _temp_arrow")
+                conn.unregister('_temp_arrow')
+                
+                elapsed = time.time() - start_time
+                
+                # Get current count for logging
+                result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                current_count = result[0] if result else 0
+                
+                logger.info(f"PyArrow insert for {table}: {num_records} records in {elapsed:.2f}s (table now has {current_count} rows)")
+                return num_records
+                
+            except Exception as e:
+                logger.warning(f"PyArrow insert failed for {table}: {e}, falling back to pandas")
+                # Fall through to pandas method
         
-        # For smaller batches or if pandas approach fails, use optimized executemany
+        # =================================================================
+        # METHOD 2: Pandas DataFrame insertion (FALLBACK)
+        # =================================================================
+        # For very large batches (>10K records), use chunked pandas insert
+        if num_records > 10000 or (table == "order_book_features" and num_records > 5000):
+            logger.info(f"Large batch for {table} ({num_records} records), using chunked pandas insert...")
+            inserted = 0
+            chunk_size = 5000
+            start_time = time.time()
+            
+            for i in range(0, num_records, chunk_size):
+                chunk = records[i:i + chunk_size]
+                try:
+                    # Use pandas for each chunk
+                    df = pd.DataFrame(chunk)
+                    df = df[columns]
+                    
+                    # Convert datetime columns
+                    for col in df.columns:
+                        if df[col].dtype == 'object':
+                            try:
+                                df[col] = pd.to_datetime(df[col], errors='ignore')
+                            except:
+                                pass
+                    
+                    conn.register('_temp_import', df)
+                    conn.execute(f"INSERT OR IGNORE INTO {table} ({columns_str}) SELECT {columns_str} FROM _temp_import")
+                    conn.unregister('_temp_import')
+                    inserted += len(chunk)
+                    logger.debug(f"  Chunk {i//chunk_size + 1}: inserted {len(chunk)} records")
+                except Exception as e:
+                    logger.warning(f"Chunk insert failed for {table} chunk {i//chunk_size}: {e}")
+            
+            elapsed = time.time() - start_time
+            logger.info(f"Pandas chunked insert for {table}: {inserted}/{num_records} records in {elapsed:.2f}s")
+            return inserted
+        
+        # For medium batches (500-10K), use single pandas DataFrame
+        if num_records > 500:
+            try:
+                start_time = time.time()
+                
+                # DuckDB can efficiently insert from pandas DataFrame
+                df = pd.DataFrame(records)
+                df = df[columns]  # Ensure column order matches
+                
+                # Convert datetime columns to proper format
+                for col in df.columns:
+                    if df[col].dtype == 'object':
+                        try:
+                            df[col] = pd.to_datetime(df[col], errors='ignore')
+                        except:
+                            pass
+                
+                # Register as temp view and insert (use explicit columns to avoid order mismatch)
+                conn.register('_temp_import', df)
+                conn.execute(f"INSERT OR IGNORE INTO {table} ({columns_str}) SELECT {columns_str} FROM _temp_import")
+                conn.unregister('_temp_import')
+                
+                elapsed = time.time() - start_time
+                
+                # Count actual inserted rows
+                result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                current_count = result[0] if result else 0
+                logger.info(f"Pandas insert for {table}: {num_records} records in {elapsed:.2f}s (table now has {current_count} rows)")
+                return num_records
+            except Exception as e:
+                logger.warning(f"Pandas insert failed for {table}: {e}, falling back to executemany")
+                logger.debug(f"Sample record columns: {list(records[0].keys())}")
+                # Fall through to executemany
+        
+        # =================================================================
+        # METHOD 3: executemany (LAST RESORT - for small batches or fallback)
+        # =================================================================
         placeholders = ", ".join(["?" for _ in columns])
         
         # Pre-allocate and use list comprehension (faster than generator)
         all_values = [tuple(record[col] for col in columns) for record in records]
         
+        before_count = 0
         try:
+            result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            before_count = result[0] if result else 0
+        except:
+            pass
+        
+        try:
+            start_time = time.time()
             conn.executemany(
                 f"INSERT OR IGNORE INTO {table} ({columns_str}) VALUES ({placeholders})",
                 all_values
             )
-            return len(records)
-        except Exception:
+            elapsed = time.time() - start_time
+            
+            # Check how many were actually inserted
+            after_count = 0
+            try:
+                result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                after_count = result[0] if result else 0
+                inserted = after_count - before_count
+                if inserted == 0 and num_records > 0:
+                    logger.warning(f"Executemany for {table}: 0 rows inserted (all duplicates or schema mismatch?)")
+                else:
+                    logger.info(f"Executemany insert for {table}: {num_records} records in {elapsed:.2f}s")
+                return num_records
+            except:
+                return num_records
+        except Exception as e:
+            logger.warning(f"Executemany insert failed for {table}: {e}")
             # Fallback: smaller batches
             inserted = 0
             batch_size = 1000
@@ -1245,8 +1492,13 @@ def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
                         batch
                     )
                     inserted += len(batch)
-                except:
-                    pass
+                except Exception as e2:
+                    logger.error(f"Batch insert failed for {table} (batch {i//batch_size}): {e2}")
+                    if i == 0:  # Log first record of first failed batch
+                        logger.error(f"First record sample: {records[0]}")
+            
+            if inserted == 0 and num_records > 0:
+                logger.error(f"CRITICAL: Could not insert any of {num_records} records into {table}")
             return inserted
     
     # Use lock if provided (for shared in-memory connections)
@@ -1453,43 +1705,32 @@ def backfill_from_data_engine(hours: int = 2):
 
 def sync_new_data_from_engine():
     """
-    Periodically sync new data from the Data Engine.
+    Sync new data from the Data Engine (runs every 1 second).
     
-    This job runs frequently to keep local DuckDB up to date with
-    the latest data from master.py.
+    CRITICAL FOR TRADING: Uses PyArrow batch insert for maximum speed.
+    Gets last 1 minute of data to ensure no gaps.
     """
     global _data_client, _local_duckdb, _local_duckdb_lock
     
-    # Tables to sync (just get last few minutes)
-    # NOTE: cycle_tracker is needed for wallet profile creation
-    sync_tables = ["prices", "sol_stablecoin_trades", "order_book_features", "cycle_tracker"]
+    # Tables to sync - ordered by priority for trading decisions
+    # prices & order_book_features are most critical for trading signals
+    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "cycle_tracker"]
     
-    # Lock during writes to prevent memory corruption
-    with _local_duckdb_lock:
-        for table in sync_tables:
-            try:
-                # Get very recent data (last 1 minute)
-                records = _data_client.get_backfill(table, hours=0.017, limit=1000)  # ~1 minute
+    for table in sync_tables:
+        try:
+            # Get last 1 minute of data (fresh for trading)
+            records = _data_client.get_backfill(table, minutes=1, limit=500)
+            
+            if not records:
+                continue
+            
+            # Use the fast batch insert (PyArrow if available)
+            with _local_duckdb_lock:
+                _insert_records_fast(_local_duckdb, table, records)
                 
-                if not records:
-                    continue
-                
-                columns = list(records[0].keys())
-                for record in records:
-                    placeholders = ", ".join(["?" for _ in columns])
-                    columns_str = ", ".join(columns)
-                    values = [record.get(col) for col in columns]
-                    
-                    try:
-                        _local_duckdb.execute(
-                            f"INSERT OR IGNORE INTO {table} ({columns_str}) VALUES ({placeholders})",
-                            values
-                        )
-                    except:
-                        pass
-                        
-            except Exception as e:
-                logger.debug(f"Sync error for {table}: {e}")
+        except Exception as e:
+            # Only log at debug level to avoid spam (sync runs every 1s)
+            logger.debug(f"Sync error for {table}: {e}")
 
 
 # =============================================================================
@@ -1659,6 +1900,33 @@ def run_cleanup_wallet_profiles():
         logger.error(f"Wallet profiles cleanup error: {e}")
 
 
+@track_job("export_job_status", "Export job status to file (every 5s)")
+def export_job_status_to_file():
+    """Export current job status to JSON file for website_api.py to read."""
+    import json
+    from scheduler.status import _job_status, _job_status_lock
+    
+    try:
+        status_file = LOGS_DIR / "master2_job_status.json"
+        
+        with _job_status_lock:
+            status_data = {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'jobs': dict(_job_status)
+            }
+        
+        # Write atomically (write to temp file, then rename)
+        temp_file = status_file.with_suffix('.tmp')
+        with open(temp_file, 'w') as f:
+            json.dump(status_data, f, indent=2)
+        
+        temp_file.replace(status_file)
+        logger.debug(f"Exported {len(status_data['jobs'])} job statuses")
+        
+    except Exception as e:
+        logger.error(f"Failed to export job status: {e}")
+
+
 @track_job("process_price_cycles", "Process price cycles (every 1s)")
 def run_process_price_cycles():
     """
@@ -1718,9 +1986,9 @@ def create_scheduler() -> BackgroundScheduler:
     # =====================================================
     scheduler.add_job(
         func=run_sync_from_engine,
-        trigger=IntervalTrigger(seconds=5),
+        trigger=IntervalTrigger(seconds=1),
         id="sync_from_engine",
-        name="Sync data from Data Engine (every 5s)",
+        name="Sync data from Data Engine (every 1s)",
         replace_existing=True,
         executor='realtime',
     )
@@ -1821,6 +2089,17 @@ def create_scheduler() -> BackgroundScheduler:
         name="Process price cycles (every 1s)",
         replace_existing=True,
         executor='heavy',
+    )
+    
+    # Export job status to file (every 5 seconds)
+    # Writes current job status to JSON file for website_api.py to read
+    scheduler.add_job(
+        func=export_job_status_to_file,
+        trigger=IntervalTrigger(seconds=5),
+        id="export_job_status",
+        name="Export job status (every 5s)",
+        replace_existing=True,
+        executor='realtime',
     )
     
     return scheduler

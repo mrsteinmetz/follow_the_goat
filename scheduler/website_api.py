@@ -50,8 +50,12 @@ CORS(app)
 
 logger = logging.getLogger("website_api")
 
-# Master2 Local API URL (computed data: cycles, profiles, etc.)
-DATA_ENGINE_URL = "http://127.0.0.1:5052"
+# Master.py Data Engine API URL (port 5050)
+DATA_ENGINE_URL = "http://127.0.0.1:5050"
+
+
+# Master2.py Local API URL (port 5052)
+MASTER2_LOCAL_API_URL = "http://127.0.0.1:5052"
 
 
 # =============================================================================
@@ -122,57 +126,23 @@ def get_stats():
 
 
 @app.route('/scheduler_status', methods=['GET'])
-@engine_required
 def get_scheduler_status():
-    """
-    Get scheduler job status.
-    
-    This proxies to master.py's /query endpoint to get status from the
-    shared status module (if available) or from job_execution_metrics table.
-    """
-    import requests
-    
+    """Get scheduler job status from in-memory tracking."""
     try:
-        # Try to get scheduler status directly from master.py if it exposes it
-        # For now, we'll use the job_execution_metrics table
-        client = get_engine_client()
+        # Import here to avoid circular imports
+        from scheduler.status import _job_status, _job_status_lock, _scheduler_start_time
         
-        # Get recent job executions
-        results = client.query("""
-            SELECT 
-                job_id,
-                MAX(started_at) as last_start,
-                MAX(CASE WHEN status = 'success' THEN started_at END) as last_success,
-                MAX(CASE WHEN status = 'error' THEN started_at END) as last_error,
-                COUNT(*) as run_count,
-                AVG(duration_ms) as avg_duration_ms
-            FROM job_execution_metrics
-            WHERE started_at >= NOW() - INTERVAL 1 HOUR
-            GROUP BY job_id
-            ORDER BY job_id
-        """)
-        
-        jobs = {}
-        for row in results:
-            job_id = row.get('job_id', 'unknown')
-            jobs[job_id] = {
-                'job_id': job_id,
-                'last_start': row.get('last_start'),
-                'last_success': row.get('last_success'),
-                'last_error': row.get('last_error'),
-                'run_count': row.get('run_count', 0),
-                'avg_duration_ms': row.get('avg_duration_ms'),
-                'status': 'success' if row.get('last_success') else 'unknown'
-            }
+        with _job_status_lock:
+            jobs = dict(_job_status)
         
         return jsonify({
             'status': 'ok',
             'jobs': jobs,
             'timestamp': datetime.now().isoformat(),
-            'source': 'job_execution_metrics'
+            'scheduler_started': _scheduler_start_time.isoformat() if _scheduler_start_time else None
         })
-        
     except Exception as e:
+        logger.error(f"Failed to get scheduler status: {e}")
         return jsonify({
             'status': 'error',
             'error': str(e),
@@ -182,57 +152,128 @@ def get_scheduler_status():
 
 
 @app.route('/job_metrics', methods=['GET'])
-@engine_required
 def get_job_metrics_endpoint():
-    """Get detailed job execution metrics."""
-    hours = safe_float(request.args.get('hours', 1))
+    """
+    Get detailed job execution metrics from BOTH master.py and master2.py.
     
-    client = get_engine_client()
+    Combines:
+    - DuckDB metrics (master.py jobs + any master2 jobs that successfully write)
+    - In-memory metrics (master2.py jobs via shared status module)
+    """
+    hours = safe_float(request.args.get('hours', 1))
     minutes = int(hours * 60)
     
+    all_jobs = {}
+    
     try:
-        results = client.query(f"""
-            SELECT 
-                job_id,
-                COUNT(*) as execution_count,
-                AVG(duration_ms) as avg_duration_ms,
-                MAX(duration_ms) as max_duration_ms,
-                MIN(duration_ms) as min_duration_ms,
-                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
-                MAX(started_at) as last_execution
-            FROM job_execution_metrics
-            WHERE started_at >= NOW() - INTERVAL {minutes} MINUTE
-            GROUP BY job_id
-            ORDER BY job_id
-        """)
+        # SOURCE 1: Get DuckDB metrics (master.py jobs)
+        import requests
+        response = requests.post(
+            "http://127.0.0.1:5050/query",
+            json={"sql": f"""
+                SELECT 
+                    job_id,
+                    COUNT(*) as execution_count,
+                    AVG(duration_ms) as avg_duration_ms,
+                    MAX(duration_ms) as max_duration_ms,
+                    MIN(duration_ms) as min_duration_ms,
+                    SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
+                    MAX(started_at) as last_execution
+                FROM job_execution_metrics
+                WHERE started_at >= NOW() - INTERVAL {minutes} MINUTE
+                GROUP BY job_id
+                ORDER BY job_id
+            """},
+            timeout=10
+        )
         
-        jobs = {}
-        for row in results:
-            job_id = row.get('job_id', 'unknown')
-            jobs[job_id] = {
-                'job_id': job_id,
-                'execution_count': row.get('execution_count', 0),
-                'avg_duration_ms': round(row.get('avg_duration_ms', 0), 2),
-                'max_duration_ms': round(row.get('max_duration_ms', 0), 2),
-                'min_duration_ms': round(row.get('min_duration_ms', 0), 2),
-                'error_count': row.get('error_count', 0),
-                'last_execution': row.get('last_execution')
-            }
-        
-        return jsonify({
-            'status': 'ok',
-            'hours': hours,
-            'jobs': jobs,
-            'timestamp': datetime.now().isoformat()
-        })
-        
+        if response.status_code == 200:
+            data = response.json()
+            
+            # Import expected intervals for determining if jobs are slow
+            try:
+                from features.price_api.schema import JOB_EXPECTED_INTERVALS_MS
+            except ImportError:
+                JOB_EXPECTED_INTERVALS_MS = {}
+            
+            for row in data.get('results', []):
+                job_id = row.get('job_id', 'unknown')
+                avg_ms = row.get('avg_duration_ms', 0) or 0
+                expected_interval = JOB_EXPECTED_INTERVALS_MS.get(job_id, 60000)
+                
+                all_jobs[job_id] = {
+                    'job_id': job_id,
+                    'execution_count': row.get('execution_count', 0),
+                    'avg_duration_ms': round(avg_ms, 2),
+                    'max_duration_ms': round(row.get('max_duration_ms', 0) or 0, 2),
+                    'min_duration_ms': round(row.get('min_duration_ms', 0) or 0, 2),
+                    'error_count': row.get('error_count', 0),
+                    'expected_interval_ms': expected_interval,
+                    'is_slow': avg_ms > expected_interval * 0.8,
+                    'last_execution': row.get('last_execution'),
+                    'recent_executions': [],
+                    'source': 'master.py (DuckDB)'
+                }
     except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'error': str(e),
-            'jobs': {},
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        logger.warning(f"Could not fetch DuckDB metrics: {e}")
+    
+    try:
+        # SOURCE 2: Get in-memory status from master2.py jobs (via JSON file)
+        import json
+        status_file = Path(__file__).parent.parent / "logs" / "master2_job_status.json"
+        
+        if status_file.exists():
+            try:
+                with open(status_file, 'r') as f:
+                    status_data = json.load(f)
+                
+                # Import expected intervals
+                try:
+                    from features.price_api.schema import JOB_EXPECTED_INTERVALS_MS
+                except ImportError:
+                    JOB_EXPECTED_INTERVALS_MS = {}
+                
+                for job_id, job_info in status_data.get('jobs', {}).items():
+                    # Skip if already in DuckDB results (prefer DuckDB metrics)
+                    if job_id in all_jobs:
+                        continue
+                    
+                    # Add master2.py in-memory status
+                    last_duration_ms = job_info.get('last_duration_ms', 0) or 0
+                    expected_interval = JOB_EXPECTED_INTERVALS_MS.get(job_id, 60000)
+                    
+                    all_jobs[job_id] = {
+                        'job_id': job_id,
+                        'execution_count': job_info.get('run_count', 0),
+                        'avg_duration_ms': round(last_duration_ms, 2),  # Using last duration as proxy
+                        'max_duration_ms': round(last_duration_ms, 2),
+                        'min_duration_ms': round(last_duration_ms, 2),
+                        'error_count': 1 if job_info.get('status') == 'error' else 0,
+                        'expected_interval_ms': expected_interval,
+                        'is_slow': last_duration_ms > expected_interval * 0.8,
+                        'last_execution': job_info.get('last_end') or job_info.get('last_start'),
+                        'recent_executions': [],
+                        'source': 'master2.py (in-memory)',
+                        'status': job_info.get('status', 'unknown'),
+                        'description': job_info.get('description', job_id)
+                    }
+            except json.JSONDecodeError as e:
+                logger.warning(f"Could not parse job status file: {e}")
+        else:
+            logger.debug(f"Job status file not found: {status_file}")
+    except Exception as e:
+        logger.warning(f"Could not fetch in-memory status: {e}")
+    
+    return jsonify({
+        'status': 'ok',
+        'hours': hours,
+        'jobs': all_jobs,
+        'timestamp': datetime.now().isoformat(),
+        'sources': {
+            'duckdb': len([j for j in all_jobs.values() if j.get('source') == 'master.py (DuckDB)']),
+            'memory': len([j for j in all_jobs.values() if j.get('source') == 'master2.py (in-memory)'])
+        }
+    })
 
 
 # =============================================================================
@@ -696,6 +737,102 @@ def get_buyins():
             'status': 'error',
             'error': str(e),
             'buyins': []
+        }), 500
+
+
+@app.route('/buyins/<int:buyin_id>', methods=['GET'])
+def get_single_buyin(buyin_id):
+    """
+    Get a single buyin/trade by ID.
+    
+    Queries MySQL directly to avoid lock contention with master2's jobs.
+    """
+    try:
+        from core.database import get_mysql
+        
+        with get_mysql() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT *
+                FROM follow_the_goat_buyins
+                WHERE id = %s
+            """, (buyin_id,))
+            
+            buyin = cursor.fetchone()
+            
+            if buyin:
+                # Convert datetime objects to strings for JSON
+                for key, value in buyin.items():
+                    if hasattr(value, 'isoformat'):
+                        buyin[key] = value.isoformat()
+                
+                return jsonify({
+                    'status': 'ok',
+                    'buyin': buyin
+                })
+            else:
+                return jsonify({
+                    'status': 'error',
+                    'error': f'Buyin {buyin_id} not found'
+                }), 404
+        
+    except Exception as e:
+        logger.error(f"Error fetching buyin {buyin_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+# =============================================================================
+# TRAIL DATA ENDPOINTS
+# =============================================================================
+
+@app.route('/trail/buyin/<int:buyin_id>', methods=['GET'])
+def get_trail_for_buyin(buyin_id):
+    """
+    Get 15-minute trail data for a specific buyin.
+    
+    Query params:
+        - source: 'duckdb' (default) or 'mysql'
+    
+    Queries MySQL directly to avoid lock contention with master2's jobs.
+    """
+    source = request.args.get('source', 'mysql')
+    
+    try:
+        from core.database import get_mysql
+        
+        with get_mysql() as conn:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT *
+                FROM buyin_trail_minutes
+                WHERE buyin_id = %s
+                ORDER BY minute ASC
+            """, (buyin_id,))
+            
+            trail_data = cursor.fetchall()
+            
+            # Convert datetime objects to strings for JSON
+            for row in trail_data:
+                for key, value in row.items():
+                    if hasattr(value, 'isoformat'):
+                        row[key] = value.isoformat()
+            
+            return jsonify({
+                'status': 'ok',
+                'trail_data': trail_data,
+                'count': len(trail_data),
+                'source': 'mysql'
+            })
+        
+    except Exception as e:
+        logger.error(f"Error fetching trail data for buyin {buyin_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'trail_data': []
         }), 500
 
 

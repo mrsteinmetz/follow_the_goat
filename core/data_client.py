@@ -220,26 +220,38 @@ class DataClient:
     def get_backfill(
         self, 
         table: str, 
-        hours: int = 2, 
+        hours: int = None,
+        minutes: int = None,
         limit: int = 10000
     ) -> List[Dict[str, Any]]:
         """
         Get historical data for backfill on startup.
         
         This is typically used by master2.py to load recent data when starting.
+        Use hours for startup backfill, minutes for continuous sync.
         
         Args:
             table: Table name
-            hours: Hours of data to retrieve (default: 2)
+            hours: Hours of data to retrieve (1-24, for startup backfill)
+            minutes: Minutes of data to retrieve (1-60, for continuous sync)
             limit: Maximum records to return (default: 10000)
         
         Returns:
             List of records from the specified time range
         """
         try:
+            # Build params - use minutes for short intervals, hours for longer
+            params = {"limit": limit}
+            if minutes is not None:
+                params["minutes"] = minutes
+            elif hours is not None:
+                params["hours"] = hours
+            else:
+                params["hours"] = 2  # Default to 2 hours
+            
             response = self._session.get(
                 f"{self.base_url}/backfill/{table}",
-                params={"hours": hours, "limit": limit},
+                params=params,
                 timeout=self.timeout * 3  # Allow more time for backfill
             )
             
@@ -248,7 +260,8 @@ class DataClient:
             
             response.raise_for_status()
             result = response.json()
-            return result.get("results", [])
+            # Support both 'results' (old) and 'records' (new) keys
+            return result.get("records", result.get("results", []))
             
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"Backfill failed: {e}")
@@ -386,9 +399,9 @@ def query(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     return get_client().query(sql, params)
 
 
-def get_backfill(table: str, hours: int = 2) -> List[Dict[str, Any]]:
+def get_backfill(table: str, hours: int = None, minutes: int = None) -> List[Dict[str, Any]]:
     """Get backfill data (convenience function)."""
-    return get_client().get_backfill(table, hours)
+    return get_client().get_backfill(table, hours=hours, minutes=minutes)
 
 
 def get_latest(table: str, limit: int = 100) -> List[Dict[str, Any]]:

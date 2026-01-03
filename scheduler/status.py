@@ -412,14 +412,14 @@ def get_job_metrics(hours: float = 1) -> dict:
                         'error_count': row[5],
                         'expected_interval_ms': expected_interval,
                         'is_slow': avg_ms > expected_interval * 0.8,
-                        'last_execution': row[6].isoformat() if row[6] else None,
+                        'last_execution': row[6].isoformat() if (row[6] and hasattr(row[6], 'isoformat')) else (str(row[6]) if row[6] else None),
                         'recent_executions': []
                     }
                 
                 # Add recent execution if present
                 if row[7] is not None:  # recent_started_at
                     metrics[job_id]['recent_executions'].append({
-                        'started_at': row[7].isoformat() if row[7] else None,
+                        'started_at': row[7].isoformat() if (row[7] and hasattr(row[7], 'isoformat')) else (str(row[7]) if row[7] else None),
                         'duration_ms': round(row[8], 2) if row[8] else 0,
                         'status': row[9]
                     })

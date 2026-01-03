@@ -207,7 +207,8 @@ class StepLogger:
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
     """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
     
-    Uses the in-memory engine for speed. No MySQL fallback.
+    Uses the in-memory engine for speed, with fallback to get_duckdb("central")
+    when running under master2.py (which has its own local DuckDB with plays).
     """
     engine = _get_engine_if_running()
     
@@ -226,8 +227,23 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
             
             play = dict(result)
         else:
-            logger.error("TradingDataEngine is not running - cannot load play config")
-            return None
+            # Fallback to get_duckdb("central") - used when running under master2.py
+            # master2.py loads plays from PostgreSQL into its local DuckDB and registers it as 'central'
+            logger.debug("TradingDataEngine not running - using get_duckdb('central') fallback")
+            with get_duckdb("central") as conn:
+                result = conn.execute("""
+                    SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
+                    FROM follow_the_goat_plays
+                    WHERE id = ?
+                """, [play_id]).fetchone()
+                
+                if not result:
+                    logger.error(f"Play #{play_id} not found in DuckDB")
+                    return None
+                
+                # Convert tuple to dict with column names
+                columns = ['id', 'name', 'pattern_validator_enable', 'pattern_validator', 'project_ids']
+                play = dict(zip(columns, result))
         
         # Parse pattern validator config
         pattern_validator_raw = play.get('pattern_validator')
@@ -311,9 +327,37 @@ def check_data_readiness() -> tuple[bool, str]:
             return False, f"TradingDataEngine not ready: {e}"
     
     # Fallback to file-based DuckDB (standalone mode)
+    # NOTE: When running under master2.py, get_duckdb("central") returns master2's
+    # in-memory DuckDB which uses 'prices' table, not 'price_points'
     try:
         with get_duckdb("central") as conn:
-            # Check price_points (need at least some price data)
+            # Try 'prices' table first (used by master2.py's local DuckDB)
+            try:
+                result = conn.execute("""
+                    SELECT COUNT(*) FROM prices WHERE token = 'SOL'
+                """).fetchone()
+                price_count = result[0] if result else 0
+                
+                if price_count >= 10:
+                    # Check order_book_features
+                    try:
+                        result = conn.execute("""
+                            SELECT COUNT(*) FROM order_book_features
+                        """).fetchone()
+                        ob_count = result[0] if result else 0
+                        
+                        if ob_count < 5:
+                            return False, f"Waiting for order book data ({ob_count}/5 rows)"
+                    except Exception as e:
+                        logger.warning(f"Order book check error: {e}")
+                        return False, "Order book table not ready yet"
+                    
+                    return True, "Data ready (using local DuckDB 'prices' table)"
+            except Exception as e:
+                # 'prices' table doesn't exist, try 'price_points' instead
+                logger.debug(f"Prices table check failed ({e}), trying price_points...")
+            
+            # Fallback: Check price_points (standalone file-based mode)
             result = conn.execute("""
                 SELECT COUNT(*) FROM price_points WHERE coin_id = 5
             """).fetchone()
@@ -331,12 +375,14 @@ def check_data_readiness() -> tuple[bool, str]:
                 
                 if ob_count < 5:
                     return False, f"Waiting for order book data ({ob_count}/5 rows)"
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Order book check error (price_points mode): {e}")
                 return False, "Order book table not ready yet"
             
             return True, "Data ready (using file DuckDB)"
             
     except Exception as e:
+        logger.error(f"Database check error: {e}")
         return False, f"Database not ready: {e}"
 
 
@@ -358,8 +404,25 @@ def get_current_market_price() -> Optional[float]:
                 return float(result[0]['price'])
             return None
         else:
-            # File-based DuckDB uses 'price_points' table with 'coin_id' column and 'value'
+            # When running under master2.py, get_duckdb("central") returns master2's
+            # in-memory DuckDB which uses 'prices' table, not 'price_points'
             with get_duckdb("central") as conn:
+                # Try 'prices' table first (used by master2.py's local DuckDB)
+                try:
+                    result = conn.execute("""
+                        SELECT price
+                        FROM prices
+                        WHERE token = 'SOL'
+                        ORDER BY id DESC
+                        LIMIT 1
+                    """).fetchone()
+                    if result:
+                        return float(result[0])
+                except Exception:
+                    # 'prices' table doesn't exist, try 'price_points' instead
+                    pass
+                
+                # Fallback: File-based DuckDB uses 'price_points' table
                 result = conn.execute("""
                     SELECT value
                     FROM price_points
@@ -656,7 +719,7 @@ def update_validation_result(
             fresh_price = get_current_market_price()
             followed_at = datetime.now(timezone.utc).isoformat()
         
-        # Update TradingDataEngine (in-memory)
+        # Update TradingDataEngine (in-memory) or local DuckDB
         if engine is not None:
             if new_status == 'pending' and fresh_price:
                 engine.execute("""
@@ -676,6 +739,27 @@ def update_validation_result(
                     SET pattern_validator_log = ?, our_status = ?
                     WHERE id = ?
                 """, [pattern_validator_log_json, new_status, buyin_id])
+        else:
+            # Fallback to get_duckdb("central") when running under master2.py
+            with get_duckdb("central") as conn:
+                if new_status == 'pending' and fresh_price:
+                    conn.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
+                        WHERE id = ?
+                    """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
+                elif new_status == 'pending':
+                    conn.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET pattern_validator_log = ?, our_status = ?, followed_at = ?
+                        WHERE id = ?
+                    """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
+                else:
+                    conn.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET pattern_validator_log = ?, our_status = ?
+                        WHERE id = ?
+                    """, [pattern_validator_log_json, new_status, buyin_id])
         
         step_logger.end(
             update_token,
@@ -694,19 +778,27 @@ def update_validation_result(
 def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
     """Update the entry log with final step logger data.
     
-    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    Uses TradingDataEngine (in-memory) for speed, with fallback to local DuckDB.
     """
     engine = _get_engine_if_running()
     try:
         final_log_json = json.dumps(step_logger.to_json())
         
-        # Update TradingDataEngine (in-memory)
+        # Update TradingDataEngine (in-memory) or local DuckDB
         if engine is not None:
             engine.execute("""
                 UPDATE follow_the_goat_buyins
                 SET entry_log = ?
                 WHERE id = ?
             """, [final_log_json, buyin_id])
+        else:
+            # Fallback to get_duckdb("central") when running under master2.py
+            with get_duckdb("central") as conn:
+                conn.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET entry_log = ?
+                    WHERE id = ?
+                """, [final_log_json, buyin_id])
         
     except Exception as e:
         logger.error(f"Error updating entry log for buy-in #{buyin_id}: {e}")
@@ -715,7 +807,7 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
 def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[StepLogger] = None) -> None:
     """Mark a buyin as 'error' status when validation pipeline fails.
     
-    Uses TradingDataEngine (in-memory) for speed, with MySQL for persistence.
+    Uses TradingDataEngine (in-memory) for speed, with fallback to local DuckDB.
     """
     engine = _get_engine_if_running()
     try:
@@ -730,7 +822,7 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
         if step_logger:
             entry_log = json.dumps(step_logger.to_json())
         
-        # Update TradingDataEngine (in-memory)
+        # Update TradingDataEngine (in-memory) or local DuckDB
         if engine is not None:
             if entry_log:
                 engine.execute("""
@@ -744,6 +836,21 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
                     SET our_status = 'error', pattern_validator_log = ?
                     WHERE id = ?
                 """, [error_log, buyin_id])
+        else:
+            # Fallback to get_duckdb("central") when running under master2.py
+            with get_duckdb("central") as conn:
+                if entry_log:
+                    conn.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
+                        WHERE id = ?
+                    """, [error_log, entry_log, buyin_id])
+                else:
+                    conn.execute("""
+                        UPDATE follow_the_goat_buyins
+                        SET our_status = 'error', pattern_validator_log = ?
+                        WHERE id = ?
+                    """, [error_log, buyin_id])
         
         
         logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")

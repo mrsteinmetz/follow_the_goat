@@ -7,8 +7,8 @@
  * and shows price cycle analysis with configurable thresholds.
  */
 
-// Set timezone to match server
-date_default_timezone_set('Europe/Berlin');
+// Set timezone to UTC - all database timestamps are stored in UTC
+date_default_timezone_set('UTC');
 
 // --- DuckDB API Client ---
 // Port 5051 = Website API (can restart freely)
@@ -32,13 +32,13 @@ $token = 'SOL';
 $coin_id = 5;
 
 // Use 24-hour interval from now
-// Note: Timestamps in database are stored in server local time (CET) 
-// So we need to use server time, not UTC
-$end_datetime = date('Y-m-d H:i:s');
-$start_datetime = date('Y-m-d H:i:s', strtotime('-24 hours'));
+// Note: Timestamps in database are stored in UTC
+// So we use UTC for all queries
+$end_datetime = gmdate('Y-m-d H:i:s');
+$start_datetime = gmdate('Y-m-d H:i:s', strtotime('-24 hours'));
 
 // For new deployments, also try last 2 hours if 24h returns no data
-$fallback_start_datetime = date('Y-m-d H:i:s', strtotime('-2 hours'));
+$fallback_start_datetime = gmdate('Y-m-d H:i:s', strtotime('-2 hours'));
 
 // --- Chart Data ---
 $chart_data = [
@@ -64,8 +64,10 @@ function aggregateToCandles(array $prices, float $intervalMinutes = 1): array {
     $intervalSeconds = $intervalMinutes * 60; // Handles 0.5 (30 sec) correctly
     
     // Group prices by interval
+    // Timestamps from database are UTC strings like "2025-01-04 06:49:49"
     $buckets = [];
     foreach ($prices as $point) {
+        // Parse UTC timestamp - database returns UTC strings
         $timestamp = strtotime($point['x'] . ' UTC');
         $bucketTime = floor($timestamp / $intervalSeconds) * $intervalSeconds;
         
@@ -98,6 +100,7 @@ $error_message = null;
 
 if ($use_duckdb) {
     $data_source = "DuckDB API";
+    // Request with max_points limit to reduce data transfer (default 5000)
     $price_response = $duckdb->getPricePoints($token, $start_datetime, $end_datetime);
     
     if ($price_response && isset($price_response['prices'])) {
@@ -123,13 +126,24 @@ $chart_data['candles'] = aggregateToCandles($chart_data['prices'], $candle_inter
 $analysis_data = [];
 $selected_cycle = null;
 $cycle_start_times = [];
+$all_cycles_for_display = []; // All cycles for initial display (not filtered by increase)
 
 if ($use_duckdb) {
     // Get cycle tracker data from API
     $cycle_response = $duckdb->getCycleTracker($threshold, '24', 100);
     
     if ($cycle_response && isset($cycle_response['cycles'])) {
-        // Filter cycles by minimum increase
+        // First, collect ALL cycles for display (not filtered by increase)
+        foreach ($cycle_response['cycles'] as $cycle) {
+            $all_cycles_for_display[] = [
+                'id' => $cycle['id'],
+                'cycle_start_time' => $cycle['cycle_start_time'],
+                'cycle_end_time' => $cycle['cycle_end_time'],
+            ];
+            $cycle_start_times[] = $cycle['cycle_start_time'];
+        }
+        
+        // Then filter cycles by minimum increase for the table
         foreach ($cycle_response['cycles'] as $cycle) {
             $percent_change = $cycle['max_percent_increase_from_lowest'] ?? 0;
             if ($percent_change > $increase) {
@@ -142,7 +156,6 @@ if ($use_duckdb) {
                     'percent_change' => $percent_change,
                     'total_data_points' => $cycle['total_data_points'] ?? 0,
                 ];
-                $cycle_start_times[] = $cycle['cycle_start_time'];
             }
         }
     }
@@ -192,17 +205,25 @@ if ($use_duckdb && !empty($chart_data['prices'])) {
     $status_data['last_price_time'] = $last_price['x'];
 }
 
-// Get latest price analysis time
+// Get latest price analysis time and active cycle
+// Optimize: Reuse cycle data if threshold is 0.3, otherwise fetch separately
 if ($use_duckdb) {
+    // Get price analysis (lightweight query)
     $analysis_response = $duckdb->getPriceAnalysis(5, '1', 1);
     if ($analysis_response && isset($analysis_response['price_analysis']) && !empty($analysis_response['price_analysis'])) {
         $status_data['price_analysis'] = $analysis_response['price_analysis'][0]['created_at'] ?? null;
     }
     
-    // Get active cycle (most recent for threshold 0.3)
-    $active_cycle_response = $duckdb->getCycleTracker(0.3, '24', 1);
-    if ($active_cycle_response && isset($active_cycle_response['cycles']) && !empty($active_cycle_response['cycles'])) {
-        $status_data['active_cycle'] = $active_cycle_response['cycles'][0]['cycle_start_time'] ?? null;
+    // Get active cycle - reuse data if threshold is 0.3, otherwise fetch
+    if ($threshold == 0.3 && !empty($cycle_response['cycles'])) {
+        // Reuse already-fetched cycle data
+        $status_data['active_cycle'] = $cycle_response['cycles'][0]['cycle_start_time'] ?? null;
+    } else {
+        // Only fetch if threshold is different
+        $active_cycle_response = $duckdb->getCycleTracker(0.3, '24', 1);
+        if ($active_cycle_response && isset($active_cycle_response['cycles']) && !empty($active_cycle_response['cycles'])) {
+            $status_data['active_cycle'] = $active_cycle_response['cycles'][0]['cycle_start_time'] ?? null;
+        }
     }
 }
 
@@ -212,13 +233,24 @@ $scheduler_jobs = [];
 if ($use_duckdb) {
     $scheduler_status = $duckdb->getSchedulerStatus();
     if ($scheduler_status && isset($scheduler_status['jobs'])) {
-        $scheduler_jobs = $scheduler_status['jobs'];
+        // Convert object to array if needed, and ensure it's not empty
+        $jobs = $scheduler_status['jobs'];
+        if (is_array($jobs) && !empty($jobs)) {
+            $scheduler_jobs = $jobs;
+        } elseif (is_object($jobs)) {
+            // Convert object to array
+            $jobs_array = (array) $jobs;
+            if (!empty($jobs_array)) {
+                $scheduler_jobs = $jobs_array;
+            }
+        }
     }
 }
 
 $json_chart_data = json_encode($chart_data);
 $json_status_data = json_encode($status_data);
 $json_cycle_start_times = json_encode($cycle_start_times);
+$json_all_cycles_for_display = json_encode($all_cycles_for_display);
 $json_selected_cycle = json_encode($selected_cycle);
 $json_scheduler_jobs = json_encode($scheduler_jobs);
 // Validate scheduler_started is a valid date string before JSON encoding
@@ -529,9 +561,9 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                         <div class="flex-fill">
                                             <h6 class="mb-1">Viewing Cycle #<?php echo htmlspecialchars($price_cycle_id); ?></h6>
                                             <div class="d-flex flex-wrap gap-3 fs-13">
-                                                <span><strong>Start:</strong> <?php echo date('M d, H:i:s', strtotime($selected_cycle['cycle_start_time'])); ?></span>
+                                                <span><strong>Start:</strong> <?php echo gmdate('M d, H:i:s', strtotime($selected_cycle['cycle_start_time'] . ' UTC')); ?></span>
                                                 <?php if ($selected_cycle['cycle_end_time']): ?>
-                                                <span><strong>End:</strong> <?php echo date('H:i:s', strtotime($selected_cycle['cycle_end_time'])); ?></span>
+                                                <span><strong>End:</strong> <?php echo gmdate('H:i:s', strtotime($selected_cycle['cycle_end_time'] . ' UTC')); ?></span>
                                                 <?php else: ?>
                                                 <span><strong>Status:</strong> <span class="badge bg-success">Active</span></span>
                                                 <?php endif; ?>
@@ -615,7 +647,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                     <div class="text-center py-4">
                                         <i class="ti ti-clock-off fs-1 text-muted mb-3 d-block"></i>
                                         <h6 class="text-muted">No scheduler data available</h6>
-                                        <p class="text-muted fs-13">Start the scheduler to see job status: <code>python scheduler/master.py</code></p>
+                                        <p class="text-muted fs-13">Start the scheduler to see job status: <code>python scheduler/master2.py</code></p>
                                     </div>
                                     <?php else: ?>
                                     <div class="job-status-grid" id="jobStatusGrid">
@@ -711,10 +743,10 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                                     <td>
                                                         <span class="badge bg-success">+<?php echo number_format($row['percent_change'], 2); ?>%</span>
                                                     </td>
-                                                    <td><?php echo date('M d, H:i:s', strtotime($row['cycle_start_time'])); ?></td>
+                                                    <td><?php echo gmdate('M d, H:i:s', strtotime($row['cycle_start_time'] . ' UTC')); ?></td>
                                                     <td>
                                                         <?php if ($row['cycle_end_time']): ?>
-                                                        <?php echo date('H:i:s', strtotime($row['cycle_end_time'])); ?>
+                                                        <?php echo gmdate('H:i:s', strtotime($row['cycle_end_time'] . ' UTC')); ?>
                                                         <?php else: ?>
                                                         <span class="badge bg-warning text-dark">Active</span>
                                                         <?php endif; ?>
@@ -723,8 +755,8 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                                         <?php if ($row['cycle_end_time']): ?>
                                                         <span class="badge bg-info">
                                                             <?php 
-                                                            $start_ts = strtotime($row['cycle_start_time']);
-                                                            $end_ts = strtotime($row['cycle_end_time']);
+                                                            $start_ts = strtotime($row['cycle_start_time'] . ' UTC');
+                                                            $end_ts = strtotime($row['cycle_end_time'] . ' UTC');
                                                             echo round(($end_ts - $start_ts) / 60) . ' min';
                                                             ?>
                                                         </span>
@@ -785,6 +817,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
             window.statusData = <?php echo $json_status_data; ?>;
             window.chartData = <?php echo $json_chart_data; ?>;
             window.cycleStartTimes = <?php echo $json_cycle_start_times; ?>;
+            window.allCyclesForDisplay = <?php echo $json_all_cycles_for_display; ?>;
             window.selectedCycle = <?php echo $json_selected_cycle; ?>;
             window.schedulerJobs = <?php echo $json_scheduler_jobs; ?>;
             window.schedulerStarted = <?php echo $json_scheduler_started; ?>;
@@ -839,44 +872,64 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
             document.addEventListener('DOMContentLoaded', function() {
                 const chartData = window.chartData;
                 const cycleStartTimes = window.cycleStartTimes;
+                const allCyclesForDisplay = window.allCyclesForDisplay || [];
                 const selectedCycle = window.selectedCycle;
 
                 if (!chartData.candles || chartData.candles.length === 0) {
                     return;
                 }
 
-                // Build annotations for cycle start times
-                const xAxisAnnotations = cycleStartTimes.map(function(timestamp, index) {
-                    const timeValue = new Date(timestamp + ' UTC').getTime();
-                    return {
-                        x: timeValue,
-                        borderColor: '#50cd89',
-                        strokeDashArray: 0,
-                        label: {
+                // Build annotations for cycle start times (all cycles, not just filtered ones)
+                // Only show these if no cycle is selected (initial display)
+                // Timestamps from database are UTC strings like "2025-01-04 06:49:49"
+                const xAxisAnnotations = [];
+                if (!selectedCycle && allCyclesForDisplay.length > 0) {
+                    allCyclesForDisplay.forEach(function(cycle, index) {
+                        // Parse UTC timestamp - database returns UTC strings without timezone indicator
+                        const timeValue = new Date(cycle.cycle_start_time.replace(' ', 'T') + 'Z').getTime();
+                        xAxisAnnotations.push({
+                            x: timeValue,
                             borderColor: '#50cd89',
-                            style: {
-                                color: '#fff',
-                                background: '#50cd89',
-                                fontSize: '10px'
-                            },
-                            text: 'Cycle ' + (index + 1)
-                        }
-                    };
-                });
+                            borderWidth: 2,
+                            opacity: 0.8,
+                            strokeDashArray: 0,
+                            label: {
+                                borderColor: '#50cd89',
+                                style: {
+                                    color: '#fff',
+                                    background: '#50cd89',
+                                    fontSize: '10px',
+                                    padding: {
+                                        left: 4,
+                                        right: 4,
+                                        top: 2,
+                                        bottom: 2
+                                    }
+                                },
+                                text: 'Cycle #' + cycle.id,
+                                position: 'top'
+                            }
+                        });
+                    });
+                }
 
-                // Add highlighted region for selected cycle
+                // Add highlighted region and vertical lines for selected cycle
+                // Timestamps from database are UTC strings like "2025-01-04 06:49:49"
                 if (selectedCycle && selectedCycle.cycle_start_time) {
-                    const cycleStart = new Date(selectedCycle.cycle_start_time + ' UTC').getTime();
+                    // Parse UTC timestamps - database returns UTC strings without timezone indicator
+                    const cycleStart = new Date(selectedCycle.cycle_start_time.replace(' ', 'T') + 'Z').getTime();
                     const cycleEnd = selectedCycle.cycle_end_time 
-                        ? new Date(selectedCycle.cycle_end_time + ' UTC').getTime()
-                        : new Date().getTime();
+                        ? new Date(selectedCycle.cycle_end_time.replace(' ', 'T') + 'Z').getTime()
+                        : Date.now(); // Current time in UTC milliseconds
                     
-                    // Add the highlighted region annotation
+                    // Add the highlighted region annotation (background fill)
                     xAxisAnnotations.push({
                         x: cycleStart,
                         x2: cycleEnd,
                         fillColor: 'rgba(16, 185, 129, 0.15)',
-                        borderColor: 'rgb(16, 185, 129)',
+                        borderColor: 'rgba(16, 185, 129, 0.3)',
+                        borderWidth: 1,
+                        opacity: 1,
                         strokeDashArray: 0,
                         label: {
                             borderColor: 'rgb(16, 185, 129)',
@@ -884,46 +937,71 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                 color: '#fff',
                                 background: 'rgb(16, 185, 129)',
                                 fontSize: '11px',
-                                fontWeight: 600
+                                fontWeight: 600,
+                                padding: {
+                                    left: 6,
+                                    right: 6,
+                                    top: 3,
+                                    bottom: 3
+                                }
                             },
                             text: 'Selected Cycle (+' + parseFloat(selectedCycle.percent_change).toFixed(2) + '%)',
                             position: 'top'
                         }
                     });
                     
-                    // Add vertical lines at start and end
+                    // Add vertical line at START
                     xAxisAnnotations.push({
                         x: cycleStart,
                         borderColor: 'rgb(16, 185, 129)',
-                        borderWidth: 2,
+                        borderWidth: 3,
+                        opacity: 1,
                         strokeDashArray: 0,
                         label: {
                             borderColor: 'rgb(16, 185, 129)',
                             style: {
                                 color: '#fff',
                                 background: 'rgb(16, 185, 129)',
-                                fontSize: '10px'
+                                fontSize: '10px',
+                                fontWeight: 600,
+                                padding: {
+                                    left: 4,
+                                    right: 4,
+                                    top: 2,
+                                    bottom: 2
+                                }
                             },
                             text: 'START',
-                            position: 'bottom'
+                            position: 'bottom',
+                            offsetY: -5
                         }
                     });
                     
+                    // Add vertical line at END (if cycle has ended)
                     if (selectedCycle.cycle_end_time) {
                         xAxisAnnotations.push({
                             x: cycleEnd,
                             borderColor: 'rgb(239, 68, 68)',
-                            borderWidth: 2,
+                            borderWidth: 3,
+                            opacity: 1,
                             strokeDashArray: 0,
                             label: {
                                 borderColor: 'rgb(239, 68, 68)',
                                 style: {
                                     color: '#fff',
                                     background: 'rgb(239, 68, 68)',
-                                    fontSize: '10px'
+                                    fontSize: '10px',
+                                    fontWeight: 600,
+                                    padding: {
+                                        left: 4,
+                                        right: 4,
+                                        top: 2,
+                                        bottom: 2
+                                    }
                                 },
                                 text: 'END',
-                                position: 'bottom'
+                                position: 'bottom',
+                                offsetY: -5
                             }
                         });
                     }
@@ -992,7 +1070,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                     xaxis: {
                         type: 'datetime',
                         labels: {
-                            datetimeUTC: false,
+                            datetimeUTC: true,  // Display UTC times consistently
                             style: {
                                 colors: 'rgb(161, 165, 183)',
                                 fontSize: '11px'
@@ -1208,15 +1286,40 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
             async function refreshSchedulerStatus() {
                 try {
                     const response = await fetch('<?php echo DUCKDB_API_URL; ?>/scheduler_status');
+                    if (!response.ok) {
+                        console.error('Scheduler status API returned:', response.status, response.statusText);
+                        return;
+                    }
+                    
                     const data = await response.json();
                     
-                    if (data.status === 'ok' && data.jobs) {
-                        window.schedulerJobs = data.jobs;
+                    if (data.status === 'ok') {
+                        // Handle jobs - can be object or array
+                        const jobs = data.jobs || {};
+                        const jobCount = Object.keys(jobs).length;
+                        
+                        if (jobCount > 0) {
+                            window.schedulerJobs = jobs;
+                            updateJobStatusUI(jobs);
+                        } else {
+                            // No jobs - clear the UI
+                            const grid = document.getElementById('jobStatusGrid');
+                            if (grid) {
+                                grid.innerHTML = '<div class="text-center py-4 w-100"><i class="ti ti-clock-off fs-1 text-muted mb-3 d-block"></i><h6 class="text-muted">No scheduler data available</h6><p class="text-muted fs-13">Start the scheduler to see job status: <code>python scheduler/master2.py</code></p></div>';
+                            }
+                        }
+                        
                         // Only set schedulerStarted if it's a valid non-empty string
                         if (data.scheduler_started && typeof data.scheduler_started === 'string' && data.scheduler_started.length > 0) {
                             window.schedulerStarted = data.scheduler_started;
+                        } else {
+                            window.schedulerStarted = null;
                         }
-                        updateJobStatusUI(data.jobs);
+                        
+                        // Update uptime display
+                        updateJobTimes();
+                    } else {
+                        console.error('Scheduler status error:', data.error || 'Unknown error');
                     }
                 } catch (error) {
                     console.error('Failed to refresh scheduler status:', error);

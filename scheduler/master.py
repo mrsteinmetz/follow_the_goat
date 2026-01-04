@@ -896,6 +896,34 @@ def create_scheduler() -> BackgroundScheduler:
     )
     
     # =====================================================
+    # PRICE CYCLE ANALYSIS (runs every 2 seconds)
+    # =====================================================
+    
+    # Import price cycles processor
+    from sys import path as syspath
+    from pathlib import Path
+    project_root = Path(__file__).parent.parent
+    syspath.insert(0, str(project_root / "000data_feeds" / "2_create_price_cycles"))
+    
+    try:
+        from create_price_cycles import process_price_cycles as process_price_cycles_run, set_engine
+        
+        # Set the global engine for price cycles
+        set_engine(_trading_engine)
+        
+        scheduler.add_job(
+            func=process_price_cycles_run,
+            trigger=IntervalTrigger(seconds=2),
+            id="process_price_cycles",
+            name="Process price cycles (every 2s)",
+            replace_existing=True,
+            executor='realtime',
+        )
+        logger.info("✓ Price cycles job registered")
+    except ImportError as e:
+        logger.warning(f"Price cycles module not available: {e}")
+    
+    # =====================================================
     # LEGACY JOBS (for backward compatibility)
     # =====================================================
     
@@ -974,6 +1002,9 @@ def main():
     logger.info("-" * 60)
     logger.info("STEP 1: Starting TradingDataEngine (in-memory DuckDB)...")
     _trading_engine = start_trading_engine()
+    
+    # TODO: Register the engine so price cycles can access it via get_duckdb("central")
+    # For now, price cycles will need to be updated to work with the engine directly
     
     # Register shutdown handler for unexpected exits
     atexit.register(shutdown_all)

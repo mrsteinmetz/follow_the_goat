@@ -73,7 +73,8 @@ class EngineClient:
             resp = self._session.post(
                 f"{self.base_url}/query",
                 json={"sql": sql, "params": params or []},
-                timeout=self.timeout
+                timeout=self.timeout,
+                headers={'Connection': 'keep-alive'}  # Enable connection reuse
             )
             resp.raise_for_status()
             data = resp.json()
@@ -84,6 +85,9 @@ class EngineClient:
                 logger.error(f"Query failed: {data.get('error')}")
                 return []
                 
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Query timeout after {self.timeout}s: {sql[:100]}...")
+            return []
         except requests.exceptions.RequestException as e:
             logger.error(f"Data Engine request failed: {e}")
             return []

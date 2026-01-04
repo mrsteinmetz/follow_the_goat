@@ -23,7 +23,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 
 # Configure logger
 logger = logging.getLogger("update_potential_gains")
@@ -59,8 +59,8 @@ def get_records_to_update():
     """
     
     try:
-        with get_duckdb("central") as conn:
-            results = conn.execute(query, [THRESHOLD]).fetchall()
+        with get_duckdb("central", read_only=True) as cursor:
+            results = cursor.execute(query, [THRESHOLD]).fetchall()
             return results
     except Exception as e:
         logger.error(f"Error fetching records to update: {e}")
@@ -79,12 +79,11 @@ def update_potential_gains_duckdb(record_id: int, potential_gains_value: float) 
         bool: True if update successful
     """
     try:
-        with get_duckdb("central") as conn:
-            conn.execute(
-                "UPDATE follow_the_goat_buyins SET potential_gains = ? WHERE id = ?",
-                [potential_gains_value, record_id]
-            )
-            return True
+        duckdb_execute_write("central",
+            "UPDATE follow_the_goat_buyins SET potential_gains = ? WHERE id = ?",
+            [potential_gains_value, record_id]
+        )
+        return True
     except Exception as e:
         logger.error(f"DuckDB update error for record {record_id}: {e}")
         return False

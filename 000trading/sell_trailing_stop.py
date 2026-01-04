@@ -54,7 +54,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 
 # =============================================================================
 # CONFIGURATION
@@ -193,8 +193,8 @@ class TrailingStopSeller:
             Current SOL price as float, or None if not found.
         """
         try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT value as price, created_at, id
                     FROM price_points 
                     WHERE coin_id = 5
@@ -217,7 +217,7 @@ class TrailingStopSeller:
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """Get all open positions that we're tracking (matching live_trade mode)."""
         try:
-            with get_duckdb("central") as conn:
+            with get_duckdb("central", read_only=True) as cursor:
                 # Build query depending on monitoring filter
                 base_sql = """
                     SELECT 
@@ -246,8 +246,8 @@ class TrailingStopSeller:
                 
                 base_sql += " ORDER BY followed_at ASC"
                 
-                result = conn.execute(base_sql).fetchall()
-                columns = [desc[0] for desc in conn.description]
+                result = cursor.execute(base_sql).fetchall()
+                columns = [desc[0] for desc in cursor.description]
                 
                 positions = [dict(zip(columns, row)) for row in result]
                 return positions
@@ -271,8 +271,8 @@ class TrailingStopSeller:
         
         # Cache miss or expired - fetch from database
         try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT sell_logic
                     FROM follow_the_goat_plays
                     WHERE id = ?
@@ -375,11 +375,10 @@ class TrailingStopSeller:
         MySQL sync happens when trade is sold.
         """
         try:
-            with get_duckdb("central") as conn:
-                conn.execute(
-                    "UPDATE follow_the_goat_buyins SET higest_price_reached = ? WHERE id = ?",
-                    [highest_price, position_id]
-                )
+            duckdb_execute_write("central",
+                "UPDATE follow_the_goat_buyins SET higest_price_reached = ? WHERE id = ?",
+                [highest_price, position_id]
+            )
             logger.debug(f"Highest price updated for position #{position_id} to ${highest_price:.6f}")
             return True
         except Exception as e:
@@ -406,11 +405,10 @@ class TrailingStopSeller:
         MySQL sync happens when trade is sold.
         """
         try:
-            with get_duckdb("central") as conn:
-                conn.execute(
-                    "UPDATE follow_the_goat_buyins SET tolerance = ? WHERE id = ?",
-                    [tolerance, position_id]
-                )
+            duckdb_execute_write("central",
+                "UPDATE follow_the_goat_buyins SET tolerance = ? WHERE id = ?",
+                [tolerance, position_id]
+            )
             logger.info(f"TOLERANCE LOCKED for position #{position_id}: {tolerance} ({tolerance*100:.4f}%)")
             return True
         except Exception as e:
@@ -643,12 +641,11 @@ class TrailingStopSeller:
             ])
             ids_str = ", ".join(str(pid) for pid in position_ids)
             
-            with get_duckdb("central") as conn:
-                conn.execute(f"""
-                    UPDATE follow_the_goat_buyins
-                    SET current_price = CASE {case_clauses} END
-                    WHERE id IN ({ids_str})
-                """)
+            duckdb_execute_write("central", f"""
+                UPDATE follow_the_goat_buyins
+                SET current_price = CASE {case_clauses} END
+                WHERE id IN ({ids_str})
+            """)
             logger.debug(f"DuckDB batch updated {len(price_updates)} positions")
             return True
         except Exception as e:
@@ -672,11 +669,10 @@ class TrailingStopSeller:
             # Only update current_price if not being batched (DuckDB only)
             if not skip_price_update:
                 try:
-                    with get_duckdb("central") as conn:
-                        conn.execute(
-                            "UPDATE follow_the_goat_buyins SET current_price = ? WHERE id = ?",
-                            [current_price, position_id]
-                        )
+                    duckdb_execute_write("central",
+                        "UPDATE follow_the_goat_buyins SET current_price = ? WHERE id = ?",
+                        [current_price, position_id]
+                    )
                 except Exception as e:
                     logger.error(f"Error updating current_price for position {position_id}: {e}")
             
@@ -702,20 +698,19 @@ class TrailingStopSeller:
             
             # DuckDB-only insert for price_checks (MySQL synced on sell)
             try:
-                with get_duckdb("central") as conn:
-                    conn.execute("""
-                        INSERT INTO follow_the_goat_buyins_price_checks (
-                            buyin_id, checked_at, current_price, entry_price, highest_price,
-                            reference_price, gain_from_entry, drop_from_high, drop_from_entry,
-                            drop_from_reference, tolerance, basis, bucket, applied_rule,
-                            should_sell, is_backfill
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        position_id, checked_at, current_price, entry_price, highest_price,
+                duckdb_execute_write("central", """
+                    INSERT INTO follow_the_goat_buyins_price_checks (
+                        buyin_id, checked_at, current_price, entry_price, highest_price,
                         reference_price, gain_from_entry, drop_from_high, drop_from_entry,
                         drop_from_reference, tolerance, basis, bucket, applied_rule,
                         should_sell, is_backfill
-                    ])
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    position_id, checked_at, current_price, entry_price, highest_price,
+                    reference_price, gain_from_entry, drop_from_high, drop_from_entry,
+                    drop_from_reference, tolerance, basis, bucket, applied_rule,
+                    should_sell, is_backfill
+                ])
             except Exception as e:
                 logger.debug(f"DuckDB price_checks insert failed: {e}")
             
@@ -757,19 +752,18 @@ class TrailingStopSeller:
             
             # Update DuckDB with sold status (no MySQL - all data in DuckDB)
             try:
-                with get_duckdb("central") as conn:
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins 
-                        SET our_exit_price = ?,
-                            our_exit_timestamp = ?,
-                            our_profit_loss = ?,
-                            our_status = 'sold',
-                            current_price = ?,
-                            higest_price_reached = ?,
-                            tolerance = ?
-                        WHERE id = ?
-                    """, [actual_exit_price, exit_timestamp, percent_change, actual_exit_price, 
-                          highest_price, locked_tolerance, position_id])
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins 
+                    SET our_exit_price = ?,
+                        our_exit_timestamp = ?,
+                        our_profit_loss = ?,
+                        our_status = 'sold',
+                        current_price = ?,
+                        higest_price_reached = ?,
+                        tolerance = ?
+                    WHERE id = ?
+                """, [actual_exit_price, exit_timestamp, percent_change, actual_exit_price, 
+                      highest_price, locked_tolerance, position_id], sync=True)
                 logger.debug(f"DuckDB updated position {position_id} to sold")
             except Exception as e:
                 logger.error(f"DuckDB sell update failed for {position_id}: {e}")

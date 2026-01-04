@@ -366,16 +366,23 @@ def get_duckdb(name: str = "central", read_only: bool = False):
     AUTOMATICALLY uses TradingDataEngine (in-memory) when running under scheduler.
     Falls back to pooled DuckDB when engine is not available.
     
-    IMPORTANT: For registered in-memory connections, uses locking to prevent
-    memory corruption from concurrent access to the same connection object.
+    THREAD-SAFE ACCESS:
+    - read_only=True: Uses thread-local cursor for concurrent reads (no blocking)
+    - read_only=False: Uses connection with lock for serialized writes
     
     Usage:
-        with get_duckdb() as conn:
-            result = conn.execute("SELECT * FROM table").fetchall()
+        # For READ operations (concurrent, no blocking):
+        with get_duckdb("central", read_only=True) as cursor:
+            result = cursor.execute("SELECT * FROM table").fetchall()
+        
+        # For WRITE operations (serialized with lock):
+        with get_duckdb("central") as conn:
+            conn.execute("INSERT INTO table ...")
     
     Args:
         name: Database name ("central" or "prices")
-        read_only: Ignored (kept for API compatibility)
+        read_only: If True, use thread-local cursor for concurrent reads.
+                  If False (default), use connection with lock for writes.
     """
     # Try to use TradingDataEngine first (in-memory, zero locks)
     engine = _get_engine_if_running()
@@ -384,14 +391,27 @@ def get_duckdb(name: str = "central", read_only: bool = False):
         yield EngineConnectionWrapper(engine)
         return
     
-    # Check if this is a registered external connection with a lock
+    # Check if this is a registered external connection
     if name in _pool._external_registered:
+        # For READ operations with cursor factory, use thread-local cursor (no lock needed)
+        if read_only:
+            cursor_factory = getattr(_pool, '_cursor_factories', {}).get(name)
+            if cursor_factory:
+                # Thread-local cursor for concurrent reads - no lock needed!
+                yield cursor_factory()
+                return
+        
+        # For WRITE operations or when no cursor factory, use connection with lock
         conn = _pool.get_connection(name)
         lock = getattr(_pool, '_external_locks', {}).get(name)
         if lock:
-            # Lock required for safe access to shared in-memory connection
+            # Lock required for safe WRITE access to shared in-memory connection
             with lock:
                 yield conn
+            return
+        else:
+            # No lock available, yield connection directly (caller responsible for safety)
+            yield conn
             return
     
     # Fallback to pooled DuckDB (standalone mode or non-central DB)
@@ -464,21 +484,24 @@ def register_database(name: str, path: Path):
     DATABASES[name] = path
 
 
-def register_connection(name: str, conn, lock=None):
+def register_connection(name: str, conn, lock=None, cursor_factory=None):
     """
     Register an external DuckDB connection into the pool.
     
     This allows master2.py to inject its local in-memory DuckDB so that
     all modules using get_duckdb("central") will use the same connection.
     
-    IMPORTANT: In-memory DuckDB connections MUST be protected with a lock
-    even on Linux, because the same connection object cannot handle truly
-    concurrent operations without memory corruption.
+    THREAD-SAFE ARCHITECTURE:
+    - READ operations: Use thread-local cursors via cursor_factory (concurrent, no lock)
+    - WRITE operations: Use connection with lock (serialized)
     
     Args:
         name: Database name (e.g., "central")
         conn: DuckDB connection object
-        lock: threading.Lock() for thread-safe access (REQUIRED for in-memory)
+        lock: threading.Lock() for thread-safe WRITE access
+        cursor_factory: Function that returns a thread-local cursor for READ operations.
+                       When provided, get_duckdb(name, read_only=True) will use this
+                       to get a cursor that can perform concurrent reads without blocking.
     """
     _pool._connections[name] = conn
     _pool._external_registered.add(name)  # Mark as externally managed (skip health checks)
@@ -488,7 +511,86 @@ def register_connection(name: str, conn, lock=None):
         _pool._external_locks = {}
     _pool._external_locks[name] = lock
     
-    logger.info(f"Registered external DuckDB connection as '{name}'")
+    # Store the cursor factory for thread-local cursor support
+    if not hasattr(_pool, '_cursor_factories'):
+        _pool._cursor_factories = {}
+    _pool._cursor_factories[name] = cursor_factory
+    
+    cursor_info = " with cursor factory" if cursor_factory else ""
+    logger.info(f"Registered external DuckDB connection as '{name}'{cursor_info}")
+
+
+def register_write_queue(name: str, queue_write_func, queue_write_sync_func):
+    """
+    Register write queue functions for a database.
+    
+    When registered, duckdb_execute_write() will use the queue for serialized writes
+    instead of acquiring locks directly.
+    
+    Args:
+        name: Database name (e.g., "central")
+        queue_write_func: Async write function (fire and forget)
+        queue_write_sync_func: Sync write function (waits for completion)
+    """
+    if not hasattr(_pool, '_write_queues'):
+        _pool._write_queues = {}
+    _pool._write_queues[name] = {
+        'queue_write': queue_write_func,
+        'queue_write_sync': queue_write_sync_func
+    }
+    logger.info(f"Registered write queue for '{name}'")
+
+
+def duckdb_execute_write(name: str, sql: str, params: list = None, sync: bool = False):
+    """
+    Execute a write (INSERT/UPDATE/DELETE) query through the write queue.
+    
+    If a write queue is registered for this database, uses the queue for
+    serialized writes (no conflicts). Otherwise falls back to direct execution
+    with lock.
+    
+    Args:
+        name: Database name (e.g., "central")
+        sql: SQL query to execute
+        params: Query parameters (optional)
+        sync: If True, wait for write to complete. If False (default), fire and forget.
+    
+    Example:
+        duckdb_execute_write("central", "UPDATE table SET col = ? WHERE id = ?", [value, id])
+    """
+    write_queues = getattr(_pool, '_write_queues', {})
+    
+    if name in write_queues:
+        # Use write queue (serialized, no conflicts)
+        queue_funcs = write_queues[name]
+        conn = _pool.get_connection(name)
+        
+        if sync:
+            if params:
+                return queue_funcs['queue_write_sync'](conn.execute, sql, params)
+            else:
+                return queue_funcs['queue_write_sync'](conn.execute, sql)
+        else:
+            if params:
+                queue_funcs['queue_write'](conn.execute, sql, params)
+            else:
+                queue_funcs['queue_write'](conn.execute, sql)
+    else:
+        # Fallback to direct execution with lock
+        lock = getattr(_pool, '_external_locks', {}).get(name)
+        conn = _pool.get_connection(name)
+        
+        if lock:
+            with lock:
+                if params:
+                    conn.execute(sql, params)
+                else:
+                    conn.execute(sql)
+        else:
+            if params:
+                conn.execute(sql, params)
+            else:
+                conn.execute(sql)
 
 
 def close_all_duckdb():

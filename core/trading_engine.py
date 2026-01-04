@@ -518,7 +518,8 @@ class TradingDataEngine:
         self._bootstrap_plays()
         
         # 2. Load today's trading data from Parquet (if exists)
-        self._bootstrap_from_parquet()
+        # DISABLED: For live trading bot, always start fresh with new data
+        # self._bootstrap_from_parquet()
         
         # Start background threads
         self._running = True
@@ -595,6 +596,8 @@ class TradingDataEngine:
         # Create indexes for fast queries
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_ts ON prices(ts)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_token ON prices(token)")
+        # Composite index for common query pattern: WHERE token = ? AND ts >= ? AND ts <= ?
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_prices_token_ts ON prices(token, ts)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_orderbook_ts ON orderbook(ts)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_price_analysis_created ON price_analysis(created_at)")
@@ -776,6 +779,21 @@ class TradingDataEngine:
     # Read Operations (Instant)
     # =========================================================================
     
+    @contextmanager
+    def get_connection(self):
+        """
+        Get a context-managed connection for direct SQL execution.
+        
+        This is used by price cycles and other code that needs raw DuckDB access.
+        The connection is thread-safe via the internal lock.
+        
+        Usage:
+            with engine.get_connection() as conn:
+                result = conn.execute("SELECT * FROM prices").fetchall()
+        """
+        with self._conn_lock:
+            yield self._conn
+    
     def read(self, query: str, params: List[Any] = None) -> List[Dict[str, Any]]:
         """
         Execute a read query instantly.
@@ -923,7 +941,9 @@ class TradingDataEngine:
                     columns_str = ", ".join(columns)
                     values = [op.data[col] for col in columns]
                     
-                    sql = f"INSERT INTO {table} ({columns_str}) VALUES ({placeholders})"
+                    # Use INSERT OR IGNORE for tables with primary keys to handle duplicates gracefully
+                    # This prevents errors when master2.py syncs data back to the engine
+                    sql = f"INSERT OR IGNORE INTO {table} ({columns_str}) VALUES ({placeholders})"
                     try:
                         self._conn.execute(sql, values)
                         self._stats["writes_committed"] += 1

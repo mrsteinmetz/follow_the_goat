@@ -26,6 +26,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
 import logging
+import threading
+import time
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -56,6 +58,46 @@ DATA_ENGINE_URL = "http://127.0.0.1:5050"
 
 # Master2.py Local API URL (port 5052)
 MASTER2_LOCAL_API_URL = "http://127.0.0.1:5052"
+
+
+# =============================================================================
+# SIMPLE CACHE FOR FREQUENTLY ACCESSED ENDPOINTS
+# =============================================================================
+
+class SimpleCache:
+    """Thread-safe simple cache with TTL."""
+    
+    def __init__(self, default_ttl=5):
+        self._cache = {}
+        self._lock = threading.Lock()
+        self.default_ttl = default_ttl
+    
+    def get(self, key):
+        """Get cached value if not expired."""
+        with self._lock:
+            if key in self._cache:
+                value, expiry = self._cache[key]
+                if time.time() < expiry:
+                    return value
+                else:
+                    del self._cache[key]
+            return None
+    
+    def set(self, key, value, ttl=None):
+        """Set cached value with TTL."""
+        if ttl is None:
+            ttl = self.default_ttl
+        with self._lock:
+            self._cache[key] = (value, time.time() + ttl)
+    
+    def clear(self):
+        """Clear all cached values."""
+        with self._lock:
+            self._cache.clear()
+
+
+# Global cache instance
+_cache = SimpleCache(default_ttl=5)  # 5 second TTL for most endpoints
 
 
 # =============================================================================
@@ -126,23 +168,69 @@ def get_stats():
 
 
 @app.route('/scheduler_status', methods=['GET'])
+@engine_required
 def get_scheduler_status():
-    """Get scheduler job status from in-memory tracking."""
+    """
+    Get scheduler job status from master2.py's Local API.
+    
+    Proxies to master2.py's /scheduler/status endpoint which has access to
+    the in-memory job status tracking.
+    
+    Cached for 3 seconds to reduce load on master2.py.
+    """
+    # Check cache first
+    cache_key = 'scheduler_status'
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return jsonify(cached)
+    
     try:
-        # Import here to avoid circular imports
-        from scheduler.status import _job_status, _job_status_lock, _scheduler_start_time
+        import requests
         
-        with _job_status_lock:
-            jobs = dict(_job_status)
+        # Proxy to master2.py's Local API
+        url = f"{MASTER2_LOCAL_API_URL}/scheduler/status"
+        logger.debug(f"Proxying scheduler_status request to: {url}")
         
+        response = requests.get(url, timeout=10)
+        
+        logger.debug(f"Master2 API response status: {response.status_code}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            logger.debug(f"Received data keys: {list(data.keys())}")
+            logger.debug(f"Jobs count: {len(data.get('jobs', {}))}")
+            
+            # Prepare response
+            result = {
+                'status': 'ok',
+                'jobs': data.get('jobs', {}),
+                'timestamp': data.get('timestamp', datetime.now().isoformat()),
+                'scheduler_started': data.get('scheduler_started')
+            }
+            
+            # Cache for 3 seconds
+            _cache.set(cache_key, result, ttl=3)
+            
+            return jsonify(result)
+        else:
+            logger.error(f"Master2 API returned status {response.status_code}: {response.text}")
+            return jsonify({
+                'status': 'error',
+                'error': f"Master2 API returned status {response.status_code}",
+                'jobs': {},
+                'timestamp': datetime.now().isoformat()
+            }), response.status_code
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to get scheduler status from master2: {e}", exc_info=True)
         return jsonify({
-            'status': 'ok',
-            'jobs': jobs,
-            'timestamp': datetime.now().isoformat(),
-            'scheduler_started': _scheduler_start_time.isoformat() if _scheduler_start_time else None
-        })
+            'status': 'error',
+            'error': f"Failed to connect to master2.py: {str(e)}",
+            'jobs': {},
+            'timestamp': datetime.now().isoformat()
+        }), 503
     except Exception as e:
-        logger.error(f"Failed to get scheduler status: {e}")
+        logger.error(f"Failed to get scheduler status: {e}", exc_info=True)
         return jsonify({
             'status': 'error',
             'error': str(e),
@@ -290,29 +378,62 @@ def get_price_points():
     {
         "token": "SOL",
         "start_datetime": "2024-01-01 00:00:00",
-        "end_datetime": "2024-01-02 00:00:00"
+        "end_datetime": "2024-01-02 00:00:00",
+        "max_points": 5000  # Optional: limit number of points (default: 5000)
     }
     
     Note: This endpoint now queries the 'prices' table (not the legacy 'price_points' table)
+    For large time ranges, data is sampled to reduce transfer size.
     """
     data = request.get_json() or {}
     
     token = data.get('token', 'SOL').upper()
     end_datetime = data.get('end_datetime', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     start_datetime = data.get('start_datetime', (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S'))
+    max_points = data.get('max_points', 5000)  # Default limit to 5000 points
     
     client = get_engine_client()
     
     try:
-        # Query the 'prices' table (where Jupiter price data is actually stored)
-        results = client.query(f"""
-            SELECT ts, price, token
+        # First, get count to determine if we need sampling
+        count_result = client.query(f"""
+            SELECT COUNT(*) as cnt
             FROM prices
             WHERE token = '{token}'
               AND ts >= '{start_datetime}'
               AND ts <= '{end_datetime}'
-            ORDER BY ts ASC
         """)
+        
+        total_count = count_result[0].get('cnt', 0) if count_result else 0
+        
+        # If we have more points than max_points, sample the data
+        if total_count > max_points:
+            # Use sampling: get every Nth point
+            sample_interval = max(1, total_count // max_points)
+            
+            results = client.query(f"""
+                SELECT ts, price, token
+                FROM (
+                    SELECT ts, price, token,
+                           ROW_NUMBER() OVER (ORDER BY ts ASC) as rn
+                    FROM prices
+                    WHERE token = '{token}'
+                      AND ts >= '{start_datetime}'
+                      AND ts <= '{end_datetime}'
+                ) ranked
+                WHERE rn % {sample_interval} = 1
+                ORDER BY ts ASC
+            """)
+        else:
+            # Get all points if under limit
+            results = client.query(f"""
+                SELECT ts, price, token
+                FROM prices
+                WHERE token = '{token}'
+                  AND ts >= '{start_datetime}'
+                  AND ts <= '{end_datetime}'
+                ORDER BY ts ASC
+            """)
         
         prices = []
         for row in results:
@@ -326,10 +447,13 @@ def get_price_points():
             'token': token,
             'prices': prices,
             'count': len(prices),
+            'total_available': total_count,
+            'sampled': total_count > max_points,
             'source': 'data_engine'
         })
         
     except Exception as e:
+        logger.error(f"Error fetching price points: {e}", exc_info=True)
         return jsonify({
             'status': 'error',
             'error': str(e),
@@ -401,6 +525,7 @@ def get_cycle_tracker():
     where_clause = " AND ".join(conditions)
     
     try:
+        # Get paginated results
         results = client.query(f"""
             SELECT 
                 id, coin_id, threshold, cycle_start_time, cycle_end_time,
@@ -413,10 +538,35 @@ def get_cycle_tracker():
             LIMIT {limit}
         """)
         
+        # Get total count (all cycles matching filters, not just paginated)
+        total_count_result = client.query(f"""
+            SELECT COUNT(*) as total
+            FROM cycle_tracker
+            WHERE {where_clause}
+        """)
+        total_count = total_count_result[0]['total'] if total_count_result else 0
+        
+        # Calculate missing cycles: gaps in the ID sequence
+        # Get min and max IDs for this filter
+        minmax_result = client.query(f"""
+            SELECT MIN(id) as min_id, MAX(id) as max_id
+            FROM cycle_tracker
+            WHERE {where_clause}
+        """)
+        
+        missing_cycles = 0
+        if minmax_result and minmax_result[0]['min_id'] is not None:
+            min_id = minmax_result[0]['min_id']
+            max_id = minmax_result[0]['max_id']
+            expected_count = max_id - min_id + 1
+            missing_cycles = expected_count - total_count
+        
         return jsonify({
             'status': 'ok',
             'cycles': results,
-            'count': len(results),
+            'count': len(results),  # Paginated count
+            'total_count': total_count,  # Total matching filter
+            'missing_cycles': missing_cycles,  # Gaps in ID sequence
             'source': 'data_engine'
         })
         
@@ -670,6 +820,115 @@ def get_plays():
         }), 500
 
 
+@app.route('/plays/performance', methods=['GET'])
+@engine_required
+def get_all_plays_performance():
+    """
+    Get performance metrics for all plays (batch operation).
+    
+    Query params:
+        hours: Time window (default: 'all', or number like 24, 12, 6, 2)
+    """
+    try:
+        hours = request.args.get('hours', 'all')
+        
+        # Build time filters
+        time_filter_pending = ""
+        time_filter_no_go = ""
+        time_filter_sold = ""
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                time_filter_pending = f"AND followed_at >= CURRENT_TIMESTAMP - INTERVAL {hours_int} HOUR"
+                time_filter_no_go = f"AND followed_at >= CURRENT_TIMESTAMP - INTERVAL {hours_int} HOUR"
+                time_filter_sold = f"AND our_exit_timestamp >= CURRENT_TIMESTAMP - INTERVAL {hours_int} HOUR"
+            except ValueError:
+                pass
+        
+        client = get_engine_client()
+        plays_data = {}
+        
+        # Get all play IDs
+        plays_result = client.query("SELECT id FROM follow_the_goat_plays ORDER BY id")
+        play_ids = [p['id'] for p in plays_result] if plays_result else []
+        
+        if not play_ids:
+            return jsonify({
+                'success': True,
+                'plays': {}
+            })
+        
+        # Get live trades stats (pending trades)
+        live_query = f"""
+            SELECT 
+                play_id,
+                COUNT(*) as active_trades,
+                AVG(CASE 
+                    WHEN our_entry_price > 0 AND current_price > 0 
+                    THEN ((current_price - our_entry_price) / our_entry_price) * 100 
+                    ELSE NULL 
+                END) as active_avg_profit
+            FROM follow_the_goat_buyins
+            WHERE our_status = 'pending' {time_filter_pending}
+            GROUP BY play_id
+        """
+        live_results = client.query(live_query)
+        live_stats = {r['play_id']: r for r in live_results} if live_results else {}
+        
+        # Get no_go counts
+        no_go_query = f"""
+            SELECT 
+                play_id,
+                COUNT(*) as no_go_count
+            FROM follow_the_goat_buyins
+            WHERE our_status = 'no_go' {time_filter_no_go}
+            GROUP BY play_id
+        """
+        no_go_results = client.query(no_go_query)
+        no_go_stats = {r['play_id']: r['no_go_count'] for r in no_go_results} if no_go_results else {}
+        
+        # Get sold/completed trades stats
+        sold_query = f"""
+            SELECT 
+                play_id,
+                SUM(our_profit_loss) as total_profit_loss,
+                COUNT(CASE WHEN our_profit_loss > 0 THEN 1 END) as winning_trades,
+                COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades
+            FROM follow_the_goat_buyins
+            WHERE our_status IN ('sold', 'completed') {time_filter_sold}
+            GROUP BY play_id
+        """
+        sold_results = client.query(sold_query)
+        sold_stats = {r['play_id']: r for r in sold_results} if sold_results else {}
+        
+        # Combine stats for each play - use string keys for JavaScript compatibility
+        for play_id in play_ids:
+            live = live_stats.get(play_id, {})
+            sold = sold_stats.get(play_id, {})
+            
+            plays_data[str(play_id)] = {
+                'total_profit_loss': float(sold.get('total_profit_loss') or 0),
+                'winning_trades': int(sold.get('winning_trades') or 0),
+                'losing_trades': int(sold.get('losing_trades') or 0),
+                'total_no_gos': no_go_stats.get(play_id, 0),
+                'active_trades': int(live.get('active_trades') or 0),
+                'active_avg_profit': float(live.get('active_avg_profit')) if live.get('active_avg_profit') is not None else None
+            }
+        
+        return jsonify({
+            'success': True,
+            'plays': plays_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in get_all_plays_performance: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/plays/<int:play_id>', methods=['GET'])
 @engine_required
 def get_play(play_id):
@@ -726,16 +985,17 @@ def get_buyins():
     
     if hours != 'all':
         hours_int = safe_int(hours, 24)
-        conditions.append(f"created_at >= NOW() - INTERVAL {hours_int} HOUR")
+        conditions.append(f"followed_at >= NOW() - INTERVAL {hours_int} HOUR")
     
     where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
     
     try:
+        # Use followed_at (correct column name) and leverage composite index
         results = client.query(f"""
             SELECT *
             FROM follow_the_goat_buyins
             {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY followed_at DESC
             LIMIT {limit}
         """)
         
@@ -972,9 +1232,9 @@ def main():
     
     # Check if Master2 Local API is available
     if is_engine_available():
-        print(f"✓ Master2 Local API is available at {DATA_ENGINE_URL}")
+        print(f"✓ Master2 Local API is available at {MASTER2_LOCAL_API_URL}")
     else:
-        print(f"✗ WARNING: Master2 Local API not available at {DATA_ENGINE_URL}")
+        print(f"✗ WARNING: Master2 Local API not available at {MASTER2_LOCAL_API_URL}")
         print("  Make sure master2.py is running first!")
     
     print("=" * 60)

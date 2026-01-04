@@ -247,13 +247,68 @@ $effective_exit_price = null;
 $effective_exit_timestamp = null;
 
 if ($trade && $trade['followed_at']) {
-    $entry_time = strtotime($trade['followed_at']);
+    // Parse followed_at - handle both ISO format and plain datetime
+    $followed_at_str = $trade['followed_at'];
+    if (strpos($followed_at_str, 'T') !== false) {
+        // ISO format: ensure it has timezone
+        if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $followed_at_str)) {
+            $followed_at_str .= 'Z'; // Add Z if no timezone
+        }
+        $entry_time = strtotime($followed_at_str);
+    } else {
+        // Plain datetime format: treat as UTC
+        $entry_time = strtotime($followed_at_str . ' UTC');
+    }
+    
     $status = strtolower($trade['our_status']);
     
     if ($status !== 'completed' && $status !== 'sold') {
-        // Use PHP's current UTC time instead of MySQL query (DuckDB only)
-        $effective_exit_timestamp = gmdate('Y-m-d H:i:s');
-        $effective_exit_ms = time();
+        // For no_go/pending trades, try to get the actual exit time from entry_log
+        $exit_time_from_log = null;
+        if (!empty($entry_log_raw)) {
+            // Parse entry_log_raw (could be JSON string or already decoded)
+            $entry_log_data = null;
+            if (is_string($entry_log_raw)) {
+                $entry_log_data = json_decode($entry_log_raw, true);
+                // Handle double-encoded JSON
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    $entry_log_data = json_decode(stripslashes($entry_log_raw), true);
+                }
+            } elseif (is_array($entry_log_raw)) {
+                $entry_log_data = $entry_log_raw;
+            }
+            
+            if (is_array($entry_log_data)) {
+                // Find the last timestamp in the log (usually when status was updated)
+                foreach ($entry_log_data as $log_entry) {
+                    if (isset($log_entry['timestamp'])) {
+                        $log_timestamp = $log_entry['timestamp'];
+                        // Parse timestamp - handle ISO format with timezone
+                        if (strpos($log_timestamp, 'T') !== false) {
+                            if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $log_timestamp)) {
+                                $log_timestamp .= 'Z';
+                            }
+                            $log_ts = strtotime($log_timestamp);
+                        } else {
+                            $log_ts = strtotime($log_timestamp . ' UTC');
+                        }
+                        if ($log_ts && $log_ts > $entry_time) {
+                            $exit_time_from_log = $log_ts;
+                        }
+                    }
+                }
+            }
+        }
+        
+        if ($exit_time_from_log) {
+            // Use the timestamp from entry log (when trade was actually processed)
+            $effective_exit_timestamp = gmdate('Y-m-d H:i:s', $exit_time_from_log);
+            $effective_exit_ms = $exit_time_from_log;
+        } else {
+            // Fallback: Use PHP's current UTC time
+            $effective_exit_timestamp = gmdate('Y-m-d H:i:s');
+            $effective_exit_ms = time();
+        }
         
         $price_movements = json_decode($trade['price_movements'] ?? '[]', true);
         if (is_array($price_movements) && count($price_movements) > 0) {
@@ -261,8 +316,17 @@ if ($trade && $trade['followed_at']) {
             $effective_exit_price = $last['current_price'] ?? null;
         }
     } elseif ($trade['our_exit_timestamp']) {
+        // Parse exit timestamp - handle both ISO format and plain datetime
+        $exit_timestamp_str = $trade['our_exit_timestamp'];
+        if (strpos($exit_timestamp_str, 'T') !== false) {
+            if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $exit_timestamp_str)) {
+                $exit_timestamp_str .= 'Z';
+            }
+            $effective_exit_ms = strtotime($exit_timestamp_str);
+        } else {
+            $effective_exit_ms = strtotime($exit_timestamp_str . ' UTC');
+        }
         $effective_exit_timestamp = $trade['our_exit_timestamp'];
-        $effective_exit_ms = strtotime($trade['our_exit_timestamp']);
         $effective_exit_price = $trade['our_exit_price'];
     } else {
         $effective_exit_timestamp = $trade['followed_at'];
@@ -276,9 +340,34 @@ if ($trade && $trade['followed_at']) {
 }
 
 // Pass computed values to JavaScript
-// Use server timezone (same as how data is stored in database)
-$followed_at_ms = $trade['followed_at'] ? strtotime($trade['followed_at']) * 1000 : null;
-$block_timestamp_ms = $trade['block_timestamp'] ? strtotime($trade['block_timestamp']) * 1000 : null;
+// Parse timestamps as UTC (database stores UTC)
+$followed_at_str = $trade['followed_at'] ?? '';
+if ($followed_at_str) {
+    if (strpos($followed_at_str, 'T') !== false) {
+        if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $followed_at_str)) {
+            $followed_at_str .= 'Z';
+        }
+        $followed_at_ms = strtotime($followed_at_str) * 1000;
+    } else {
+        $followed_at_ms = strtotime($followed_at_str . ' UTC') * 1000;
+    }
+} else {
+    $followed_at_ms = null;
+}
+
+$block_timestamp_str = $trade['block_timestamp'] ?? '';
+if ($block_timestamp_str) {
+    if (strpos($block_timestamp_str, 'T') !== false) {
+        if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $block_timestamp_str)) {
+            $block_timestamp_str .= 'Z';
+        }
+        $block_timestamp_ms = strtotime($block_timestamp_str) * 1000;
+    } else {
+        $block_timestamp_ms = strtotime($block_timestamp_str . ' UTC') * 1000;
+    }
+} else {
+    $block_timestamp_ms = null;
+}
 
 $js_data = [
     'trade' => $trade,
@@ -459,8 +548,16 @@ ob_start();
         <div class="trade-info-value">
             <?php 
             if ($trade['followed_at']) {
-                date_default_timezone_set('UTC');
-                echo gmdate('M d, Y H:i:s', strtotime($trade['followed_at'])) . ' UTC';
+                $followed_at_str = $trade['followed_at'];
+                if (strpos($followed_at_str, 'T') !== false) {
+                    if (!preg_match('/[+-]\d{2}:\d{2}|Z$/', $followed_at_str)) {
+                        $followed_at_str .= 'Z';
+                    }
+                    $entry_ts = strtotime($followed_at_str);
+                } else {
+                    $entry_ts = strtotime($followed_at_str . ' UTC');
+                }
+                echo gmdate('M d, Y H:i:s', $entry_ts) . ' UTC';
             } else {
                 echo '--';
             }

@@ -714,8 +714,8 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
         return False
     
     columns = _get_all_columns()
-    col_list = ", ".join(["id"] + columns)
-    placeholders = ", ".join(["?" for _ in (["id"] + columns)])
+    col_list = ", ".join(columns)
+    placeholders = ", ".join(["?" for _ in columns])
     
     # PRIORITY 1: Try master2's local DuckDB
     try:
@@ -726,18 +726,13 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
                 # Delete existing rows for this buyin (in case of re-run)
                 local_db.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
                 
-                # Get the next available ID
-                result = local_db.execute("SELECT COALESCE(MAX(id), 0) FROM buyin_trail_minutes").fetchone()
-                next_id = result[0] + 1
-                
-                # Insert new rows with explicit IDs
+                # Insert new rows (no id column needed - composite PK on buyin_id + minute)
                 for row in rows:
-                    values = [next_id] + [row.get(col) for col in columns]
+                    values = [row.get(col) for col in columns]
                     local_db.execute(
-                        f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
+                        f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
                         values
                     )
-                    next_id += 1
             
             logger.debug(f"Inserted {len(rows)} trail rows into master2 DuckDB for buyin_id={buyin_id}")
             return True
@@ -755,23 +750,19 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
         requests.post("http://127.0.0.1:5052/execute", json={"sql": delete_sql}, timeout=10)
         
         # Get next ID
-        resp = requests.post(
-            "http://127.0.0.1:5052/query",
-            json={"sql": "SELECT COALESCE(MAX(id), 0) as max_id FROM buyin_trail_minutes"},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success") and data.get("results"):
-                next_id = data["results"][0].get("max_id", 0) + 1
-            else:
-                next_id = 1
-        else:
-            next_id = 1
+        # Delete existing rows first (via HTTP API)
+        try:
+            resp = requests.post(
+                "http://127.0.0.1:5052/execute",
+                json={"sql": f"DELETE FROM buyin_trail_minutes WHERE buyin_id = {buyin_id}"},
+                timeout=10
+            )
+        except:
+            pass  # Ignore delete errors
         
-        # Insert rows via HTTP
+        # Insert rows via HTTP (no id column - composite PK on buyin_id + minute)
         for row in rows:
-            values = [next_id] + [row.get(col) for col in columns]
+            values = [row.get(col) for col in columns]
             # Build INSERT SQL with proper escaping
             value_strs = []
             for v in values:
@@ -788,9 +779,8 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
                     escaped = str(v).replace("'", "''")
                     value_strs.append(f"'{escaped}'")
             
-            insert_sql = f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({', '.join(value_strs)})"
+            insert_sql = f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({', '.join(value_strs)})"
             resp = requests.post("http://127.0.0.1:5052/execute", json={"sql": insert_sql}, timeout=10)
-            next_id += 1
         
         logger.debug(f"Inserted {len(rows)} trail rows via HTTP API for buyin_id={buyin_id}")
         return True
@@ -804,18 +794,13 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
             # Delete existing rows for this buyin (in case of re-run)
             conn.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
             
-            # Get the next available ID
-            result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM buyin_trail_minutes").fetchone()
-            next_id = result[0] + 1
-            
-            # Insert new rows with explicit IDs
+            # Insert new rows (no id column - composite PK on buyin_id + minute)
             for row in rows:
-                values = [next_id] + [row.get(col) for col in columns]
+                values = [row.get(col) for col in columns]
                 conn.execute(
-                    f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
+                    f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
                     values
                 )
-                next_id += 1
         
         logger.debug(f"Inserted {len(rows)} trail rows into file DuckDB for buyin_id={buyin_id}")
         return True

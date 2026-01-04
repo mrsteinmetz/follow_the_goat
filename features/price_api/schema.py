@@ -258,7 +258,6 @@ CREATE INDEX IF NOT EXISTS idx_pattern_filters_is_active ON pattern_config_filte
 
 SCHEMA_BUYIN_TRAIL_MINUTES = """
 CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
-    id BIGINT PRIMARY KEY,
     buyin_id BIGINT NOT NULL,
     minute TINYINT NOT NULL,
     
@@ -422,10 +421,11 @@ CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
     eth_open_price DOUBLE,
     eth_close_price DOUBLE,
     
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    PRIMARY KEY (buyin_id, minute)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_trail_buyin_minute ON buyin_trail_minutes(buyin_id, minute);
 CREATE INDEX IF NOT EXISTS idx_trail_buyin_id ON buyin_trail_minutes(buyin_id);
 CREATE INDEX IF NOT EXISTS idx_trail_minute ON buyin_trail_minutes(minute);
 CREATE INDEX IF NOT EXISTS idx_trail_created_at ON buyin_trail_minutes(created_at);
@@ -533,20 +533,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tracking_wallet ON follow_the_goat_trackin
 """
 
 # Expected intervals for each job (in milliseconds) - used to determine "slow" jobs
+# Updated 2026-01-04 to match actual scheduler configuration in master.py and master2.py
 JOB_EXPECTED_INTERVALS_MS = {
-    "fetch_jupiter_prices": 1000,           # 1 second (bundled 3 tokens = 60 req/min)
-    "sync_trades_from_webhook": 1000,       # 1 second (was 0.5s, but job takes longer)
-    "follow_the_goat": 1000,                # 1 second (was 0.5s, but job takes longer)
-    "trailing_stop_seller": 1000,           # 1 second (was 0.5s, but job takes longer)
-    "process_price_cycles": 15000,          # 15 seconds (increased - job takes ~11s)
-    "process_wallet_profiles": 10000,       # 10 seconds (increased - job takes ~8s)
-    "train_validator": 30000,               # 30 seconds
-    "update_potential_gains": 15000,        # 15 seconds
-    "sync_plays_from_mysql": 300000,        # 5 minutes
-    "sync_pattern_config_from_mysql": 300000,  # 5 minutes
+    # === MASTER.PY JOBS (Data Engine - port 5050) ===
+    "fetch_jupiter_prices": 1000,           # 1 second
+    "sync_trades_from_webhook": 1000,       # 1 second
     "cleanup_jupiter_prices": 3600000,      # 1 hour
     "cleanup_duckdb_hot_tables": 3600000,   # 1 hour
+    
+    # === MASTER2.PY JOBS (Trading Logic - port 5052) ===
+    "sync_from_engine": 1000,               # 1 second (incremental sync by ID)
+    "follow_the_goat": 1000,                # 1 second
+    "trailing_stop_seller": 1000,           # 1 second
+    "train_validator": 15000,               # 15 seconds
+    "update_potential_gains": 15000,        # 15 seconds
+    "create_wallet_profiles": 5000,         # 5 seconds
     "cleanup_wallet_profiles": 3600000,     # 1 hour
+    "process_price_cycles": 2000,           # 2 seconds
+    "export_job_status": 5000,              # 5 seconds
+    "create_new_patterns": 900000,          # 15 minutes
+    
+    # === DEPRECATED (kept for backwards compatibility) ===
+    "process_wallet_profiles": 5000,        # Renamed to create_wallet_profiles
+    "sync_plays_from_mysql": 300000,        # 5 minutes (if still used)
+    "sync_pattern_config_from_mysql": 300000,  # 5 minutes (if still used)
 }
 
 # =============================================================================

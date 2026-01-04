@@ -35,7 +35,7 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 from core.config import settings
 from features.price_api.schema import (
     SCHEMA_SOL_STABLECOIN_TRADES,
@@ -63,17 +63,19 @@ THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
 def get_last_processed_id(threshold: float) -> int:
     """Get the last processed trade ID for a threshold from DuckDB."""
     try:
-        with get_duckdb("central") as conn:
-            # Create state table if needed
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS wallet_profiles_state (
-                    id INTEGER PRIMARY KEY,
-                    threshold DOUBLE NOT NULL UNIQUE,
-                    last_trade_id BIGINT NOT NULL DEFAULT 0,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            result = conn.execute(
+        # Ensure table exists (write operation via queue)
+        duckdb_execute_write("central", """
+            CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                id INTEGER PRIMARY KEY,
+                threshold DOUBLE NOT NULL UNIQUE,
+                last_trade_id BIGINT NOT NULL DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """, sync=True)
+        
+        # Read state (read operation)
+        with get_duckdb("central", read_only=True) as cursor:
+            result = cursor.execute(
                 "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = ?",
                 [threshold]
             ).fetchone()
@@ -86,24 +88,23 @@ def get_last_processed_id(threshold: float) -> int:
 def update_last_processed_id(threshold: float, last_trade_id: int):
     """Update the last processed trade ID for a threshold in DuckDB."""
     try:
-        with get_duckdb("central") as conn:
-            # Create state table if needed
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS wallet_profiles_state (
-                    id INTEGER PRIMARY KEY,
-                    threshold DOUBLE NOT NULL UNIQUE,
-                    last_trade_id BIGINT NOT NULL DEFAULT 0,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            # Upsert using DuckDB syntax
-            conn.execute("""
-                INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT (threshold) DO UPDATE SET 
-                    last_trade_id = excluded.last_trade_id,
-                    last_updated = CURRENT_TIMESTAMP
-            """, [threshold, last_trade_id])
+        # Ensure table exists (write operation via queue)
+        duckdb_execute_write("central", """
+            CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                id INTEGER PRIMARY KEY,
+                threshold DOUBLE NOT NULL UNIQUE,
+                last_trade_id BIGINT NOT NULL DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Upsert using DuckDB syntax
+        duckdb_execute_write("central", """
+            INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
+            VALUES (?, ?, NOW())
+            ON CONFLICT (threshold) DO UPDATE SET 
+                last_trade_id = excluded.last_trade_id,
+                last_updated = NOW()
+        """, [threshold, last_trade_id])
     except Exception as e:
         logger.error(f"Failed to update state for threshold {threshold}: {e}")
 
@@ -115,11 +116,10 @@ def update_last_processed_id(threshold: float, last_trade_id: int):
 def ensure_duckdb_tables():
     """Ensure DuckDB tables exist (idempotent)."""
     try:
-        with get_duckdb("central") as conn:
-            conn.execute(SCHEMA_SOL_STABLECOIN_TRADES)
-            conn.execute(SCHEMA_CYCLE_TRACKER)
-            conn.execute(SCHEMA_PRICE_POINTS)
-            conn.execute(SCHEMA_WALLET_PROFILES)
+        duckdb_execute_write("central", SCHEMA_SOL_STABLECOIN_TRADES, sync=True)
+        duckdb_execute_write("central", SCHEMA_CYCLE_TRACKER, sync=True)
+        duckdb_execute_write("central", SCHEMA_PRICE_POINTS, sync=True)
+        duckdb_execute_write("central", SCHEMA_WALLET_PROFILES, sync=True)
         return True
     except Exception as e:
         logger.error(f"Failed to ensure DuckDB tables: {e}")
@@ -353,34 +353,36 @@ def insert_profiles_batch(profiles: List[Dict]) -> int:
     
     # Write to DuckDB (central.duckdb)
     try:
-        with get_duckdb("central") as conn:
-            # Generate IDs for new profiles
-            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM wallet_profiles").fetchone()
+        # Get next ID (read operation)
+        with get_duckdb("central", read_only=True) as cursor:
+            max_id_result = cursor.execute("SELECT COALESCE(MAX(id), 0) FROM wallet_profiles").fetchone()
             next_id = (max_id_result[0] or 0) + 1
-            
-            # Prepare batch insert data
-            batch_data = []
-            for i, profile in enumerate(profiles):
-                batch_data.append([
-                    next_id + i,
-                    profile['wallet_address'],
-                    profile['threshold'],
-                    profile['trade_id'],
-                    profile['trade_timestamp'],
-                    profile['price_cycle'],
-                    profile['price_cycle_start_time'],
-                    profile['price_cycle_end_time'],
-                    profile['trade_entry_price_org'],
-                    profile['stablecoin_amount'],
-                    profile['trade_entry_price'],
-                    profile['sequence_start_price'],
-                    profile['highest_price_reached'],
-                    profile['lowest_price_reached'],
-                    profile['long_short'],
-                    profile['short'],
-                ])
-            
-            # Batch insert with conflict handling
+        
+        # Prepare batch insert data
+        batch_data = []
+        for i, profile in enumerate(profiles):
+            batch_data.append([
+                next_id + i,
+                profile['wallet_address'],
+                profile['threshold'],
+                profile['trade_id'],
+                profile['trade_timestamp'],
+                profile['price_cycle'],
+                profile['price_cycle_start_time'],
+                profile['price_cycle_end_time'],
+                profile['trade_entry_price_org'],
+                profile['stablecoin_amount'],
+                profile['trade_entry_price'],
+                profile['sequence_start_price'],
+                profile['highest_price_reached'],
+                profile['lowest_price_reached'],
+                profile['long_short'],
+                profile['short'],
+            ])
+        
+        # Batch insert via write queue
+        # Define helper for executemany
+        def _batch_insert(conn, data):
             conn.executemany("""
                 INSERT OR IGNORE INTO wallet_profiles 
                 (id, wallet_address, threshold, trade_id, trade_timestamp, price_cycle,
@@ -388,9 +390,12 @@ def insert_profiles_batch(profiles: List[Dict]) -> int:
                  stablecoin_amount, trade_entry_price, sequence_start_price,
                  highest_price_reached, lowest_price_reached, long_short, short)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, batch_data)
-            duckdb_ok = True
-            inserted_count = len(batch_data)
+            """, data)
+        
+        from scheduler.master2 import queue_write_sync, _local_duckdb
+        queue_write_sync(_batch_insert, _local_duckdb, batch_data)
+        duckdb_ok = True
+        inserted_count = len(batch_data)
     except Exception as e:
         logger.error(f"DuckDB insert failed: {e}")
     
@@ -411,18 +416,22 @@ def cleanup_old_profiles(hours: int = 24) -> int:
     total_deleted = 0
     cutoff = datetime.now() - timedelta(hours=hours)
     
-    # Clean up DuckDB only
+    # Clean up DuckDB only via write queue
     try:
-        with get_duckdb("central") as conn:
+        # Define helper for delete with return count
+        def _delete_old_profiles(conn, cutoff_time):
             result = conn.execute("""
                 DELETE FROM wallet_profiles
                 WHERE trade_timestamp < ?
                 RETURNING id
-            """, [cutoff]).fetchall()
-            deleted = len(result)
-            if deleted > 0:
-                total_deleted = deleted
-                logger.debug(f"Cleaned up {deleted} old profiles from DuckDB")
+            """, [cutoff_time]).fetchall()
+            return len(result)
+        
+        from scheduler.master2 import queue_write_sync, _local_duckdb
+        deleted = queue_write_sync(_delete_old_profiles, _local_duckdb, cutoff)
+        if deleted > 0:
+            total_deleted = deleted
+            logger.debug(f"Cleaned up {deleted} old profiles from DuckDB")
     except Exception as e:
         logger.error(f"DuckDB cleanup failed: {e}")
     
@@ -534,10 +543,10 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
         try:
             conn.execute("""
                 INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, NOW())
                 ON CONFLICT (threshold) DO UPDATE SET 
                     last_trade_id = excluded.last_trade_id,
-                    last_updated = CURRENT_TIMESTAMP
+                    last_updated = NOW()
             """, [threshold, last_id])
         except Exception as e:
             logger.debug(f"State update failed: {e}")

@@ -62,10 +62,6 @@ follow_the_goat/
 
 ## Database Conventions
 
-### Table Naming
-- Hot tables: `{feature}_{data_type}` (e.g., `trades_positions`)
-- Cold tables: `{feature}_{data_type}_archive` (e.g., `trades_positions_archive`)
-
 ### Required Columns
 Every table must have:
 - `id`: INTEGER PRIMARY KEY (auto-increment)

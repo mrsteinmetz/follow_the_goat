@@ -27,6 +27,8 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
     $error_message = null;
     $data_source = "No Data";
     $actual_source = null;
+    $total_count = 0;
+    $missing_cycles = 0;
 
     if ($duckdb->isAvailable()) {
         $response = $duckdb->getCycleTracker($threshold, $hours, $limit);
@@ -34,6 +36,8 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
         if ($response && isset($response['cycles'])) {
             $cycles = $response['cycles'];
             $actual_source = $response['source'] ?? 'unknown';
+            $total_count = $response['total_count'] ?? count($cycles);
+            $missing_cycles = $response['missing_cycles'] ?? 0;
             
             switch ($actual_source) {
                 case 'engine':
@@ -49,14 +53,16 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
             $data_source = "No Data";
         }
     } else {
-        $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+        $error_message = "DuckDB API is not available. Please start the services: python scheduler/master2.py (and python scheduler/website_api.py)";
     }
     
     return [
         'cycles' => $cycles,
         'error_message' => $error_message,
         'data_source' => $data_source,
-        'actual_source' => $actual_source
+        'actual_source' => $actual_source,
+        'total_count' => $total_count,
+        'missing_cycles' => $missing_cycles
     ];
 }
 
@@ -83,7 +89,9 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
         'error_message' => $result['error_message'],
         'data_source' => $result['data_source'],
         'actual_source' => $result['actual_source'],
-        'count' => count($result['cycles'])
+        'count' => count($result['cycles']),
+        'total_count' => $result['total_count'],
+        'missing_cycles' => $result['missing_cycles']
     ]);
     exit;
 }
@@ -94,6 +102,8 @@ $cycles = $result['cycles'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
 $actual_source = $result['actual_source'];
+$total_count = $result['total_count'];
+$missing_cycles = $result['missing_cycles'];
 
 // Fetch ALL cycles for the threshold range table (ignoring threshold filter)
 $all_cycles_for_table = fetchAllCyclesForRangeTable($duckdb, $hours, 1000);
@@ -311,7 +321,10 @@ foreach ($all_cycles_for_table as $cycle) {
                                 <div class="d-flex justify-content-between align-items-start">
                                     <div>
                                         <p class="stat-label">Total Cycles</p>
-                                        <p class="stat-value" id="stat-total" style="color: #fff;"><?php echo count($cycles); ?></p>
+                                        <p class="stat-value" id="stat-total" style="color: #fff;"><?php echo $total_count; ?></p>
+                                        <?php if ($total_count > $limit): ?>
+                                        <p class="text-muted mb-0" style="font-size: 0.7rem;">Showing <?php echo count($cycles); ?></p>
+                                        <?php endif; ?>
                                     </div>
                                     <div class="stat-icon bg-primary-transparent text-primary">
                                         <i class="ri-loop-right-line"></i>
@@ -349,7 +362,27 @@ foreach ($all_cycles_for_table as $cycle) {
                             <div class="stat-card">
                                 <div class="d-flex justify-content-between align-items-start">
                                     <div>
-                                        <p class="stat-label">Avg Max Increase</p>
+                                        <p class="stat-label">Missing Cycles</p>
+                                        <p class="stat-value <?php echo $missing_cycles > 0 ? 'text-warning' : 'text-muted'; ?>" id="stat-missing">
+                                            <?php echo $missing_cycles; ?>
+                                        </p>
+                                        <p class="text-muted mb-0" style="font-size: 0.7rem;">ID sequence gaps</p>
+                                    </div>
+                                    <div class="stat-icon bg-warning-transparent text-warning">
+                                        <i class="ri-alert-line"></i>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Avg Max Increase moved to a separate row -->
+                    <div class="row g-3 mb-4">
+                        <div class="col-12">
+                            <div class="stat-card">
+                                <div class="d-flex justify-content-between align-items-start">
+                                    <div>
+                                        <p class="stat-label">Average Max Increase</p>
                                         <p class="stat-value <?php echo $avg_max_increase >= 0 ? 'price-up' : 'price-down'; ?>" id="stat-avg">
                                             <?php echo number_format($avg_max_increase, 4); ?>%
                                         </p>
@@ -631,7 +664,18 @@ foreach ($all_cycles_for_table as $cycle) {
             totalIncrease += parseFloat(cycle.max_percent_increase || 0);
         });
         
-        document.getElementById('stat-total').textContent = data.count;
+        // Update total count (from database, not just paginated results)
+        const totalCount = data.total_count || data.count;
+        document.getElementById('stat-total').textContent = totalCount.toLocaleString();
+        
+        // Update missing cycles
+        const missingEl = document.getElementById('stat-missing');
+        if (missingEl) {
+            const missingCount = data.missing_cycles || 0;
+            missingEl.textContent = missingCount;
+            missingEl.className = 'stat-value ' + (missingCount > 0 ? 'text-warning' : 'text-muted');
+        }
+        
         document.getElementById('stat-active').textContent = active;
         document.getElementById('stat-completed').textContent = completed;
         

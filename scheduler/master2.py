@@ -50,6 +50,13 @@ try:
 except ImportError:
     HAS_PYARROW = False
 
+# Try to import Polars for ultra-fast data processing
+try:
+    import polars as pl
+    HAS_POLARS = True
+except ImportError:
+    HAS_POLARS = False
+
 from core.config import settings
 from core.data_client import DataClient, get_client
 
@@ -72,6 +79,212 @@ _local_duckdb = None
 _local_duckdb_lock = threading.Lock()
 _data_client = None
 _local_api_server = None  # Uvicorn server thread for port 5052
+
+# Thread-local storage for cursors (allows concurrent reads)
+_thread_local = threading.local()
+
+
+def get_thread_cursor():
+    """
+    Get a thread-specific cursor for concurrent read operations.
+    
+    Each thread gets its own cursor from the shared connection.
+    DuckDB cursors can safely perform concurrent reads on the same
+    underlying data without blocking each other.
+    
+    Returns:
+        DuckDB cursor for the current thread
+    """
+    global _local_duckdb, _local_duckdb_lock
+    
+    if _local_duckdb is None:
+        raise RuntimeError("Local DuckDB not initialized")
+    
+    if not hasattr(_thread_local, 'cursor') or _thread_local.cursor is None:
+        # Create cursor with lock (cursor creation needs serialization)
+        with _local_duckdb_lock:
+            _thread_local.cursor = _local_duckdb.cursor()
+    
+    return _thread_local.cursor
+
+
+# =============================================================================
+# WRITE QUEUE INFRASTRUCTURE
+# =============================================================================
+# Serializes ALL write operations through a single background thread.
+# This eliminates write conflicts while keeping reads concurrent.
+
+from queue import Queue, Empty
+from typing import Callable, Any
+
+_write_queue = Queue()
+_writer_thread = None
+_writer_running = threading.Event()
+_write_queue_stats = {
+    'total_writes': 0,
+    'failed_writes': 0,
+    'queue_size': 0
+}
+
+
+def queue_write(func: Callable, *args, **kwargs) -> None:
+    """
+    Queue a write operation to be executed by the background writer thread.
+    
+    This ensures all writes are serialized (no conflicts) while reads remain concurrent.
+    All thread-local cursors will see the data immediately after write completes.
+    
+    Args:
+        func: Function to call (usually _local_duckdb.execute or _insert_records_fast)
+        *args: Positional arguments for func
+        **kwargs: Keyword arguments for func
+    
+    Example:
+        queue_write(_local_duckdb.execute, "INSERT INTO prices VALUES (?, ?)", [1, 100.5])
+        queue_write(_insert_records_fast, _local_duckdb, "prices", records)
+    """
+    _write_queue.put((func, args, kwargs))
+    _write_queue_stats['queue_size'] = _write_queue.qsize()
+
+
+def queue_write_sync(func: Callable, *args, **kwargs) -> Any:
+    """
+    Queue a write and WAIT for it to complete (blocking).
+    
+    Use this ONLY when you need to read data you just wrote in the same job.
+    Most jobs should use queue_write() (non-blocking) instead.
+    
+    Returns:
+        The return value from func
+    """
+    result_queue = Queue()
+    
+    def wrapper():
+        try:
+            result = func(*args, **kwargs)
+            result_queue.put(('success', result))
+        except Exception as e:
+            result_queue.put(('error', e))
+    
+    _write_queue.put((wrapper, [], {}))
+    
+    # Wait for result (120s timeout for large PyArrow inserts)
+    status, value = result_queue.get(timeout=120)
+    if status == 'error':
+        raise value
+    return value
+
+
+def background_writer():
+    """
+    Background thread that processes ALL write operations sequentially.
+    
+    This runs continuously, processing writes from the queue.
+    Ensures no write conflicts and all jobs see consistent data.
+    """
+    global _local_duckdb, _write_queue_stats
+    
+    logger.info("Write queue processor started")
+    _writer_running.set()
+    
+    batch_writes = []
+    last_batch_time = time.time()
+    
+    while _writer_running.is_set():
+        try:
+            # Try to get a write operation (short timeout to check running flag)
+            try:
+                func, args, kwargs = _write_queue.get(timeout=0.1)
+                batch_writes.append((func, args, kwargs))
+            except Empty:
+                # No writes pending - process any batched writes
+                if batch_writes and (time.time() - last_batch_time > 0.05):
+                    # Process batch if 50ms elapsed
+                    pass
+                else:
+                    continue
+            
+            # Process all pending writes in a batch (up to 100 at once)
+            while len(batch_writes) < 100:
+                try:
+                    func, args, kwargs = _write_queue.get_nowait()
+                    batch_writes.append((func, args, kwargs))
+                except Empty:
+                    break
+            
+            if not batch_writes:
+                continue
+            
+            # Execute all writes in batch with lock
+            with _local_duckdb_lock:
+                for func, args, kwargs in batch_writes:
+                    try:
+                        func(*args, **kwargs)
+                        _write_queue_stats['total_writes'] += 1
+                    except Exception as e:
+                        _write_queue_stats['failed_writes'] += 1
+                        logger.error(f"Write queue operation failed: {e}", exc_info=True)
+                        logger.error(f"  Function: {func.__name__ if hasattr(func, '__name__') else str(func)}")
+            
+            batch_writes.clear()
+            last_batch_time = time.time()
+            _write_queue_stats['queue_size'] = _write_queue.qsize()
+                
+        except Exception as e:
+            logger.error(f"Write queue processor error: {e}", exc_info=True)
+            batch_writes.clear()
+    
+    logger.info("Write queue processor stopped")
+
+
+def start_write_queue():
+    """Start the background writer thread."""
+    global _writer_thread
+    
+    if _writer_thread is not None:
+        logger.warning("Write queue already started")
+        return
+    
+    _writer_thread = threading.Thread(
+        target=background_writer,
+        name="DuckDB-Writer",
+        daemon=True
+    )
+    _writer_thread.start()
+    
+    # Wait for thread to start
+    time.sleep(0.1)
+    
+    logger.info("Write queue processor initialized")
+
+
+def stop_write_queue():
+    """Stop the background writer thread gracefully."""
+    global _writer_thread
+    
+    if _writer_thread is None:
+        return
+    
+    logger.info("Stopping write queue processor...")
+    _writer_running.clear()
+    
+    # Wait for queue to drain (max 5 seconds)
+    for i in range(50):
+        if _write_queue.empty():
+            break
+        time.sleep(0.1)
+    
+    if _writer_thread.is_alive():
+        _writer_thread.join(timeout=5)
+    
+    logger.info(f"Write queue stopped. Stats: {_write_queue_stats}")
+    _writer_thread = None
+
+
+def get_write_queue_stats():
+    """Get write queue statistics for monitoring."""
+    return dict(_write_queue_stats)
+
 
 # =============================================================================
 # LOGGING CONFIGURATION
@@ -446,6 +659,51 @@ def init_local_duckdb():
             raw_data_json VARCHAR,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS follow_the_goat_tracking (
+            id INTEGER PRIMARY KEY,
+            wallet_address VARCHAR(255) NOT NULL UNIQUE,
+            last_trade_id BIGINT DEFAULT 0,
+            last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS pattern_config_projects (
+            id INTEGER PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS pattern_config_filters (
+            id INTEGER PRIMARY KEY,
+            project_id INTEGER,
+            name VARCHAR(255) NOT NULL,
+            section VARCHAR(100),
+            minute TINYINT,
+            field_name VARCHAR(100) NOT NULL,
+            field_column VARCHAR(100),
+            from_value DECIMAL(20,8),
+            to_value DECIMAL(20,8),
+            include_null TINYINT DEFAULT 0,
+            exclude_mode TINYINT DEFAULT 0,
+            play_id INTEGER,
+            is_active TINYINT DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+            id INTEGER PRIMARY KEY,
+            threshold DOUBLE NOT NULL UNIQUE,
+            last_trade_id BIGINT NOT NULL DEFAULT 0,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
         """
     ]
     
@@ -454,30 +712,62 @@ def init_local_duckdb():
     
     # Create indexes
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_prices_ts ON prices(ts)")
+    # Composite index for common query pattern: WHERE token = ? AND ts >= ? AND ts <= ?
+    _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_prices_token_ts ON prices(token, ts)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_price_points_created ON price_points(created_at)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_buyins_status ON follow_the_goat_buyins(our_status)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON sol_stablecoin_trades(trade_timestamp)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_price_analysis_threshold ON price_analysis(coin_id, percent_threshold)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_cycle_tracker_threshold ON cycle_tracker(threshold, cycle_end_time)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_whale_timestamp ON whale_movements(timestamp)")
+    _local_duckdb.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tracking_wallet ON follow_the_goat_tracking(wallet_address)")
+    _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_pattern_filters_project_id ON pattern_config_filters(project_id)")
+    _local_duckdb.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_state_threshold ON wallet_profiles_state(threshold)")
     
     # CRITICAL: Register this connection into the pool so that all modules
     # using get_duckdb("central") will use THIS in-memory DB with the data.
     # Without this, trading modules would create NEW empty in-memory DBs!
     #
-    # IMPORTANT: Even on Linux, in-memory connections need locking because
-    # the same connection object cannot handle truly concurrent operations
-    # without memory corruption at the C/C++ level.
+    # THREAD-SAFE ARCHITECTURE:
+    # - READ operations: Use thread-local cursors (concurrent, no lock needed)
+    # - WRITE operations: Use connection with lock (serialized)
+    #
+    # The cursor_factory allows get_duckdb("central", read_only=True) to return
+    # a thread-local cursor for concurrent reads without blocking other threads.
     from core.database import register_connection
-    register_connection("central", _local_duckdb, _local_duckdb_lock)
+    register_connection("central", _local_duckdb, _local_duckdb_lock, cursor_factory=get_thread_cursor)
     
-    logger.info("Local DuckDB initialized and registered as 'central'")
+    logger.info("Local DuckDB initialized and registered as 'central' with thread-local cursor support")
 
 
-def get_local_duckdb():
-    """Get the local DuckDB connection."""
+def get_local_duckdb(use_cursor=True):
+    """
+    Get database access for the current thread.
+    
+    Args:
+        use_cursor: If True (default), returns a thread-local cursor for READ operations.
+                   Cursors can perform concurrent reads without blocking.
+                   If False, returns the raw connection (caller MUST hold _local_duckdb_lock for WRITES).
+    
+    Returns:
+        Thread-local cursor (for reads) or connection (for writes with lock)
+    
+    Usage:
+        # For READ operations (concurrent, no lock needed):
+        cursor = get_local_duckdb(use_cursor=True)
+        result = cursor.execute("SELECT ...").fetchall()
+        
+        # For WRITE operations (must hold lock):
+        with _local_duckdb_lock:
+            conn = get_local_duckdb(use_cursor=False)
+            conn.execute("INSERT ...")
+    """
     global _local_duckdb
-    return _local_duckdb
+    
+    if use_cursor:
+        return get_thread_cursor()
+    else:
+        return _local_duckdb
 
 
 # =============================================================================
@@ -1022,17 +1312,18 @@ def create_local_api() -> FastAPI:
         
         if hours != 'all':
             hours_int = _safe_int(hours, 24)
-            conditions.append(f"created_at >= NOW() - INTERVAL {hours_int} HOUR")
+            conditions.append(f"followed_at >= NOW() - INTERVAL {hours_int} HOUR")
         
         where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
         
         try:
             with _local_duckdb_lock:
+                # Use followed_at (correct column name) and leverage composite index idx_buyins_query_opt
                 results = _local_duckdb.execute(f"""
                     SELECT *
                     FROM follow_the_goat_buyins
                     {where_clause}
-                    ORDER BY created_at DESC
+                    ORDER BY followed_at DESC
                     LIMIT {limit}
                 """).fetchall()
                 columns = [desc[0] for desc in _local_duckdb.description]
@@ -1085,7 +1376,7 @@ def create_local_api() -> FastAPI:
     @app.post("/execute")
     async def execute_write(request: QueryRequest):
         """Execute INSERT/UPDATE/DELETE queries for trail data persistence."""
-        global _local_duckdb, _local_duckdb_lock
+        global _local_duckdb
         
         if _local_duckdb is None:
             raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
@@ -1109,11 +1400,11 @@ def create_local_api() -> FastAPI:
             )
         
         try:
-            with _local_duckdb_lock:
-                if request.params:
-                    _local_duckdb.execute(request.sql, request.params)
-                else:
-                    _local_duckdb.execute(request.sql)
+            # Queue write operation (sync to wait for completion)
+            if request.params:
+                queue_write_sync(_local_duckdb.execute, request.sql, request.params)
+            else:
+                queue_write_sync(_local_duckdb.execute, request.sql)
             
             return {
                 "success": True,
@@ -1266,6 +1557,22 @@ def create_local_api() -> FastAPI:
         from scheduler.status import get_job_status
         return get_job_status()
     
+    @app.get("/write_queue_stats")
+    async def get_write_queue_stats_endpoint():
+        """
+        Get write queue statistics for monitoring.
+        
+        Returns:
+            - total_writes: Total number of write operations processed
+            - failed_writes: Number of failed write operations
+            - queue_size: Current number of pending writes in queue
+        """
+        return {
+            "status": "ok",
+            "stats": get_write_queue_stats(),
+            "timestamp": datetime.now().isoformat()
+        }
+    
     return app
 
 
@@ -1350,16 +1657,26 @@ def _fetch_table_data(client, table: str, hours: int, limit: int) -> tuple:
         return table, None, 0, str(e)
 
 
-def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
+def _insert_records_fast(conn, table: str, records: list) -> int:
     """
     Fast batch insert using DuckDB's native capabilities.
     
     Insertion priority (tries in order):
-    1. PyArrow zero-copy (fastest, ~1s for 50K records)
-    2. Pandas DataFrame (slower, ~30s for 50K records)
-    3. executemany (slowest, for small batches or fallback)
+    1. Polars DataFrame (FASTEST - native Rust, ~0.5s for 50K records)
+    2. PyArrow zero-copy (fast, ~1s for 50K records)
+    3. Pandas DataFrame (slower, ~30s for 50K records)
+    4. executemany (slowest, for small batches or fallback)
     
-    Uses lock if provided (for shared in-memory connections).
+    NOTE: This function is called from the write queue thread which already
+    holds _local_duckdb_lock. Do NOT acquire any locks here.
+    
+    Args:
+        conn: DuckDB connection (must be _local_duckdb)
+        table: Table name
+        records: List of dict records
+    
+    Returns:
+        Number of records inserted
     """
     if not records:
         return 0
@@ -1370,7 +1687,44 @@ def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
         num_records = len(records)
         
         # =================================================================
-        # METHOD 1: PyArrow zero-copy insertion (PRIMARY - fastest)
+        # METHOD 1: Polars DataFrame (PRIMARY - FASTEST!)
+        # =================================================================
+        # Polars is MUCH faster than PyArrow for large datasets:
+        # - Native Rust implementation (no Python overhead)
+        # - Optimized Arrow conversion
+        # - Better datetime/JSON handling
+        # Use for any batch > 100 records
+        if HAS_POLARS and num_records > 100:
+            try:
+                start_time = time.time()
+                
+                # Create Polars DataFrame directly from list of dicts
+                # This is MUCH faster than building columnar data manually
+                df = pl.DataFrame(records)
+                
+                # Convert to Arrow (zero-copy, native Rust speed)
+                arrow_table = df.to_arrow()
+                
+                # Register and insert (same as PyArrow method)
+                conn.register('_temp_polars', arrow_table)
+                conn.execute(f"INSERT OR IGNORE INTO {table} ({columns_str}) SELECT {columns_str} FROM _temp_polars")
+                conn.unregister('_temp_polars')
+                
+                elapsed = time.time() - start_time
+                
+                # Get current count for logging
+                result = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                current_count = result[0] if result else 0
+                
+                logger.info(f"Polars insert for {table}: {num_records} records in {elapsed:.2f}s (table now has {current_count} rows)")
+                return num_records
+                
+            except Exception as e:
+                logger.warning(f"Polars insert failed for {table}: {e}, falling back to PyArrow")
+                # Fall through to PyArrow method
+        
+        # =================================================================
+        # METHOD 2: PyArrow zero-copy insertion (FALLBACK #1)
         # =================================================================
         # Use PyArrow for batches > 20 records (even small batches benefit)
         if HAS_PYARROW and num_records > 20:
@@ -1571,12 +1925,8 @@ def _insert_records_fast(conn, table: str, records: list, lock=None) -> int:
                 logger.error(f"CRITICAL: Could not insert any of {num_records} records into {table}")
             return inserted
     
-    # Use lock if provided (for shared in-memory connections)
-    if lock:
-        with lock:
-            return _do_insert()
-    else:
-        return _do_insert()
+    # Execute directly - caller (write queue thread) already holds the lock
+    return _do_insert()
 
 
 def _load_plays_from_postgres():
@@ -1647,7 +1997,7 @@ def _load_plays_from_json_cache():
         return []
 
 
-def backfill_from_data_engine(hours: int = 2):
+def backfill_from_data_engine(hours: int = 24):
     """
     Load historical data from master.py's Data Engine API.
     
@@ -1692,8 +2042,8 @@ def backfill_from_data_engine(hours: int = 2):
     
     if plays:
         try:
-            # Insert plays into local DuckDB
-            inserted = _insert_records_fast(_local_duckdb, "follow_the_goat_plays", plays, _local_duckdb_lock)
+            # Insert plays into local DuckDB via write queue
+            inserted = queue_write_sync(_insert_records_fast, _local_duckdb, "follow_the_goat_plays", plays)
             logger.info(f"  Loaded {inserted} plays into DuckDB")
             
             # Show active plays count
@@ -1708,12 +2058,11 @@ def backfill_from_data_engine(hours: int = 2):
     # Tables to backfill from Data Engine API
     # =========================================================================
     # NOTE: follow_the_goat_plays is NOT included here - loaded from PostgreSQL above
-    # NOTE: cycle_tracker is NOT included - it's created from scratch by create_price_cycles.py
-    #       based on the prices data. Backfilling cycle_tracker would import old/duplicate cycles.
+    # NOTE: cycle_tracker IS backfilled from master.py where it's now computed incrementally
     tables_to_backfill = [
         ("prices", 10000),
         ("price_points", 10000),
-        # ("cycle_tracker", 1000),  # REMOVED - cycles are COMPUTED, not backfilled
+        ("cycle_tracker", 1000),  # Copy cycles computed by master.py
         ("follow_the_goat_buyins", 5000),
         ("sol_stablecoin_trades", 20000),
         ("wallet_profiles", 10000),
@@ -1761,7 +2110,8 @@ def backfill_from_data_engine(hours: int = 2):
     for table, records in fetch_results.items():
         try:
             start_time = time.time()
-            inserted = _insert_records_fast(_local_duckdb, table, records, _local_duckdb_lock)
+            # Use sync write during backfill to ensure data is ready before scheduler starts
+            inserted = queue_write_sync(_insert_records_fast, _local_duckdb, table, records)
             elapsed = time.time() - start_time
             total_loaded += inserted
             logger.info(f"    {table}: inserted {inserted} records ({elapsed:.2f}s)")
@@ -1771,19 +2121,62 @@ def backfill_from_data_engine(hours: int = 2):
     phase2_elapsed = time.time() - phase2_start
     logger.info(f"  Phase 2 complete: inserted records ({phase2_elapsed:.2f}s)")
     
+    # =========================================================================
+    # PHASE 3: Initialize last_synced_ids for incremental sync
+    # =========================================================================
+    logger.info("  Phase 3: Initializing incremental sync positions...")
+    _initialize_sync_positions()
+    
     total_elapsed = phase1_elapsed + phase2_elapsed
     logger.info(f"Backfill complete: {total_loaded} total records loaded ({total_elapsed:.2f}s)")
     return True
 
 
+def _initialize_sync_positions():
+    """
+    Initialize _last_synced_ids with the max ID from each table.
+    
+    This ensures incremental sync starts from where backfill ended,
+    not from ID 0 (which would re-sync all backfilled data).
+    """
+    global _local_duckdb, _local_duckdb_lock, _last_synced_ids
+    
+    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements"]
+    
+    try:
+        with _local_duckdb_lock:
+            for table in sync_tables:
+                try:
+                    result = _local_duckdb.execute(f"SELECT MAX(id) FROM {table}").fetchone()
+                    max_id = result[0] if result and result[0] else 0
+                    _last_synced_ids[table] = max_id
+                    logger.debug(f"    {table}: sync position set to ID {max_id}")
+                except Exception as e:
+                    logger.debug(f"    {table}: could not get max ID - {e}")
+                    _last_synced_ids[table] = 0
+    except Exception as e:
+        logger.warning(f"Failed to initialize sync positions: {e}")
+
+
+# Track last synced IDs for incremental sync
+_last_synced_ids = {
+    "prices": 0,
+    "order_book_features": 0,
+    "sol_stablecoin_trades": 0,
+    "whale_movements": 0
+}
+
+
 def sync_new_data_from_engine():
     """
-    Sync new data from the Data Engine (runs every 1 second).
+    Sync NEW data from the Data Engine (runs every 1 second).
+    
+    INCREMENTAL SYNC: Only fetches records with ID > last_synced_id.
+    This is much faster than time-based backfill for real-time trading.
     
     CRITICAL FOR TRADING: Uses PyArrow batch insert for maximum speed.
-    Gets last 1 minute of data to ensure no gaps.
     """
-    global _data_client, _local_duckdb, _local_duckdb_lock
+    global _data_client, _local_duckdb, _local_duckdb_lock, _last_synced_ids
     
     # Tables to sync - ordered by priority for trading decisions
     # prices & order_book_features are most critical for trading signals
@@ -1792,15 +2185,22 @@ def sync_new_data_from_engine():
     
     for table in sync_tables:
         try:
-            # Get last 1 minute of data (fresh for trading)
-            records = _data_client.get_backfill(table, minutes=1, limit=500)
+            since_id = _last_synced_ids.get(table, 0)
+            
+            # Get only NEW records since last sync
+            records, max_id = _data_client.get_new_since_id(table, since_id=since_id, limit=1000)
             
             if not records:
                 continue
             
-            # Use the fast batch insert (PyArrow if available)
-            with _local_duckdb_lock:
-                _insert_records_fast(_local_duckdb, table, records)
+            # Queue the batch insert (non-blocking, no conflicts!)
+            queue_write(_insert_records_fast, _local_duckdb, table, records)
+            
+            # Update sync position immediately (write queue processes in FIFO order)
+            _last_synced_ids[table] = max_id
+            
+            if len(records) > 10:
+                logger.debug(f"Queued {len(records)} records from {table} (max_id: {max_id})")
                 
         except Exception as e:
             # Only log at debug level to avoid spam (sync runs every 1s)
@@ -1905,9 +2305,9 @@ def run_create_new_patterns():
         logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
 
 
-@track_job("sync_from_engine", "Sync data from Data Engine (every 5s)")
+@track_job("sync_from_engine", "Sync data from Data Engine (every 1s)")
 def run_sync_from_engine():
-    """Sync new data from the Data Engine API."""
+    """Sync NEW data from the Data Engine API (incremental sync by ID)."""
     sync_new_data_from_engine()
 
 
@@ -2001,70 +2401,18 @@ def export_job_status_to_file():
         logger.error(f"Failed to export job status: {e}")
 
 
-def sync_cycles_to_engine():
-    """
-    Sync active cycles from local DuckDB to master.py's Data Engine.
-    
-    Syncs the MOST RECENT active cycle per threshold from local DuckDB.
-    The website_api filters duplicates on read, so we just sync our clean data.
-    """
-    global _local_duckdb, _local_duckdb_lock, _data_client
-    
-    if _data_client is None or not _data_client.is_available():
-        return
-    
-    try:
-        with _local_duckdb_lock:
-            # Get the MOST RECENT active cycle per threshold from local DuckDB
-            results = _local_duckdb.execute("""
-                WITH ranked_cycles AS (
-                    SELECT 
-                        id, coin_id, threshold, cycle_start_time, cycle_end_time,
-                        sequence_start_id, sequence_start_price, highest_price_reached,
-                        lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
-                        total_data_points, created_at,
-                        ROW_NUMBER() OVER (PARTITION BY threshold ORDER BY cycle_start_time DESC) as rn
-                    FROM cycle_tracker
-                    WHERE coin_id = 5 AND cycle_end_time IS NULL
-                )
-                SELECT 
-                    id, coin_id, threshold, cycle_start_time, cycle_end_time,
-                    sequence_start_id, sequence_start_price, highest_price_reached,
-                    lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
-                    total_data_points, created_at
-                FROM ranked_cycles
-                WHERE rn = 1
-                ORDER BY threshold ASC
-            """).fetchall()
-            
-            if not results:
-                return
-            
-            columns = [desc[0] for desc in _local_duckdb.description]
-            synced_count = 0
-            
-            for row in results:
-                cycle_dict = dict(zip(columns, row))
-                
-                # Serialize datetime objects for JSON
-                for key, value in cycle_dict.items():
-                    if hasattr(value, 'isoformat'):
-                        cycle_dict[key] = value.isoformat()
-                
-                try:
-                    _data_client.insert("cycle_tracker", cycle_dict)
-                    synced_count += 1
-                except Exception as e:
-                    logger.debug(f"Failed to sync cycle {cycle_dict.get('id')} to Data Engine: {e}")
-            
-            if synced_count > 0:
-                logger.debug(f"Synced {synced_count} active cycle(s) to Data Engine (website deduplicates on read)")
-                
-    except Exception as e:
-        logger.debug(f"Cycle sync error: {e}")
+# NOTE: sync_cycles_to_engine() REMOVED
+# 
+# Architecture clarification:
+#   - master.py (5050) = Raw data ingestion API ONLY (prices, whale, order book, transactions)
+#   - master2.py (5052) = MAIN database with ALL computed data (cycles, profiles, buyins, etc.)
+#   - website_api.py (5051) = Proxies ALL queries to master2.py (5052)
+#
+# There is NO need to sync data back to master.py. All data lives in master2's DuckDB
+# and is queried directly via the Local API (port 5052).
 
 
-@track_job("process_price_cycles", "Process price cycles (every 1s)")
+@track_job("process_price_cycles", "Process price cycles (every 2s)")
 def run_process_price_cycles():
     """
     Process price points into price cycle analysis.
@@ -2075,7 +2423,8 @@ def run_process_price_cycles():
     A cycle ends when price drops X% below the highest price reached in that cycle.
     There can only be 7 active cycles at any time (one per threshold).
     
-    After processing, syncs cycles to master.py's Data Engine so the website can see them.
+    All cycle data stays in master2's local DuckDB and is served via Local API (port 5052).
+    Website queries master2 directly - no need to sync back to master.py.
     """
     enabled = os.getenv("PRICE_CYCLES_ENABLED", "1") == "1"
     if not enabled:
@@ -2090,9 +2439,6 @@ def run_process_price_cycles():
         processed = process_price_cycles()
         if processed > 0:
             logger.debug(f"Price cycles: processed {processed} price points")
-        
-        # Sync cycles to master.py's Data Engine (so website can see them)
-        sync_cycles_to_engine()
         
     except Exception as e:
         logger.error(f"Price cycles error: {e}")
@@ -2126,6 +2472,7 @@ def create_scheduler() -> BackgroundScheduler:
     
     # =====================================================
     # DATA SYNC JOB (keeps local DuckDB up to date)
+    # INCREMENTAL SYNC: Only fetches records with ID > last_synced_id
     # =====================================================
     scheduler.add_job(
         func=run_sync_from_engine,
@@ -2194,14 +2541,14 @@ def create_scheduler() -> BackgroundScheduler:
     # WALLET PROFILE JOBS (moved from master.py)
     # =====================================================
     
-    # Wallet Profile Builder (every 2 seconds)
+    # Wallet Profile Builder (every 5 seconds) - INCREASED from 2s
     # Builds profiles from trades + completed cycles at all thresholds
     # Uses local in-memory DuckDB (synced from master.py's Data Engine API)
     scheduler.add_job(
         func=run_create_wallet_profiles,
-        trigger=IntervalTrigger(seconds=2),
+        trigger=IntervalTrigger(seconds=5),
         id="create_wallet_profiles",
-        name="Build wallet profiles (every 2s)",
+        name="Build wallet profiles (every 5s)",
         replace_existing=True,
         executor='heavy',
     )
@@ -2221,18 +2568,25 @@ def create_scheduler() -> BackgroundScheduler:
     # PRICE CYCLE ANALYSIS (moved from master.py)
     # =====================================================
     
-    # Process Price Cycles (every 1 second)
+    # Process Price Cycles (every 2 seconds) - INCREASED from 1s
     # Tracks price cycles at 7 thresholds (0.2% to 0.5%)
     # A cycle ends when price drops X% below highest price in that cycle
     # Max 7 active cycles at any time (one per threshold)
-    scheduler.add_job(
-        func=run_process_price_cycles,
-        trigger=IntervalTrigger(seconds=1),
-        id="process_price_cycles",
-        name="Process price cycles (every 1s)",
-        replace_existing=True,
-        executor='heavy',
-    )
+    # ==============================================
+    # REMOVED: Process price cycles (now runs in master.py)
+    # ==============================================
+    # Price cycles are now computed in master.py (Data Engine) where all the
+    # historical price data lives. Master2 copies the computed cycles via backfill.
+    # This eliminates the blocking issue on master2 startup.
+    
+    # scheduler.add_job(
+    #     func=run_process_price_cycles,
+    #     trigger=IntervalTrigger(seconds=2),
+    #     id="process_price_cycles",
+    #     name="Process price cycles (every 2s)",
+    #     replace_existing=True,
+    #     executor='heavy',
+    # )
     
     # Export job status to file (every 5 seconds)
     # Writes current job status to JSON file for website_api.py to read
@@ -2292,11 +2646,22 @@ def main():
     init_local_duckdb()
     
     # =====================================================
+    # STEP 2.5: Start Write Queue Processor
+    # =====================================================
+    logger.info("-" * 60)
+    logger.info("STEP 2.5: Starting write queue processor...")
+    start_write_queue()
+    
+    # Register write queue with core.database so trading modules can use duckdb_execute_write()
+    from core.database import register_write_queue
+    register_write_queue("central", queue_write, queue_write_sync)
+    
+    # =====================================================
     # STEP 3: Backfill Historical Data
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 3: Backfilling 2 hours of historical data...")
-    if not backfill_from_data_engine(hours=2):
+    logger.info("STEP 3: Backfilling 24 hours of historical data...")
+    if not backfill_from_data_engine(hours=24):
         logger.error("Failed to backfill data - master.py may not be running!")
         logger.error("Please start master.py first, then restart master2.py")
         return
@@ -2308,6 +2673,16 @@ def main():
     logger.info("STEP 3.5: Starting Local API Server (port 5052)...")
     start_local_api(port=5052)
     logger.info(f"Website can now connect to http://localhost:5052")
+
+    # =====================================================
+    # STEP 3.25: SKIP Historical Price Cycles Processing
+    # =====================================================
+    # NO LONGER NEEDED: Cycles are built incrementally by the scheduler job (every 2s)
+    # Historical processing was causing write queue backlog and timeouts
+    logger.info("-" * 60)
+    logger.info("STEP 3.25: Skipping historical cycle processing (handled by scheduler)")
+    logger.info("  Cycles will be built incrementally as new prices arrive")
+    logger.info("  This avoids write queue backlog on startup")
 
     atexit.register(shutdown_all)
 
@@ -2346,21 +2721,25 @@ def shutdown_all():
 
     if _scheduler is not None:
         try:
-            logger.info("[1/4] Stopping scheduler...")
+            logger.info("[1/5] Stopping scheduler...")
             _scheduler.shutdown(wait=False)
             _scheduler = None
         except Exception as e:
             logger.error(f"Error stopping scheduler: {e}")
 
-    logger.info("[2/4] Stopping Local API server...")
+    # Stop write queue BEFORE closing database (allows pending writes to complete)
+    logger.info("[2/5] Stopping write queue processor...")
+    stop_write_queue()
+
+    logger.info("[3/5] Stopping Local API server...")
     stop_local_api()
 
-    logger.info("[3/4] Stopping metrics writer...")
+    logger.info("[4/5] Stopping metrics writer...")
     stop_metrics_writer()
 
     if _local_duckdb is not None:
         try:
-            logger.info("[4/4] Closing local DuckDB...")
+            logger.info("[5/5] Closing local DuckDB...")
             _local_duckdb.close()
             _local_duckdb = None
         except Exception as e:

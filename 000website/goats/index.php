@@ -701,7 +701,7 @@ ob_start();
                 max_buys_per_cycle: parseInt(form.querySelector('[name="max_buys_per_cycle"]').value)
             };
             
-            const response = await fetch(API_BASE + '/plays', {
+            const response = await fetch(API_BASE + '?endpoint=/plays', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -756,7 +756,8 @@ ob_start();
         }
         
         try {
-            const response = await fetch(API_BASE + '/plays/performance?hours=' + timeInterval);
+            // Use query string format since PATH_INFO may not be available
+            const response = await fetch(API_BASE + '?endpoint=/plays/performance&hours=' + timeInterval);
             const result = await response.json();
             
             if (!result.success) {
@@ -878,7 +879,7 @@ ob_start();
         button.innerHTML = '<i class="ri-loader-4-line me-1"></i>Cleaning...';
         
         try {
-            const response = await fetch(API_BASE + '/buyins/cleanup_no_gos', {
+            const response = await fetch(API_BASE + '?endpoint=/buyins/cleanup_no_gos', {
                 method: 'DELETE'
             });
             const data = await response.json();
@@ -907,7 +908,7 @@ ob_start();
         }
         
         try {
-            const response = await fetch(API_BASE + '/plays/' + playId + '/duplicate', {
+            const response = await fetch(API_BASE + '?endpoint=/plays/' + playId + '/duplicate', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',

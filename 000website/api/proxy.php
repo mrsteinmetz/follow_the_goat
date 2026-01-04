@@ -24,6 +24,15 @@ if (!empty($_SERVER['PATH_INFO'])) {
 } elseif (isset($_GET['endpoint'])) {
     $endpoint = $_GET['endpoint'];
     unset($_GET['endpoint']); // Remove from query params
+} elseif (!empty($_SERVER['REQUEST_URI'])) {
+    // Fallback: Parse REQUEST_URI to extract path after proxy.php
+    $request_uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+    $script_name = $_SERVER['SCRIPT_NAME'];
+    
+    // Remove script name from request URI
+    if (strpos($request_uri, $script_name) === 0) {
+        $endpoint = substr($request_uri, strlen($script_name));
+    }
 }
 
 if (empty($endpoint)) {

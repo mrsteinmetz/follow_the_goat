@@ -54,7 +54,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, duckdb_insert, duckdb_update, get_trading_engine
+from core.database import get_duckdb, duckdb_insert, duckdb_update, get_trading_engine, duckdb_execute_write
 
 # Import our modules (direct imports after adding module dir to path)
 from trail_generator import generate_trail_payload, TrailError
@@ -360,8 +360,8 @@ class WalletFollower:
     def get_all_plays(self, log_summary: bool = True) -> List[Dict[str, Any]]:
         """Fetch all active plays from DuckDB."""
         try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT id, name, find_wallets_sql, max_buys_per_cycle,
                            pattern_validator_enable, pattern_validator,
                            tricker_on_perp, bundle_trades, 
@@ -492,13 +492,12 @@ class WalletFollower:
             }
             cache_json = json.dumps(cache_data)
             
-            # Update in DuckDB only (no MySQL writes)
-            with get_duckdb("central") as conn:
-                conn.execute("""
-                    UPDATE follow_the_goat_plays
-                    SET cashe_wallets_settings = ?
-                    WHERE id = ?
-                """, [cache_json, play_id])
+            # Update in DuckDB only (no MySQL writes) via write queue
+            duckdb_execute_write("central", """
+                UPDATE follow_the_goat_plays
+                SET cashe_wallets_settings = ?
+                WHERE id = ?
+            """, [cache_json, play_id])
             
             # Update in-memory
             for play in self.plays:
@@ -586,10 +585,10 @@ class WalletFollower:
                     results = engine.read(query_duckdb)
                 else:
                     # Fallback to file-based DuckDB
-                    with get_duckdb("central") as conn:
-                        raw_results = conn.execute(query_duckdb).fetchall()
+                    with get_duckdb("central", read_only=True) as cursor:
+                        raw_results = cursor.execute(query_duckdb).fetchall()
                         if raw_results:
-                            columns = [desc[0] for desc in conn.description]
+                            columns = [desc[0] for desc in cursor.description]
                             results = [dict(zip(columns, row)) for row in raw_results]
                         else:
                             results = []
@@ -681,9 +680,9 @@ class WalletFollower:
         # DuckDB query - simplified for speed
         # Find wallets that traded together within the time window
         try:
-            with get_duckdb("central") as conn:
+            with get_duckdb("central", read_only=True) as cursor:
                 # Get recent buy trades from target wallets
-                result = conn.execute(f"""
+                result = cursor.execute(f"""
                     SELECT wallet_address, trade_timestamp, 
                            EPOCH(trade_timestamp) AS ts_unix
                     FROM sol_stablecoin_trades
@@ -846,8 +845,8 @@ class WalletFollower:
     def get_last_processed_trade_id(self, wallet_address: str) -> int:
         """Get the last trade ID we processed for this wallet (from DuckDB)."""
         try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT last_trade_id 
                     FROM follow_the_goat_tracking 
                     WHERE wallet_address = ?
@@ -863,16 +862,17 @@ class WalletFollower:
     def update_last_processed_trade_id(self, wallet_address: str, trade_id: int) -> None:
         """Update the last processed trade ID (DuckDB only - no MySQL)."""
         try:
-            with get_duckdb("central") as conn:
-                # DuckDB upsert syntax
-                conn.execute("""
-                    INSERT INTO follow_the_goat_tracking 
-                    (wallet_address, last_trade_id, last_checked_at)
-                    VALUES (?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT (wallet_address) DO UPDATE SET
-                        last_trade_id = excluded.last_trade_id,
-                        last_checked_at = CURRENT_TIMESTAMP
-                """, [wallet_address, trade_id])
+            # DuckDB upsert via write queue
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            duckdb_execute_write("central", """
+                INSERT INTO follow_the_goat_tracking 
+                (wallet_address, last_trade_id, last_checked_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT (wallet_address) DO UPDATE SET
+                    last_trade_id = excluded.last_trade_id,
+                    last_checked_at = excluded.last_checked_at
+            """, [wallet_address, trade_id, now])
         except Exception as e:
             logger.debug(f"DuckDB error updating last trade ID: {e}")
     
@@ -920,8 +920,8 @@ class WalletFollower:
             
             # Fallback to file-based DuckDB if engine didn't return results
             if not all_trades:
-                with get_duckdb("central") as conn:
-                    result = conn.execute(f"""
+                with get_duckdb("central", read_only=True) as cursor:
+                    result = cursor.execute(f"""
                         SELECT id, signature, trade_timestamp, stablecoin_amount, sol_amount, 
                                price, direction, wallet_address, perp_direction
                         FROM sol_stablecoin_trades 
@@ -980,8 +980,8 @@ class WalletFollower:
     def get_current_market_price(self) -> Optional[float]:
         """Get current SOL price from price_points table."""
         try:
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT value, id, created_at 
                     FROM price_points 
                     WHERE coin_id = 5
@@ -1048,8 +1048,8 @@ class WalletFollower:
             
             # Fallback to file-based DuckDB if engine not running
             logger.warning("TradingDataEngine not running - falling back to file-based DuckDB for cycle lookup")
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT id, cycle_start_time, cycle_end_time 
                     FROM cycle_tracker
                     WHERE threshold = 0.3
@@ -1090,9 +1090,9 @@ class WalletFollower:
             return True, "no_cycle"
         
         try:
-            with get_duckdb("central") as conn:
+            with get_duckdb("central", read_only=True) as cursor:
                 # Check wallet already bought in this cycle
-                result = conn.execute("""
+                result = cursor.execute("""
                     SELECT COUNT(*) as wallet_buy_count
                     FROM follow_the_goat_buyins
                     WHERE play_id = ?
@@ -1107,7 +1107,7 @@ class WalletFollower:
                     return False, "wallet_already_bought"
                 
                 # Check total buys in cycle
-                result = conn.execute("""
+                result = cursor.execute("""
                     SELECT COUNT(*) as buy_count
                     FROM follow_the_goat_buyins
                     WHERE play_id = ?
@@ -1223,20 +1223,19 @@ class WalletFollower:
                 })
                 logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
             else:
-                # Fallback to file-based DuckDB
-                with get_duckdb("central") as conn:
-                    conn.execute("""
-                        INSERT INTO follow_the_goat_buyins (
-                            id, play_id, wallet_address, original_trade_id, trade_signature,
-                            block_timestamp, quote_amount, base_amount, price, direction,
-                            our_entry_price, live_trade, price_cycle, our_status, followed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
-                        block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),
-                        trade.get('price'), trade.get('direction', 'buy'), our_entry_price,
-                        1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str
-                    ])
+                # Fallback to file-based DuckDB via write queue
+                duckdb_execute_write("central", """
+                    INSERT INTO follow_the_goat_buyins (
+                        id, play_id, wallet_address, original_trade_id, trade_signature,
+                        block_timestamp, quote_amount, base_amount, price, direction,
+                        our_entry_price, live_trade, price_cycle, our_status, followed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
+                    block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),
+                    trade.get('price'), trade.get('direction', 'buy'), our_entry_price,
+                    1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str
+                ])
                 logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
         except Exception as e:
             logger.error(f"Buyin insert failed: {e}")

@@ -37,7 +37,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 
 # Try to get TradingDataEngine for in-memory queries (when running under scheduler)
 def _get_engine_if_running():
@@ -230,8 +230,8 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
             # Fallback to get_duckdb("central") - used when running under master2.py
             # master2.py loads plays from PostgreSQL into its local DuckDB and registers it as 'central'
             logger.debug("TradingDataEngine not running - using get_duckdb('central') fallback")
-            with get_duckdb("central") as conn:
-                result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
                     FROM follow_the_goat_plays
                     WHERE id = ?
@@ -330,10 +330,10 @@ def check_data_readiness() -> tuple[bool, str]:
     # NOTE: When running under master2.py, get_duckdb("central") returns master2's
     # in-memory DuckDB which uses 'prices' table, not 'price_points'
     try:
-        with get_duckdb("central") as conn:
+        with get_duckdb("central", read_only=True) as cursor:
             # Try 'prices' table first (used by master2.py's local DuckDB)
             try:
-                result = conn.execute("""
+                result = cursor.execute("""
                     SELECT COUNT(*) FROM prices WHERE token = 'SOL'
                 """).fetchone()
                 price_count = result[0] if result else 0
@@ -341,7 +341,7 @@ def check_data_readiness() -> tuple[bool, str]:
                 if price_count >= 10:
                     # Check order_book_features
                     try:
-                        result = conn.execute("""
+                        result = cursor.execute("""
                             SELECT COUNT(*) FROM order_book_features
                         """).fetchone()
                         ob_count = result[0] if result else 0
@@ -358,7 +358,7 @@ def check_data_readiness() -> tuple[bool, str]:
                 logger.debug(f"Prices table check failed ({e}), trying price_points...")
             
             # Fallback: Check price_points (standalone file-based mode)
-            result = conn.execute("""
+            result = cursor.execute("""
                 SELECT COUNT(*) FROM price_points WHERE coin_id = 5
             """).fetchone()
             price_count = result[0] if result else 0
@@ -368,7 +368,7 @@ def check_data_readiness() -> tuple[bool, str]:
             
             # Check order_book_features exists and has data
             try:
-                result = conn.execute("""
+                result = cursor.execute("""
                     SELECT COUNT(*) FROM order_book_features
                 """).fetchone()
                 ob_count = result[0] if result else 0
@@ -406,10 +406,10 @@ def get_current_market_price() -> Optional[float]:
         else:
             # When running under master2.py, get_duckdb("central") returns master2's
             # in-memory DuckDB which uses 'prices' table, not 'price_points'
-            with get_duckdb("central") as conn:
+            with get_duckdb("central", read_only=True) as cursor:
                 # Try 'prices' table first (used by master2.py's local DuckDB)
                 try:
-                    result = conn.execute("""
+                    result = cursor.execute("""
                         SELECT price
                         FROM prices
                         WHERE token = 'SOL'
@@ -423,7 +423,7 @@ def get_current_market_price() -> Optional[float]:
                     pass
                 
                 # Fallback: File-based DuckDB uses 'price_points' table
-                result = conn.execute("""
+                result = cursor.execute("""
                     SELECT value
                     FROM price_points
                     WHERE coin_id = 5
@@ -458,8 +458,8 @@ def get_current_price_cycle() -> Optional[int]:
                 return result[0]['id']
             return None
         else:
-            with get_duckdb("central") as conn:
-                result = conn.execute(query).fetchone()
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute(query).fetchone()
                 if result:
                     return result[0]
                 return None
@@ -522,25 +522,26 @@ def insert_synthetic_buyin(
             ])
             logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
         else:
-            # Fallback to file-based DuckDB
-            with get_duckdb("central") as conn:
-                result = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM follow_the_goat_buyins").fetchone()
+            # Fallback to file-based DuckDB via write queue
+            # Use sync to get next ID atomically with insert
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM follow_the_goat_buyins").fetchone()
                 buyin_id = result[0] if result else 1
-                
-                conn.execute("""
-                    INSERT INTO follow_the_goat_buyins (
-                        id, play_id, wallet_address, original_trade_id, trade_signature,
-                        block_timestamp, quote_amount, base_amount, price, direction,
-                        our_entry_price, swap_response, live_trade, price_cycle,
-                        entry_log, pattern_validator_log, our_status, followed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [
-                    buyin_id, play_id, wallet_address, 0, signature,
-                    block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
-                    our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
-                    pre_insert_log, None, 'validating', block_timestamp_str
-                ])
-                logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
+            
+            duckdb_execute_write("central", """
+                INSERT INTO follow_the_goat_buyins (
+                    id, play_id, wallet_address, original_trade_id, trade_signature,
+                    block_timestamp, quote_amount, base_amount, price, direction,
+                    our_entry_price, swap_response, live_trade, price_cycle,
+                    entry_log, pattern_validator_log, our_status, followed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                buyin_id, play_id, wallet_address, 0, signature,
+                block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
+                our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
+                pre_insert_log, None, 'validating', block_timestamp_str
+            ], sync=True)
+            logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
         
         step_logger.end(
             insert_token,
@@ -740,26 +741,25 @@ def update_validation_result(
                     WHERE id = ?
                 """, [pattern_validator_log_json, new_status, buyin_id])
         else:
-            # Fallback to get_duckdb("central") when running under master2.py
-            with get_duckdb("central") as conn:
-                if new_status == 'pending' and fresh_price:
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
-                        WHERE id = ?
-                    """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
-                elif new_status == 'pending':
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET pattern_validator_log = ?, our_status = ?, followed_at = ?
-                        WHERE id = ?
-                    """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
-                else:
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET pattern_validator_log = ?, our_status = ?
-                        WHERE id = ?
-                    """, [pattern_validator_log_json, new_status, buyin_id])
+            # Fallback to get_duckdb("central") via write queue
+            if new_status == 'pending' and fresh_price:
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
+            elif new_status == 'pending':
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?, followed_at = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
+            else:
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins
+                    SET pattern_validator_log = ?, our_status = ?
+                    WHERE id = ?
+                """, [pattern_validator_log_json, new_status, buyin_id])
         
         step_logger.end(
             update_token,
@@ -792,13 +792,12 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
                 WHERE id = ?
             """, [final_log_json, buyin_id])
         else:
-            # Fallback to get_duckdb("central") when running under master2.py
-            with get_duckdb("central") as conn:
-                conn.execute("""
-                    UPDATE follow_the_goat_buyins
-                    SET entry_log = ?
-                    WHERE id = ?
-                """, [final_log_json, buyin_id])
+            # Fallback to get_duckdb("central") via write queue
+            duckdb_execute_write("central", """
+                UPDATE follow_the_goat_buyins
+                SET entry_log = ?
+                WHERE id = ?
+            """, [final_log_json, buyin_id])
         
     except Exception as e:
         logger.error(f"Error updating entry log for buy-in #{buyin_id}: {e}")
@@ -837,20 +836,19 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
                     WHERE id = ?
                 """, [error_log, buyin_id])
         else:
-            # Fallback to get_duckdb("central") when running under master2.py
-            with get_duckdb("central") as conn:
-                if entry_log:
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
-                        WHERE id = ?
-                    """, [error_log, entry_log, buyin_id])
-                else:
-                    conn.execute("""
-                        UPDATE follow_the_goat_buyins
-                        SET our_status = 'error', pattern_validator_log = ?
-                        WHERE id = ?
-                    """, [error_log, buyin_id])
+            # Fallback to get_duckdb("central") via write queue
+            if entry_log:
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins
+                    SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
+                    WHERE id = ?
+                """, [error_log, entry_log, buyin_id])
+            else:
+                duckdb_execute_write("central", """
+                    UPDATE follow_the_goat_buyins
+                    SET our_status = 'error', pattern_validator_log = ?
+                    WHERE id = ?
+                """, [error_log, buyin_id])
         
         
         logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")
@@ -923,8 +921,8 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
             stuck_ids = [row['id'] for row in result]
         else:
             # Fallback to file-based DuckDB
-            with get_duckdb("central") as conn:
-                raw_result = conn.execute("""
+            with get_duckdb("central", read_only=True) as cursor:
+                raw_result = cursor.execute("""
                     SELECT id, followed_at
                     FROM follow_the_goat_buyins
                     WHERE our_status = 'validating'

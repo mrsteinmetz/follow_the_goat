@@ -11,10 +11,17 @@
 class DuckDBClient {
     private string $apiBaseUrl;
     private int $timeout;
+    private $curlHandle = null;  // Reuse curl handle for connection pooling
     
     public function __construct(string $apiBaseUrl = 'http://127.0.0.1:5051', int $timeout = 30) {
         $this->apiBaseUrl = rtrim($apiBaseUrl, '/');
         $this->timeout = $timeout;
+    }
+    
+    public function __destruct() {
+        if ($this->curlHandle !== null) {
+            curl_close($this->curlHandle);
+        }
     }
     
     // =========================================================================
@@ -58,45 +65,53 @@ class DuckDBClient {
     }
     
     /**
-     * Make HTTP request using cURL
+     * Make HTTP request using cURL with connection reuse
      */
     private function request(string $url, string $method = 'GET', ?array $data = null): ?array {
-        $ch = curl_init();
-        
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json', 
-                'Accept: application/json',
-                'Connection: keep-alive'  // Enable HTTP keep-alive for faster requests
-            ],
-            CURLOPT_TCP_KEEPALIVE => 1,  // Enable TCP keep-alive
-        ]);
-        
-        if ($method === 'POST') {
-            curl_setopt($ch, CURLOPT_POST, true);
-            if ($data !== null) {
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-            }
-        } elseif ($method === 'PUT') {
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
-            if ($data !== null) {
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
-            }
-        } elseif ($method === 'DELETE') {
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+        // Reuse curl handle for connection pooling (HTTP keep-alive)
+        if ($this->curlHandle === null) {
+            $this->curlHandle = curl_init();
+            curl_setopt_array($this->curlHandle, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => $this->timeout,
+                CURLOPT_CONNECTTIMEOUT => 5,
+                CURLOPT_HTTPHEADER => [
+                    'Content-Type: application/json', 
+                    'Accept: application/json',
+                    'Connection: keep-alive'  // Enable HTTP keep-alive for faster requests
+                ],
+                CURLOPT_TCP_KEEPALIVE => 1,  // Enable TCP keep-alive
+            ]);
         }
         
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
-        curl_close($ch);
+        // Reset options for this request
+        curl_setopt($this->curlHandle, CURLOPT_URL, $url);
+        
+        if ($method === 'POST') {
+            curl_setopt($this->curlHandle, CURLOPT_POST, true);
+            if ($data !== null) {
+                curl_setopt($this->curlHandle, CURLOPT_POSTFIELDS, json_encode($data));
+            }
+        } elseif ($method === 'PUT') {
+            curl_setopt($this->curlHandle, CURLOPT_CUSTOMREQUEST, 'PUT');
+            if ($data !== null) {
+                curl_setopt($this->curlHandle, CURLOPT_POSTFIELDS, json_encode($data));
+            }
+        } elseif ($method === 'DELETE') {
+            curl_setopt($this->curlHandle, CURLOPT_CUSTOMREQUEST, 'DELETE');
+        } else {
+            curl_setopt($this->curlHandle, CURLOPT_HTTPGET, true);
+        }
+        
+        $response = curl_exec($this->curlHandle);
+        $httpCode = curl_getinfo($this->curlHandle, CURLINFO_HTTP_CODE);
+        $error = curl_error($this->curlHandle);
         
         if ($error) {
             error_log("DuckDB API cURL error: {$error}");
+            // Reset handle on error
+            curl_close($this->curlHandle);
+            $this->curlHandle = null;
             return null;
         }
         
@@ -318,14 +333,19 @@ class DuckDBClient {
      * @param string $token Token symbol (BTC, ETH, SOL)
      * @param string $startDatetime Start datetime
      * @param string $endDatetime End datetime
+     * @param int $maxPoints Maximum number of points to return (default: 5000, set to 0 for all)
      * @return array|null Array with 'prices' and 'count' or null on error
      */
-    public function getPricePoints(string $token, string $startDatetime, string $endDatetime): ?array {
-        return $this->post('/price_points', [
+    public function getPricePoints(string $token, string $startDatetime, string $endDatetime, int $maxPoints = 5000): ?array {
+        $data = [
             'token' => $token,
             'start_datetime' => $startDatetime,
             'end_datetime' => $endDatetime,
-        ]);
+        ];
+        if ($maxPoints > 0) {
+            $data['max_points'] = $maxPoints;
+        }
+        return $this->post('/price_points', $data);
     }
     
     /**

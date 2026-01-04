@@ -435,6 +435,67 @@ async def get_latest(
         raise HTTPException(status_code=500, detail=f"Failed to get latest: {e}")
 
 
+@app.get("/sync/{table}")
+async def get_new_records(
+    table: str,
+    since_id: int = Query(default=0, ge=0, description="Get records with id > since_id"),
+    limit: int = Query(default=1000, ge=1, le=10000, description="Maximum records to return")
+):
+    """
+    Get NEW records since a specific ID (for incremental sync).
+    
+    This is optimized for continuous sync - only fetches records that haven't been synced yet.
+    Much more efficient than time-based backfill for real-time trading.
+    
+    Args:
+        table: Table name
+        since_id: Get records with ID greater than this value
+        limit: Maximum records to return (default: 1000)
+    
+    Returns:
+        - success: bool
+        - count: number of new records
+        - records: list of new records
+        - max_id: highest ID in results (use this as since_id for next sync)
+    """
+    engine = _get_engine()
+    
+    # All tables have 'id' as primary key
+    valid_tables = [
+        "prices", "price_points", "order_book_features", 
+        "sol_stablecoin_trades", "whale_movements", "wallet_profiles",
+        "follow_the_goat_buyins", "buyin_trail_minutes", "cycle_tracker"
+    ]
+    
+    if table not in valid_tables:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown table '{table}'. Valid tables: {valid_tables}"
+        )
+    
+    try:
+        # Get records with ID > since_id, ordered by ID ascending
+        results = engine.read(
+            f"SELECT * FROM {table} WHERE id > ? ORDER BY id ASC LIMIT ?",
+            [since_id, limit]
+        )
+        serialized = [_serialize_row(row) for row in results]
+        
+        # Get the max ID from results for next sync
+        max_id = max((r.get('id', 0) for r in serialized), default=since_id)
+        
+        return {
+            "success": True,
+            "table": table,
+            "count": len(serialized),
+            "records": serialized,
+            "since_id": since_id,
+            "max_id": max_id
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync query failed: {e}")
+
+
 @app.get("/price/{token}")
 async def get_current_price(token: str = "SOL"):
     """

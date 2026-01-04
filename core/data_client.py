@@ -301,6 +301,42 @@ class DataClient:
         except requests.exceptions.RequestException as e:
             raise ConnectionError(f"Get latest failed: {e}")
     
+    def get_new_since_id(
+        self,
+        table: str,
+        since_id: int = 0,
+        limit: int = 1000
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """
+        Get NEW records since a specific ID (for incremental sync).
+        
+        This is the most efficient way to sync - only fetches records
+        that haven't been synced yet based on ID.
+        
+        Args:
+            table: Table name
+            since_id: Get records with ID greater than this value
+            limit: Maximum records to return
+        
+        Returns:
+            Tuple of (records, max_id) where max_id is the highest ID returned
+        """
+        try:
+            response = self._session.get(
+                f"{self.base_url}/sync/{table}",
+                params={"since_id": since_id, "limit": limit},
+                timeout=self.timeout
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            records = result.get("records", [])
+            max_id = result.get("max_id", since_id)
+            return records, max_id
+            
+        except requests.exceptions.RequestException as e:
+            raise ConnectionError(f"Incremental sync failed: {e}")
+    
     def get_price(self, token: str = "SOL") -> Optional[float]:
         """
         Get the current price of a token.

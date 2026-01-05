@@ -698,10 +698,7 @@ def _get_all_columns() -> List[str]:
 def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     """Insert trail rows into DuckDB.
     
-    Priority:
-    1. master2's local DuckDB (when running in master2 process)
-    2. HTTP API (when running standalone)
-    3. File-based DuckDB (fallback)
+    CRITICAL: Uses master2's write queue for thread-safe writes.
     
     Args:
         buyin_id: The buyin ID (used for logging)
@@ -717,96 +714,57 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     col_list = ", ".join(columns)
     placeholders = ", ".join(["?" for _ in columns])
     
-    # PRIORITY 1: Try master2's local DuckDB
+    # Use the write queue registered by master2
     try:
-        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
-        local_db = get_local_duckdb()
-        if local_db is not None:
-            with _local_duckdb_lock:
-                # Delete existing rows for this buyin (in case of re-run)
-                local_db.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
-                
-                # Insert new rows (no id column needed - composite PK on buyin_id + minute)
-                for row in rows:
-                    values = [row.get(col) for col in columns]
-                    local_db.execute(
-                        f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
-                        values
-                    )
+        from core.database import duckdb_execute_write
+        
+        # Check if data already exists first (read operation)
+        with get_duckdb("central", read_only=True) as cursor:
+            existing = cursor.execute(
+                "SELECT COUNT(*) FROM buyin_trail_minutes WHERE buyin_id = ?",
+                [buyin_id]
+            ).fetchone()
+            existing_count = existing[0] if existing else 0
             
-            logger.debug(f"Inserted {len(rows)} trail rows into master2 DuckDB for buyin_id={buyin_id}")
-            return True
-    except (ImportError, AttributeError):
-        pass  # master2 not available
-    except Exception as e:
-        logger.debug(f"master2 DB insert failed: {e}")
-    
-    # PRIORITY 2: Try HTTP API to master2
-    try:
-        import requests
+            if existing_count > 0:
+                logger.debug(f"Trail data already exists for buyin_id={buyin_id}, skipping")
+                return True
         
-        # First delete existing rows
-        delete_sql = f"DELETE FROM buyin_trail_minutes WHERE buyin_id = {buyin_id}"
-        requests.post("http://127.0.0.1:5052/execute", json={"sql": delete_sql}, timeout=10)
-        
-        # Get next ID
-        # Delete existing rows first (via HTTP API)
-        try:
-            resp = requests.post(
-                "http://127.0.0.1:5052/execute",
-                json={"sql": f"DELETE FROM buyin_trail_minutes WHERE buyin_id = {buyin_id}"},
-                timeout=10
-            )
-        except:
-            pass  # Ignore delete errors
-        
-        # Insert rows via HTTP (no id column - composite PK on buyin_id + minute)
+        # Insert rows via write queue (thread-safe, non-blocking)
+        inserted_count = 0
         for row in rows:
             values = [row.get(col) for col in columns]
-            # Build INSERT SQL with proper escaping
-            value_strs = []
-            for v in values:
-                if v is None:
-                    value_strs.append("NULL")
-                elif isinstance(v, bool):
-                    value_strs.append("TRUE" if v else "FALSE")
-                elif isinstance(v, (int, float)):
-                    value_strs.append(str(v))
-                elif isinstance(v, str):
-                    escaped = v.replace("'", "''")
-                    value_strs.append(f"'{escaped}'")
-                else:
-                    escaped = str(v).replace("'", "''")
-                    value_strs.append(f"'{escaped}'")
-            
-            insert_sql = f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({', '.join(value_strs)})"
-            resp = requests.post("http://127.0.0.1:5052/execute", json={"sql": insert_sql}, timeout=10)
+            duckdb_execute_write(
+                "central",
+                f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
+                values,
+                sync=False  # Non-blocking for speed
+            )
+            inserted_count += 1
         
-        logger.debug(f"Inserted {len(rows)} trail rows via HTTP API for buyin_id={buyin_id}")
+        # Final sync write to ensure completion
+        duckdb_execute_write(
+            "central",
+            "SELECT 1",  # Dummy query to ensure all previous writes complete
+            [],
+            sync=True
+        )
+        
+        # Verify
+        with get_duckdb("central", read_only=True) as cursor:
+            verify = cursor.execute(
+                "SELECT COUNT(*) FROM buyin_trail_minutes WHERE buyin_id = ?",
+                [buyin_id]
+            ).fetchone()
+            verify_count = verify[0] if verify else 0
+        
+        logger.info(f"✅ PERSISTED via write queue: {inserted_count} trail rows for buyin_id={buyin_id}, verified: {verify_count}")
         return True
-        
-    except Exception as e:
-        logger.debug(f"HTTP API insert failed: {e}")
-    
-    # PRIORITY 3: Fallback to file-based DuckDB
-    try:
-        with get_duckdb("central") as conn:
-            # Delete existing rows for this buyin (in case of re-run)
-            conn.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
             
-            # Insert new rows (no id column - composite PK on buyin_id + minute)
-            for row in rows:
-                values = [row.get(col) for col in columns]
-                conn.execute(
-                    f"INSERT OR REPLACE INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
-                    values
-                )
-        
-        logger.debug(f"Inserted {len(rows)} trail rows into file DuckDB for buyin_id={buyin_id}")
-        return True
-        
     except Exception as e:
-        logger.error(f"DuckDB insert failed for buyin_id={buyin_id}: {e}")
+        logger.error(f"Failed to write trail data via write queue for buyin_id={buyin_id}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
 

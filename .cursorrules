@@ -6,6 +6,103 @@ Once migration is complete, `000old_code/` will be deleted.
 
 ---
 
+## 🚨 CRITICAL: DUAL-MASTER ARCHITECTURE 🚨
+
+**THIS SYSTEM USES TWO SEPARATE PROCESSES WITH DIFFERENT DATABASES**
+
+### Master.py - DATA ENGINE (Port 5050)
+**Purpose:** Raw data ingestion only - runs indefinitely without restarts
+
+**Database Setup:**
+1. **TradingDataEngine** - In-memory DuckDB (primary hot storage)
+   - Runs continuously with zero file locks
+   - Stores: prices, order book, trades (hot data only)
+   - Exposed via FastAPI on port 5050
+   
+2. **PostgreSQL Archive** - Long-term cold storage
+   - Data older than 24-72 hours gets archived here
+   - Used for historical analysis only
+
+**Services Started by master.py:**
+- FastAPI Data API (port 5050) - serves data to master2.py
+- FastAPI Webhook Server (port 8001) - receives trade data
+- PHP Web Server (port 8000) - serves website
+- Binance Order Book Stream (WebSocket)
+- Jupiter Price Fetcher (every 1 second)
+- Data cleanup jobs (hourly)
+
+**⚠️ NEVER add trading logic to master.py - it ONLY handles raw data**
+
+---
+
+### Master2.py - TRADING LOGIC (Port 5052)
+**Purpose:** All trading computation and decision making - CAN restart independently
+
+**Database Setup:**
+1. **Local In-Memory DuckDB** - Completely separate instance
+   - Master2 has its OWN in-memory DuckDB
+   - Gets data FROM master.py via API at startup (backfill)
+   - Runs all trading calculations on THIS local copy
+   - Exposes computed data via FastAPI on port 5052
+
+**How Data Flows:**
+```
+master.py (port 5050) 
+  ↓ HTTP API backfill at startup
+master2.py local DuckDB
+  ↓ continuous sync via HTTP API
+master2.py trading jobs
+```
+
+**Sync Strategy:**
+- **Startup:** Loads 2 hours of historical data from master.py API
+- **Runtime:** Fetches new data incrementally every 1-5 seconds
+- **Computed Data:** Stays in master2's local DuckDB (cycles, profiles, patterns)
+
+**Jobs in master2.py:**
+- Price cycle analysis (every 2 seconds)
+- Wallet profile building (every 10 seconds)
+- Trade validation (train_validator)
+- Trade following (follow_the_goat)
+- Trailing stop monitoring
+- Pattern creation
+
+**⚠️ Master2 can restart without stopping master.py - data feeds continue**
+
+---
+
+## Database Access Patterns
+
+### From master.py context:
+```python
+from core.database import get_trading_engine
+
+engine = get_trading_engine()  # Gets master.py's in-memory DuckDB
+engine.execute("INSERT INTO prices ...")
+```
+
+### From master2.py context:
+```python
+from core.data_client import get_client
+
+client = get_client()  # Connects to master.py API on port 5050
+prices = client.get_backfill("prices", hours=2)  # Fetch from master.py
+
+# Then insert into master2's local DuckDB
+queue_write(_local_duckdb.execute, "INSERT INTO prices ...")
+```
+
+### From feature modules (after master2 registers connection):
+```python
+from core.database import get_duckdb
+
+# This will use master2's local DuckDB if registered
+with get_duckdb("central") as conn:
+    conn.execute("SELECT * FROM prices ...")
+```
+
+---
+
 ## Core Principles
 
 ### 1. Clean Code
@@ -14,12 +111,17 @@ Once migration is complete, `000old_code/` will be deleted.
 - Single responsibility per module
 - No duplicate code across features
 
-### 2. Database: DuckDB Only
-- **NO MySQL** - this project uses DuckDB exclusively
+### 2. Database: DuckDB + PostgreSQL
+- **DuckDB** - Hot storage (in-memory, fast access)
+  - master.py: TradingDataEngine (raw data)
+  - master2.py: Local instance (computed data + synced raw data)
+- **PostgreSQL** - Cold storage (archive only)
+  - Archived data older than 24-72 hours
+  - Used for historical analysis
 - All database setup is documented in `duckdb/ARCHITECTURE.md`
-- Use the shared database connection pattern from `core/database.py`
 
 
+### 3. Hot/Cold Storage Pattern
 ```python
 # Example: price_points (hot) + price_points_archive (cold)
 # Data older than 24 hours is moved from hot to cold storage
@@ -27,15 +129,30 @@ Once migration is complete, `000old_code/` will be deleted.
 
 ### 4. Scheduling: APScheduler Only
 - **NEVER use .bat files** for scheduling Python scripts
-- All scheduled tasks run through `scheduler/master.py`
+- Data ingestion jobs run in `scheduler/master.py`
+- Trading logic jobs run in `scheduler/master2.py`
 - Use APScheduler with cron or interval triggers
 
 ```python
-# Correct: APScheduler in master.py
-scheduler.add_job(archive_old_data, 'interval', hours=1)
+# Correct: APScheduler in master.py for data jobs
+scheduler.add_job(fetch_jupiter_prices, 'interval', seconds=1)
+
+# Correct: APScheduler in master2.py for trading jobs
+scheduler.add_job(follow_the_goat_job, 'interval', seconds=5)
 
 # WRONG: Never create .bat files for scheduling
 ```
+
+---
+
+## Port Assignments
+
+| Port | Service | Master | Purpose |
+|------|---------|--------|---------|
+| 5050 | FastAPI Data API | master.py | Serves raw data from TradingDataEngine |
+| 5052 | FastAPI Local API | master2.py | Serves computed trading data |
+| 8000 | PHP Server | master.py | Website frontend |
+| 8001 | FastAPI Webhook | master.py | Receives trade data from QuickNode |
 
 ---
 
@@ -43,13 +160,17 @@ scheduler.add_job(archive_old_data, 'interval', hours=1)
 
 ```
 follow_the_goat/
-├── .cursorrules           # This file
+├── .cursorrules           # This file - READ THIS FIRST
 ├── core/                  # Shared utilities
-│   ├── database.py        # DuckDB connection manager
+│   ├── database.py        # DuckDB/PostgreSQL connection manager
+│   ├── data_client.py     # HTTP client for master.py API (used by master2)
+│   ├── data_api.py        # FastAPI app for master.py (port 5050)
 │   ├── config.py          # Environment and settings
 │   └── logging.py         # Centralized logging
-├── scheduler/             # APScheduler master
-│   └── master.py          # Single entry point for all scheduled tasks
+├── scheduler/             # APScheduler masters
+│   ├── master.py          # DATA ENGINE - raw data ingestion (port 5050)
+│   ├── master2.py         # TRADING LOGIC - all computations (port 5052)
+│   └── status.py          # Job status tracking (shared)
 ├── features/              # Individual feature modules
 │   └── [feature_name]/    # One folder per feature
 ├── duckdb/                # Database documentation
@@ -57,6 +178,25 @@ follow_the_goat/
 │   └── duckdb.exe         # DuckDB CLI
 └── 000old_code/           # Legacy code (DO NOT MODIFY, reference only)
 ```
+
+---
+
+## When to Use Which Master
+
+### Add to master.py IF:
+✅ Fetching data from external API (Jupiter, Binance, etc.)
+✅ Receiving data via webhook
+✅ Data cleanup/archiving jobs
+✅ Raw data storage
+
+### Add to master2.py IF:
+✅ Analyzing/processing existing data
+✅ Making trading decisions
+✅ Building wallet profiles
+✅ Pattern detection
+✅ Any computation on data
+
+**Rule of Thumb:** If it creates NEW raw data, it goes in master.py. If it PROCESSES existing data, it goes in master2.py.
 
 ---
 
@@ -77,14 +217,43 @@ Always create indexes on:
 
 ## Code Patterns
 
-### Database Connection
+### Accessing Data in master.py
 ```python
-from core.database import get_db
+from core.database import get_trading_engine
 
-def query_data():
-    with get_db() as conn:
-        result = conn.execute("SELECT * FROM table_name").fetchall()
-    return result
+# Direct access to master.py's in-memory DuckDB
+engine = get_trading_engine()
+engine.execute("INSERT INTO prices VALUES (?, ?, ?)", [ts, token, price])
+results = engine.read_all("SELECT * FROM prices WHERE token = 'SOL'")
+```
+
+### Accessing Data in master2.py
+```python
+from core.data_client import get_client
+
+# STEP 1: Fetch data from master.py via API
+client = get_client()  # Connects to http://localhost:5050
+prices = client.get_backfill("prices", hours=2)
+
+# STEP 2: Insert into master2's local DuckDB
+from scheduler.master2 import queue_write, _local_duckdb
+queue_write(_local_duckdb.execute, 
+    "INSERT INTO prices VALUES (?, ?, ?)", 
+    [ts, token, price])
+
+# STEP 3: Read from master2's local DuckDB (concurrent-safe)
+from scheduler.master2 import get_local_duckdb
+cursor = get_local_duckdb(use_cursor=True)
+result = cursor.execute("SELECT * FROM prices WHERE token = 'SOL'").fetchall()
+```
+
+### Accessing Data from Feature Modules
+```python
+from core.database import get_duckdb
+
+# After master2 registers its connection, this returns master2's local DuckDB
+with get_duckdb("central") as conn:
+    result = conn.execute("SELECT * FROM price_cycles").fetchall()
 ```
 
 ### Feature Module Structure
@@ -93,27 +262,48 @@ def query_data():
 """
 Feature: My Feature Name
 Migrated from: 000old_code/solana_node/path/to/original.py
+Runs in: master2.py (trading logic)
 """
 
-from core.database import get_db
-from core.config import settings
+from core.database import get_duckdb
 
 def run():
     """Main entry point for this feature."""
-    pass
+    # Feature runs in master2.py context
+    # Can access master2's local DuckDB via get_duckdb("central")
+    with get_duckdb("central") as conn:
+        # Read synced data from master2's local copy
+        prices = conn.execute("SELECT * FROM prices ORDER BY ts DESC LIMIT 10").fetchall()
+        # Perform computations...
 ```
 
-### Scheduled Task Registration
+### Scheduled Task Registration - master.py (Data Jobs)
 ```python
 # In scheduler/master.py
+from get_prices_from_jupiter import fetch_and_store_once
+
+scheduler.add_job(
+    fetch_and_store_once,
+    trigger='interval',
+    seconds=1,
+    id='fetch_jupiter_prices',
+    name='Fetch prices from Jupiter API',
+    executor='realtime'
+)
+```
+
+### Scheduled Task Registration - master2.py (Trading Jobs)
+```python
+# In scheduler/master2.py
 from features.my_feature.main import run as my_feature_run
 
 scheduler.add_job(
     my_feature_run,
     trigger='interval',
-    minutes=5,
+    seconds=10,
     id='my_feature',
-    name='My Feature Description'
+    name='My Feature Description',
+    executor='trading'
 )
 ```
 
@@ -124,12 +314,13 @@ scheduler.add_job(
 When migrating a feature from `000old_code/`:
 
 1. **Reference only** - read the old code but don't modify it
-2. **Create new module** in `features/[feature_name]/`
-3. **Document origin** - note which old file(s) this replaces
-4. **Convert MySQL to DuckDB** queries
-5. **Implement hot/cold pattern** for any data storage
-6. **Register with scheduler** if it needs to run periodically
-7. **Test thoroughly** before marking migration complete
+2. **Determine which master** - data ingestion (master.py) or trading logic (master2.py)?
+3. **Create new module** in `features/[feature_name]/`
+4. **Document origin** - note which old file(s) this replaces
+5. **Update database access** - use correct pattern for master.py or master2.py context
+6. **Implement hot/cold pattern** for any data storage
+7. **Register with correct scheduler** - master.py for data jobs, master2.py for trading jobs
+8. **Test thoroughly** before marking migration complete
 
 ---
 
@@ -137,9 +328,37 @@ When migrating a feature from `000old_code/`:
 
 ❌ Never look in `/000old_code/` unless directly referenced for migration  
 ❌ Never create `.bat` files for scheduling  
-❌ Never use MySQL - DuckDB only  
+❌ Never add trading logic to master.py (data ingestion only)  
+❌ Never add data ingestion to master2.py (trading logic only)  
+❌ Never access master.py's TradingDataEngine from master2.py directly (use API)  
 ❌ Never create duplicate utility files - use `core/`  
 ❌ Never skip the hot/cold storage pattern for time-series data  
+❌ Never forget that master2.py has its OWN separate in-memory DuckDB
+
+---
+
+## Critical Reminders for AI Agents
+
+### 🔴 MOST IMPORTANT: Two Separate Databases
+- **master.py** has TradingDataEngine (in-memory DuckDB) + PostgreSQL archive
+- **master2.py** has its OWN in-memory DuckDB (completely separate instance)
+- They communicate via HTTP API (port 5050), NOT shared memory
+- master2 syncs data FROM master.py at startup and continuously
+
+### 🔴 Which Master for What
+- **Data ingestion** (APIs, webhooks, raw data) → master.py
+- **Data processing** (analysis, decisions, patterns) → master2.py
+- When in doubt: "Does this CREATE new raw data?" → master.py, else → master2.py
+
+### 🔴 Database Access Patterns
+- In master.py: `get_trading_engine()` for direct DuckDB access
+- In master2.py: `get_client()` to fetch from master.py, then `queue_write()` to local DuckDB
+- In features: `get_duckdb("central")` uses master2's registered connection
+
+### 🔴 Restart Independence
+- master.py runs continuously (data feeds must never stop)
+- master2.py can restart independently (trading logic updates don't affect data)
+- Restarting master2.py triggers re-sync from master.py API
 
 ---
 
@@ -147,11 +366,109 @@ When migrating a feature from `000old_code/`:
 
 | Purpose | Location |
 |---------|----------|
-| DuckDB databases | `000data_feeds/*/` or feature-specific |
+| DuckDB databases | In-memory only (no files) |
+| PostgreSQL archive | See `core/config.py` for connection details |
 | DuckDB CLI | `duckdb/duckdb.exe` |
 | DB documentation | `duckdb/ARCHITECTURE.md` |
-| Scheduler | `scheduler/master.py` |
+| Data Engine scheduler | `scheduler/master.py` |
+| Trading Logic scheduler | `scheduler/master2.py` |
 | Shared code | `core/` |
 | Features | `features/` |
 | Legacy reference | `000old_code/` (read-only) |
+
+---
+
+## Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     MASTER.PY - DATA ENGINE                     │
+│                    (Runs Indefinitely)                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     TradingDataEngine (In-Memory DuckDB)                │   │
+│  │     - Raw price data (SOL, BTC, ETH)                    │   │
+│  │     - Order book snapshots (Binance)                    │   │
+│  │     - Trade data (sol_stablecoin_trades)                │   │
+│  │     - Hot storage only (24-72 hours)                    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          ▲                                      │
+│                          │ Insert Data                          │
+│                          │                                      │
+│  ┌────────────────┬─────┴────────┬─────────────────────────┐   │
+│  │ Jupiter API    │ Binance WS   │ QuickNode Webhook       │   │
+│  │ (every 1s)     │ (real-time)  │ (FastAPI port 8001)     │   │
+│  └────────────────┴──────────────┴─────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     FastAPI Data API (Port 5050)                        │   │
+│  │     - /query - Execute SELECT queries                   │   │
+│  │     - /backfill/{table} - Historical data for startup   │   │
+│  │     - /sync/{table} - Incremental sync by ID            │   │
+│  │     - /insert - Queue write to DuckDB                   │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          │                                      │
+│                          │ HTTP API                             │
+│                          ▼                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     PostgreSQL Archive (Cold Storage)                   │   │
+│  │     - Data older than 24-72 hours                       │   │
+│  │     - Historical analysis only                          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  Other Services:                                                │
+│  - PHP Web Server (port 8000)                                   │
+│  - Cleanup jobs (hourly)                                        │
+└─────────────────────────────────────────────────────────────────┘
+                             │
+                             │ HTTP API (port 5050)
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    MASTER2.PY - TRADING LOGIC                   │
+│                    (Can Restart Independently)                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     DataClient (HTTP Client)                            │   │
+│  │     - Connects to master.py API (port 5050)             │   │
+│  │     - Fetches 2 hours of data at startup                │   │
+│  │     - Continuous sync every 1-5 seconds                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          │                                      │
+│                          │ Insert into Local DB                 │
+│                          ▼                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     Local In-Memory DuckDB (SEPARATE INSTANCE)          │   │
+│  │     - Synced raw data (prices, trades, order book)      │   │
+│  │     - Computed data (cycles, profiles, patterns)        │   │
+│  │     - Thread-safe with write queue + read cursors       │   │
+│  │     - Registered as "central" for feature modules       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                          │                                      │
+│                          │ Read Data                            │
+│                          ▼                                      │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     Trading Jobs (APScheduler)                          │   │
+│  │     - Price cycle analysis (every 2s)                   │   │
+│  │     - Wallet profile building (every 10s)               │   │
+│  │     - Trade validation (train_validator)                │   │
+│  │     - Trade following (follow_the_goat)                 │   │
+│  │     - Trailing stop monitoring                          │   │
+│  │     - Pattern detection                                 │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │     FastAPI Local API (Port 5052)                       │   │
+│  │     - Serves computed trading data                      │   │
+│  │     - /cycles - Price cycle analysis                    │   │
+│  │     - /profiles - Wallet profiles                       │   │
+│  │     - /buyins - Active positions                        │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 

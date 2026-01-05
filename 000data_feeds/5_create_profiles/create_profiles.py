@@ -508,6 +508,9 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     IMPORTANT: Also pushes profiles to master.py's Data Engine API so the website
     can access them (website reads from TradingDataEngine, not master2.py's local DB).
     
+    STATE PERSISTENCE: Uses PostgreSQL for tracking last_trade_id per threshold.
+    This ensures incremental processing survives master2.py restarts.
+    
     Args:
         local_conn: DuckDB connection from master2.py (_local_duckdb)
         lock: Optional threading lock for the connection (_local_duckdb_lock)
@@ -516,40 +519,85 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     Returns:
         Total number of profiles inserted across all thresholds
     """
+    from core.database import get_postgres_connection
+    import psycopg2
+    
     total_inserted = 0
     
-    # State tracking - use local table in the same connection
-    def _ensure_state_table(conn):
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS wallet_profiles_state (
-                id INTEGER PRIMARY KEY,
-                threshold DOUBLE NOT NULL UNIQUE,
-                last_trade_id BIGINT NOT NULL DEFAULT 0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-    
-    def _get_last_id(conn, threshold):
+    # State tracking - use PostgreSQL for persistence across restarts
+    def _ensure_state_table():
+        """Ensure state table exists in PostgreSQL (already done in schema)."""
         try:
-            result = conn.execute(
-                "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = ?",
-                [threshold]
-            ).fetchone()
-            return result[0] if result else 0
-        except:
+            pg_conn = get_postgres_connection()
+            cur = pg_conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                    id SERIAL PRIMARY KEY,
+                    threshold DECIMAL(5,2) NOT NULL UNIQUE,
+                    last_trade_id BIGINT NOT NULL DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            pg_conn.commit()
+            cur.close()
+            pg_conn.close()
+        except Exception as e:
+            logger.debug(f"State table check: {e}")
+    
+    def _get_last_id(threshold):
+        """Get last processed trade_id from PostgreSQL."""
+        try:
+            pg_conn = get_postgres_connection()
+            if not pg_conn:
+                logger.warning("PostgreSQL not available, starting from 0")
+                return 0
+                
+            cur = pg_conn.cursor()
+            cur.execute(
+                "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = %s",
+                [float(threshold)]
+            )
+            result = cur.fetchone()
+            cur.close()
+            pg_conn.close()
+            
+            # RealDictCursor returns a dict (RealDictRow), not a tuple
+            if result:
+                last_id = int(result['last_trade_id'])
+                logger.debug(f"Retrieved last_trade_id={last_id} for threshold={threshold}")
+                return last_id
+            else:
+                logger.info(f"No state found for threshold={threshold}, starting from 0")
+                return 0
+        except Exception as e:
+            import traceback
+            logger.error(f"Failed to get last_trade_id from PostgreSQL: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return 0
     
-    def _update_last_id(conn, threshold, last_id):
+    def _update_last_id(threshold, last_id):
+        """Update last processed trade_id in PostgreSQL."""
         try:
-            conn.execute("""
+            pg_conn = get_postgres_connection()
+            if not pg_conn:
+                logger.warning("PostgreSQL not available, cannot persist state")
+                return
+                
+            cur = pg_conn.cursor()
+            cur.execute("""
                 INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
-                VALUES (?, ?, NOW())
+                VALUES (%s, %s, NOW())
                 ON CONFLICT (threshold) DO UPDATE SET 
-                    last_trade_id = excluded.last_trade_id,
+                    last_trade_id = EXCLUDED.last_trade_id,
                     last_updated = NOW()
-            """, [threshold, last_id])
+            """, [float(threshold), int(last_id)])
+            pg_conn.commit()
+            cur.close()
+            pg_conn.close()
+            logger.debug(f"Updated state: threshold={threshold}, last_trade_id={last_id}")
         except Exception as e:
-            logger.debug(f"State update failed: {e}")
+            logger.warning(f"State update failed (non-critical): {e}")
     
     def _get_latest_cycle_end(conn, threshold):
         try:
@@ -604,22 +652,23 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
             logger.error(f"Local DuckDB insert failed: {e}")
             return 0
     
+    # Ensure PostgreSQL state table exists
+    _ensure_state_table()
+    
     # Process all thresholds
     try:
         if lock:
             lock.acquire()
         
-        _ensure_state_table(local_conn)
-        
         for threshold in THRESHOLDS:
             try:
-                # Get latest completed cycle end time
+                # Get latest completed cycle end time (from DuckDB)
                 latest_cycle_end = _get_latest_cycle_end(local_conn, threshold)
                 if not latest_cycle_end:
                     continue
                 
-                # Get last processed trade ID
-                last_trade_id = _get_last_id(local_conn, threshold)
+                # Get last processed trade ID (from PostgreSQL)
+                last_trade_id = _get_last_id(threshold)
                 
                 # Build profiles using local connection
                 profiles = build_profiles_batch_duckdb(
@@ -665,10 +714,10 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
                     except Exception as api_err:
                         logger.warning(f"Failed to push profiles to API (non-critical): {api_err}")
                 
-                # Update state
+                # Update state (in PostgreSQL)
                 if profiles:
                     max_id = max(p['trade_id'] for p in profiles)
-                    _update_last_id(local_conn, threshold, max_id)
+                    _update_last_id(threshold, max_id)
                 
                 total_inserted += inserted
                 if inserted > 0:

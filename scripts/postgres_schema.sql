@@ -162,6 +162,18 @@ CREATE INDEX IF NOT EXISTS idx_profiles_wallet ON wallet_profiles(wallet_address
 CREATE INDEX IF NOT EXISTS idx_profiles_trade_ts ON wallet_profiles(trade_timestamp);
 CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON wallet_profiles(created_at);
 
+-- Wallet Profiles State (PERSISTENT - survives master2 restarts)
+-- Tracks last processed trade_id per threshold for incremental processing
+CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+    id SERIAL PRIMARY KEY,
+    threshold DECIMAL(5,2) NOT NULL UNIQUE,
+    last_trade_id BIGINT NOT NULL DEFAULT 0,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_state_threshold ON wallet_profiles_state(threshold);
+
 -- Jupiter Prices (24h hot storage)
 CREATE TABLE IF NOT EXISTS prices (
     id BIGSERIAL PRIMARY KEY,

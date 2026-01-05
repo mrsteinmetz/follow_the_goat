@@ -4,6 +4,7 @@
 # Database
 duckdb>=1.0.0
 psycopg2-binary>=2.9.9  # PostgreSQL for archive database
+pymysql>=1.1.0  # For one-time MySQL migrations
 
 # Scheduling (NO .bat files - use this instead)
 APScheduler>=3.10.0

@@ -2965,6 +2965,7 @@ def get_trail_gain_distribution():
 # =============================================================================
 # FILTER ANALYSIS ENDPOINTS (Auto-filter suggestions dashboard)
 # =============================================================================
+# Uses DuckDB (TradingDataEngine) for data, config.json for settings
 
 # Section display names for filter analysis
 FILTER_SECTION_NAMES = {
@@ -2974,49 +2975,67 @@ FILTER_SECTION_NAMES = {
     'whale_activity': 'Whale Activity',
     'patterns': 'Patterns',
     'second_prices': 'Second Prices',
+    'btc_correlation': 'BTC Correlation',
+    'eth_correlation': 'ETH Correlation',
+}
+
+# Path to filter analysis config
+FILTER_CONFIG_PATH = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns" / "config.json"
+
+# Default settings for filter analysis
+FILTER_SETTINGS_DEFAULTS = {
+    'good_trade_threshold': {'value': 0.3, 'description': 'Minimum % gain for a trade to be considered good.', 'type': 'decimal', 'min': 0.1, 'max': 5.0},
+    'analysis_hours': {'value': 24, 'description': 'Hours of historical trade data to analyze.', 'type': 'number', 'min': 1, 'max': 168},
+    'min_filters_in_combo': {'value': 1, 'description': 'Minimum filters required in a combination.', 'type': 'number', 'min': 1, 'max': 10},
+    'max_filters_in_combo': {'value': 6, 'description': 'Maximum filters to combine.', 'type': 'number', 'min': 2, 'max': 15},
+    'min_good_trades_kept_pct': {'value': 50, 'description': 'Min % of good trades a single filter must keep.', 'type': 'number', 'min': 10, 'max': 100},
+    'min_bad_trades_removed_pct': {'value': 10, 'description': 'Min % of bad trades a single filter must remove.', 'type': 'number', 'min': 5, 'max': 100},
+    'combo_min_good_kept_pct': {'value': 25, 'description': 'Min % of good trades a combination must keep.', 'type': 'number', 'min': 5, 'max': 100},
+    'combo_min_improvement': {'value': 1.0, 'description': 'Min % improvement to add another filter.', 'type': 'decimal', 'min': 0.1, 'max': 10.0},
 }
 
 
-def ensure_filter_tables_postgres():
-    """Ensure filter analysis tables exist in PostgreSQL."""
-    with safe_postgres() as conn:
-        with conn.cursor() as cursor:
-            # Auto filter settings table
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS auto_filter_settings (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    setting_key VARCHAR(50) UNIQUE NOT NULL,
-                    setting_value VARCHAR(100) NOT NULL,
-                    description VARCHAR(255),
-                    setting_type ENUM('number', 'decimal', 'boolean') DEFAULT 'decimal',
-                    min_value DECIMAL(10,4) DEFAULT NULL,
-                    max_value DECIMAL(10,4) DEFAULT NULL,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_key (setting_key)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-            """)
-            
-            # Insert defaults if not exist
-            cursor.execute("""
-                INSERT IGNORE INTO auto_filter_settings (setting_key, setting_value, description, setting_type, min_value, max_value) VALUES
-                ('good_trade_threshold', '0.3', 'Minimum % gain for a trade to be considered good.', 'decimal', 0.1, 5.0),
-                ('analysis_hours', '24', 'Hours of historical trade data to analyze.', 'number', 1, 168),
-                ('min_filters_in_combo', '1', 'Minimum filters required in a combination.', 'number', 1, 10),
-                ('max_filters_in_combo', '6', 'Maximum filters to combine.', 'number', 2, 15),
-                ('min_good_trades_kept_pct', '50', 'Min % of good trades a single filter must keep.', 'number', 10, 100),
-                ('min_bad_trades_removed_pct', '10', 'Min % of bad trades a single filter must remove.', 'number', 5, 100),
-                ('combo_min_good_kept_pct', '25', 'Min % of good trades a combination must keep.', 'number', 5, 100),
-                ('combo_min_improvement', '1.0', 'Min % improvement to add another filter.', 'decimal', 0.1, 10.0)
-            """)
-        conn.commit()
+def load_filter_config():
+    """Load filter analysis config from JSON file."""
+    try:
+        if FILTER_CONFIG_PATH.exists():
+            with open(FILTER_CONFIG_PATH, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load filter config: {e}")
+    return {}
+
+
+def save_filter_config(config):
+    """Save filter analysis config to JSON file."""
+    try:
+        with open(FILTER_CONFIG_PATH, 'w') as f:
+            json.dump(config, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save filter config: {e}")
+        return False
+
+
+def query_duckdb_safe(query):
+    """Query DuckDB via TradingDataEngine, return empty list on failure."""
+    try:
+        engine = get_trading_engine()
+        if engine._running:
+            return engine.read(query) or []
+    except Exception as e:
+        logger.debug(f"DuckDB query failed: {e}")
+    return []
 
 
 @app.route('/filter-analysis/dashboard', methods=['GET'])
 def get_filter_analysis_dashboard():
-    """Get all data for the filter analysis dashboard."""
+    """Get all data for the filter analysis dashboard.
+    
+    Reads from DuckDB (TradingDataEngine) for filter data,
+    and config.json for settings.
+    """
     try:
-        ensure_filter_tables_postgres()
-        
         result = {
             'success': True,
             'summary': {},
@@ -3031,213 +3050,184 @@ def get_filter_analysis_dashboard():
             'rolling_avgs': {}
         }
         
-        with safe_postgres() as conn:
-            with conn.cursor() as cursor:
-                # Get auto filter settings
-                try:
-                    cursor.execute("SELECT * FROM auto_filter_settings ORDER BY id")
-                    result['settings'] = cursor.fetchall()
-                except:
-                    pass
-                
-                # Summary statistics
-                try:
-                    cursor.execute("""
-                        SELECT COUNT(*) as total_filters, 
-                            ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept,
-                            ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
-                            ROUND(MAX(bad_trades_removed_pct), 1) as best_bad_removed,
-                            MAX(good_trades_before) as total_good_trades, 
-                            MAX(bad_trades_before) as total_bad_trades,
-                            MAX(created_at) as last_updated, 
-                            MAX(analysis_hours) as analysis_hours
-                        FROM filter_reference_suggestions
-                    """)
-                    summary = cursor.fetchone()
-                    if summary:
-                        if summary.get('last_updated'):
-                            summary['last_updated'] = summary['last_updated'].strftime('%Y-%m-%d %H:%M:%S')
-                        result['summary'] = summary
-                except:
-                    pass
-                
-                # Minute distribution
-                try:
-                    cursor.execute("""
-                        SELECT minute_analyzed, COUNT(*) as filter_count, 
-                            ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
-                            ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept
-                        FROM filter_reference_suggestions 
-                        GROUP BY minute_analyzed 
-                        ORDER BY avg_bad_removed DESC
-                    """)
-                    result['minute_distribution'] = cursor.fetchall()
-                except:
-                    pass
-                
-                # All suggestions with field info
-                try:
-                    cursor.execute("""
-                        SELECT frs.*, ffc.section, ffc.field_name, ffc.value_type, ffc.description
-                        FROM filter_reference_suggestions frs 
-                        LEFT JOIN filter_fields_catalog ffc ON frs.filter_field_id = ffc.id
-                        ORDER BY bad_trades_removed_pct DESC
-                    """)
-                    suggestions = cursor.fetchall()
-                    for s in suggestions:
-                        if s.get('created_at'):
-                            s['created_at'] = s['created_at'].strftime('%Y-%m-%d %H:%M:%S')
-                        # Convert Decimal to float
-                        for key in ['from_value', 'to_value', 'good_trades_kept_pct', 'bad_trades_removed_pct']:
-                            if s.get(key) is not None:
-                                s[key] = float(s[key])
-                    result['suggestions'] = suggestions
-                except:
-                    pass
-                
-                # Filter combinations
-                try:
-                    cursor.execute("""
-                        SELECT *, COALESCE(minute_analyzed, 0) as minute_analyzed 
-                        FROM filter_combinations 
-                        ORDER BY bad_trades_removed_pct DESC
-                    """)
-                    combinations = cursor.fetchall()
-                    for combo in combinations:
-                        for key in ['good_trades_kept_pct', 'bad_trades_removed_pct']:
-                            if combo.get(key) is not None:
-                                combo[key] = float(combo[key])
-                        # Get filter details
-                        filter_ids = json.loads(combo.get('filter_ids', '[]') or '[]')
-                        if filter_ids:
-                            placeholders = ','.join(['%s'] * len(filter_ids))
-                            cursor.execute(f"""
-                                SELECT id, column_name, from_value, to_value 
-                                FROM filter_reference_suggestions 
-                                WHERE id IN ({placeholders})
-                            """, filter_ids)
-                            details = cursor.fetchall()
-                            combo['filter_details'] = {d['id']: d for d in details}
-                        else:
-                            combo['filter_details'] = {}
-                    result['combinations'] = combinations
-                except:
-                    pass
-                
-                # Recent scheduler runs
-                try:
-                    cursor.execute("""
-                        SELECT * FROM filter_scheduler_runs 
-                        ORDER BY run_timestamp DESC 
-                        LIMIT 20
-                    """)
-                    runs = cursor.fetchall()
-                    for run in runs:
-                        if run.get('run_timestamp'):
-                            run['run_timestamp'] = run['run_timestamp'].strftime('%Y-%m-%d %H:%M:%S')
-                        if run.get('completed_at'):
-                            run['completed_at'] = run['completed_at'].strftime('%Y-%m-%d %H:%M:%S')
-                        for key in ['best_bad_removed_pct', 'best_good_kept_pct']:
-                            if run.get(key) is not None:
-                                run[key] = float(run[key])
-                    result['scheduler_runs'] = runs
-                except:
-                    pass
-                
-                # Filter consistency (last 24 hours)
-                try:
-                    cursor.execute("""
-                        SELECT 
-                            fph.filter_column,
-                            COUNT(*) as total_runs,
-                            SUM(fph.is_in_best_combination) as times_in_best_combo,
-                            ROUND(SUM(fph.is_in_best_combination) / COUNT(*) * 100, 1) as consistency_pct,
-                            ROUND(AVG(fph.bad_trades_removed_pct), 2) as avg_bad_removed,
-                            ROUND(AVG(fph.good_trades_kept_pct), 2) as avg_good_kept,
-                            ROUND(AVG(fph.effectiveness_score), 2) as avg_effectiveness,
-                            MAX(fph.run_timestamp) as last_seen,
-                            (SELECT minute_analyzed FROM filter_performance_history 
-                             WHERE filter_column = fph.filter_column 
-                             ORDER BY run_timestamp DESC LIMIT 1) as latest_minute,
-                            (SELECT from_value FROM filter_performance_history 
-                             WHERE filter_column = fph.filter_column 
-                             ORDER BY run_timestamp DESC LIMIT 1) as latest_from,
-                            (SELECT to_value FROM filter_performance_history 
-                             WHERE filter_column = fph.filter_column 
-                             ORDER BY run_timestamp DESC LIMIT 1) as latest_to
-                        FROM filter_performance_history fph
-                        WHERE fph.run_timestamp >= NOW() - INTERVAL 24 HOUR
-                        GROUP BY fph.filter_column
-                        HAVING total_runs >= 2
-                        ORDER BY consistency_pct DESC, avg_effectiveness DESC
-                        LIMIT 30
-                    """)
-                    consistency = cursor.fetchall()
-                    for c in consistency:
-                        if c.get('last_seen'):
-                            c['last_seen'] = c['last_seen'].strftime('%Y-%m-%d %H:%M:%S')
-                        for key in ['consistency_pct', 'avg_bad_removed', 'avg_good_kept', 'avg_effectiveness', 'latest_from', 'latest_to']:
-                            if c.get(key) is not None:
-                                c[key] = float(c[key])
-                    result['filter_consistency'] = consistency
-                except:
-                    pass
-                
-                # Trend chart data
-                try:
-                    cursor.execute("""
-                        SELECT 
-                            DATE_FORMAT(run_timestamp, '%Y-%m-%d %H:%i') as time_bucket,
-                            ROUND(AVG(bad_trades_removed_pct), 2) as avg_bad_removed,
-                            ROUND(AVG(good_trades_kept_pct), 2) as avg_good_kept,
-                            ROUND(AVG(effectiveness_score), 2) as avg_effectiveness,
-                            COUNT(DISTINCT filter_column) as filter_count
-                        FROM filter_performance_history
-                        WHERE run_timestamp >= NOW() - INTERVAL 24 HOUR
-                        GROUP BY DATE_FORMAT(run_timestamp, '%Y-%m-%d %H:%i')
-                        ORDER BY time_bucket ASC
-                    """)
-                    trend_data = cursor.fetchall()
-                    for t in trend_data:
-                        for key in ['avg_bad_removed', 'avg_good_kept', 'avg_effectiveness']:
-                            if t.get(key) is not None:
-                                t[key] = float(t[key])
-                    result['trend_chart_data'] = trend_data
-                except:
-                    pass
-                
-                # Scheduler stats
-                try:
-                    cursor.execute("""
-                        SELECT 
-                            COUNT(*) as runs_today,
-                            MAX(run_timestamp) as last_run,
-                            ROUND(AVG(total_filters_analyzed)) as avg_filters
-                        FROM filter_scheduler_runs
-                        WHERE DATE(run_timestamp) = CURDATE()
-                    """)
-                    stats = cursor.fetchone()
-                    if stats:
-                        if stats.get('last_run'):
-                            stats['last_run'] = stats['last_run'].strftime('%Y-%m-%d %H:%M:%S')
-                        result['scheduler_stats'] = stats
-                except:
-                    pass
-                
-                # Rolling averages
-                try:
-                    cursor.execute("""
-                        SELECT 
-                            filter_column,
-                            ROUND(AVG(bad_trades_removed_pct), 2) as rolling_avg
-                        FROM filter_performance_history
-                        WHERE run_timestamp >= NOW() - INTERVAL 6 HOUR
-                        GROUP BY filter_column
-                    """)
-                    for r in cursor.fetchall():
-                        result['rolling_avgs'][r['filter_column']] = float(r['rolling_avg']) if r['rolling_avg'] else 0
-                except:
-                    pass
+        # Load settings from config.json
+        config = load_filter_config()
+        settings_list = []
+        for key, meta in FILTER_SETTINGS_DEFAULTS.items():
+            value = config.get(key, meta['value'])
+            settings_list.append({
+                'setting_key': key,
+                'setting_value': str(value),
+                'description': meta['description'],
+                'setting_type': meta['type'],
+                'min_value': meta['min'],
+                'max_value': meta['max']
+            })
+        result['settings'] = settings_list
+        
+        # Check if TradingDataEngine is running
+        try:
+            engine = get_trading_engine()
+            if not engine._running:
+                result['error_info'] = 'TradingDataEngine not running. Start scheduler with: python scheduler/master2.py'
+                return jsonify(result)
+        except Exception as e:
+            result['error_info'] = f'Cannot connect to TradingDataEngine: {str(e)}'
+            return jsonify(result)
+        
+        # Summary statistics from filter_reference_suggestions
+        try:
+            summary_rows = engine.read("""
+                SELECT 
+                    COUNT(*) as total_filters, 
+                    ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept,
+                    ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                    ROUND(MAX(bad_trades_removed_pct), 1) as best_bad_removed,
+                    MAX(good_trades_before) as total_good_trades, 
+                    MAX(bad_trades_before) as total_bad_trades,
+                    MAX(created_at) as last_updated, 
+                    MAX(analysis_hours) as analysis_hours
+                FROM filter_reference_suggestions
+            """)
+            if summary_rows:
+                summary = dict(zip(['total_filters', 'avg_good_kept', 'avg_bad_removed', 
+                                   'best_bad_removed', 'total_good_trades', 'total_bad_trades',
+                                   'last_updated', 'analysis_hours'], summary_rows[0]))
+                if summary.get('last_updated'):
+                    try:
+                        summary['last_updated'] = str(summary['last_updated'])[:19]
+                    except:
+                        pass
+                result['summary'] = summary
+        except Exception as e:
+            logger.debug(f"Summary query failed: {e}")
+        
+        # Minute distribution
+        try:
+            minute_rows = engine.read("""
+                SELECT 
+                    minute_analyzed, 
+                    COUNT(*) as filter_count, 
+                    ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                    ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept
+                FROM filter_reference_suggestions 
+                GROUP BY minute_analyzed 
+                ORDER BY avg_bad_removed DESC
+            """)
+            if minute_rows:
+                result['minute_distribution'] = [
+                    dict(zip(['minute_analyzed', 'filter_count', 'avg_bad_removed', 'avg_good_kept'], row))
+                    for row in minute_rows
+                ]
+        except Exception as e:
+            logger.debug(f"Minute distribution query failed: {e}")
+        
+        # All suggestions with field info (join with catalog)
+        try:
+            suggestions_rows = engine.read("""
+                SELECT 
+                    frs.id, frs.filter_field_id, frs.column_name, frs.from_value, frs.to_value,
+                    frs.total_trades, frs.good_trades_before, frs.bad_trades_before,
+                    frs.good_trades_after, frs.bad_trades_after,
+                    frs.good_trades_kept_pct, frs.bad_trades_removed_pct,
+                    frs.bad_negative_count, frs.bad_0_to_01_count, frs.bad_01_to_02_count, frs.bad_02_to_03_count,
+                    frs.analysis_hours, frs.minute_analyzed, frs.created_at,
+                    ffc.section, ffc.field_name, ffc.value_type
+                FROM filter_reference_suggestions frs 
+                LEFT JOIN filter_fields_catalog ffc ON frs.filter_field_id = ffc.id
+                ORDER BY frs.bad_trades_removed_pct DESC
+            """)
+            if suggestions_rows:
+                columns = ['id', 'filter_field_id', 'column_name', 'from_value', 'to_value',
+                          'total_trades', 'good_trades_before', 'bad_trades_before',
+                          'good_trades_after', 'bad_trades_after',
+                          'good_trades_kept_pct', 'bad_trades_removed_pct',
+                          'bad_negative_count', 'bad_0_to_01_count', 'bad_01_to_02_count', 'bad_02_to_03_count',
+                          'analysis_hours', 'minute_analyzed', 'created_at',
+                          'section', 'field_name', 'value_type']
+                suggestions = []
+                for row in suggestions_rows:
+                    s = dict(zip(columns, row))
+                    for key in ['from_value', 'to_value', 'good_trades_kept_pct', 'bad_trades_removed_pct']:
+                        if s.get(key) is not None:
+                            s[key] = float(s[key])
+                    if s.get('created_at'):
+                        try:
+                            s['created_at'] = str(s['created_at'])[:19]
+                        except:
+                            pass
+                    suggestions.append(s)
+                result['suggestions'] = suggestions
+        except Exception as e:
+            logger.debug(f"Suggestions query failed: {e}")
+        
+        # Filter combinations
+        try:
+            combo_rows = engine.read("""
+                SELECT 
+                    id, combination_name, filter_count, filter_ids, filter_columns,
+                    total_trades, good_trades_before, bad_trades_before,
+                    good_trades_after, bad_trades_after,
+                    good_trades_kept_pct, bad_trades_removed_pct,
+                    best_single_bad_removed_pct, improvement_over_single,
+                    bad_negative_count, bad_0_to_01_count, bad_01_to_02_count, bad_02_to_03_count,
+                    COALESCE(minute_analyzed, 0) as minute_analyzed, analysis_hours
+                FROM filter_combinations 
+                ORDER BY bad_trades_removed_pct DESC
+            """)
+            if combo_rows:
+                columns = ['id', 'combination_name', 'filter_count', 'filter_ids', 'filter_columns',
+                          'total_trades', 'good_trades_before', 'bad_trades_before',
+                          'good_trades_after', 'bad_trades_after',
+                          'good_trades_kept_pct', 'bad_trades_removed_pct',
+                          'best_single_bad_removed_pct', 'improvement_over_single',
+                          'bad_negative_count', 'bad_0_to_01_count', 'bad_01_to_02_count', 'bad_02_to_03_count',
+                          'minute_analyzed', 'analysis_hours']
+                combinations = []
+                for row in combo_rows:
+                    combo = dict(zip(columns, row))
+                    for key in ['good_trades_kept_pct', 'bad_trades_removed_pct', 
+                               'best_single_bad_removed_pct', 'improvement_over_single']:
+                        if combo.get(key) is not None:
+                            combo[key] = float(combo[key])
+                    if isinstance(combo.get('filter_ids'), str):
+                        combo['filter_ids'] = json.loads(combo['filter_ids'])
+                    if isinstance(combo.get('filter_columns'), str):
+                        combo['filter_columns'] = json.loads(combo['filter_columns'])
+                    combo['filter_details'] = {}
+                    combinations.append(combo)
+                result['combinations'] = combinations
+        except Exception as e:
+            logger.debug(f"Combinations query failed: {e}")
+        
+        # Filter consistency - derived from current suggestions (since we don't have history table)
+        try:
+            if result['suggestions']:
+                consistency_data = []
+                for s in result['suggestions'][:30]:
+                    consistency_data.append({
+                        'filter_column': s['column_name'],
+                        'total_runs': 1,
+                        'times_in_best_combo': 1,
+                        'consistency_pct': 100.0,
+                        'avg_bad_removed': s['bad_trades_removed_pct'],
+                        'avg_good_kept': s['good_trades_kept_pct'],
+                        'avg_effectiveness': round((s['bad_trades_removed_pct'] * s['good_trades_kept_pct']) / 100, 2),
+                        'last_seen': s.get('created_at'),
+                        'latest_minute': s['minute_analyzed'],
+                        'latest_from': s['from_value'],
+                        'latest_to': s['to_value']
+                    })
+                result['filter_consistency'] = consistency_data
+        except Exception as e:
+            logger.debug(f"Consistency derivation failed: {e}")
+        
+        # Rolling averages - use current suggestion values as "rolling averages"
+        try:
+            for s in result['suggestions']:
+                result['rolling_avgs'][s['column_name']] = s['bad_trades_removed_pct']
+        except:
+            pass
         
         return jsonify(result)
     except Exception as e:
@@ -3247,50 +3237,65 @@ def get_filter_analysis_dashboard():
 
 @app.route('/filter-analysis/settings', methods=['GET'])
 def get_filter_settings():
-    """Get auto filter settings."""
+    """Get auto filter settings from config.json."""
     try:
-        ensure_filter_tables_postgres()
+        config = load_filter_config()
+        settings_list = []
+        for key, meta in FILTER_SETTINGS_DEFAULTS.items():
+            value = config.get(key, meta['value'])
+            settings_list.append({
+                'setting_key': key,
+                'setting_value': str(value),
+                'description': meta['description'],
+                'setting_type': meta['type'],
+                'min_value': meta['min'],
+                'max_value': meta['max']
+            })
         
-        with safe_postgres() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT * FROM auto_filter_settings ORDER BY id")
-                settings = cursor.fetchall()
-        
-        return jsonify({'success': True, 'settings': settings})
+        return jsonify({'success': True, 'settings': settings_list})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/filter-analysis/settings', methods=['POST'])
 def save_filter_settings():
-    """Save auto filter settings."""
+    """Save auto filter settings to config.json."""
     try:
-        ensure_filter_tables_postgres()
         data = request.get_json() or {}
-        settings = data.get('settings', {})
+        new_settings = data.get('settings', {})
         
+        # Load existing config
+        config = load_filter_config()
+        
+        # Update settings with proper type conversion
         errors = []
-        with safe_postgres() as conn:
-            with conn.cursor() as cursor:
-                for key, value in settings.items():
-                    try:
-                        cursor.execute("""
-                            UPDATE auto_filter_settings 
-                            SET setting_value = %s 
-                            WHERE setting_key = %s
-                        """, [str(value), key])
-                    except Exception as e:
-                        errors.append(f"{key}: {str(e)}")
-            conn.commit()
-            
-            # Get updated settings
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT setting_key, setting_value FROM auto_filter_settings")
-                current = {r['setting_key']: r['setting_value'] for r in cursor.fetchall()}
+        for key, value in new_settings.items():
+            if key in FILTER_SETTINGS_DEFAULTS:
+                meta = FILTER_SETTINGS_DEFAULTS[key]
+                try:
+                    # Convert to appropriate type
+                    if meta['type'] == 'number':
+                        config[key] = int(float(value))
+                    elif meta['type'] == 'decimal':
+                        config[key] = float(value)
+                    else:
+                        config[key] = value
+                except Exception as e:
+                    errors.append(f"{key}: {str(e)}")
+            else:
+                errors.append(f"{key}: unknown setting")
+        
+        # Save config
+        if not save_filter_config(config):
+            return jsonify({'success': False, 'error': 'Failed to save config file'}), 500
+        
+        # Return current settings
+        current = {key: config.get(key, meta['value']) 
+                  for key, meta in FILTER_SETTINGS_DEFAULTS.items()}
         
         return jsonify({
             'success': True,
-            'message': 'Settings saved',
+            'message': 'Settings saved to config.json',
             'errors': errors,
             'current_settings': current
         })

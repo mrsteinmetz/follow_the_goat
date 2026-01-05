@@ -770,6 +770,28 @@ def get_local_duckdb(use_cursor=True):
         return _local_duckdb
 
 
+def get_master2_db_for_writes():
+    """
+    Get master2's local DuckDB connection and lock for WRITE operations.
+    
+    This is the OFFICIAL way for external modules to write to master2's database.
+    
+    Returns:
+        Tuple of (connection, lock) or (None, None) if not available
+        
+    Usage:
+        conn, lock = get_master2_db_for_writes()
+        if conn:
+            with lock:
+                conn.execute("INSERT ...")
+    """
+    global _local_duckdb, _local_duckdb_lock
+    
+    if _local_duckdb is not None:
+        return (_local_duckdb, _local_duckdb_lock)
+    return (None, None)
+
+
 # =============================================================================
 # LOCAL API SERVER (Port 5052) - Serves data from _local_duckdb
 # =============================================================================
@@ -1232,8 +1254,10 @@ def create_local_api() -> FastAPI:
             raise HTTPException(status_code=500, detail=str(e))
     
     @app.get("/plays")
-    async def get_plays():
-        """Get all plays."""
+    async def get_plays(
+        full: bool = Query(default=False, description="Return all columns if True, else only id and name")
+    ):
+        """Get all plays - optimized with PyArrow zero-copy reads."""
         global _local_duckdb, _local_duckdb_lock
         
         if _local_duckdb is None:
@@ -1241,14 +1265,25 @@ def create_local_api() -> FastAPI:
         
         try:
             with _local_duckdb_lock:
-                results = _local_duckdb.execute("""
-                    SELECT *
+                # For dropdowns and lists, only fetch id and name (fast)
+                # For editing, use full=true to get all columns
+                if full:
+                    select_clause = "*"
+                else:
+                    select_clause = "id, name, is_active"
+                
+                # Use fetch_arrow() for zero-copy read
+                arrow_result = _local_duckdb.execute(f"""
+                    SELECT {select_clause}
                     FROM follow_the_goat_plays
                     ORDER BY sorting ASC, id DESC
-                """).fetchall()
-                columns = [desc[0] for desc in _local_duckdb.description]
+                """).fetch_arrow_table()
             
-            plays = [_serialize_row(dict(zip(columns, row))) for row in results]
+            # Convert Arrow table to list of dicts
+            plays = arrow_result.to_pylist()
+            
+            # Serialize special types
+            plays = [_serialize_row(play) for play in plays]
             
             return {
                 "status": "ok",
@@ -1296,7 +1331,7 @@ def create_local_api() -> FastAPI:
         hours: str = Query(default="24"),
         limit: int = Query(default=100)
     ):
-        """Get buyins/trades."""
+        """Get buyins/trades - optimized with PyArrow zero-copy reads."""
         global _local_duckdb, _local_duckdb_lock
         
         if _local_duckdb is None:
@@ -1319,16 +1354,26 @@ def create_local_api() -> FastAPI:
         try:
             with _local_duckdb_lock:
                 # Use followed_at (correct column name) and leverage composite index idx_buyins_query_opt
-                results = _local_duckdb.execute(f"""
-                    SELECT *
+                # Only select columns needed by the UI (avoid large JSON fields like fifteen_min_trail)
+                # Use fetch_arrow() for zero-copy read (10-100x faster than fetchall())
+                arrow_result = _local_duckdb.execute(f"""
+                    SELECT 
+                        id, play_id, wallet_address, followed_at,
+                        our_entry_price, our_exit_price, our_exit_timestamp,
+                        our_profit_loss, our_status,
+                        higest_price_reached, current_price,
+                        CASE WHEN fifteen_min_trail IS NOT NULL THEN 1 ELSE 0 END as has_trail
                     FROM follow_the_goat_buyins
                     {where_clause}
                     ORDER BY followed_at DESC
                     LIMIT {limit}
-                """).fetchall()
-                columns = [desc[0] for desc in _local_duckdb.description]
+                """).fetch_arrow_table()
             
-            buyins = [_serialize_row(dict(zip(columns, row))) for row in results]
+            # Convert Arrow table to list of dicts (fast columnar-to-row conversion)
+            buyins = arrow_result.to_pylist()
+            
+            # Serialize timestamps and other special types
+            buyins = [_serialize_row(buyin) for buyin in buyins]
             
             return {
                 "status": "ok",
@@ -1571,6 +1616,552 @@ def create_local_api() -> FastAPI:
             "status": "ok",
             "stats": get_write_queue_stats(),
             "timestamp": datetime.now().isoformat()
+        }
+    
+    # =========================================================================
+    # PATTERN CONFIG ENDPOINTS
+    # =========================================================================
+    
+    @app.get("/patterns/projects")
+    async def get_pattern_projects():
+        """Get all pattern config projects with filter counts."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            with _local_duckdb_lock:
+                # Get all projects
+                projects_result = _local_duckdb.execute("""
+                    SELECT id, name, description, created_at, updated_at
+                    FROM pattern_config_projects
+                    ORDER BY id
+                """).fetchall()
+                projects_cols = [desc[0] for desc in _local_duckdb.description]
+                
+                # Get filter counts per project
+                filter_counts = _local_duckdb.execute("""
+                    SELECT project_id, COUNT(*) as filter_count
+                    FROM pattern_config_filters
+                    GROUP BY project_id
+                """).fetchall()
+                
+                filter_count_map = {row[0]: row[1] for row in filter_counts}
+            
+            projects = []
+            for row in projects_result:
+                project = _serialize_row(dict(zip(projects_cols, row)))
+                project['filter_count'] = filter_count_map.get(project['id'], 0)
+                projects.append(project)
+            
+            return {
+                "status": "ok",
+                "projects": projects,
+                "count": len(projects)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/patterns/projects/{project_id}")
+    async def get_pattern_project(project_id: int):
+        """Get a single pattern project with its filters."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            with _local_duckdb_lock:
+                # Get project
+                project_result = _local_duckdb.execute(f"""
+                    SELECT id, name, description, created_at, updated_at
+                    FROM pattern_config_projects
+                    WHERE id = {project_id}
+                """).fetchall()
+                
+                if not project_result:
+                    raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
+                
+                project_cols = [desc[0] for desc in _local_duckdb.description]
+                project = _serialize_row(dict(zip(project_cols, project_result[0])))
+                
+                # Get filters for this project
+                filters_result = _local_duckdb.execute(f"""
+                    SELECT id, project_id, name, section, minute, field_name, field_column,
+                           from_value, to_value, include_null, exclude_mode, play_id,
+                           is_active, created_at, updated_at
+                    FROM pattern_config_filters
+                    WHERE project_id = {project_id}
+                    ORDER BY id
+                """).fetchall()
+                filters_cols = [desc[0] for desc in _local_duckdb.description]
+            
+            filters = [_serialize_row(dict(zip(filters_cols, row))) for row in filters_result]
+            
+            return {
+                "status": "ok",
+                "project": project,
+                "filters": filters
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/patterns/projects")
+    async def create_pattern_project(data: Dict[str, Any]):
+        """Create a new pattern project."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        name = data.get('name')
+        description = data.get('description', '')
+        
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        
+        try:
+            with _local_duckdb_lock:
+                _local_duckdb.execute("""
+                    INSERT INTO pattern_config_projects (name, description)
+                    VALUES (?, ?)
+                """, [name, description])
+                
+                # Get the new project ID
+                result = _local_duckdb.execute("SELECT last_insert_rowid()").fetchone()
+                new_id = result[0] if result else None
+            
+            return {
+                "status": "ok",
+                "message": "Project created successfully",
+                "id": new_id
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.delete("/patterns/projects/{project_id}")
+    async def delete_pattern_project(project_id: int):
+        """Delete a pattern project and all its filters."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            with _local_duckdb_lock:
+                # Delete filters first
+                _local_duckdb.execute(f"""
+                    DELETE FROM pattern_config_filters WHERE project_id = {project_id}
+                """)
+                
+                # Delete project
+                _local_duckdb.execute(f"""
+                    DELETE FROM pattern_config_projects WHERE id = {project_id}
+                """)
+            
+            return {
+                "status": "ok",
+                "message": f"Project {project_id} deleted successfully"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/patterns/filters")
+    async def create_pattern_filter(data: Dict[str, Any]):
+        """Create a new pattern filter."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        required_fields = ['project_id', 'name', 'field_name']
+        for field in required_fields:
+            if field not in data:
+                raise HTTPException(status_code=400, detail=f"{field} is required")
+        
+        try:
+            with _local_duckdb_lock:
+                _local_duckdb.execute("""
+                    INSERT INTO pattern_config_filters 
+                    (project_id, name, section, minute, field_name, field_column,
+                     from_value, to_value, include_null, exclude_mode, play_id, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    data.get('project_id'),
+                    data.get('name'),
+                    data.get('section'),
+                    data.get('minute'),
+                    data.get('field_name'),
+                    data.get('field_column'),
+                    data.get('from_value'),
+                    data.get('to_value'),
+                    data.get('include_null', 0),
+                    data.get('exclude_mode', 0),
+                    data.get('play_id'),
+                    data.get('is_active', 1)
+                ])
+                
+                result = _local_duckdb.execute("SELECT last_insert_rowid()").fetchone()
+                new_id = result[0] if result else None
+            
+            return {
+                "status": "ok",
+                "message": "Filter created successfully",
+                "id": new_id
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.put("/patterns/filters/{filter_id}")
+    async def update_pattern_filter(filter_id: int, data: Dict[str, Any]):
+        """Update a pattern filter."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            # Build UPDATE query dynamically
+            set_clauses = []
+            values = []
+            
+            updateable_fields = [
+                'name', 'section', 'minute', 'field_name', 'field_column',
+                'from_value', 'to_value', 'include_null', 'exclude_mode', 
+                'play_id', 'is_active'
+            ]
+            
+            for field in updateable_fields:
+                if field in data:
+                    set_clauses.append(f"{field} = ?")
+                    values.append(data[field])
+            
+            if not set_clauses:
+                raise HTTPException(status_code=400, detail="No fields to update")
+            
+            # Add updated_at
+            set_clauses.append("updated_at = CURRENT_TIMESTAMP")
+            values.append(filter_id)
+            
+            with _local_duckdb_lock:
+                _local_duckdb.execute(f"""
+                    UPDATE pattern_config_filters
+                    SET {', '.join(set_clauses)}
+                    WHERE id = ?
+                """, values)
+            
+            return {
+                "status": "ok",
+                "message": f"Filter {filter_id} updated successfully"
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.delete("/patterns/filters/{filter_id}")
+    async def delete_pattern_filter(filter_id: int):
+        """Delete a pattern filter."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            with _local_duckdb_lock:
+                _local_duckdb.execute(f"""
+                    DELETE FROM pattern_config_filters WHERE id = {filter_id}
+                """)
+            
+            return {
+                "status": "ok",
+                "message": f"Filter {filter_id} deleted successfully"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    # =========================================================================
+    # FILTER ANALYSIS ENDPOINTS (reads from TradingDataEngine)
+    # =========================================================================
+    
+    # Config path and defaults for filter analysis
+    FILTER_CONFIG_PATH = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns" / "config.json"
+    
+    FILTER_SETTINGS_DEFAULTS = {
+        'good_trade_threshold': {'value': 0.3, 'description': 'Minimum % gain for a trade to be considered good.', 'type': 'decimal', 'min': 0.1, 'max': 5.0},
+        'analysis_hours': {'value': 24, 'description': 'Hours of historical trade data to analyze.', 'type': 'number', 'min': 1, 'max': 168},
+        'min_filters_in_combo': {'value': 1, 'description': 'Minimum filters required in a combination.', 'type': 'number', 'min': 1, 'max': 10},
+        'max_filters_in_combo': {'value': 6, 'description': 'Maximum filters to combine.', 'type': 'number', 'min': 2, 'max': 15},
+        'min_good_trades_kept_pct': {'value': 50, 'description': 'Min % of good trades a single filter must keep.', 'type': 'number', 'min': 10, 'max': 100},
+        'min_bad_trades_removed_pct': {'value': 10, 'description': 'Min % of bad trades a single filter must remove.', 'type': 'number', 'min': 5, 'max': 100},
+        'combo_min_good_kept_pct': {'value': 25, 'description': 'Min % of good trades a combination must keep.', 'type': 'number', 'min': 5, 'max': 100},
+        'combo_min_improvement': {'value': 1.0, 'description': 'Min % improvement to add another filter.', 'type': 'decimal', 'min': 0.1, 'max': 10.0},
+    }
+    
+    def _load_filter_config():
+        """Load filter analysis config from JSON file."""
+        try:
+            if FILTER_CONFIG_PATH.exists():
+                with open(FILTER_CONFIG_PATH, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load filter config: {e}")
+        return {}
+    
+    def _save_filter_config(config):
+        """Save filter analysis config to JSON file."""
+        try:
+            with open(FILTER_CONFIG_PATH, 'w') as f:
+                json.dump(config, f, indent=2)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save filter config: {e}")
+            return False
+    
+    def _get_trading_engine_safe():
+        """Get TradingDataEngine, start it if needed."""
+        try:
+            from core.trading_engine import get_engine
+            engine = get_engine()
+            if not engine._running:
+                logger.info("Starting TradingDataEngine for filter analysis...")
+                engine.start()
+            return engine
+        except Exception as e:
+            logger.debug(f"TradingDataEngine not available: {e}")
+        return None
+    
+    @app.get("/filter-analysis/dashboard")
+    async def get_filter_analysis_dashboard():
+        """Get all data for the filter analysis dashboard."""
+        result = {
+            'success': True,
+            'summary': {},
+            'suggestions': [],
+            'combinations': [],
+            'minute_distribution': [],
+            'scheduler_runs': [],
+            'filter_consistency': [],
+            'trend_chart_data': [],
+            'scheduler_stats': {'runs_today': 0, 'last_run': None, 'avg_filters': 0},
+            'settings': [],
+            'rolling_avgs': {}
+        }
+        
+        # Load settings from config.json
+        config = _load_filter_config()
+        settings_list = []
+        for key, meta in FILTER_SETTINGS_DEFAULTS.items():
+            value = config.get(key, meta['value'])
+            settings_list.append({
+                'setting_key': key,
+                'setting_value': str(value),
+                'description': meta['description'],
+                'setting_type': meta['type'],
+                'min_value': meta['min'],
+                'max_value': meta['max']
+            })
+        result['settings'] = settings_list
+        
+        # Get TradingDataEngine
+        engine = _get_trading_engine_safe()
+        if engine is None:
+            result['error_info'] = 'TradingDataEngine not running. Run create_new_patterns job first.'
+            return result
+        
+        # Summary statistics
+        try:
+            summary_rows = engine.read("""
+                SELECT 
+                    COUNT(*) as total_filters, 
+                    ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept,
+                    ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                    ROUND(MAX(bad_trades_removed_pct), 1) as best_bad_removed,
+                    MAX(good_trades_before) as total_good_trades, 
+                    MAX(bad_trades_before) as total_bad_trades,
+                    MAX(created_at) as last_updated, 
+                    MAX(analysis_hours) as analysis_hours
+                FROM filter_reference_suggestions
+            """)
+            if summary_rows:
+                cols = ['total_filters', 'avg_good_kept', 'avg_bad_removed', 'best_bad_removed',
+                       'total_good_trades', 'total_bad_trades', 'last_updated', 'analysis_hours']
+                summary = dict(zip(cols, summary_rows[0]))
+                if summary.get('last_updated'):
+                    summary['last_updated'] = str(summary['last_updated'])[:19]
+                result['summary'] = summary
+        except Exception as e:
+            logger.debug(f"Summary query failed: {e}")
+        
+        # Minute distribution
+        try:
+            minute_rows = engine.read("""
+                SELECT minute_analyzed, COUNT(*) as filter_count, 
+                    ROUND(AVG(bad_trades_removed_pct), 1) as avg_bad_removed, 
+                    ROUND(AVG(good_trades_kept_pct), 1) as avg_good_kept
+                FROM filter_reference_suggestions 
+                GROUP BY minute_analyzed 
+                ORDER BY avg_bad_removed DESC
+            """)
+            if minute_rows:
+                result['minute_distribution'] = [
+                    dict(zip(['minute_analyzed', 'filter_count', 'avg_bad_removed', 'avg_good_kept'], row))
+                    for row in minute_rows
+                ]
+        except Exception as e:
+            logger.debug(f"Minute distribution query failed: {e}")
+        
+        # All suggestions
+        try:
+            suggestions_rows = engine.read("""
+                SELECT 
+                    frs.id, frs.filter_field_id, frs.column_name, frs.from_value, frs.to_value,
+                    frs.total_trades, frs.good_trades_before, frs.bad_trades_before,
+                    frs.good_trades_after, frs.bad_trades_after,
+                    frs.good_trades_kept_pct, frs.bad_trades_removed_pct,
+                    frs.analysis_hours, frs.minute_analyzed, frs.created_at,
+                    ffc.section, ffc.field_name, ffc.value_type
+                FROM filter_reference_suggestions frs 
+                LEFT JOIN filter_fields_catalog ffc ON frs.filter_field_id = ffc.id
+                ORDER BY frs.bad_trades_removed_pct DESC
+            """)
+            if suggestions_rows:
+                cols = ['id', 'filter_field_id', 'column_name', 'from_value', 'to_value',
+                       'total_trades', 'good_trades_before', 'bad_trades_before',
+                       'good_trades_after', 'bad_trades_after',
+                       'good_trades_kept_pct', 'bad_trades_removed_pct',
+                       'analysis_hours', 'minute_analyzed', 'created_at',
+                       'section', 'field_name', 'value_type']
+                suggestions = []
+                for row in suggestions_rows:
+                    s = dict(zip(cols, row))
+                    for key in ['from_value', 'to_value', 'good_trades_kept_pct', 'bad_trades_removed_pct']:
+                        if s.get(key) is not None:
+                            s[key] = float(s[key])
+                    if s.get('created_at'):
+                        s['created_at'] = str(s['created_at'])[:19]
+                    suggestions.append(s)
+                result['suggestions'] = suggestions
+        except Exception as e:
+            logger.debug(f"Suggestions query failed: {e}")
+        
+        # Filter combinations
+        try:
+            combo_rows = engine.read("""
+                SELECT id, combination_name, filter_count, filter_ids, filter_columns,
+                    total_trades, good_trades_before, bad_trades_before,
+                    good_trades_after, bad_trades_after,
+                    good_trades_kept_pct, bad_trades_removed_pct,
+                    COALESCE(minute_analyzed, 0) as minute_analyzed, analysis_hours
+                FROM filter_combinations 
+                ORDER BY bad_trades_removed_pct DESC
+            """)
+            if combo_rows:
+                cols = ['id', 'combination_name', 'filter_count', 'filter_ids', 'filter_columns',
+                       'total_trades', 'good_trades_before', 'bad_trades_before',
+                       'good_trades_after', 'bad_trades_after',
+                       'good_trades_kept_pct', 'bad_trades_removed_pct',
+                       'minute_analyzed', 'analysis_hours']
+                combinations = []
+                for row in combo_rows:
+                    combo = dict(zip(cols, row))
+                    for key in ['good_trades_kept_pct', 'bad_trades_removed_pct']:
+                        if combo.get(key) is not None:
+                            combo[key] = float(combo[key])
+                    if isinstance(combo.get('filter_ids'), str):
+                        combo['filter_ids'] = json.loads(combo['filter_ids'])
+                    if isinstance(combo.get('filter_columns'), str):
+                        combo['filter_columns'] = json.loads(combo['filter_columns'])
+                    combo['filter_details'] = {}
+                    combinations.append(combo)
+                result['combinations'] = combinations
+        except Exception as e:
+            logger.debug(f"Combinations query failed: {e}")
+        
+        # Filter consistency from suggestions
+        try:
+            if result['suggestions']:
+                consistency_data = []
+                for s in result['suggestions'][:30]:
+                    consistency_data.append({
+                        'filter_column': s['column_name'],
+                        'total_runs': 1,
+                        'times_in_best_combo': 1,
+                        'consistency_pct': 100.0,
+                        'avg_bad_removed': s['bad_trades_removed_pct'],
+                        'avg_good_kept': s['good_trades_kept_pct'],
+                        'avg_effectiveness': round((s['bad_trades_removed_pct'] * s['good_trades_kept_pct']) / 100, 2),
+                        'last_seen': s.get('created_at'),
+                        'latest_minute': s['minute_analyzed'],
+                        'latest_from': s['from_value'],
+                        'latest_to': s['to_value']
+                    })
+                result['filter_consistency'] = consistency_data
+        except Exception as e:
+            logger.debug(f"Consistency derivation failed: {e}")
+        
+        # Rolling averages
+        try:
+            for s in result['suggestions']:
+                result['rolling_avgs'][s['column_name']] = s['bad_trades_removed_pct']
+        except:
+            pass
+        
+        return result
+    
+    @app.get("/filter-analysis/settings")
+    async def get_filter_settings():
+        """Get auto filter settings from config.json."""
+        config = _load_filter_config()
+        settings_list = []
+        for key, meta in FILTER_SETTINGS_DEFAULTS.items():
+            value = config.get(key, meta['value'])
+            settings_list.append({
+                'setting_key': key,
+                'setting_value': str(value),
+                'description': meta['description'],
+                'setting_type': meta['type'],
+                'min_value': meta['min'],
+                'max_value': meta['max']
+            })
+        return {'success': True, 'settings': settings_list}
+    
+    @app.post("/filter-analysis/settings")
+    async def save_filter_settings(data: dict):
+        """Save auto filter settings to config.json."""
+        new_settings = data.get('settings', {})
+        config = _load_filter_config()
+        
+        errors = []
+        for key, value in new_settings.items():
+            if key in FILTER_SETTINGS_DEFAULTS:
+                meta = FILTER_SETTINGS_DEFAULTS[key]
+                try:
+                    if meta['type'] == 'number':
+                        config[key] = int(float(value))
+                    elif meta['type'] == 'decimal':
+                        config[key] = float(value)
+                    else:
+                        config[key] = value
+                except Exception as e:
+                    errors.append(f"{key}: {str(e)}")
+            else:
+                errors.append(f"{key}: unknown setting")
+        
+        if not _save_filter_config(config):
+            raise HTTPException(status_code=500, detail="Failed to save config file")
+        
+        current = {key: config.get(key, meta['value']) 
+                  for key, meta in FILTER_SETTINGS_DEFAULTS.items()}
+        
+        return {
+            'success': True,
+            'message': 'Settings saved to config.json',
+            'errors': errors,
+            'current_settings': current
         }
     
     return app
@@ -2055,6 +2646,19 @@ def backfill_from_data_engine(hours: int = 24):
         logger.warning("  WARNING: No plays loaded! Trading logic may not work.")
     
     # =========================================================================
+    # SPECIAL: Load pattern projects from PostgreSQL (not from Data Engine API)
+    # =========================================================================
+    logger.info("  Loading pattern projects from PostgreSQL...")
+    try:
+        from core.pattern_loader import load_pattern_projects_from_postgres
+        if load_pattern_projects_from_postgres(_local_duckdb):
+            logger.info("  ✓ Pattern projects loaded successfully")
+        else:
+            logger.info("  Pattern projects not available (skipping)")
+    except Exception as e:
+        logger.warning(f"  Failed to load pattern projects: {e}")
+    
+    # =========================================================================
     # Tables to backfill from Data Engine API
     # =========================================================================
     # NOTE: follow_the_goat_plays is NOT included here - loaded from PostgreSQL above
@@ -2126,6 +2730,39 @@ def backfill_from_data_engine(hours: int = 24):
     # =========================================================================
     logger.info("  Phase 3: Initializing incremental sync positions...")
     _initialize_sync_positions()
+    
+    # =========================================================================
+    # PHASE 4: Populate price_points from prices for legacy compatibility
+    # =========================================================================
+    logger.info("  Phase 4: Syncing prices → price_points (legacy compatibility)...")
+    try:
+        with _local_duckdb_lock:
+            # Check if we have prices data
+            result = _local_duckdb.execute("SELECT COUNT(*) FROM prices WHERE token = 'SOL'").fetchone()
+            prices_count = result[0] if result else 0
+            
+            if prices_count > 0:
+                # Populate price_points from prices (coin_id=5 for SOL)
+                _local_duckdb.execute("""
+                    INSERT INTO price_points (id, ts_idx, coin_id, value, created_at)
+                    SELECT 
+                        ROW_NUMBER() OVER (ORDER BY id) as id,
+                        id as ts_idx,
+                        5 as coin_id,
+                        price as value,
+                        ts as created_at
+                    FROM prices 
+                    WHERE token = 'SOL'
+                    ORDER BY id
+                """)
+                
+                result = _local_duckdb.execute("SELECT COUNT(*) FROM price_points").fetchone()
+                pp_count = result[0] if result else 0
+                logger.info(f"    Synced {pp_count} price points (coin_id=5 for SOL)")
+            else:
+                logger.info("    No prices to sync yet")
+    except Exception as e:
+        logger.warning(f"    Failed to sync prices→price_points: {e}")
     
     total_elapsed = phase1_elapsed + phase2_elapsed
     logger.info(f"Backfill complete: {total_loaded} total records loaded ({total_elapsed:.2f}s)")
@@ -2205,6 +2842,69 @@ def sync_new_data_from_engine():
         except Exception as e:
             # Only log at debug level to avoid spam (sync runs every 1s)
             logger.debug(f"Sync error for {table}: {e}")
+
+
+def sync_prices_to_price_points():
+    """
+    Sync prices table → price_points table with proper coin_id format.
+    
+    This bridges the gap between:
+    - prices table (token='SOL', used by master.py Data Engine)
+    - price_points table (coin_id=5, used by legacy modules like create_price_cycles)
+    
+    Runs after prices sync to ensure price_points is always up to date.
+    """
+    global _local_duckdb, _local_duckdb_lock
+    
+    try:
+        # Get latest price_point ID to avoid duplicates
+        with _local_duckdb_lock:
+            result = _local_duckdb.execute("""
+                SELECT COALESCE(MAX(id), 0) as max_id FROM price_points
+            """).fetchone()
+            last_price_point_id = result[0] if result else 0
+        
+        # Get latest prices.id that we've already synced
+        with _local_duckdb_lock:
+            result = _local_duckdb.execute("""
+                SELECT COALESCE(MAX(id), 0) as max_prices_id 
+                FROM price_points 
+                WHERE ts_idx IS NOT NULL
+            """).fetchone()
+            last_synced_prices_id = result[0] if result else 0
+        
+        # Fetch new prices that haven't been synced to price_points yet
+        cursor = get_thread_cursor()
+        new_prices = cursor.execute("""
+            SELECT id, ts, price 
+            FROM prices 
+            WHERE token = 'SOL' 
+              AND id > ?
+            ORDER BY id ASC
+            LIMIT 1000
+        """, [last_synced_prices_id]).fetchall()
+        
+        if not new_prices:
+            return  # No new prices to sync
+        
+        # Transform to price_points format
+        price_points = []
+        for idx, (prices_id, ts, price) in enumerate(new_prices):
+            price_points.append({
+                'id': last_price_point_id + idx + 1,  # Sequential ID
+                'ts_idx': prices_id,  # Reference to prices.id
+                'coin_id': 5,  # SOL = coin_id 5 (legacy format)
+                'value': price,
+                'created_at': ts
+            })
+        
+        # Insert into price_points via write queue
+        if price_points:
+            queue_write(_insert_records_fast, _local_duckdb, "price_points", price_points)
+            logger.debug(f"Synced {len(price_points)} prices → price_points (SOL coin_id=5)")
+    
+    except Exception as e:
+        logger.debug(f"Sync prices→price_points error: {e}")
 
 
 # =============================================================================
@@ -2309,6 +3009,9 @@ def run_create_new_patterns():
 def run_sync_from_engine():
     """Sync NEW data from the Data Engine API (incremental sync by ID)."""
     sync_new_data_from_engine()
+    
+    # After syncing prices, also sync to price_points table for legacy compatibility
+    sync_prices_to_price_points()
 
 
 @track_job("create_wallet_profiles", "Build wallet profiles (every 2s)")

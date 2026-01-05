@@ -381,7 +381,7 @@ def cleanup_old_data() -> int:
     try:
         with get_duckdb("prices") as con:
             result = con.execute(
-                "DELETE FROM price_points WHERE ts < ? RETURNING *",
+                "DELETE FROM price_points WHERE created_at < ? RETURNING *",
                 [cutoff]
             ).fetchall()
             deleted = len(result)

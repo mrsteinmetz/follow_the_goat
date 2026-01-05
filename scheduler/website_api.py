@@ -1139,6 +1139,245 @@ def get_recent_trades():
 
 
 # =============================================================================
+# PATTERN CONFIG ENDPOINTS
+# =============================================================================
+
+@app.route('/patterns/projects', methods=['GET'])
+@engine_required
+def get_pattern_projects():
+    """Get all pattern config projects - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/patterns/projects",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error fetching pattern projects: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'projects': []
+        }), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['GET'])
+@engine_required
+def get_pattern_project(project_id):
+    """Get a single pattern project with its filters - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/patterns/projects/{project_id}",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error fetching pattern project {project_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/patterns/projects', methods=['POST'])
+@engine_required
+def create_pattern_project():
+    """Create a new pattern project - proxies to master2's DuckDB."""
+    import requests
+    
+    data = request.get_json() or {}
+    
+    try:
+        response = requests.post(
+            f"{MASTER2_LOCAL_API_URL}/patterns/projects",
+            json=data,
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error creating pattern project: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['DELETE'])
+@engine_required
+def delete_pattern_project(project_id):
+    """Delete a pattern project and all its filters - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.delete(
+            f"{MASTER2_LOCAL_API_URL}/patterns/projects/{project_id}",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error deleting pattern project {project_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/patterns/projects/<int:project_id>/filters', methods=['GET'])
+@engine_required
+def get_pattern_filters(project_id):
+    """Get filters for a pattern project - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/patterns/projects/{project_id}/filters",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error fetching filters for project {project_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'filters': []
+        }), 500
+
+
+@app.route('/patterns/filters', methods=['POST'])
+@engine_required
+def create_pattern_filter():
+    """Create a new pattern filter - proxies to master2's DuckDB."""
+    import requests
+    
+    data = request.get_json() or {}
+    
+    try:
+        response = requests.post(
+            f"{MASTER2_LOCAL_API_URL}/patterns/filters",
+            json=data,
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error creating pattern filter: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['PUT'])
+@engine_required
+def update_pattern_filter(filter_id):
+    """Update a pattern filter - proxies to master2's DuckDB."""
+    import requests
+    
+    data = request.get_json() or {}
+    
+    try:
+        response = requests.put(
+            f"{MASTER2_LOCAL_API_URL}/patterns/filters/{filter_id}",
+            json=data,
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error updating pattern filter {filter_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['DELETE'])
+@engine_required
+def delete_pattern_filter(filter_id):
+    """Delete a pattern filter - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.delete(
+            f"{MASTER2_LOCAL_API_URL}/patterns/filters/{filter_id}",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error deleting pattern filter {filter_id}: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 500
+
+
+# =============================================================================
+# FILTER ANALYSIS ENDPOINTS (proxy to master2)
+# =============================================================================
+
+@app.route('/filter-analysis/dashboard', methods=['GET'])
+def get_filter_analysis_dashboard():
+    """Get filter analysis dashboard - proxies to master2's DuckDB."""
+    import requests
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/filter-analysis/dashboard",
+            timeout=30
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error getting filter analysis dashboard: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/filter-analysis/settings', methods=['GET'])
+def get_filter_settings():
+    """Get auto filter settings - proxies to master2."""
+    import requests
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/filter-analysis/settings",
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error getting filter settings: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/filter-analysis/settings', methods=['POST'])
+def save_filter_settings():
+    """Save auto filter settings - proxies to master2."""
+    import requests
+    
+    data = request.get_json() or {}
+    
+    try:
+        response = requests.post(
+            f"{MASTER2_LOCAL_API_URL}/filter-analysis/settings",
+            json=data,
+            timeout=10
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error saving filter settings: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# =============================================================================
 # GENERIC QUERY ENDPOINT
 # =============================================================================
 

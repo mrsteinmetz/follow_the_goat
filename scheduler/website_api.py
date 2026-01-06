@@ -396,44 +396,69 @@ def get_price_points():
     
     try:
         # First, get count to determine if we need sampling
-        count_result = client.query(f"""
+        count_sql = f"""
             SELECT COUNT(*) as cnt
             FROM prices
             WHERE token = '{token}'
               AND ts >= '{start_datetime}'
               AND ts <= '{end_datetime}'
-        """)
+        """
+        logger.info(f"[PRICE_POINTS] Count query: {count_sql}")
+        count_result = client.query(count_sql)
+        logger.info(f"[PRICE_POINTS] Count result: {count_result}")
         
         total_count = count_result[0].get('cnt', 0) if count_result else 0
+        logger.info(f"[PRICE_POINTS] Total count: {total_count}, max_points: {max_points}")
         
         # If we have more points than max_points, sample the data
         if total_count > max_points:
             # Use sampling: get every Nth point
             sample_interval = max(1, total_count // max_points)
             
-            results = client.query(f"""
-                SELECT ts, price, token
-                FROM (
-                    SELECT ts, price, token,
-                           ROW_NUMBER() OVER (ORDER BY ts ASC) as rn
+            # BUG FIX: If sample_interval is 1, we don't need sampling at all
+            # because rn % 1 is always 0, so rn % 1 = 1 will return NO results
+            if sample_interval == 1:
+                logger.info(f"[PRICE_POINTS] Sample interval is 1, getting all points instead")
+                full_sql = f"""
+                    SELECT ts, price, token
                     FROM prices
                     WHERE token = '{token}'
                       AND ts >= '{start_datetime}'
                       AND ts <= '{end_datetime}'
-                ) ranked
-                WHERE rn % {sample_interval} = 1
-                ORDER BY ts ASC
-            """)
+                    ORDER BY ts ASC
+                """
+                results = client.query(full_sql)
+            else:
+                sample_sql = f"""
+                    SELECT ts, price, token
+                    FROM (
+                        SELECT ts, price, token,
+                               ROW_NUMBER() OVER (ORDER BY ts ASC) as rn
+                        FROM prices
+                        WHERE token = '{token}'
+                          AND ts >= '{start_datetime}'
+                          AND ts <= '{end_datetime}'
+                    ) ranked
+                    WHERE rn % {sample_interval} = 1
+                    ORDER BY ts ASC
+                """
+                logger.info(f"[PRICE_POINTS] Using sampling with interval {sample_interval}")
+                logger.info(f"[PRICE_POINTS] Sample SQL: {sample_sql[:200]}...")
+                results = client.query(sample_sql)
+            logger.info(f"[PRICE_POINTS] Results count: {len(results) if results else 0}")
         else:
             # Get all points if under limit
-            results = client.query(f"""
+            full_sql = f"""
                 SELECT ts, price, token
                 FROM prices
                 WHERE token = '{token}'
                   AND ts >= '{start_datetime}'
                   AND ts <= '{end_datetime}'
                 ORDER BY ts ASC
-            """)
+            """
+            logger.info(f"[PRICE_POINTS] Getting all points (no sampling)")
+            results = client.query(full_sql)
+            logger.info(f"[PRICE_POINTS] Full results count: {len(results) if results else 0}")
         
         prices = []
         for row in results:
@@ -492,51 +517,34 @@ def get_latest_prices():
 @engine_required
 def get_cycle_tracker():
     """
-    Get cycle tracker data.
+    Get cycle tracker data - proxies to master2's Local API.
     
-    Returns all cycles (active and completed) based on filters.
-    Active cycles (cycle_end_time IS NULL) are always included regardless of start time.
+    By default, only returns COMPLETED cycles (cycle_end_time IS NOT NULL).
+    Set active_only=true to get active cycles.
     """
-    threshold = safe_float(request.args.get('threshold'), None)
-    hours = request.args.get('hours', '24')
-    limit = safe_int(request.args.get('limit', 100))
-    active_only = request.args.get('active_only', 'false').lower() == 'true'
+    import requests
     
-    client = get_engine_client()
-    
-    # Build query conditions
-    conditions = ["coin_id = 5"]  # SOL
-    
-    if threshold is not None:
-        conditions.append(f"threshold = {threshold}")
-    
-    if active_only:
-        # Only return active cycles (regardless of start time)
-        conditions.append("cycle_end_time IS NULL")
-    elif hours != 'all':
-        # For time-windowed queries:
-        # - Include ALL active cycles (regardless of start time)
-        # - Include completed cycles within the time window
-        hours_int = safe_int(hours, 24)
-        conditions.append(
-            f"(cycle_end_time IS NULL OR cycle_start_time >= NOW() - INTERVAL {hours_int} HOUR)"
-        )
-    
-    where_clause = " AND ".join(conditions)
-    
+    # Proxy to master2's Local API
     try:
-        # Get paginated results
-        results = client.query(f"""
-            SELECT 
-                id, coin_id, threshold, cycle_start_time, cycle_end_time,
-                sequence_start_id, sequence_start_price, highest_price_reached,
-                lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
-                total_data_points, created_at
-            FROM cycle_tracker
-            WHERE {where_clause}
-            ORDER BY cycle_start_time DESC
-            LIMIT {limit}
-        """)
+        params = dict(request.args)
+        # Force active_only=false to get completed cycles only (unless explicitly requested)
+        if params.get('active_only', 'false').lower() != 'true':
+            params['active_only'] = 'false'
+        
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/cycle_tracker",
+            params=params,
+            timeout=30
+        )
+        response.raise_for_status()
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error proxying cycle_tracker to master2: {e}")
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'cycles': []
+        }), 500
         
         # Get total count (all cycles matching filters, not just paginated)
         total_count_result = client.query(f"""
@@ -629,162 +637,52 @@ def get_price_analysis():
 # =============================================================================
 
 @app.route('/profiles', methods=['GET'])
-@engine_required
 def get_profiles():
     """
     Get wallet profiles with aggregated data per wallet.
     
-    This endpoint aggregates the wallet_profiles table to show:
-    - One row per wallet (instead of one per trade)
-    - Average potential gain across all trades
-    - Total invested amount
-    - Trade counts above/below threshold
+    Proxies to master2's local DuckDB where wallet_profiles are stored.
     """
-    threshold = safe_float(request.args.get('threshold'), None)
-    hours = request.args.get('hours', '24')
-    limit = safe_int(request.args.get('limit', 100))
-    wallet = request.args.get('wallet')
-    order_by = request.args.get('order_by', 'recent')
+    import requests
     
-    client = get_engine_client()
-    
-    # Build WHERE conditions
-    conditions = []
-    
-    if threshold is not None:
-        conditions.append(f"threshold = {threshold}")
-    
-    if wallet:
-        conditions.append(f"wallet_address = '{wallet}'")
-    
-    if hours != 'all':
-        hours_int = safe_int(hours, 24)
-        conditions.append(f"trade_timestamp >= NOW() - INTERVAL {hours_int} HOUR")
-    
-    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
-    
-    # Determine ORDER BY
-    if order_by == 'avg_gain':
-        order_clause = "ORDER BY avg_potential_gain DESC"
-    elif order_by == 'trade_count':
-        order_clause = "ORDER BY trade_count DESC"
-    else:  # 'recent'
-        order_clause = "ORDER BY latest_trade DESC"
+    # Forward all query parameters to master2
+    params = request.args.to_dict()
     
     try:
-        # Aggregated query: one row per wallet
-        # Note: We use the row's 'threshold' column (not the filter parameter) for gain comparisons
-        results = client.query(f"""
-            SELECT 
-                wallet_address,
-                COUNT(*) as trade_count,
-                AVG(
-                    CASE 
-                        WHEN short = 1 THEN 
-                            ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100
-                        ELSE 
-                            ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
-                    END
-                ) as avg_potential_gain,
-                SUM(COALESCE(stablecoin_amount, 0)) as total_invested,
-                SUM(
-                    CASE 
-                        WHEN short = 1 THEN 
-                            CASE WHEN ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100 < threshold THEN 1 ELSE 0 END
-                        ELSE 
-                            CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100 < threshold THEN 1 ELSE 0 END
-                    END
-                ) as trades_below_threshold,
-                SUM(
-                    CASE 
-                        WHEN short = 1 THEN 
-                            CASE WHEN ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100 >= threshold THEN 1 ELSE 0 END
-                        ELSE 
-                            CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100 >= threshold THEN 1 ELSE 0 END
-                    END
-                ) as trades_at_above_threshold,
-                MAX(trade_timestamp) as latest_trade,
-                ANY_VALUE(threshold) as threshold_value
-            FROM wallet_profiles
-            {where_clause}
-            GROUP BY wallet_address
-            {order_clause}
-            LIMIT {limit}
-        """)
-        
-        return jsonify({
-            'status': 'ok',
-            'profiles': results,
-            'count': len(results),
-            'source': 'data_engine'
-        })
-        
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/profiles",
+            params=params,
+            timeout=30
+        )
+        return jsonify(response.json()), response.status_code
     except Exception as e:
+        logger.error(f"Error proxying profiles request to master2: {e}")
         return jsonify({
             'status': 'error',
-            'error': str(e),
+            'error': f'Failed to connect to master2: {str(e)}',
             'profiles': []
         }), 500
 
 
 @app.route('/profiles/stats', methods=['GET'])
-@engine_required
 def get_profiles_stats():
-    """Get aggregated statistics for wallet profiles."""
-    threshold = safe_float(request.args.get('threshold'), None)
-    hours = request.args.get('hours', 'all')
+    """Get aggregated statistics for wallet profiles - proxies to master2."""
+    import requests
     
-    client = get_engine_client()
-    
-    # Build WHERE conditions
-    conditions = []
-    
-    if threshold is not None:
-        conditions.append(f"threshold = {threshold}")
-    
-    if hours != 'all':
-        hours_int = safe_int(hours, 24)
-        conditions.append(f"trade_timestamp >= NOW() - INTERVAL {hours_int} HOUR")
-    
-    where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+    params = request.args.to_dict()
     
     try:
-        results = client.query(f"""
-            SELECT 
-                COUNT(*) as total_profiles,
-                COUNT(DISTINCT wallet_address) as unique_wallets,
-                COUNT(DISTINCT price_cycle) as unique_cycles,
-                SUM(COALESCE(stablecoin_amount, 0)) as total_invested,
-                AVG(trade_entry_price) as avg_entry_price
-            FROM wallet_profiles
-            {where_clause}
-        """)
-        
-        stats = results[0] if results else {
-            'total_profiles': 0,
-            'unique_wallets': 0,
-            'unique_cycles': 0,
-            'total_invested': 0,
-            'avg_entry_price': 0
-        }
-        
-        return jsonify({
-            'status': 'ok',
-            'stats': stats,
-            'source': 'data_engine'
-        })
-        
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/profiles/stats",
+            params=params,
+            timeout=30
+        )
+        return jsonify(response.json()), response.status_code
     except Exception as e:
+        logger.error(f"Error proxying profiles/stats request to master2: {e}")
         return jsonify({
             'status': 'error',
-            'error': str(e),
-            'stats': {
-                'total_profiles': 0,
-                'unique_wallets': 0,
-                'unique_cycles': 0,
-                'total_invested': 0,
-                'avg_entry_price': 0
-            }
+            'error': f'Failed to connect to master2: {str(e)}'
         }), 500
 
 

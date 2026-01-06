@@ -384,6 +384,17 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
+    "trade_filter_values": """
+        CREATE TABLE IF NOT EXISTS trade_filter_values (
+            id BIGINT PRIMARY KEY,
+            buyin_id BIGINT NOT NULL,
+            minute INTEGER NOT NULL,
+            filter_name VARCHAR(100) NOT NULL,
+            filter_value DOUBLE,
+            section VARCHAR(50),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
 }
 
 # Timestamp column for each table (used for cleanup and sync)
@@ -405,6 +416,7 @@ TIMESTAMP_COLUMNS = {
     "filter_fields_catalog": "created_at",
     "filter_reference_suggestions": "created_at",
     "filter_combinations": "created_at",
+    "trade_filter_values": "created_at",
 }
 
 # MySQL table mappings (if different from DuckDB table names)
@@ -587,6 +599,14 @@ class TradingDataEngine:
         logger.info("Initializing in-memory DuckDB...")
         
         self._conn = duckdb.connect(":memory:")
+        
+        # CRITICAL: Set timezone to UTC for all timestamps
+        # DuckDB defaults to system timezone (CET/UTC+1), we need UTC
+        try:
+            self._conn.execute("SET TimeZone='UTC'")
+            logger.info("Set DuckDB timezone to UTC in TradingDataEngine")
+        except Exception as e:
+            logger.warning(f"Failed to set UTC timezone in TradingDataEngine: {e}")
         
         # Create tables
         for table_name, schema in TABLE_SCHEMAS.items():
@@ -918,7 +938,7 @@ class TradingDataEngine:
         logger.info("Batch writer thread stopped")
     
     def _commit_batch(self, batch: List[WriteOperation]):
-        """Commit a batch of writes to DuckDB."""
+        """Commit a batch of writes to DuckDB AND queue for PostgreSQL (dual-write)."""
         if not batch:
             return
         
@@ -929,8 +949,12 @@ class TradingDataEngine:
                 by_table[op.table] = []
             by_table[op.table].append(op)
         
+        # Collect rows for PostgreSQL dual-write (per table)
+        postgres_batches: Dict[str, List[Dict[str, Any]]] = {}
+        
         with self._conn_lock:
             for table, ops in by_table.items():
+                table_rows = []
                 for op in ops:
                     # Assign ID if not present
                     if 'id' not in op.data:
@@ -947,8 +971,23 @@ class TradingDataEngine:
                     try:
                         self._conn.execute(sql, values)
                         self._stats["writes_committed"] += 1
+                        # Collect for PostgreSQL dual-write
+                        table_rows.append(op.data.copy())
                     except Exception as e:
                         logger.error(f"Failed to insert into {table}: {e}")
+                
+                if table_rows:
+                    postgres_batches[table] = table_rows
+        
+        # DUAL-WRITE: Queue for async PostgreSQL write (fire-and-forget, never blocks)
+        # This ensures we have a complete historical record in PostgreSQL
+        try:
+            from core.database import write_batch_to_postgres_async
+            for table, rows in postgres_batches.items():
+                write_batch_to_postgres_async(table, rows)
+        except Exception as e:
+            # PostgreSQL write is optional - don't fail the batch if it errors
+            logger.debug(f"PostgreSQL dual-write skipped: {e}")
     
     def _flush_write_queue(self):
         """Flush all pending writes."""

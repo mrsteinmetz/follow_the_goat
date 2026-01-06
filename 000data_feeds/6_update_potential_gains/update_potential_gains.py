@@ -60,10 +60,54 @@ def get_records_to_update():
     
     try:
         with get_duckdb("central", read_only=True) as cursor:
+            # Diagnostic queries to understand why no records match
+            try:
+                total_buyins = cursor.execute("SELECT COUNT(*) FROM follow_the_goat_buyins").fetchone()[0]
+                buyins_with_price_cycle = cursor.execute("SELECT COUNT(*) FROM follow_the_goat_buyins WHERE price_cycle IS NOT NULL").fetchone()[0]
+                buyins_null_potential = cursor.execute("SELECT COUNT(*) FROM follow_the_goat_buyins WHERE potential_gains IS NULL").fetchone()[0]
+                buyins_valid_entry = cursor.execute("SELECT COUNT(*) FROM follow_the_goat_buyins WHERE our_entry_price IS NOT NULL AND our_entry_price > 0").fetchone()[0]
+                
+                completed_cycles = cursor.execute("SELECT COUNT(*) FROM cycle_tracker WHERE cycle_end_time IS NOT NULL AND threshold = ?", [THRESHOLD]).fetchone()[0]
+                total_cycles = cursor.execute("SELECT COUNT(*) FROM cycle_tracker WHERE threshold = ?", [THRESHOLD]).fetchone()[0]
+                
+                # Check what threshold values actually exist
+                threshold_values = cursor.execute("SELECT DISTINCT threshold FROM cycle_tracker ORDER BY threshold").fetchall()
+                threshold_list = [str(t[0]) for t in threshold_values] if threshold_values else []
+                
+                buyins_linked_to_completed = cursor.execute("""
+                    SELECT COUNT(*) 
+                    FROM follow_the_goat_buyins buyins
+                    INNER JOIN cycle_tracker ct ON ct.id = buyins.price_cycle
+                    WHERE ct.cycle_end_time IS NOT NULL AND ct.threshold = ?
+                """, [THRESHOLD]).fetchone()[0]
+                
+                # Check for orphaned price_cycle references
+                orphaned_buyins = cursor.execute("""
+                    SELECT COUNT(*) 
+                    FROM follow_the_goat_buyins buyins
+                    WHERE buyins.price_cycle IS NOT NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cycle_tracker ct WHERE ct.id = buyins.price_cycle
+                      )
+                """).fetchone()[0]
+                
+                logger.debug(f"Diagnostics - Total buyins: {total_buyins}, "
+                           f"With price_cycle: {buyins_with_price_cycle}, "
+                           f"NULL potential_gains: {buyins_null_potential}, "
+                           f"Valid entry price: {buyins_valid_entry}, "
+                           f"Completed cycles (threshold={THRESHOLD}): {completed_cycles}/{total_cycles}, "
+                           f"Buyins linked to completed: {buyins_linked_to_completed}, "
+                           f"Orphaned price_cycle refs: {orphaned_buyins}, "
+                           f"Available thresholds: {', '.join(threshold_list)}")
+            except Exception as diag_error:
+                logger.debug(f"Diagnostic queries failed (non-critical): {diag_error}")
+            
             results = cursor.execute(query, [THRESHOLD]).fetchall()
             return results
     except Exception as e:
         logger.error(f"Error fetching records to update: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return []
 
 

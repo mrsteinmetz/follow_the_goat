@@ -34,7 +34,7 @@
   "section_prefixes": {
     "pm_": "price_movements",
     "tx_": "transactions",
-    "ob_": "order_book_signals",
+    "ob_": "order_book",
     "wh_": "whale_activity",
     "sp_": "second_prices",
     "pat_": "patterns",

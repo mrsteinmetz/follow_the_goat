@@ -353,14 +353,14 @@ async def get_backfill_data(
         time_desc = "2 hours (default)"
     
     try:
-        # Special handling for cycle_tracker: include ALL active cycles
-        # Active cycles may have started > 2 hours ago but are still running
+        # Special handling for cycle_tracker: get ALL cycles (no time filter)
+        # Cycles are cumulative - we need all cycles for website display
+        # Active cycles have cycle_end_time IS NULL, completed cycles have end_time set
         if table == "cycle_tracker":
             results = engine.read(
                 f"""SELECT * FROM {table} 
-                    WHERE {ts_col} >= ? OR cycle_end_time IS NULL 
-                    ORDER BY {ts_col} DESC LIMIT ?""",
-                [cutoff, limit]
+                    ORDER BY id DESC LIMIT ?""",
+                [limit]
             )
         else:
             # Query with time filter

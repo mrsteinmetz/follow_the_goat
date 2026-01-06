@@ -397,16 +397,10 @@ def fetch_transactions(
     Data source: master2's local DuckDB (sol_stablecoin_trades table)
     Priority: master2 local DB > TradingDataEngine > file-based DuckDB
     
-    Note: sol_stablecoin_trades timestamps are in local time (UTC+1),
-    while buyin followed_at is in UTC. We adjust the query time range.
+    Note: All timestamps are in UTC (server time).
     """
-    # Adjust for timezone: trades are stored in local time (UTC+1)
-    # Add 1 hour to convert UTC to local time
-    tz_offset = timedelta(hours=1)
-    local_start = start_time + tz_offset
-    local_end = end_time + tz_offset
-    
     # Query sol_stablecoin_trades from local DuckDB
+    # All timestamps are UTC now (after timezone fix)
     query = """
         SELECT 
             trade_timestamp,
@@ -420,7 +414,7 @@ def fetch_transactions(
             AND trade_timestamp <= ?
         ORDER BY trade_timestamp ASC
     """
-    raw_trades = _execute_query(query, [local_start, local_end])
+    raw_trades = _execute_query(query, [start_time, end_time])
     
     if not raw_trades:
         logger.warning("No trades found in time range %s to %s", start_time, end_time)
@@ -530,13 +524,6 @@ def fetch_transactions(
     # Return latest 15 minutes, sorted descending
     final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
     
-    # Convert timestamps back to UTC (subtract the timezone offset we added earlier)
-    for result in final_results:
-        if isinstance(result.get('minute_timestamp'), datetime):
-            result['minute_timestamp'] = result['minute_timestamp'] - tz_offset
-        elif isinstance(result.get('minute_timestamp'), pd.Timestamp):
-            result['minute_timestamp'] = (result['minute_timestamp'] - tz_offset).to_pydatetime()
-    
     logger.info("Aggregated transactions into %d minutes of data", len(final_results))
     return final_results
 
@@ -550,16 +537,10 @@ def fetch_whale_activity(
     Data source: master2's local DuckDB or TradingDataEngine (whale_movements table)
     Priority: master2 local DB > TradingDataEngine > file-based DuckDB
     
-    Note: whale_movements timestamps are in local time (UTC+1),
-    while buyin followed_at is in UTC. We adjust the query time range.
+    Note: All timestamps are in UTC (server time).
     """
-    # Adjust for timezone: whale data is stored in local time (UTC+1)
-    # Add 1 hour to convert UTC to local time
-    tz_offset = timedelta(hours=1)
-    local_start = start_time + tz_offset
-    local_end = end_time + tz_offset
-    
     # Query whale_movements from local DuckDB
+    # All timestamps are UTC now (after timezone fix)
     query = """
         SELECT 
             timestamp,
@@ -574,7 +555,7 @@ def fetch_whale_activity(
             AND timestamp <= ?
         ORDER BY timestamp ASC
     """
-    raw_whales = _execute_query(query, [local_start, local_end])
+    raw_whales = _execute_query(query, [start_time, end_time])
     
     if not raw_whales:
         logger.warning("No whale movements found in time range %s to %s", start_time, end_time)
@@ -746,13 +727,6 @@ def fetch_whale_activity(
     
     # Return latest 15 minutes, sorted descending
     final_results = sorted(results, key=lambda x: x['minute_timestamp'], reverse=True)[:15]
-    
-    # Convert timestamps back to UTC (subtract the timezone offset we added earlier)
-    for result in final_results:
-        if isinstance(result.get('minute_timestamp'), datetime):
-            result['minute_timestamp'] = result['minute_timestamp'] - tz_offset
-        elif isinstance(result.get('minute_timestamp'), pd.Timestamp):
-            result['minute_timestamp'] = (result['minute_timestamp'] - tz_offset).to_pydatetime()
     
     logger.info("Aggregated whale activity into %d minutes of data", len(final_results))
     return final_results

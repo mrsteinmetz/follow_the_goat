@@ -27,6 +27,7 @@ import threading
 import atexit
 import duckdb
 import time
+import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -61,7 +62,7 @@ from core.config import settings
 from core.data_client import DataClient, get_client
 
 # Import schemas
-from features.price_api.schema import SCHEMA_BUYIN_TRAIL_MINUTES
+from features.price_api.schema import SCHEMA_BUYIN_TRAIL_MINUTES, SCHEMA_TRADE_FILTER_VALUES
 
 # Import job status tracking from shared module
 from scheduler.status import track_job, update_job_status, set_scheduler_start_time, stop_metrics_writer
@@ -86,26 +87,28 @@ _thread_local = threading.local()
 
 def get_thread_cursor():
     """
-    Get a thread-specific cursor for concurrent read operations.
+    Get a fresh cursor for read operations.
     
-    Each thread gets its own cursor from the shared connection.
-    DuckDB cursors can safely perform concurrent reads on the same
-    underlying data without blocking each other.
+    IMPORTANT: Creates a NEW cursor each time to ensure visibility of recent writes.
+    DuckDB cursors have snapshot isolation - cached cursors won't see data
+    written through the main connection via the write queue.
+    
+    Previous implementation cached cursors per-thread, but this caused a visibility
+    bug where reads couldn't see data written through queue_write() because the
+    cached cursor's snapshot was stale.
     
     Returns:
-        DuckDB cursor for the current thread
+        Fresh DuckDB cursor with current data snapshot
     """
     global _local_duckdb, _local_duckdb_lock
     
     if _local_duckdb is None:
         raise RuntimeError("Local DuckDB not initialized")
     
-    if not hasattr(_thread_local, 'cursor') or _thread_local.cursor is None:
-        # Create cursor with lock (cursor creation needs serialization)
-        with _local_duckdb_lock:
-            _thread_local.cursor = _local_duckdb.cursor()
-    
-    return _thread_local.cursor
+    # Always create fresh cursor to ensure visibility of recent writes
+    # Cursor creation is fast (~0.01-0.1ms) and ensures data consistency
+    with _local_duckdb_lock:
+        return _local_duckdb.cursor()
 
 
 # =============================================================================
@@ -422,6 +425,14 @@ def init_local_duckdb():
     logger.info("Initializing local in-memory DuckDB...")
     _local_duckdb = duckdb.connect(":memory:")
     
+    # CRITICAL: Set timezone to UTC for all timestamps
+    # DuckDB defaults to system timezone (CET/UTC+1), we need UTC
+    try:
+        _local_duckdb.execute("SET TimeZone='UTC'")
+        logger.info("Set DuckDB timezone to UTC in master2")
+    except Exception as e:
+        logger.warning(f"Failed to set UTC timezone in master2: {e}")
+    
     # Create essential tables for trading
     schemas = [
         """
@@ -575,6 +586,7 @@ def init_local_duckdb():
         )
         """,
         SCHEMA_BUYIN_TRAIL_MINUTES,  # Use full schema from features/price_api/schema.py
+        SCHEMA_TRADE_FILTER_VALUES,  # Normalized filter values table
         """
         CREATE TABLE IF NOT EXISTS order_book_features (
             id INTEGER PRIMARY KEY,
@@ -903,15 +915,14 @@ def create_local_api() -> FastAPI:
         threshold: Optional[float] = Query(default=None),
         hours: str = Query(default="24"),
         limit: int = Query(default=100),
-        active_only: bool = Query(default=True)
+        active_only: bool = Query(default=False)  # Changed to False to show all cycles by default
     ):
         """
         Get cycle tracker data.
         
-        By default, returns only ACTIVE cycles (cycle_end_time IS NULL).
+        By default, returns ALL cycles (both active and completed).
+        Set active_only=true to get only ACTIVE cycles (cycle_end_time IS NULL).
         There should be max 7 active cycles (one per threshold: 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5%).
-        
-        Set active_only=false to include completed cycles.
         """
         global _local_duckdb, _local_duckdb_lock
         
@@ -949,8 +960,8 @@ def create_local_api() -> FastAPI:
                     """).fetchall()
                     columns = [desc[0] for desc in _local_duckdb.description]
             else:
-                # Return all cycles (including completed) with optional filters
-                conditions = ["coin_id = 5"]  # SOL
+                # Return ALL cycles (both active and completed) - default behavior
+                conditions = ["coin_id = 5"]  # SOL cycles (all of them)
                 
                 if threshold is not None:
                     conditions.append(f"threshold = {threshold}")
@@ -1457,6 +1468,38 @@ def create_local_api() -> FastAPI:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Execute failed: {e}")
+    
+    @app.post("/admin/fix_corrupted_cycles")
+    async def fix_corrupted_cycles():
+        """
+        Admin endpoint: Delete cycles where end_time < start_time (data corruption).
+        This is a one-time fix for the initialization bug.
+        """
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            def _delete_corrupted(conn):
+                result = conn.execute("""
+                    DELETE FROM cycle_tracker 
+                    WHERE cycle_end_time IS NOT NULL 
+                    AND cycle_end_time < cycle_start_time
+                    RETURNING id
+                """).fetchall()
+                return [row[0] for row in result]
+            
+            deleted_ids = queue_write_sync(_delete_corrupted, _local_duckdb)
+            
+            return {
+                "success": True,
+                "deleted_count": len(deleted_ids),
+                "deleted_ids": deleted_ids,
+                "message": f"Deleted {len(deleted_ids)} corrupted cycles"
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Fix failed: {e}")
     
     @app.get("/tables")
     async def list_tables():
@@ -1986,13 +2029,17 @@ def create_local_api() -> FastAPI:
                     MAX(analysis_hours) as analysis_hours
                 FROM filter_reference_suggestions
             """)
-            if summary_rows:
-                cols = ['total_filters', 'avg_good_kept', 'avg_bad_removed', 'best_bad_removed',
-                       'total_good_trades', 'total_bad_trades', 'last_updated', 'analysis_hours']
-                summary = dict(zip(cols, summary_rows[0]))
-                if summary.get('last_updated'):
-                    summary['last_updated'] = str(summary['last_updated'])[:19]
-                result['summary'] = summary
+            # engine.read() returns list of dictionaries, not tuples
+            if summary_rows and len(summary_rows) > 0:
+                summary = summary_rows[0]  # Already a dictionary, no need to zip
+                # Verify it's actual data: COUNT(*) should return a number, not a string column name
+                if summary.get('total_filters') is not None:
+                    # Check if total_filters is numeric (actual count) vs string (column name)
+                    total_filters = summary.get('total_filters')
+                    if isinstance(total_filters, (int, float)) or (isinstance(total_filters, str) and total_filters.replace('.', '').replace('-', '').isdigit()):
+                        if summary.get('last_updated'):
+                            summary['last_updated'] = str(summary['last_updated'])[:19]
+                        result['summary'] = summary
         except Exception as e:
             logger.debug(f"Summary query failed: {e}")
         
@@ -2007,10 +2054,8 @@ def create_local_api() -> FastAPI:
                 ORDER BY avg_bad_removed DESC
             """)
             if minute_rows:
-                result['minute_distribution'] = [
-                    dict(zip(['minute_analyzed', 'filter_count', 'avg_bad_removed', 'avg_good_kept'], row))
-                    for row in minute_rows
-                ]
+                # engine.read() returns dictionaries, use them directly
+                result['minute_distribution'] = minute_rows
         except Exception as e:
             logger.debug(f"Minute distribution query failed: {e}")
         
@@ -2029,15 +2074,10 @@ def create_local_api() -> FastAPI:
                 ORDER BY frs.bad_trades_removed_pct DESC
             """)
             if suggestions_rows:
-                cols = ['id', 'filter_field_id', 'column_name', 'from_value', 'to_value',
-                       'total_trades', 'good_trades_before', 'bad_trades_before',
-                       'good_trades_after', 'bad_trades_after',
-                       'good_trades_kept_pct', 'bad_trades_removed_pct',
-                       'analysis_hours', 'minute_analyzed', 'created_at',
-                       'section', 'field_name', 'value_type']
+                # engine.read() returns dictionaries, use them directly
                 suggestions = []
-                for row in suggestions_rows:
-                    s = dict(zip(cols, row))
+                for s in suggestions_rows:
+                    # Convert numeric fields
                     for key in ['from_value', 'to_value', 'good_trades_kept_pct', 'bad_trades_removed_pct']:
                         if s.get(key) is not None:
                             s[key] = float(s[key])
@@ -2060,17 +2100,15 @@ def create_local_api() -> FastAPI:
                 ORDER BY bad_trades_removed_pct DESC
             """)
             if combo_rows:
-                cols = ['id', 'combination_name', 'filter_count', 'filter_ids', 'filter_columns',
-                       'total_trades', 'good_trades_before', 'bad_trades_before',
-                       'good_trades_after', 'bad_trades_after',
-                       'good_trades_kept_pct', 'bad_trades_removed_pct',
-                       'minute_analyzed', 'analysis_hours']
+                # engine.read() returns dictionaries, use them directly
                 combinations = []
-                for row in combo_rows:
-                    combo = dict(zip(cols, row))
-                    for key in ['good_trades_kept_pct', 'bad_trades_removed_pct']:
+                for combo in combo_rows:
+                    # Convert numeric fields
+                    for key in ['good_trades_kept_pct', 'bad_trades_removed_pct', 
+                               'best_single_bad_removed_pct', 'improvement_over_single']:
                         if combo.get(key) is not None:
                             combo[key] = float(combo[key])
+                    # Parse JSON fields
                     if isinstance(combo.get('filter_ids'), str):
                         combo['filter_ids'] = json.loads(combo['filter_ids'])
                     if isinstance(combo.get('filter_columns'), str):
@@ -2163,6 +2201,172 @@ def create_local_api() -> FastAPI:
             'errors': errors,
             'current_settings': current
         }
+    
+    # =========================================================================
+    # PROFILES ENDPOINTS
+    # =========================================================================
+    
+    @app.get("/profiles")
+    async def get_profiles(
+        threshold: float = None,
+        hours: str = "24",
+        limit: int = 100,
+        order_by: str = "recent",
+        wallet: str = None
+    ):
+        """
+        Get wallet profiles with aggregated data per wallet.
+        
+        Reads from master2's local DuckDB wallet_profiles table.
+        """
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        # Build WHERE conditions
+        conditions = []
+        
+        if threshold is not None:
+            conditions.append(f"threshold = {threshold}")
+        
+        if wallet:
+            conditions.append(f"wallet_address = '{wallet}'")
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                conditions.append(f"trade_timestamp >= NOW() - INTERVAL {hours_int} HOUR")
+            except:
+                pass
+        
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        
+        # Determine ORDER BY
+        if order_by == 'avg_gain':
+            order_clause = "ORDER BY avg_potential_gain DESC"
+        elif order_by == 'trade_count':
+            order_clause = "ORDER BY trade_count DESC"
+        else:  # 'recent'
+            order_clause = "ORDER BY latest_trade DESC"
+        
+        try:
+            with _local_duckdb_lock:
+                result = _local_duckdb.execute(f"""
+                    SELECT 
+                        wallet_address,
+                        COUNT(*) as trade_count,
+                        AVG(
+                            CASE 
+                                WHEN short = 1 THEN 
+                                    ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100
+                                ELSE 
+                                    ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+                            END
+                        ) as avg_potential_gain,
+                        SUM(COALESCE(stablecoin_amount, 0)) as total_invested,
+                        SUM(
+                            CASE 
+                                WHEN short = 1 THEN 
+                                    CASE WHEN ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100 < threshold THEN 1 ELSE 0 END
+                                ELSE 
+                                    CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100 < threshold THEN 1 ELSE 0 END
+                            END
+                        ) as trades_below_threshold,
+                        SUM(
+                            CASE 
+                                WHEN short = 1 THEN 
+                                    CASE WHEN ((trade_entry_price - lowest_price_reached) / trade_entry_price) * 100 >= threshold THEN 1 ELSE 0 END
+                                ELSE 
+                                    CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100 >= threshold THEN 1 ELSE 0 END
+                            END
+                        ) as trades_at_above_threshold,
+                        MAX(trade_timestamp) as latest_trade,
+                        ANY_VALUE(threshold) as threshold_value
+                    FROM wallet_profiles
+                    {where_clause}
+                    GROUP BY wallet_address
+                    {order_clause}
+                    LIMIT {limit}
+                """)
+                
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+                profiles = [dict(zip(columns, row)) for row in rows]
+            
+            return {
+                'status': 'ok',
+                'profiles': profiles,
+                'count': len(profiles),
+                'source': 'master2_local_duckdb'
+            }
+        
+        except Exception as e:
+            logger.error(f"Error querying profiles: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/profiles/stats")
+    async def get_profiles_stats(
+        threshold: float = None,
+        hours: str = "all"
+    ):
+        """Get aggregated statistics for wallet profiles."""
+        global _local_duckdb, _local_duckdb_lock
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        # Build WHERE conditions
+        conditions = []
+        
+        if threshold is not None:
+            conditions.append(f"threshold = {threshold}")
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                conditions.append(f"trade_timestamp >= NOW() - INTERVAL {hours_int} HOUR")
+            except:
+                pass
+        
+        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
+        
+        try:
+            with _local_duckdb_lock:
+                result = _local_duckdb.execute(f"""
+                    SELECT 
+                        COUNT(*) as total_profiles,
+                        COUNT(DISTINCT wallet_address) as unique_wallets,
+                        COUNT(DISTINCT price_cycle) as unique_cycles,
+                        SUM(COALESCE(stablecoin_amount, 0)) as total_invested,
+                        AVG(trade_entry_price) as avg_entry_price
+                    FROM wallet_profiles
+                    {where_clause}
+                """)
+                
+                row = result.fetchone()
+                
+                if row:
+                    columns = [desc[0] for desc in result.description]
+                    stats = dict(zip(columns, row))
+                else:
+                    stats = {
+                        'total_profiles': 0,
+                        'unique_wallets': 0,
+                        'unique_cycles': 0,
+                        'total_invested': 0,
+                        'avg_entry_price': 0
+                    }
+            
+            return {
+                'status': 'ok',
+                'stats': stats,
+                'source': 'master2_local_duckdb'
+            }
+        
+        except Exception as e:
+            logger.error(f"Error querying profile stats: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
     
     return app
 
@@ -2520,6 +2724,39 @@ def _insert_records_fast(conn, table: str, records: list) -> int:
     return _do_insert()
 
 
+def _insert_cycles_with_replace(conn, records: List[Dict[str, Any]]):
+    """
+    Insert or REPLACE cycle_tracker records to handle updates.
+    
+    Unlike other tables, cycle_tracker records can be UPDATED (when cycle_end_time is set),
+    so we use INSERT OR REPLACE instead of INSERT OR IGNORE.
+    """
+    if not records:
+        return 0
+    
+    try:
+        # Get column names from first record
+        columns = list(records[0].keys())
+        columns_str = ", ".join(columns)
+        placeholders = ", ".join(["?" for _ in columns])
+        
+        # Prepare batch data
+        batch_data = []
+        for record in records:
+            batch_data.append([record.get(col) for col in columns])
+        
+        # Use INSERT OR REPLACE to handle both inserts and updates
+        conn.executemany(
+            f"INSERT OR REPLACE INTO cycle_tracker ({columns_str}) VALUES ({placeholders})",
+            batch_data
+        )
+        
+        return len(batch_data)
+    except Exception as e:
+        logger.error(f"Cycle tracker insert/replace failed: {e}")
+        return 0
+
+
 def _load_plays_from_postgres():
     """
     Load plays from PostgreSQL into local DuckDB.
@@ -2714,8 +2951,12 @@ def backfill_from_data_engine(hours: int = 24):
     for table, records in fetch_results.items():
         try:
             start_time = time.time()
-            # Use sync write during backfill to ensure data is ready before scheduler starts
-            inserted = queue_write_sync(_insert_records_fast, _local_duckdb, table, records)
+            # Special handling for cycle_tracker: use INSERT OR REPLACE instead of INSERT OR IGNORE
+            if table == "cycle_tracker":
+                inserted = queue_write_sync(_insert_cycles_with_replace, _local_duckdb, records)
+            else:
+                # Use sync write during backfill to ensure data is ready before scheduler starts
+                inserted = queue_write_sync(_insert_records_fast, _local_duckdb, table, records)
             elapsed = time.time() - start_time
             total_loaded += inserted
             logger.info(f"    {table}: inserted {inserted} records ({elapsed:.2f}s)")
@@ -2778,7 +3019,7 @@ def _initialize_sync_positions():
     """
     global _local_duckdb, _local_duckdb_lock, _last_synced_ids
     
-    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements"]
+    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements", "cycle_tracker"]
     
     try:
         with _local_duckdb_lock:
@@ -2800,7 +3041,8 @@ _last_synced_ids = {
     "prices": 0,
     "order_book_features": 0,
     "sol_stablecoin_trades": 0,
-    "whale_movements": 0
+    "whale_movements": 0,
+    "cycle_tracker": 0
 }
 
 
@@ -2817,8 +3059,8 @@ def sync_new_data_from_engine():
     
     # Tables to sync - ordered by priority for trading decisions
     # prices & order_book_features are most critical for trading signals
-    # NOTE: cycle_tracker is NOT synced - it's computed locally by create_price_cycles.py
-    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements"]
+    # cycle_tracker IS synced from master.py where cycles are computed
+    sync_tables = ["prices", "order_book_features", "sol_stablecoin_trades", "whale_movements", "cycle_tracker"]
     
     for table in sync_tables:
         try:
@@ -2830,8 +3072,14 @@ def sync_new_data_from_engine():
             if not records:
                 continue
             
-            # Queue the batch insert (non-blocking, no conflicts!)
-            queue_write(_insert_records_fast, _local_duckdb, table, records)
+            # Special handling for cycle_tracker: use INSERT OR REPLACE to handle updates
+            # (cycles can be updated when cycle_end_time is set, not just inserted)
+            if table == "cycle_tracker":
+                # Use INSERT OR REPLACE to handle both new cycles and updates to existing cycles
+                queue_write(_insert_cycles_with_replace, _local_duckdb, records)
+            else:
+                # Queue the batch insert (non-blocking, no conflicts!)
+                queue_write(_insert_records_fast, _local_duckdb, table, records)
             
             # Update sync position immediately (write queue processes in FIFO order)
             _last_synced_ids[table] = max_id
@@ -2983,7 +3231,7 @@ def run_update_potential_gains():
         logger.debug(f"Potential gains: updated {result['updated']} records")
 
 
-@track_job("create_new_patterns", "Auto-generate filter patterns (every 15 min)")
+@track_job("create_new_patterns", "Auto-generate filter patterns (every 5 min)")
 def run_create_new_patterns():
     """Auto-generate filter patterns from trade data analysis."""
     enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
@@ -3230,12 +3478,12 @@ def create_scheduler() -> BackgroundScheduler:
         executor='heavy',
     )
     
-    # Create New Patterns (every 15 min)
+    # Create New Patterns (every 5 min)
     scheduler.add_job(
         func=run_create_new_patterns,
-        trigger=IntervalTrigger(minutes=15),
+        trigger=IntervalTrigger(minutes=5),
         id="create_new_patterns",
-        name="Auto-generate filter patterns (every 15 min)",
+        name="Auto-generate filter patterns (every 5 min)",
         replace_existing=True,
         executor='heavy',
     )

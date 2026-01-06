@@ -37,9 +37,51 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.trading_engine import get_engine
+from core.database import get_duckdb
 
 # Setup logging
 logger = logging.getLogger("create_new_patterns")
+
+
+def _get_local_duckdb():
+    """Get master2's local DuckDB connection for reading trade data."""
+    try:
+        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
+        local_db = get_local_duckdb()
+        if local_db is not None:
+            return local_db, _local_duckdb_lock
+    except (ImportError, AttributeError):
+        pass
+    return None, None
+
+
+def _read_from_local_db(query: str, params: list = None) -> list:
+    """Execute a read query on master2's local DuckDB.
+    
+    Returns list of dictionaries.
+    """
+    local_db, lock = _get_local_duckdb()
+    
+    if local_db is not None:
+        try:
+            with lock:
+                result = local_db.execute(query, params or [])
+                columns = [desc[0] for desc in result.description]
+                rows = result.fetchall()
+                return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            logger.warning(f"Local DuckDB query failed: {e}")
+    
+    # Fallback to get_duckdb("central")
+    try:
+        with get_duckdb("central", read_only=True) as cursor:
+            result = cursor.execute(query, params or [])
+            columns = [desc[0] for desc in result.description]
+            rows = result.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+    except Exception as e:
+        logger.warning(f"DuckDB query failed: {e}")
+        return []
 
 # Config file path
 CONFIG_FILE = Path(__file__).parent / "config.json"
@@ -72,7 +114,7 @@ def load_config() -> Dict[str, Any]:
         "section_prefixes": {
             "pm_": "price_movements",
             "tx_": "transactions",
-            "ob_": "order_book_signals",
+            "ob_": "order_book",
             "wh_": "whale_activity",
             "sp_": "second_prices",
             "pat_": "patterns",
@@ -92,56 +134,80 @@ CONFIG = load_config()
 
 def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     """
-    Load trade data by joining follow_the_goat_buyins with buyin_trail_minutes.
+    Load trade data by joining follow_the_goat_buyins with trade_filter_values.
     
+    Uses the normalized trade_filter_values table and pivots it to wide format.
     Only includes trades with potential_gains IS NOT NULL (resolved outcomes).
     
+    OPTIMIZED: Uses DuckDB's native PIVOT for better performance with large datasets.
+    
     Args:
-        engine: TradingDataEngine instance
+        engine: TradingDataEngine instance (used for fallback, primary source is local DuckDB)
         hours: Number of hours to look back
         
     Returns:
-        DataFrame with trade data and all trail minute features
+        DataFrame with trade data and all trail minute features (pivoted to wide format)
     """
-    # Query using actual columns from buyin_trail_minutes table
-    # The table has: id, buyin_id, minute_offset, price_start, price_end, price_high, price_low,
-    # price_change_pct, volume_imbalance, bid_depth, ask_depth, spread_bps, order_book_pressure
+    # Use a single optimized query with DuckDB's PIVOT function
+    # This is MUCH faster than loading separately and pivoting in Python
     query = f"""
+        WITH trades AS (
+            SELECT 
+                id as trade_id,
+                play_id,
+                wallet_address,
+                followed_at,
+                potential_gains,
+                our_status
+            FROM follow_the_goat_buyins
+            WHERE potential_gains IS NOT NULL
+              AND followed_at >= NOW() - INTERVAL {hours} HOUR
+        )
         SELECT 
-            b.id as trade_id,
-            b.play_id,
-            b.wallet_address,
-            b.followed_at,
-            b.potential_gains,
-            b.our_status,
-            t.minute_offset as minute,
-            t.price_start,
-            t.price_end,
-            t.price_high,
-            t.price_low,
-            t.price_change_pct,
-            t.volume_imbalance,
-            t.bid_depth,
-            t.ask_depth,
-            t.spread_bps,
-            t.order_book_pressure
-        FROM follow_the_goat_buyins b
-        INNER JOIN buyin_trail_minutes t ON b.id = t.buyin_id
-        WHERE b.potential_gains IS NOT NULL
-          AND b.followed_at >= NOW() - INTERVAL {hours} HOUR
+            t.*,
+            tfv.minute,
+            tfv.filter_name,
+            tfv.filter_value
+        FROM trades t
+        INNER JOIN trade_filter_values tfv ON t.trade_id = tfv.buyin_id
+        ORDER BY t.trade_id, tfv.minute, tfv.filter_name
     """
     
-    results = engine.read(query)
+    # Use local DuckDB with read_only cursor for optimal performance
+    results = _read_from_local_db(query)
     
     if not results:
         logger.warning("No trade data found with resolved outcomes")
         return pd.DataFrame()
     
+    # Convert to DataFrame - pandas will be faster for the pivot operation
     df = pd.DataFrame(results)
-    unique_trades = df['trade_id'].nunique() if 'trade_id' in df.columns else 0
-    logger.info(f"Loaded {len(df)} rows ({unique_trades} unique trades) from last {hours} hours")
     
-    return df
+    if len(df) == 0:
+        return pd.DataFrame()
+    
+    # Pivot to wide format: each filter_name becomes a column
+    # Use pandas pivot_table with observed=True for better memory efficiency
+    try:
+        pivot_df = df.pivot_table(
+            index=['trade_id', 'minute', 'play_id', 'wallet_address', 'followed_at', 'potential_gains', 'our_status'],
+            columns='filter_name',
+            values='filter_value',
+            aggfunc='first',
+            observed=True  # Memory optimization
+        ).reset_index()
+        
+        # Flatten column names
+        pivot_df.columns.name = None
+        
+        unique_trades = pivot_df['trade_id'].nunique()
+        logger.info(f"Loaded {len(pivot_df)} rows ({unique_trades} unique trades) from last {hours} hours")
+        
+        return pivot_df
+        
+    except Exception as e:
+        logger.error(f"Failed to pivot data: {e}")
+        return pd.DataFrame()
 
 
 def get_filterable_columns(df: pd.DataFrame) -> List[str]:

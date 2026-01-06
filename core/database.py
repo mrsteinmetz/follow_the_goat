@@ -160,6 +160,14 @@ class DuckDBPool:
                 except Exception as e:
                     logger.debug(f"PRAGMA setting note: {e}")
             
+            # CRITICAL: Set timezone to UTC for all timestamps
+            # DuckDB defaults to system timezone (CET/UTC+1), we need UTC
+            try:
+                conn.execute("SET TimeZone='UTC'")
+                logger.debug(f"Set DuckDB timezone to UTC for '{name}'")
+            except Exception as e:
+                logger.warning(f"Failed to set UTC timezone for '{name}': {e}")
+            
             # Apply schema (idempotent per process)
             try:
                 _apply_schema_if_needed(conn, name)
@@ -455,6 +463,8 @@ def get_duckdb_fresh(name: str = "central"):
         db_path = _get_db_path(name)
         conn = duckdb.connect(str(db_path))
         try:
+            # Set timezone to UTC
+            conn.execute("SET TimeZone='UTC'")
             yield conn
         finally:
             conn.close()
@@ -503,6 +513,13 @@ def register_connection(name: str, conn, lock=None, cursor_factory=None):
                        When provided, get_duckdb(name, read_only=True) will use this
                        to get a cursor that can perform concurrent reads without blocking.
     """
+    # Ensure UTC timezone is set on the connection
+    try:
+        conn.execute("SET TimeZone='UTC'")
+        logger.debug(f"Set UTC timezone on registered connection '{name}'")
+    except Exception as e:
+        logger.warning(f"Failed to set UTC timezone on registered connection '{name}': {e}")
+    
     _pool._connections[name] = conn
     _pool._external_registered.add(name)  # Mark as externally managed (skip health checks)
     
@@ -978,6 +995,120 @@ def _archive_to_postgres_async(table_name: str, rows: List[Dict[str, Any]]):
 def _archive_to_mysql_async(table_name: str, rows: List[Dict[str, Any]]):
     """Legacy alias for _archive_to_postgres_async()."""
     _archive_to_postgres_async(table_name, rows)
+
+
+# =============================================================================
+# DUAL-WRITE: Immediate PostgreSQL Write for Historical Archive
+# =============================================================================
+# These functions write to PostgreSQL immediately when data is ingested,
+# ensuring we have a complete historical record without waiting for cleanup.
+# Writes are fire-and-forget via background thread - NEVER blocks trading!
+# =============================================================================
+
+# Column mappings from DuckDB schema to PostgreSQL schema
+# Format: { duckdb_table: { duckdb_col: pg_col, ... } }
+# Only tables/columns that differ are listed here
+DUCKDB_TO_POSTGRES_COLUMN_MAP = {
+    "prices": {
+        "ts": "timestamp",  # DuckDB uses 'ts', PostgreSQL uses 'timestamp'
+    },
+    "order_book_features": {
+        "ts": "timestamp",  # DuckDB uses 'ts', PostgreSQL uses 'timestamp'
+    },
+}
+
+# Default values to add when writing to PostgreSQL
+# Format: { table_name: { column: default_value, ... } }
+POSTGRES_DEFAULT_VALUES = {
+    "prices": {
+        "source": "jupiter",  # Add source column for prices
+    },
+}
+
+# Tables to skip dual-write (config tables, not time-series data)
+SKIP_DUAL_WRITE_TABLES = {
+    "follow_the_goat_plays",  # Config - loaded from cache, not streamed
+    "filter_fields_catalog",  # Config
+    "filter_reference_suggestions",  # Computed
+    "filter_combinations",  # Computed
+    "wallet_profiles",  # Computed in master2.py only - should NOT be in master.py
+}
+
+
+def _map_row_for_postgres(table_name: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map DuckDB column names to PostgreSQL column names and add defaults.
+    
+    Args:
+        table_name: Table name
+        row: Dictionary with DuckDB column names
+        
+    Returns:
+        Dictionary with PostgreSQL column names and default values added
+    """
+    column_map = DUCKDB_TO_POSTGRES_COLUMN_MAP.get(table_name, {})
+    defaults = POSTGRES_DEFAULT_VALUES.get(table_name, {})
+    
+    # Start with defaults
+    mapped = dict(defaults)
+    
+    # Map and override with actual values
+    for col, val in row.items():
+        pg_col = column_map.get(col, col)  # Use mapped name or original
+        mapped[pg_col] = val
+    
+    return mapped
+
+
+def write_to_postgres_async(table_name: str, row: Dict[str, Any]):
+    """
+    Immediately queue a single row for async PostgreSQL write - NEVER BLOCKS.
+    
+    This enables dual-write: data goes to both DuckDB (fast) AND PostgreSQL (history)
+    at the time of ingestion, rather than waiting for 24h cleanup.
+    
+    Fire-and-forget: If PostgreSQL is slow/down, the write is dropped silently.
+    Trading speed is NEVER compromised.
+    
+    Args:
+        table_name: Table name (same in both DuckDB and PostgreSQL)
+        row: Dictionary of column -> value
+    """
+    if table_name in SKIP_DUAL_WRITE_TABLES:
+        return
+    
+    if not row:
+        return
+    
+    # Map column names for PostgreSQL
+    mapped_row = _map_row_for_postgres(table_name, row)
+    
+    # Queue as a single-row batch (reuses existing archive worker)
+    _archive_to_postgres_async(table_name, [mapped_row])
+
+
+def write_batch_to_postgres_async(table_name: str, rows: List[Dict[str, Any]]):
+    """
+    Immediately queue multiple rows for async PostgreSQL write - NEVER BLOCKS.
+    
+    This is a batch version of write_to_postgres_async() for efficiency
+    when writing multiple rows at once.
+    
+    Args:
+        table_name: Table name
+        rows: List of row dictionaries
+    """
+    if table_name in SKIP_DUAL_WRITE_TABLES:
+        return
+    
+    if not rows:
+        return
+    
+    # Map column names for PostgreSQL
+    mapped_rows = [_map_row_for_postgres(table_name, row) for row in rows]
+    
+    # Queue for async write
+    _archive_to_postgres_async(table_name, mapped_rows)
 
 
 def archive_old_data(table_name: str, db_name: str = "central", hours: int = 24):

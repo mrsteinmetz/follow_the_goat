@@ -815,7 +815,153 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
     else:
         logger.error(f"✗ Failed to insert trail rows for buyin_id={buyin_id}")
     
+    # Also insert normalized filter values for filter analysis
+    filter_success = insert_filter_values(buyin_id, rows)
+    if filter_success:
+        logger.debug(f"✓ Inserted filter values for buyin_id={buyin_id}")
+    
     return duckdb_success
+
+
+# =============================================================================
+# FILTER VALUES - Normalized filter storage for filter analysis
+# =============================================================================
+
+# Column to section mapping
+COLUMN_SECTION_MAP = {
+    "pm_": "price_movements",
+    "ob_": "order_book",
+    "tx_": "transactions",
+    "wh_": "whale_activity",
+    "btc_": "btc_correlation",
+    "eth_": "eth_correlation",
+    "pat_": "patterns",
+    "sp_": "second_prices",
+}
+
+
+def _get_section_for_column(column_name: str) -> str:
+    """Determine section from column prefix."""
+    for prefix, section in COLUMN_SECTION_MAP.items():
+        if column_name.startswith(prefix):
+            return section
+    return "unknown"
+
+
+def _get_filterable_columns() -> List[str]:
+    """Get all filterable column names from the field mappings."""
+    columns = []
+    columns.extend(PRICE_MOVEMENTS_FIELDS.values())
+    columns.extend(BTC_PRICE_FIELDS.values())
+    columns.extend(ETH_PRICE_FIELDS.values())
+    columns.extend(ORDER_BOOK_FIELDS.values())
+    columns.extend(TRANSACTIONS_FIELDS.values())
+    columns.extend(WHALE_ACTIVITY_FIELDS.values())
+    
+    # Add pattern columns (numeric ones only)
+    pattern_cols = [
+        "pat_breakout_score",
+        "pat_asc_tri_confidence", "pat_asc_tri_resistance_level",
+        "pat_asc_tri_support_level", "pat_asc_tri_compression_ratio",
+        "pat_bull_flag_confidence", "pat_bull_flag_pole_height_pct",
+        "pat_bull_flag_retracement_pct",
+        "pat_bull_pennant_confidence", "pat_bull_pennant_compression_ratio",
+        "pat_fall_wedge_confidence", "pat_fall_wedge_contraction",
+        "pat_cup_handle_confidence", "pat_cup_handle_depth_pct",
+        "pat_inv_hs_confidence", "pat_inv_hs_neckline",
+    ]
+    columns.extend(pattern_cols)
+    
+    # Add second prices columns
+    sp_cols = [
+        "sp_price_count", "sp_min_price", "sp_max_price", "sp_start_price",
+        "sp_end_price", "sp_price_range_pct", "sp_total_change_pct",
+        "sp_volatility_pct", "sp_avg_price",
+    ]
+    columns.extend(sp_cols)
+    
+    return columns
+
+
+def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool:
+    """Insert normalized filter values into trade_filter_values table.
+    
+    Converts wide format rows (one row per minute with many columns)
+    into long format rows (one row per filter-minute combination).
+    
+    Args:
+        buyin_id: The ID of the buyin record
+        wide_rows: List of wide-format rows from flatten_trail_to_rows()
+        
+    Returns:
+        True if insertion succeeded, False otherwise
+    """
+    if not wide_rows:
+        return False
+    
+    filterable_columns = _get_filterable_columns()
+    
+    try:
+        from core.database import duckdb_execute_write
+        
+        # Check if data already exists
+        with get_duckdb("central", read_only=True) as cursor:
+            existing = cursor.execute(
+                "SELECT COUNT(*) FROM trade_filter_values WHERE buyin_id = ?",
+                [buyin_id]
+            ).fetchone()
+            existing_count = existing[0] if existing else 0
+            
+            if existing_count > 0:
+                logger.debug(f"Filter values already exist for buyin_id={buyin_id}, skipping")
+                return True
+        
+        # Generate unique IDs using timestamp
+        import time
+        base_id = int(time.time() * 1000000)  # Microsecond precision
+        id_counter = 0
+        
+        # Convert each wide row to multiple normalized rows
+        inserted_count = 0
+        for row in wide_rows:
+            minute = row.get("minute", 0)
+            
+            for col_name in filterable_columns:
+                value = row.get(col_name)
+                
+                # Skip null values to save space
+                if value is None:
+                    continue
+                
+                # Skip non-numeric values
+                if not isinstance(value, (int, float)):
+                    continue
+                
+                section = _get_section_for_column(col_name)
+                
+                # Insert the normalized row
+                duckdb_execute_write(
+                    "central",
+                    """INSERT INTO trade_filter_values 
+                       (id, buyin_id, minute, filter_name, filter_value, section)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [base_id + id_counter, buyin_id, minute, col_name, float(value), section],
+                    sync=False
+                )
+                id_counter += 1
+                inserted_count += 1
+        
+        # Sync to ensure all writes complete
+        duckdb_execute_write("central", "SELECT 1", [], sync=True)
+        
+        logger.info(f"✓ Inserted {inserted_count} filter values for buyin_id={buyin_id}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to insert filter values for buyin_id={buyin_id}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
 
 
 # =============================================================================

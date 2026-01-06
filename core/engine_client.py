@@ -80,19 +80,25 @@ class EngineClient:
             data = resp.json()
             
             if data.get("success"):
-                return data.get("results", [])
+                results = data.get("results", [])
+                logger.info(f"[ENGINE_CLIENT] Query returned {len(results)} results")
+                return results
             else:
-                logger.error(f"Query failed: {data.get('error')}")
+                error_msg = data.get('error', 'Unknown error')
+                logger.error(f"[ENGINE_CLIENT] Query failed: {error_msg}")
+                logger.error(f"[ENGINE_CLIENT] SQL was: {sql[:200]}...")
                 return []
                 
         except requests.exceptions.Timeout as e:
-            logger.error(f"Query timeout after {self.timeout}s: {sql[:100]}...")
+            logger.error(f"[ENGINE_CLIENT] Query timeout after {self.timeout}s: {sql[:100]}...")
             return []
         except requests.exceptions.RequestException as e:
-            logger.error(f"Data Engine request failed: {e}")
+            logger.error(f"[ENGINE_CLIENT] Data Engine request failed: {e}")
+            logger.error(f"[ENGINE_CLIENT] SQL was: {sql[:200]}...")
             return []
         except Exception as e:
-            logger.error(f"Query error: {e}")
+            logger.error(f"[ENGINE_CLIENT] Query error: {e}")
+            logger.error(f"[ENGINE_CLIENT] SQL was: {sql[:200]}...")
             return []
     
     def query_one(self, sql: str, params: Optional[List[Any]] = None) -> Optional[Dict[str, Any]]:

@@ -18,11 +18,15 @@ $baseUrl = '';
 // Section display names
 $section_names = [
     'price_movements' => 'Price Movements',
-    'order_book_signals' => 'Order Book',
+    'order_book' => 'Order Book',
+    'order_book_signals' => 'Order Book',  // Legacy alias
     'transactions' => 'Transactions',
     'whale_activity' => 'Whale Activity',
     'patterns' => 'Patterns',
     'second_prices' => 'Second Prices',
+    'btc_correlation' => 'BTC Correlation',
+    'eth_correlation' => 'ETH Correlation',
+    'unknown' => 'Other',
 ];
 
 $value_type_colors = [
@@ -410,8 +414,10 @@ ob_start();
     <div class="card-body text-center py-5">
         <i class="ri-filter-off-line fs-48 text-muted mb-3"></i>
         <h4 class="text-muted">No Filter Suggestions Found</h4>
-        <p class="text-muted mb-3">Run the auto filter scheduler to analyze trade data.</p>
-        <code class="d-block bg-light p-3 rounded text-success">python chart/build_pattern_config/auto_filter_scheduler.py</code>
+        <p class="text-muted mb-3">The filter analysis requires trades with resolved outcomes (potential_gains) and filter values stored in trade_filter_values table.</p>
+        <p class="text-muted mb-2">The create_new_patterns job runs automatically via the scheduler. You can also run it manually:</p>
+        <code class="d-block bg-light p-3 rounded text-success">python 000data_feeds/7_create_new_patterns/create_new_paterns.py</code>
+        <p class="text-muted mt-3 small">Note: Trades need to have the <code>trade_filter_values</code> populated by trail_generator during follow_the_goat or train_validator execution.</p>
     </div>
 </div>
 <?php else: ?>

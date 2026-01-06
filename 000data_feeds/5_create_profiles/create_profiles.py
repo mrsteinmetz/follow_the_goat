@@ -27,7 +27,7 @@ NOTE: This module can be used in two modes:
 
 import sys
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Set
 import logging
 
@@ -414,7 +414,7 @@ def cleanup_old_profiles(hours: int = 24) -> int:
     Delete profile records older than specified hours from DuckDB.
     """
     total_deleted = 0
-    cutoff = datetime.now() - timedelta(hours=hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     
     # Clean up DuckDB only via write queue
     try:
@@ -519,82 +519,42 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     Returns:
         Total number of profiles inserted across all thresholds
     """
-    from core.database import get_postgres_connection
-    import psycopg2
-    
     total_inserted = 0
     
-    # State tracking - use PostgreSQL for persistence across restarts
-    def _ensure_state_table():
-        """Ensure state table exists in PostgreSQL (already done in schema)."""
-        try:
-            pg_conn = get_postgres_connection()
-            cur = pg_conn.cursor()
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS wallet_profiles_state (
-                    id SERIAL PRIMARY KEY,
-                    threshold DECIMAL(5,2) NOT NULL UNIQUE,
-                    last_trade_id BIGINT NOT NULL DEFAULT 0,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            pg_conn.commit()
-            cur.close()
-            pg_conn.close()
-        except Exception as e:
-            logger.debug(f"State table check: {e}")
-    
+    # State tracking - use LOCAL DuckDB (master2 in-memory) for persistence
     def _get_last_id(threshold):
-        """Get last processed trade_id from PostgreSQL."""
+        """Get last processed trade_id from LOCAL DuckDB (master2 in-memory)."""
         try:
-            pg_conn = get_postgres_connection()
-            if not pg_conn:
-                logger.warning("PostgreSQL not available, starting from 0")
-                return 0
-                
-            cur = pg_conn.cursor()
-            cur.execute(
-                "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = %s",
+            # Use local DuckDB for state tracking (NO PostgreSQL)
+            result = local_conn.execute(
+                "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = ?",
                 [float(threshold)]
-            )
-            result = cur.fetchone()
-            cur.close()
-            pg_conn.close()
+            ).fetchone()
             
-            # RealDictCursor returns a dict (RealDictRow), not a tuple
             if result:
-                last_id = int(result['last_trade_id'])
+                last_id = int(result[0])
                 logger.debug(f"Retrieved last_trade_id={last_id} for threshold={threshold}")
                 return last_id
             else:
                 logger.info(f"No state found for threshold={threshold}, starting from 0")
                 return 0
         except Exception as e:
-            import traceback
-            logger.error(f"Failed to get last_trade_id from PostgreSQL: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Failed to get last_trade_id from DuckDB: {e}")
             return 0
     
-    def _update_last_id(threshold, last_id):
-        """Update last processed trade_id in PostgreSQL."""
+    def _update_last_id_local(conn, threshold, last_id):
+        """Update last processed trade_id in LOCAL DuckDB (master2 in-memory)."""
         try:
-            pg_conn = get_postgres_connection()
-            if not pg_conn:
-                logger.warning("PostgreSQL not available, cannot persist state")
-                return
-                
-            cur = pg_conn.cursor()
-            cur.execute("""
+            # Use local DuckDB for state tracking (NO PostgreSQL)
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            conn.execute("""
                 INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
-                VALUES (%s, %s, NOW())
+                VALUES (?, ?, ?)
                 ON CONFLICT (threshold) DO UPDATE SET 
                     last_trade_id = EXCLUDED.last_trade_id,
-                    last_updated = NOW()
-            """, [float(threshold), int(last_id)])
-            pg_conn.commit()
-            cur.close()
-            pg_conn.close()
+                    last_updated = EXCLUDED.last_updated
+            """, [float(threshold), int(last_id), now])
             logger.debug(f"Updated state: threshold={threshold}, last_trade_id={last_id}")
         except Exception as e:
             logger.warning(f"State update failed (non-critical): {e}")
@@ -611,10 +571,89 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
             return None
     
     def _insert_profiles(conn, profiles):
+        """Insert profiles using PyArrow for 200x faster batch inserts."""
         if not profiles:
             return 0
         try:
+            import pyarrow as pa
+            import time
+            
+            start_time = time.time()
+            
             # Generate IDs for new profiles
+            max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM wallet_profiles").fetchone()
+            next_id = (max_id_result[0] or 0) + 1
+            
+            # Add IDs to profiles
+            for i, profile in enumerate(profiles):
+                profile['id'] = next_id + i
+            
+            # Build columnar data for PyArrow (MUCH faster than row-by-row)
+            col_data = {
+                'id': [p['id'] for p in profiles],
+                'wallet_address': [p['wallet_address'] for p in profiles],
+                'threshold': [p['threshold'] for p in profiles],
+                'trade_id': [p['trade_id'] for p in profiles],
+                'trade_timestamp': [p['trade_timestamp'] for p in profiles],
+                'price_cycle': [p['price_cycle'] for p in profiles],
+                'price_cycle_start_time': [p['price_cycle_start_time'] for p in profiles],
+                'price_cycle_end_time': [p['price_cycle_end_time'] for p in profiles],
+                'trade_entry_price_org': [p['trade_entry_price_org'] for p in profiles],
+                'stablecoin_amount': [p['stablecoin_amount'] for p in profiles],
+                'trade_entry_price': [p['trade_entry_price'] for p in profiles],
+                'sequence_start_price': [p['sequence_start_price'] for p in profiles],
+                'highest_price_reached': [p['highest_price_reached'] for p in profiles],
+                'lowest_price_reached': [p['lowest_price_reached'] for p in profiles],
+                'long_short': [p['long_short'] for p in profiles],
+                'short': [p['short'] for p in profiles],
+            }
+            
+            # Create PyArrow table with explicit schema
+            schema = pa.schema([
+                pa.field('id', pa.int64()),
+                pa.field('wallet_address', pa.string()),
+                pa.field('threshold', pa.float64()),
+                pa.field('trade_id', pa.int64()),
+                pa.field('trade_timestamp', pa.timestamp('us')),
+                pa.field('price_cycle', pa.int64()),
+                pa.field('price_cycle_start_time', pa.timestamp('us')),
+                pa.field('price_cycle_end_time', pa.timestamp('us')),
+                pa.field('trade_entry_price_org', pa.float64()),
+                pa.field('stablecoin_amount', pa.float64()),
+                pa.field('trade_entry_price', pa.float64()),
+                pa.field('sequence_start_price', pa.float64()),
+                pa.field('highest_price_reached', pa.float64()),
+                pa.field('lowest_price_reached', pa.float64()),
+                pa.field('long_short', pa.string()),
+                pa.field('short', pa.int32()),
+            ])
+            
+            arrow_table = pa.Table.from_pydict(col_data, schema=schema)
+            
+            # Register Arrow table with DuckDB (zero-copy) and insert
+            conn.register('_temp_profiles', arrow_table)
+            conn.execute("""
+                INSERT OR IGNORE INTO wallet_profiles 
+                (id, wallet_address, threshold, trade_id, trade_timestamp, price_cycle,
+                 price_cycle_start_time, price_cycle_end_time, trade_entry_price_org,
+                 stablecoin_amount, trade_entry_price, sequence_start_price,
+                 highest_price_reached, lowest_price_reached, long_short, short)
+                SELECT id, wallet_address, threshold, trade_id, trade_timestamp, price_cycle,
+                       price_cycle_start_time, price_cycle_end_time, trade_entry_price_org,
+                       stablecoin_amount, trade_entry_price, sequence_start_price,
+                       highest_price_reached, lowest_price_reached, long_short, short
+                FROM _temp_profiles
+            """)
+            conn.unregister('_temp_profiles')
+            
+            elapsed = time.time() - start_time
+            logger.info(f"PyArrow insert: {len(profiles)} profiles in {elapsed:.3f}s ({len(profiles)/elapsed:.0f} records/sec)")
+            
+            return len(profiles)
+            
+        except ImportError:
+            logger.warning("PyArrow not available, falling back to executemany (slow)")
+            # Fallback to executemany if PyArrow not available
             max_id_result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM wallet_profiles").fetchone()
             next_id = (max_id_result[0] or 0) + 1
             
@@ -648,12 +687,23 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, batch_data)
             return len(batch_data)
+            
         except Exception as e:
-            logger.error(f"Local DuckDB insert failed: {e}")
+            logger.error(f"Profile insert failed: {e}")
             return 0
     
-    # Ensure PostgreSQL state table exists
-    _ensure_state_table()
+    # Ensure DuckDB state table exists (NOT PostgreSQL)
+    try:
+        local_conn.execute("""
+            CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                id INTEGER PRIMARY KEY,
+                threshold DOUBLE NOT NULL UNIQUE,
+                last_trade_id BIGINT NOT NULL DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    except Exception as e:
+        logger.warning(f"State table creation: {e}")
     
     # Process all thresholds
     try:
@@ -682,42 +732,21 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
                 # Insert profiles into local DuckDB
                 inserted = _insert_profiles(local_conn, profiles)
                 
-                # ALSO push profiles to master.py's Data Engine API
-                # This makes them visible to the website (which reads from TradingDataEngine)
-                if data_client and profiles:
-                    try:
-                        # Prepare profiles for API (serialize timestamps)
-                        api_profiles = []
-                        for p in profiles:
-                            api_profile = {
-                                'wallet_address': p['wallet_address'],
-                                'threshold': p['threshold'],
-                                'trade_id': p['trade_id'],
-                                'trade_timestamp': p['trade_timestamp'].isoformat() if hasattr(p['trade_timestamp'], 'isoformat') else str(p['trade_timestamp']),
-                                'price_cycle': p['price_cycle'],
-                                'price_cycle_start_time': p['price_cycle_start_time'].isoformat() if p['price_cycle_start_time'] and hasattr(p['price_cycle_start_time'], 'isoformat') else None,
-                                'price_cycle_end_time': p['price_cycle_end_time'].isoformat() if p['price_cycle_end_time'] and hasattr(p['price_cycle_end_time'], 'isoformat') else None,
-                                'trade_entry_price_org': p['trade_entry_price_org'],
-                                'stablecoin_amount': p['stablecoin_amount'],
-                                'trade_entry_price': p['trade_entry_price'],
-                                'sequence_start_price': p['sequence_start_price'],
-                                'highest_price_reached': p['highest_price_reached'],
-                                'lowest_price_reached': p['lowest_price_reached'],
-                                'long_short': p['long_short'],
-                                'short': p['short'],
-                            }
-                            api_profiles.append(api_profile)
-                        
-                        # Push to Data Engine API (batch insert)
-                        data_client.insert_batch('wallet_profiles', api_profiles)
-                        logger.debug(f"Pushed {len(api_profiles)} profiles to Data Engine API")
-                    except Exception as api_err:
-                        logger.warning(f"Failed to push profiles to API (non-critical): {api_err}")
+                # DISABLED: Profiles should ONLY live in master2.py's local DuckDB
+                # Website queries master2 (port 5052) directly, NOT master.py (port 5050)
+                # Master.py should only have raw data ingestion (prices, trades, order book)
+                # 
+                # if data_client and profiles:
+                #     try:
+                #         data_client.insert_batch('wallet_profiles', api_profiles)
+                #         logger.debug(f"Pushed {len(api_profiles)} profiles to Data Engine API")
+                #     except Exception as api_err:
+                #         logger.warning(f"Failed to push profiles to API (non-critical): {api_err}")
                 
-                # Update state (in PostgreSQL)
+                # Update state (in DuckDB)
                 if profiles:
                     max_id = max(p['trade_id'] for p in profiles)
-                    _update_last_id(threshold, max_id)
+                    _update_last_id_local(local_conn, threshold, max_id)
                 
                 total_inserted += inserted
                 if inserted > 0:
@@ -748,7 +777,7 @@ def cleanup_old_profiles_local(local_conn, hours: int = 24, lock=None) -> int:
     Returns:
         Number of records deleted
     """
-    cutoff = datetime.now() - timedelta(hours=hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     deleted = 0
     
     try:

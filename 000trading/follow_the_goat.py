@@ -999,8 +999,9 @@ class WalletFollower:
     def get_current_price_cycle(self, at_timestamp: Optional[datetime] = None) -> Optional[int]:
         """Get price cycle ID for a specific timestamp.
         
-        Uses TradingDataEngine (in-memory DuckDB) since create_price_cycles.py
-        writes cycle data there.
+        CRITICAL: Uses master2.py's local DuckDB (via get_duckdb("central")) 
+        since cycles are computed locally by create_price_cycles.py in master2.py.
+        In master2.py context, get_duckdb("central") returns the registered local DuckDB.
         """
         if at_timestamp is None:
             at_timestamp = datetime.now(timezone.utc)
@@ -1008,10 +1009,10 @@ class WalletFollower:
         timestamp_str = at_timestamp.strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            # Use TradingDataEngine for cycle_tracker (it's written there by create_price_cycles.py)
-            engine = get_trading_engine()
-            if engine and engine._running:
-                result = engine.read_one("""
+            # CRITICAL: Use get_duckdb("central") which returns master2.py's local DuckDB
+            # when running in master2.py context. Cycles are computed there by create_price_cycles.py
+            with get_duckdb("central", read_only=True) as cursor:
+                result = cursor.execute("""
                     SELECT id, cycle_start_time, cycle_end_time 
                     FROM cycle_tracker
                     WHERE threshold = 0.3
@@ -1019,17 +1020,19 @@ class WalletFollower:
                       AND (cycle_end_time IS NULL OR cycle_end_time > ?)
                     ORDER BY id DESC
                     LIMIT 1
-                """, [timestamp_str, timestamp_str])
+                """, [timestamp_str, timestamp_str]).fetchone()
                 
                 if result:
-                    cycle_id = result['id']
-                    cycle_start = result.get('cycle_start_time')
+                    cycle_id = result[0]
+                    cycle_start = result[1] if len(result) > 1 else None
                     
                     # Log cycle age if it's suspiciously old (>1 hour)
                     if cycle_start:
                         try:
                             if hasattr(cycle_start, 'timestamp'):
                                 start_ts = cycle_start.timestamp()
+                            elif isinstance(cycle_start, str):
+                                start_ts = datetime.fromisoformat(cycle_start.replace('Z', '+00:00')).timestamp()
                             else:
                                 start_ts = datetime.fromisoformat(str(cycle_start).replace('Z', '+00:00')).timestamp()
                             age_minutes = (at_timestamp.timestamp() - start_ts) / 60
@@ -1041,32 +1044,15 @@ class WalletFollower:
                     return cycle_id
                 
                 # No active cycle found - try to get count for diagnostics
-                count_result = engine.read_one("SELECT COUNT(*) as cnt FROM cycle_tracker WHERE threshold = 0.3", [])
-                total_cycles = count_result['cnt'] if count_result else 0
+                count_result = cursor.execute("SELECT COUNT(*) FROM cycle_tracker WHERE threshold = 0.3").fetchone()
+                total_cycles = count_result[0] if count_result else 0
                 logger.warning(f"No active price cycle found for timestamp {timestamp_str} (total 0.3% cycles: {total_cycles})")
                 return None
             
-            # Fallback to file-based DuckDB if engine not running
-            logger.warning("TradingDataEngine not running - falling back to file-based DuckDB for cycle lookup")
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
-                    SELECT id, cycle_start_time, cycle_end_time 
-                    FROM cycle_tracker
-                    WHERE threshold = 0.3
-                      AND cycle_start_time <= ?
-                      AND (cycle_end_time IS NULL OR cycle_end_time > ?)
-                    ORDER BY id DESC
-                    LIMIT 1
-                """, [timestamp_str, timestamp_str]).fetchone()
-            
-            if result:
-                return result[0]
-            
-            logger.warning(f"No active price cycle found for timestamp {timestamp_str}")
-            return None
-            
         except Exception as e:
             logger.error(f"Error getting price cycle: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
     
     # =========================================================================

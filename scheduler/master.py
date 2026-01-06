@@ -13,7 +13,7 @@ This script (DATA ENGINE - runs indefinitely):
 3. Starts the FastAPI webhook server (port 8001)
 4. Starts the PHP webserver (port 8000)
 5. Starts Binance order book stream
-6. Schedules data jobs: Jupiter prices, trade sync, cleanup
+6. Schedules data jobs: Jupiter prices, trade sync, price cycles
 
 IMPORTANT: This is ONLY for RAW DATA ingestion.
 All computation (cycles, profiles, trading logic) is in master2.py.
@@ -45,7 +45,7 @@ from apscheduler.executors.pool import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 import traceback
 
-from core.database import cleanup_all_hot_tables, start_trading_engine, stop_trading_engine
+from core.database import start_trading_engine, stop_trading_engine
 from core.config import settings
 
 # Import job status tracking from shared module (avoids circular imports with API)
@@ -212,38 +212,9 @@ def fetch_jupiter_prices():
         logger.warning(f"Partial price write - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
 
 
-@track_job("cleanup_jupiter_prices", "Clean up Jupiter DuckDB (every hour)")
-def cleanup_jupiter_prices():
-    """Clean up old price data from Jupiter DuckDB."""
-    from get_prices_from_jupiter import cleanup_old_data
-    deleted = cleanup_old_data()
-    if deleted > 0:
-        logger.info(f"Cleaned up {deleted} old Jupiter price records")
-
-
-@track_job("cleanup_duckdb_hot_tables", "Clean up DuckDB hot tables (every hour)")
-def cleanup_duckdb_hot_tables():
-    """
-    Clean up all DuckDB hot tables with archive to MySQL.
-    
-    Process:
-    1. Select data older than retention threshold
-    2. Archive to MySQL (if configured)
-    3. Delete from DuckDB
-    
-    Retention periods:
-    - Trades (buyins): 72 hours (settings.trades_hot_storage_hours)
-    - Other tables: 24 hours (settings.hot_storage_hours)
-    """
-    logger.info(f"Running DuckDB hot table cleanup with archive (trades: {settings.trades_hot_storage_hours}h, others: {settings.hot_storage_hours}h)...")
-    total_cleaned = cleanup_all_hot_tables("central")  # Archives then deletes
-    logger.info(f"Cleanup complete: {total_cleaned} records archived and removed")
-
-
-# NOTE: archive_legacy_price_points was removed because:
-# 1. The legacy prices.duckdb uses 'ts' column, not 'created_at'
-# 2. cleanup_jupiter_prices already handles cleanup correctly via cleanup_old_data()
-# 3. See get_prices_from_jupiter.py for the correct cleanup implementation
+# NOTE: Cleanup/archive jobs REMOVED per user requirement
+# Data is written directly to BOTH PostgreSQL and DuckDB on insert
+# No cleanup or archiving is performed - data persists in both databases
 
 
 # NOTE: sync_plays_from_mysql has been removed.
@@ -812,16 +783,16 @@ def create_scheduler() -> BackgroundScheduler:
     Create and configure the scheduler for DATA INGESTION only.
     
     Executors:
-    - 'realtime': ThreadPoolExecutor(10) - Fast jobs (Jupiter prices, trade sync)
-    - 'maintenance': ThreadPoolExecutor(2) - Hourly cleanup jobs
+    - 'realtime': ThreadPoolExecutor(10) - Fast jobs (Jupiter prices, trade sync, price cycles)
     
     ALL trading computation (cycles, profiles, trading logic) runs in master2.py.
     This scheduler handles ONLY raw data ingestion.
+    
+    NOTE: No cleanup or archiving - data is written to both PostgreSQL and DuckDB directly.
     """
     # Configure executors for parallel job execution
     executors = {
-        'realtime': ThreadPoolExecutor(max_workers=10),   # Fast jobs (prices, trades)
-        'maintenance': ThreadPoolExecutor(max_workers=2), # Cleanup jobs
+        'realtime': ThreadPoolExecutor(max_workers=10),   # Fast jobs (prices, trades, cycles)
     }
     
     # Job defaults
@@ -857,29 +828,12 @@ def create_scheduler() -> BackgroundScheduler:
     )
     
     # =====================================================
-    # DATA MAINTENANCE JOBS
+    # DATA MAINTENANCE JOBS - REMOVED
     # =====================================================
     
-    # Clean up old Jupiter price data (every hour)
-    scheduler.add_job(
-        func=cleanup_jupiter_prices,
-        trigger=IntervalTrigger(hours=1),
-        id="cleanup_jupiter_prices",
-        name="Clean up Jupiter DuckDB (24hr window)",
-        replace_existing=True,
-        executor='maintenance',
-    )
-    
-    # Clean up DuckDB hot tables (every hour)
-    # Removes data older than 24 hours from in-memory DuckDB
-    scheduler.add_job(
-        func=cleanup_duckdb_hot_tables,
-        trigger=IntervalTrigger(hours=1),
-        id="cleanup_duckdb_hot_tables",
-        name="Clean up DuckDB hot tables (24hr window)",
-        replace_existing=True,
-        executor='maintenance',
-    )
+    # NOTE: Cleanup and archive jobs have been removed.
+    # Data is written directly to BOTH PostgreSQL and DuckDB on insert.
+    # No cleanup or archiving is performed - all data persists in both databases.
     
     # =====================================================
     # TRADE SYNC FROM WEBHOOK (runs every 1 second)
@@ -913,9 +867,9 @@ def create_scheduler() -> BackgroundScheduler:
         
         scheduler.add_job(
             func=process_price_cycles_run,
-            trigger=IntervalTrigger(seconds=2),
+            trigger=IntervalTrigger(seconds=1),
             id="process_price_cycles",
-            name="Process price cycles (every 2s)",
+            name="Process price cycles (every 1s)",
             replace_existing=True,
             executor='realtime',
         )
@@ -1148,10 +1102,10 @@ def main():
     
     # Log executor configuration
     logger.info("Executors configured for parallel job execution:")
-    logger.info("  - realtime (10 threads): Jupiter prices, trade sync")
-    logger.info("  - maintenance (2 threads): Hourly cleanup jobs")
+    logger.info("  - realtime (10 threads): Jupiter prices, trade sync, price cycles")
     logger.info("")
     logger.info("Trading jobs run in master2.py (can restart independently)")
+    logger.info("NOTE: No cleanup/archiving - data written to both PostgreSQL and DuckDB")
     
     # Log all registered jobs grouped by executor
     jobs = _scheduler.get_jobs()

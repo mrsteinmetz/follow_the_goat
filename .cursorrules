@@ -81,24 +81,169 @@ engine = get_trading_engine()  # Gets master.py's in-memory DuckDB
 engine.execute("INSERT INTO prices ...")
 ```
 
-### From master2.py context:
+### From master2.py context (scheduler jobs):
 ```python
 from core.data_client import get_client
 
 client = get_client()  # Connects to master.py API on port 5050
 prices = client.get_backfill("prices", hours=2)  # Fetch from master.py
 
-# Then insert into master2's local DuckDB
+# Then insert into master2's local DuckDB via write queue
+from scheduler.master2 import queue_write, _local_duckdb
 queue_write(_local_duckdb.execute, "INSERT INTO prices ...")
 ```
 
-### From feature modules (after master2 registers connection):
+### From feature modules / trading modules (RECOMMENDED):
 ```python
 from core.database import get_duckdb
 
-# This will use master2's local DuckDB if registered
+# ✅ CORRECT: Use read_only=True for SELECT queries
+with get_duckdb("central", read_only=True) as cursor:
+    result = cursor.execute("SELECT * FROM prices WHERE token = 'SOL'").fetchall()
+
+# ✅ CORRECT: Use duckdb_execute_write() for INSERT/UPDATE/DELETE
+from core.database import duckdb_execute_write
+duckdb_execute_write("central", "UPDATE table SET col = ? WHERE id = ?", [value, id])
+```
+
+---
+
+## 🚨 CRITICAL: Master2.py Database Read/Write Rules 🚨
+
+**Master2.py uses an in-memory DuckDB with a WRITE QUEUE for thread safety.**
+
+### READ Operations (SELECT queries)
+
+**ALWAYS use `read_only=True`** - this returns a fresh cursor that sees latest data:
+
+```python
+from core.database import get_duckdb
+
+# ✅ CORRECT - Always use read_only=True for reads
+with get_duckdb("central", read_only=True) as cursor:
+    result = cursor.execute("SELECT * FROM prices ORDER BY id DESC LIMIT 1").fetchone()
+    price = result[0] if result else None
+
+# ❌ WRONG - Without read_only=True, you get the connection (meant for writes)
 with get_duckdb("central") as conn:
-    conn.execute("SELECT * FROM prices ...")
+    # This works but is slower and blocks other operations
+    result = conn.execute("SELECT * FROM prices").fetchall()
+```
+
+### WRITE Operations (INSERT/UPDATE/DELETE)
+
+**ALWAYS use `duckdb_execute_write()`** - this queues writes for thread safety:
+
+```python
+from core.database import duckdb_execute_write
+
+# ✅ CORRECT - Fire-and-forget write (non-blocking)
+duckdb_execute_write("central", 
+    "INSERT INTO my_table (col1, col2) VALUES (?, ?)", 
+    [value1, value2])
+
+# ✅ CORRECT - Synchronous write (blocks until complete)
+duckdb_execute_write("central", 
+    "UPDATE my_table SET status = ? WHERE id = ?", 
+    [new_status, record_id], 
+    sync=True)
+
+# ❌ WRONG - Direct writes bypass the queue and cause conflicts
+with get_duckdb("central") as conn:
+    conn.execute("INSERT INTO my_table ...")  # DON'T DO THIS
+```
+
+### Why This Architecture?
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MASTER2.PY DATABASE ARCHITECTURE                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   WRITE PATH (Serialized via Queue)                                 │
+│   ─────────────────────────────────                                 │
+│   duckdb_execute_write()                                            │
+│         ↓                                                           │
+│   Write Queue (thread-safe)                                         │
+│         ↓                                                           │
+│   Background Writer Thread                                          │
+│         ↓                                                           │
+│   _local_duckdb.execute() [with lock]                               │
+│                                                                     │
+│   READ PATH (Concurrent via Fresh Cursors)                          │
+│   ─────────────────────────────────────────                         │
+│   get_duckdb("central", read_only=True)                             │
+│         ↓                                                           │
+│   Creates FRESH cursor [with lock]                                  │
+│         ↓                                                           │
+│   cursor.execute() [no lock needed - concurrent reads OK]           │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Key Points:**
+1. Writes go through a queue → serialized, no conflicts
+2. Reads get fresh cursors → always see latest data
+3. Multiple reads can happen concurrently (no blocking)
+4. Writes and reads don't block each other
+
+### Common Patterns in Trading Modules
+
+```python
+# Pattern 1: Read current price
+from core.database import get_duckdb
+
+def get_current_sol_price():
+    with get_duckdb("central", read_only=True) as cursor:
+        result = cursor.execute("""
+            SELECT price FROM prices 
+            WHERE token = 'SOL' 
+            ORDER BY id DESC LIMIT 1
+        """).fetchone()
+        return float(result[0]) if result else None
+
+# Pattern 2: Update a record after processing
+from core.database import duckdb_execute_write
+
+def mark_trade_complete(trade_id, status):
+    duckdb_execute_write("central", 
+        "UPDATE follow_the_goat_buyins SET our_status = ? WHERE id = ?",
+        [status, trade_id])
+
+# Pattern 3: Insert new record with sync (when you need the ID immediately)
+def insert_and_get_id():
+    # First get the next ID
+    with get_duckdb("central", read_only=True) as cursor:
+        result = cursor.execute("SELECT MAX(id) + 1 FROM my_table").fetchone()
+        next_id = result[0] if result and result[0] else 1
+    
+    # Then insert with sync=True to ensure it's committed
+    duckdb_execute_write("central",
+        "INSERT INTO my_table (id, data) VALUES (?, ?)",
+        [next_id, "my_data"],
+        sync=True)
+    
+    return next_id
+```
+
+### ❌ Anti-Patterns to Avoid
+
+```python
+# ❌ WRONG: Caching database connections or cursors
+class BadService:
+    def __init__(self):
+        self.cursor = get_duckdb("central")  # DON'T cache connections!
+    
+    def query(self):
+        return self.cursor.execute("SELECT ...").fetchall()  # Stale data!
+
+# ❌ WRONG: Direct connection access for writes
+with get_duckdb("central") as conn:
+    conn.execute("INSERT INTO ...")  # Bypasses write queue!
+
+# ❌ WRONG: Forgetting read_only=True
+with get_duckdb("central") as conn:  # Missing read_only=True
+    result = conn.execute("SELECT ...").fetchall()  # Works but inefficient
 ```
 
 ---
@@ -227,7 +372,7 @@ engine.execute("INSERT INTO prices VALUES (?, ?, ?)", [ts, token, price])
 results = engine.read_all("SELECT * FROM prices WHERE token = 'SOL'")
 ```
 
-### Accessing Data in master2.py
+### Accessing Data in master2.py (scheduler jobs only)
 ```python
 from core.data_client import get_client
 
@@ -235,25 +380,26 @@ from core.data_client import get_client
 client = get_client()  # Connects to http://localhost:5050
 prices = client.get_backfill("prices", hours=2)
 
-# STEP 2: Insert into master2's local DuckDB
+# STEP 2: Insert into master2's local DuckDB via write queue
 from scheduler.master2 import queue_write, _local_duckdb
 queue_write(_local_duckdb.execute, 
     "INSERT INTO prices VALUES (?, ?, ?)", 
     [ts, token, price])
-
-# STEP 3: Read from master2's local DuckDB (concurrent-safe)
-from scheduler.master2 import get_local_duckdb
-cursor = get_local_duckdb(use_cursor=True)
-result = cursor.execute("SELECT * FROM prices WHERE token = 'SOL'").fetchall()
 ```
 
-### Accessing Data from Feature Modules
+### Accessing Data from Feature/Trading Modules (RECOMMENDED)
 ```python
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 
-# After master2 registers its connection, this returns master2's local DuckDB
-with get_duckdb("central") as conn:
-    result = conn.execute("SELECT * FROM price_cycles").fetchall()
+# ✅ READING: Always use read_only=True for SELECT queries
+with get_duckdb("central", read_only=True) as cursor:
+    result = cursor.execute("SELECT * FROM prices WHERE token = 'SOL'").fetchall()
+    # cursor is a fresh cursor that sees latest data
+
+# ✅ WRITING: Always use duckdb_execute_write for INSERT/UPDATE/DELETE
+duckdb_execute_write("central", 
+    "UPDATE follow_the_goat_buyins SET our_status = ? WHERE id = ?",
+    [new_status, buyin_id])
 ```
 
 ### Feature Module Structure
@@ -265,16 +411,26 @@ Migrated from: 000old_code/solana_node/path/to/original.py
 Runs in: master2.py (trading logic)
 """
 
-from core.database import get_duckdb
+from core.database import get_duckdb, duckdb_execute_write
 
 def run():
     """Main entry point for this feature."""
     # Feature runs in master2.py context
-    # Can access master2's local DuckDB via get_duckdb("central")
-    with get_duckdb("central") as conn:
-        # Read synced data from master2's local copy
-        prices = conn.execute("SELECT * FROM prices ORDER BY ts DESC LIMIT 10").fetchall()
-        # Perform computations...
+    
+    # ✅ READING: Always use read_only=True
+    with get_duckdb("central", read_only=True) as cursor:
+        prices = cursor.execute(
+            "SELECT * FROM prices WHERE token = 'SOL' ORDER BY ts DESC LIMIT 10"
+        ).fetchall()
+    
+    # Process data...
+    result = analyze_prices(prices)
+    
+    # ✅ WRITING: Always use duckdb_execute_write
+    if result:
+        duckdb_execute_write("central",
+            "INSERT INTO my_results (data, created_at) VALUES (?, NOW())",
+            [result])
 ```
 
 ### Scheduled Task Registration - master.py (Data Jobs)
@@ -326,6 +482,7 @@ When migrating a feature from `000old_code/`:
 
 ## Forbidden Practices
 
+### General
 ❌ Never look in `/000old_code/` unless directly referenced for migration  
 ❌ Never create `.bat` files for scheduling  
 ❌ Never add trading logic to master.py (data ingestion only)  
@@ -334,6 +491,13 @@ When migrating a feature from `000old_code/`:
 ❌ Never create duplicate utility files - use `core/`  
 ❌ Never skip the hot/cold storage pattern for time-series data  
 ❌ Never forget that master2.py has its OWN separate in-memory DuckDB
+
+### Database Access (CRITICAL)
+❌ Never cache DuckDB connections or cursors - always get fresh ones  
+❌ Never use `get_duckdb("central")` without `read_only=True` for SELECT queries  
+❌ Never write directly via `conn.execute("INSERT/UPDATE")` - use `duckdb_execute_write()`  
+❌ Never store a cursor in a class attribute or global variable (leads to stale data)  
+❌ Never assume data written via queue_write is immediately visible without read_only=True
 
 ---
 
@@ -352,8 +516,24 @@ When migrating a feature from `000old_code/`:
 
 ### 🔴 Database Access Patterns
 - In master.py: `get_trading_engine()` for direct DuckDB access
-- In master2.py: `get_client()` to fetch from master.py, then `queue_write()` to local DuckDB
-- In features: `get_duckdb("central")` uses master2's registered connection
+- In master2.py scheduler: `get_client()` to fetch from master.py, then `queue_write()` to local DuckDB
+- In features/trading modules:
+  - **READS:** `get_duckdb("central", read_only=True)` - ALWAYS use read_only=True for SELECT
+  - **WRITES:** `duckdb_execute_write("central", sql, params)` - ALWAYS use this for INSERT/UPDATE/DELETE
+
+### 🔴 Database Do's and Don'ts
+```python
+# ✅ DO: Use read_only=True for all SELECT queries
+with get_duckdb("central", read_only=True) as cursor:
+    result = cursor.execute("SELECT * FROM prices").fetchall()
+
+# ✅ DO: Use duckdb_execute_write for all writes
+duckdb_execute_write("central", "UPDATE table SET x = ?", [value])
+
+# ❌ DON'T: Cache connections or cursors (leads to stale data)
+# ❌ DON'T: Use get_duckdb() without read_only=True for reads
+# ❌ DON'T: Write directly via get_duckdb() - bypasses write queue
+```
 
 ### 🔴 Restart Independence
 - master.py runs continuously (data feeds must never stop)

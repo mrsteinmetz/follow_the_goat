@@ -433,6 +433,28 @@ CREATE INDEX IF NOT EXISTS idx_trail_breakout_score ON buyin_trail_minutes(pat_b
 """
 
 # =============================================================================
+# TRADE FILTER VALUES - Normalized filter storage (one row per filter-minute)
+# =============================================================================
+
+SCHEMA_TRADE_FILTER_VALUES = """
+CREATE TABLE IF NOT EXISTS trade_filter_values (
+    id BIGINT PRIMARY KEY,
+    buyin_id BIGINT NOT NULL,
+    minute INTEGER NOT NULL,
+    filter_name VARCHAR(100) NOT NULL,
+    filter_value DOUBLE,
+    section VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tfv_unique ON trade_filter_values(buyin_id, minute, filter_name);
+CREATE INDEX IF NOT EXISTS idx_tfv_buyin_id ON trade_filter_values(buyin_id);
+CREATE INDEX IF NOT EXISTS idx_tfv_filter_name ON trade_filter_values(filter_name);
+CREATE INDEX IF NOT EXISTS idx_tfv_minute ON trade_filter_values(minute);
+CREATE INDEX IF NOT EXISTS idx_tfv_section ON trade_filter_values(section);
+"""
+
+# =============================================================================
 # SOL STABLECOIN TRADES (for fast trade detection - 1hr hot storage)
 # =============================================================================
 

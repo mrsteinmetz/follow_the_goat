@@ -100,19 +100,24 @@ $error_message = null;
 
 if ($use_duckdb) {
     $data_source = "DuckDB API";
-    // Request with max_points limit to reduce data transfer (default 5000)
-    $price_response = $duckdb->getPricePoints($token, $start_datetime, $end_datetime);
     
-    if ($price_response && isset($price_response['prices'])) {
+    // DEBUG: Log the API call
+    error_log("PRICE DEBUG: Requesting from $start_datetime to $end_datetime");
+    
+    // Try the 2-hour fallback FIRST (since we know data only goes back ~2 hours)
+    $price_response = $duckdb->getPricePoints($token, $fallback_start_datetime, $end_datetime);
+    error_log("PRICE DEBUG: Fallback response - count=" . ($price_response['count'] ?? 'N/A') . ", total=" . ($price_response['total_available'] ?? 'N/A'));
+    
+    if ($price_response && isset($price_response['prices']) && count($price_response['prices']) > 0) {
         $chart_data['prices'] = $price_response['prices'];
-    }
-    
-    // If no data in 24h range (new deployment), try last hour
-    if (empty($chart_data['prices'])) {
-        $price_response = $duckdb->getPricePoints($token, $fallback_start_datetime, $end_datetime);
+        $start_datetime = $fallback_start_datetime; // Update for display
+        error_log("PRICE DEBUG: Using fallback data with " . count($chart_data['prices']) . " prices");
+    } else {
+        // If fallback failed, try 24h (shouldn't happen, but for completeness)
+        error_log("PRICE DEBUG: Fallback empty, trying 24h range");
+        $price_response = $duckdb->getPricePoints($token, $start_datetime, $end_datetime);
         if ($price_response && isset($price_response['prices'])) {
             $chart_data['prices'] = $price_response['prices'];
-            $start_datetime = $fallback_start_datetime; // Update for display
         }
     }
 } else {
@@ -133,20 +138,20 @@ if ($use_duckdb) {
     $cycle_response = $duckdb->getCycleTracker($threshold, '24', 100);
     
     if ($cycle_response && isset($cycle_response['cycles'])) {
-        // First, collect ALL cycles for display (not filtered by increase)
-        foreach ($cycle_response['cycles'] as $cycle) {
-            $all_cycles_for_display[] = [
-                'id' => $cycle['id'],
-                'cycle_start_time' => $cycle['cycle_start_time'],
-                'cycle_end_time' => $cycle['cycle_end_time'],
-            ];
-            $cycle_start_times[] = $cycle['cycle_start_time'];
-        }
-        
-        // Then filter cycles by minimum increase for the table
+        // Filter cycles: only show COMPLETED cycles (cycle_end_time IS NOT NULL) that meet the filters
         foreach ($cycle_response['cycles'] as $cycle) {
             $percent_change = $cycle['max_percent_increase_from_lowest'] ?? 0;
-            if ($percent_change > $increase) {
+            $is_completed = !empty($cycle['cycle_end_time']);
+            
+            // Only include completed cycles that meet the increase threshold
+            if ($is_completed && $percent_change > $increase) {
+                $all_cycles_for_display[] = [
+                    'id' => $cycle['id'],
+                    'cycle_start_time' => $cycle['cycle_start_time'],
+                    'cycle_end_time' => $cycle['cycle_end_time'],
+                ];
+                $cycle_start_times[] = $cycle['cycle_start_time'];
+                
                 $analysis_data[] = [
                     'price_cycle' => $cycle['id'],
                     'cycle_start_time' => $cycle['cycle_start_time'],
@@ -791,7 +796,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                     <i class="ti ti-info-circle fs-4 me-2"></i>
                                     <div>
                                         <h6 class="mb-0">No Cycles Found</h6>
-                                        <p class="mb-0">No price cycles found with ><?php echo htmlspecialchars($increase); ?>% increase for threshold <?php echo htmlspecialchars($threshold); ?>% in the last 24 hours.</p>
+                                        <p class="mb-0">No completed price cycles found with ><?php echo htmlspecialchars($increase); ?>% increase for threshold <?php echo htmlspecialchars($threshold); ?>% in the last 24 hours.</p>
                                         <?php if (!$use_duckdb): ?>
                                         <p class="mb-0 mt-2"><strong>Tip:</strong> Make sure the scheduler is running: <code>python scheduler/master.py</code></p>
                                         <?php endif; ?>

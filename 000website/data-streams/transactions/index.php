@@ -35,6 +35,12 @@ function fetchTransactionsData() {
         'buy_volume' => 0,
         'sell_volume' => 0
     ];
+    $stats_data = [
+        'total_in_db' => 0,
+        'first_transaction' => null,
+        'avg_size' => 0,
+        'largest_tx' => 0
+    ];
     $error_message = null;
     $data_source = "No Data";
     $actual_source = null;
@@ -58,6 +64,8 @@ function fetchTransactionsData() {
             $actual_source = $data['source'] ?? 'duckdb_inmemory';
             $data_source = "🦆 DuckDB In-Memory";
             
+            $largest = 0;
+            
             // Calculate volume from fetched transactions
             foreach ($transactions_data as $tx) {
                 $amount = floatval($tx['stablecoin_amount'] ?? 0);
@@ -68,7 +76,18 @@ function fetchTransactionsData() {
                 } else {
                     $volume_data['sell_volume'] += $amount;
                 }
+                
+                // Track largest transaction
+                if ($amount > $largest) {
+                    $largest = $amount;
+                }
             }
+            
+            // Calculate average (from displayed transactions)
+            $stats_data['avg_size'] = count($transactions_data) > 0 
+                ? $volume_data['total_volume'] / count($transactions_data) 
+                : 0;
+            $stats_data['largest_tx'] = $largest;
         } else {
             $error_message = $data['error'] ?? 'Unknown error from API';
             $data_source = "API Error";
@@ -81,6 +100,7 @@ function fetchTransactionsData() {
     return [
         'transactions_data' => $transactions_data,
         'volume_data' => $volume_data,
+        'stats_data' => $stats_data,
         'error_message' => $error_message,
         'data_source' => $data_source,
         'actual_source' => $actual_source
@@ -118,6 +138,10 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
             if ($healthData && isset($healthData['duckdb'])) {
                 $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
                 $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
+                
+                // Get total count and first transaction timestamp from database
+                $result['stats_data']['total_in_db'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
+                $result['stats_data']['first_transaction'] = $healthData['duckdb']['first_trade_timestamp'] ?? null;
             }
         }
     }
@@ -126,6 +150,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
         'success' => true,
         'transactions' => $result['transactions_data'],
         'volume_data' => $result['volume_data'],
+        'stats_data' => $result['stats_data'],
         'status_data' => $status_data,
         'error_message' => $result['error_message'],
         'data_source' => $result['data_source'],
@@ -138,6 +163,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 $result = fetchTransactionsData();
 $transactions_data = $result['transactions_data'];
 $volume_data = $result['volume_data'];
+$stats_data = $result['stats_data'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
 $use_duckdb = isWebhookAvailable();
@@ -167,6 +193,10 @@ if ($use_duckdb) {
         if ($healthData && isset($healthData['duckdb'])) {
             $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
             $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
+            
+            // Get total count and first transaction timestamp from database
+            $stats_data['total_in_db'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
+            $stats_data['first_transaction'] = $healthData['duckdb']['first_trade_timestamp'] ?? null;
         }
     }
 }
@@ -174,6 +204,7 @@ if ($use_duckdb) {
 $json_status_data = json_encode($status_data);
 $json_transactions_data = json_encode($transactions_data);
 $json_volume_data = json_encode($volume_data);
+$json_stats_data = json_encode($stats_data);
 ?>
 
 <!-- This code is useful for internal styles -->
@@ -393,24 +424,43 @@ $json_volume_data = json_encode($volume_data);
                         <div id="txStatusBtn" class="status-btn <?php echo count($transactions_data) > 0 ? 'status-good' : 'status-warning'; ?>">
                             <div class="status-title">Transaction Stream</div>
                             <div class="status-info" id="txStatusInfo">
-                                <?php echo count($transactions_data) > 0 ? 'Active' : 'No Data'; ?>
+                                <?php echo count($transactions_data) > 0 ? count($transactions_data) . 's ago' : 'No Data'; ?>
                             </div>
                         </div>
-                        <div id="getPricesBtn" class="status-btn status-unknown">
-                            <div class="status-title">Get Prices</div>
-                            <div class="status-info" id="getPricesInfo">Loading...</div>
+                        <div id="totalInDbBtn" class="status-btn status-good">
+                            <div class="status-title">Total in Database</div>
+                            <div class="status-info" id="totalInDbInfo"><?php echo number_format($stats_data['total_in_db']); ?></div>
                         </div>
-                        <div id="priceAnalysisBtn" class="status-btn status-unknown">
-                            <div class="status-title">Price Analysis</div>
-                            <div class="status-info" id="priceAnalysisInfo">Loading...</div>
+                        <div id="firstTxBtn" class="status-btn status-good">
+                            <div class="status-title">First Transaction</div>
+                            <div class="status-info" id="firstTxInfo">
+                                <?php 
+                                if ($stats_data['first_transaction']) {
+                                    $first_time = strtotime($stats_data['first_transaction']);
+                                    $seconds_ago = time() - $first_time;
+                                    $mins_ago = floor($seconds_ago / 60);
+                                    
+                                    if ($seconds_ago < 60) {
+                                        echo $seconds_ago . 's ago';
+                                    } elseif ($mins_ago < 60) {
+                                        echo $mins_ago . 'm ago';
+                                    } else {
+                                        $hours_ago = floor($mins_ago / 60);
+                                        echo $hours_ago . 'h ago';
+                                    }
+                                } else {
+                                    echo 'N/A';
+                                }
+                                ?>
+                            </div>
                         </div>
-                        <div id="activeCycleBtn" class="status-btn status-unknown">
-                            <div class="status-title">Active Cycle</div>
-                            <div class="status-info" id="activeCycleInfo">Loading...</div>
+                        <div id="avgSizeBtn" class="status-btn status-good">
+                            <div class="status-title">Avg Transaction</div>
+                            <div class="status-info" id="avgSizeInfo">$<?php echo number_format($stats_data['avg_size'], 2); ?></div>
                         </div>
-                        <div id="recordCountBtn" class="status-btn status-good">
-                            <div class="status-title">Records Displayed</div>
-                            <div class="status-info" id="recordCountInfo"><?php echo count($transactions_data); ?></div>
+                        <div id="largestTxBtn" class="status-btn status-good">
+                            <div class="status-title">Largest (Displayed)</div>
+                            <div class="status-info" id="largestTxInfo">$<?php echo number_format($stats_data['largest_tx'], 2); ?></div>
                         </div>
                     </div>
                     <!-- End:: Status Buttons -->
@@ -513,6 +563,7 @@ $json_volume_data = json_encode($volume_data);
             window.statusData = <?php echo $json_status_data; ?>;
             window.transactionsData = <?php echo $json_transactions_data; ?>;
             window.volumeData = <?php echo $json_volume_data; ?>;
+            window.statsData = <?php echo $json_stats_data; ?>;
             
             // Copy to clipboard functionality
             function copyToClipboard(element) {
@@ -531,6 +582,11 @@ $json_volume_data = json_encode($volume_data);
             // Format currency with commas
             function formatCurrency(amount) {
                 return parseFloat(amount || 0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+            }
+            
+            // Format number with commas
+            function formatNumber(num) {
+                return parseInt(num || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
             }
             
             // Status refresh functionality - Always use UTC time
@@ -581,10 +637,50 @@ $json_volume_data = json_encode($volume_data);
                 if (statusData.last_update) {
                     updateButton('txStatusBtn', 'txStatusInfo', statusData.last_update);
                 }
+            }
+            
+            // Update stats displays
+            function updateStatsDisplay(statsData) {
+                if (!statsData) return;
                 
-                updateButton('getPricesBtn', 'getPricesInfo', statusData.get_prices);
-                updateButton('priceAnalysisBtn', 'priceAnalysisInfo', statusData.price_analysis);
-                updateButton('activeCycleBtn', 'activeCycleInfo', statusData.active_cycle);
+                // Total in DB
+                const totalInDbInfo = document.getElementById('totalInDbInfo');
+                if (totalInDbInfo && statsData.total_in_db !== undefined) {
+                    totalInDbInfo.textContent = formatNumber(statsData.total_in_db);
+                }
+                
+                // First transaction (oldest displayed - seconds, minutes or hours ago)
+                const firstTxInfo = document.getElementById('firstTxInfo');
+                if (firstTxInfo && statsData.first_transaction) {
+                    const firstTime = new Date(statsData.first_transaction).getTime();
+                    const secondsAgo = Math.floor((Date.now() - firstTime) / 1000);
+                    
+                    if (secondsAgo < 60) {
+                        firstTxInfo.textContent = secondsAgo + 's ago';
+                    } else {
+                        const minsAgo = Math.floor(secondsAgo / 60);
+                        if (minsAgo < 60) {
+                            firstTxInfo.textContent = minsAgo + 'm ago';
+                        } else {
+                            const hoursAgo = Math.floor(minsAgo / 60);
+                            firstTxInfo.textContent = hoursAgo + 'h ago';
+                        }
+                    }
+                } else if (firstTxInfo) {
+                    firstTxInfo.textContent = 'N/A';
+                }
+                
+                // Average size
+                const avgSizeInfo = document.getElementById('avgSizeInfo');
+                if (avgSizeInfo && statsData.avg_size !== undefined) {
+                    avgSizeInfo.textContent = '$' + formatCurrency(statsData.avg_size);
+                }
+                
+                // Largest transaction
+                const largestTxInfo = document.getElementById('largestTxInfo');
+                if (largestTxInfo && statsData.largest_tx !== undefined) {
+                    largestTxInfo.textContent = '$' + formatCurrency(statsData.largest_tx);
+                }
             }
             
             // Track seen signatures
@@ -679,6 +775,7 @@ $json_volume_data = json_encode($volume_data);
                         window.statusData = data.status_data;
                         window.transactionsData = data.transactions;
                         window.volumeData = data.volume_data;
+                        window.statsData = data.stats_data;
                         
                         // Update volume displays
                         if (data.volume_data) {
@@ -687,12 +784,15 @@ $json_volume_data = json_encode($volume_data);
                             document.getElementById('sellVolume').textContent = '$' + formatCurrency(data.volume_data.sell_volume);
                         }
                         
+                        // Update stats displays
+                        if (data.stats_data) {
+                            updateStatsDisplay(data.stats_data);
+                        }
+                        
                         // Update record counts
                         const count = data.transactions.length;
                         const recordCount = document.getElementById('recordCount');
-                        const recordCountInfo = document.getElementById('recordCountInfo');
                         if (recordCount) recordCount.textContent = count + ' Records';
-                        if (recordCountInfo) recordCountInfo.textContent = count;
                         
                         const tbody = document.getElementById('transactionsTableBody');
                         const newTransactions = [];
@@ -741,12 +841,16 @@ $json_volume_data = json_encode($volume_data);
             
             // Initial status refresh
             refreshStatus(window.statusData);
+            updateStatsDisplay(window.statsData);
             
             // Refresh data every 1 second
             setInterval(refreshTransactions, 1000);
             
             // Also refresh status every 5 seconds (for time-based updates)
-            setInterval(() => refreshStatus(window.statusData), 5000);
+            setInterval(() => {
+                refreshStatus(window.statusData);
+                updateStatsDisplay(window.statsData);
+            }, 5000);
         </script>
 
 <?php $scripts = ob_get_clean(); ?>
@@ -755,4 +859,5 @@ $json_volume_data = json_encode($volume_data);
 <!-- This code use for render base file -->
 <?php include __DIR__ . '/../../pages/layouts/base.php'; ?>
 <!-- This code use for render base file -->
+
 

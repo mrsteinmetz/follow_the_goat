@@ -54,16 +54,20 @@ def _next_id(engine, table: str) -> int:
 
 
 def _upsert_trade(payload: TradePayload) -> int:
+    """Insert trade into DuckDB AND queue for PostgreSQL (dual-write)."""
     engine = _engine()
     trade_id = payload.id or _next_id(engine, "sol_stablecoin_trades")
     ts = parse_timestamp(payload.trade_timestamp) or datetime.utcnow()
+    created_at = datetime.utcnow()
+    
+    # Write to DuckDB (fast, in-memory)
     engine.execute(
         """
         INSERT OR REPLACE INTO sol_stablecoin_trades
         (id, wallet_address, signature, trade_timestamp,
          stablecoin_amount, sol_amount, price, direction,
          perp_direction, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             trade_id,
@@ -75,16 +79,41 @@ def _upsert_trade(payload: TradePayload) -> int:
             payload.price,
             payload.direction,
             payload.perp_direction,
+            created_at,
         ],
     )
+    
+    # DUAL-WRITE: Queue for async PostgreSQL (fire-and-forget, never blocks)
+    try:
+        from core.database import write_to_postgres_async
+        write_to_postgres_async("sol_stablecoin_trades", {
+            "id": trade_id,
+            "wallet_address": payload.wallet_address,
+            "signature": payload.signature,
+            "trade_timestamp": ts,
+            "stablecoin_amount": payload.stablecoin_amount,
+            "sol_amount": payload.sol_amount,
+            "price": payload.price,
+            "direction": payload.direction,
+            "perp_direction": payload.perp_direction,
+            "created_at": created_at,
+        })
+    except Exception as e:
+        # PostgreSQL write is optional - don't fail the trade if it errors
+        logger.debug(f"PostgreSQL dual-write skipped for trade {trade_id}: {e}")
+    
     return trade_id
 
 
 def _upsert_whale(payload: WhalePayload) -> int:
+    """Insert whale movement into DuckDB AND queue for PostgreSQL (dual-write)."""
     engine = _engine()
     whale_id = payload.id or _next_id(engine, "whale_movements")
     ts = parse_timestamp(payload.timestamp) or datetime.utcnow()
     received_at = parse_timestamp(payload.received_at) or datetime.utcnow()
+    created_at = datetime.utcnow()
+    
+    # Write to DuckDB (fast, in-memory)
     engine.execute(
         """
         INSERT OR REPLACE INTO whale_movements
@@ -94,7 +123,7 @@ def _upsert_whale(payload: WhalePayload) -> int:
          timestamp, received_at, slot, has_perp_position, perp_platform,
          perp_direction, perp_size, perp_leverage, perp_entry_price,
          raw_data_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             whale_id,
@@ -121,8 +150,44 @@ def _upsert_whale(payload: WhalePayload) -> int:
             payload.perp_leverage,
             payload.perp_entry_price,
             payload.raw_data_json,
+            created_at,
         ],
     )
+    
+    # DUAL-WRITE: Queue for async PostgreSQL (fire-and-forget, never blocks)
+    try:
+        from core.database import write_to_postgres_async
+        write_to_postgres_async("whale_movements", {
+            "id": whale_id,
+            "signature": payload.signature,
+            "wallet_address": payload.wallet_address,
+            "whale_type": payload.whale_type,
+            "current_balance": payload.current_balance,
+            "sol_change": payload.sol_change,
+            "abs_change": payload.abs_change,
+            "percentage_moved": payload.percentage_moved,
+            "direction": payload.direction,
+            "action": payload.action,
+            "movement_significance": payload.movement_significance,
+            "previous_balance": payload.previous_balance,
+            "fee_paid": payload.fee_paid,
+            "block_time": payload.block_time,
+            "timestamp": ts,
+            "received_at": received_at,
+            "slot": payload.slot,
+            "has_perp_position": payload.has_perp_position,
+            "perp_platform": payload.perp_platform,
+            "perp_direction": payload.perp_direction,
+            "perp_size": payload.perp_size,
+            "perp_leverage": payload.perp_leverage,
+            "perp_entry_price": payload.perp_entry_price,
+            "raw_data_json": payload.raw_data_json,
+            "created_at": created_at,
+        })
+    except Exception as e:
+        # PostgreSQL write is optional - don't fail the whale if it errors
+        logger.debug(f"PostgreSQL dual-write skipped for whale {whale_id}: {e}")
+    
     return whale_id
 
 
@@ -294,12 +359,19 @@ async def webhook_health():
         engine = _engine()
         trades = engine.read_one("SELECT COUNT(*) AS cnt FROM sol_stablecoin_trades")
         whales = engine.read_one("SELECT COUNT(*) AS cnt FROM whale_movements")
+        
+        # Get first (oldest) transaction timestamp
+        first_trade = engine.read_one(
+            "SELECT trade_timestamp FROM sol_stablecoin_trades ORDER BY trade_timestamp ASC LIMIT 1"
+        )
+        
         return {
             "status": "ok",
             "timestamp": datetime.utcnow().isoformat(),
             "duckdb": {
                 "trades_in_hot_storage": trades["cnt"] if trades else 0,
                 "whale_movements_in_hot_storage": whales["cnt"] if whales else 0,
+                "first_trade_timestamp": first_trade["trade_timestamp"].isoformat() if first_trade and first_trade.get("trade_timestamp") else None,
                 "retention": "24 hours",
             },
         }

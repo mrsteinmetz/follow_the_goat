@@ -5,6 +5,42 @@
 
 ---
 
+## ⚠️ CRITICAL: All Timestamps are UTC
+
+**ALL timestamps in this system use UTC (server time), NEVER browser/local time.**
+
+### DuckDB Timezone Configuration
+
+DuckDB defaults to the system timezone (CET/UTC+1 on this system). To ensure consistent UTC timestamps:
+
+1. **All connections automatically set `SET TimeZone='UTC'`** during initialization
+2. **`CURRENT_TIMESTAMP` and `NOW()` return UTC** after this setting
+3. **Python `datetime.now(timezone.utc)`** used for all timestamp generation
+4. **Never use `datetime.now()` without timezone** - this uses local time!
+
+### Verification
+
+To verify timestamps are UTC in DuckDB:
+
+```sql
+-- This should match current UTC time (not CET/UTC+1)
+SELECT NOW();
+
+-- Check timezone setting
+SELECT current_setting('TimeZone');
+```
+
+### Files Fixed for UTC
+
+- ✅ `core/database.py` - Sets UTC timezone on all DuckDB connections
+- ✅ `core/trading_engine.py` - Sets UTC timezone on TradingDataEngine
+- ✅ `scheduler/master2.py` - Sets UTC timezone on local DuckDB
+- ✅ `000data_feeds/2_create_price_cycles/create_price_cycles.py` - Uses `datetime.now(timezone.utc)`
+- ✅ `000data_feeds/5_create_profiles/create_profiles.py` - Uses `datetime.now(timezone.utc)`
+- ✅ `000trading/trail_generator.py` - Removed timezone offset adjustments
+
+---
+
 ## Architecture Overview
 
 ```

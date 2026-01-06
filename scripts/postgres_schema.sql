@@ -280,3 +280,36 @@ CREATE TABLE IF NOT EXISTS job_execution_metrics (
 CREATE INDEX IF NOT EXISTS idx_metrics_job ON job_execution_metrics(job_name);
 CREATE INDEX IF NOT EXISTS idx_metrics_executed_at ON job_execution_metrics(executed_at);
 
+-- Whale Movements (24h hot storage, dual-write for history)
+CREATE TABLE IF NOT EXISTS whale_movements (
+    id BIGSERIAL PRIMARY KEY,
+    signature VARCHAR(255),
+    wallet_address VARCHAR(255) NOT NULL,
+    whale_type VARCHAR(50),
+    current_balance DECIMAL(20,8),
+    sol_change DECIMAL(20,8),
+    abs_change DECIMAL(20,8),
+    percentage_moved DECIMAL(10,4),
+    direction VARCHAR(10),
+    action VARCHAR(50),
+    movement_significance VARCHAR(50),
+    previous_balance DECIMAL(20,8),
+    fee_paid DECIMAL(20,8),
+    block_time BIGINT,
+    timestamp TIMESTAMP NOT NULL,
+    received_at TIMESTAMP,
+    slot BIGINT,
+    has_perp_position BOOLEAN,
+    perp_platform VARCHAR(50),
+    perp_direction VARCHAR(10),
+    perp_size DECIMAL(20,8),
+    perp_leverage DECIMAL(10,2),
+    perp_entry_price DECIMAL(20,8),
+    raw_data_json JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_whale_wallet ON whale_movements(wallet_address);
+CREATE INDEX IF NOT EXISTS idx_whale_timestamp ON whale_movements(timestamp);
+CREATE INDEX IF NOT EXISTS idx_whale_created_at ON whale_movements(created_at);
+

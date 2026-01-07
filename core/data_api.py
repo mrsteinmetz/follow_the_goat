@@ -474,11 +474,26 @@ async def get_new_records(
         )
     
     try:
-        # Get records with ID > since_id, ordered by ID ascending
-        results = engine.read(
-            f"SELECT * FROM {table} WHERE id > ? ORDER BY id ASC LIMIT ?",
-            [since_id, limit]
-        )
+        # Special handling for cycle_tracker: ALWAYS include ALL active cycles
+        # This ensures master2 sees cycle closures (when cycle_end_time is set)
+        # Regular sync only returns NEW records, but cycle closures UPDATE existing records
+        if table == "cycle_tracker":
+            # Get ALL active cycles (cycle_end_time IS NULL) regardless of ID
+            # Plus any new cycles (id > since_id)
+            results = engine.read(
+                f"""SELECT * FROM {table} 
+                    WHERE cycle_end_time IS NULL OR id > ? 
+                    ORDER BY id ASC 
+                    LIMIT ?""",
+                [since_id, limit]
+            )
+        else:
+            # Regular sync: only get NEW records with ID > since_id
+            results = engine.read(
+                f"SELECT * FROM {table} WHERE id > ? ORDER BY id ASC LIMIT ?",
+                [since_id, limit]
+            )
+        
         serialized = [_serialize_row(row) for row in results]
         
         # Get the max ID from results for next sync

@@ -959,6 +959,9 @@ def create_local_api() -> FastAPI:
                         ORDER BY threshold ASC
                     """).fetchall()
                     columns = [desc[0] for desc in _local_duckdb.description]
+                    
+                # For active_only, total_count = count (since we return all active cycles without LIMIT)
+                total_count = len(results)
             else:
                 # Return ALL cycles (both active and completed) - default behavior
                 conditions = ["coin_id = 5"]  # SOL cycles (all of them)
@@ -973,6 +976,15 @@ def create_local_api() -> FastAPI:
                 where_clause = " AND ".join(conditions)
                 
                 with _local_duckdb_lock:
+                    # Get total count (before LIMIT)
+                    total_count_result = _local_duckdb.execute(f"""
+                        SELECT COUNT(*) as total
+                        FROM cycle_tracker
+                        WHERE {where_clause}
+                    """).fetchone()
+                    total_count = total_count_result[0] if total_count_result else 0
+                    
+                    # Get paginated results
                     results = _local_duckdb.execute(f"""
                         SELECT 
                             id, coin_id, threshold, cycle_start_time, cycle_end_time,
@@ -992,6 +1004,7 @@ def create_local_api() -> FastAPI:
                 "status": "ok",
                 "cycles": cycles,
                 "count": len(cycles),
+                "total_count": total_count,  # Actual total in database (before LIMIT)
                 "source": "master2_local_duckdb"
             }
         except Exception as e:

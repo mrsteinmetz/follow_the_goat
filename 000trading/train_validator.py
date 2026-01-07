@@ -318,17 +318,16 @@ def check_data_readiness() -> tuple[bool, str]:
             if price_count < 10:
                 return False, f"Waiting for price data ({price_count}/10 points)"
             
-            # Check order_book_features
+            # Check order_book_features (optional for train_validator)
             try:
                 result = engine.read("SELECT COUNT(*) as cnt FROM order_book_features")
                 ob_count = result[0]['cnt'] if result else 0
                 logger.debug(f"TradingDataEngine: order_book count = {ob_count}")
                 
                 if ob_count < 5:
-                    return False, f"Waiting for order book data ({ob_count}/5 rows)"
+                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
             except Exception as e:
-                logger.warning(f"TradingDataEngine order book check failed: {e}")
-                return False, "Order book table not ready yet"
+                logger.debug(f"TradingDataEngine order book check failed: {e} - continuing anyway for train_validator")
             
             return True, "Data ready (using TradingDataEngine)"
             
@@ -354,7 +353,7 @@ def check_data_readiness() -> tuple[bool, str]:
                 logger.debug(f"Prices table check: price_count = {price_count}")
                 
                 if price_count >= 10:
-                    # Check order_book_features
+                    # Check order_book_features (optional for train_validator)
                     try:
                         result = cursor.execute("""
                             SELECT COUNT(*) FROM order_book_features
@@ -363,10 +362,9 @@ def check_data_readiness() -> tuple[bool, str]:
                         logger.debug(f"Order book check: ob_count = {ob_count}")
                         
                         if ob_count < 5:
-                            return False, f"Waiting for order book data ({ob_count}/5 rows)"
+                            logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
                     except Exception as e:
-                        logger.warning(f"Order book check error: {e}")
-                        return False, "Order book table not ready yet"
+                        logger.debug(f"Order book check error: {e} - continuing anyway for train_validator")
                     
                     logger.info("Data ready (using local DuckDB 'prices' table)")
                     return True, "Data ready (using local DuckDB 'prices' table)"
@@ -386,7 +384,7 @@ def check_data_readiness() -> tuple[bool, str]:
             if price_count < 10:
                 return False, f"Waiting for price data ({price_count}/10 points)"
             
-            # Check order_book_features exists and has data
+            # Check order_book_features exists and has data (optional for train_validator)
             try:
                 result = cursor.execute("""
                     SELECT COUNT(*) FROM order_book_features
@@ -395,10 +393,9 @@ def check_data_readiness() -> tuple[bool, str]:
                 logger.debug(f"Order book check (price_points mode): ob_count = {ob_count}")
                 
                 if ob_count < 5:
-                    return False, f"Waiting for order book data ({ob_count}/5 rows)"
+                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
             except Exception as e:
-                logger.warning(f"Order book check error (price_points mode): {e}")
-                return False, "Order book table not ready yet"
+                logger.debug(f"Order book check error (price_points mode): {e} - continuing anyway for train_validator")
             
             return True, "Data ready (using file DuckDB)"
             

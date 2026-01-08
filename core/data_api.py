@@ -293,7 +293,7 @@ async def get_backfill_data(
     table: str,
     hours: int = Query(default=None, ge=1, le=24, description="Hours of data to retrieve (use hours OR minutes)"),
     minutes: int = Query(default=None, ge=1, le=60, description="Minutes of data to retrieve (for short intervals)"),
-    limit: int = Query(default=10000, ge=1, le=100000, description="Maximum records to return")
+    limit: int = Query(default=None, ge=1, description="Maximum records to return (None = no limit)")
 ):
     """
     Get historical data for backfill on startup.
@@ -357,17 +357,29 @@ async def get_backfill_data(
         # Cycles are cumulative - we need all cycles for website display
         # Active cycles have cycle_end_time IS NULL, completed cycles have end_time set
         if table == "cycle_tracker":
-            results = engine.read(
-                f"""SELECT * FROM {table} 
-                    ORDER BY id DESC LIMIT ?""",
-                [limit]
-            )
+            if limit is None:
+                results = engine.read(
+                    f"""SELECT * FROM {table} 
+                        ORDER BY id DESC"""
+                )
+            else:
+                results = engine.read(
+                    f"""SELECT * FROM {table} 
+                        ORDER BY id DESC LIMIT ?""",
+                    [limit]
+                )
         else:
             # Query with time filter
-            results = engine.read(
-                f"SELECT * FROM {table} WHERE {ts_col} >= ? ORDER BY {ts_col} DESC LIMIT ?",
-                [cutoff, limit]
-            )
+            if limit is None:
+                results = engine.read(
+                    f"SELECT * FROM {table} WHERE {ts_col} >= ? ORDER BY {ts_col} DESC",
+                    [cutoff]
+                )
+            else:
+                results = engine.read(
+                    f"SELECT * FROM {table} WHERE {ts_col} >= ? ORDER BY {ts_col} DESC LIMIT ?",
+                    [cutoff, limit]
+                )
         serialized = [_serialize_row(row) for row in results]
         
         return {

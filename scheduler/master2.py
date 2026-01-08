@@ -29,7 +29,7 @@ import duckdb
 import time
 import json
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -93,22 +93,23 @@ def get_thread_cursor():
     DuckDB cursors have snapshot isolation - cached cursors won't see data
     written through the main connection via the write queue.
     
-    Previous implementation cached cursors per-thread, but this caused a visibility
-    bug where reads couldn't see data written through queue_write() because the
-    cached cursor's snapshot was stale.
+    CRITICAL FIX: Cursor creation does NOT acquire the write lock!
+    DuckDB cursors are read-only snapshots and can be created concurrently.
+    Only WRITE operations need the lock. This prevents deadlocks and segfaults.
     
     Returns:
         Fresh DuckDB cursor with current data snapshot
     """
-    global _local_duckdb, _local_duckdb_lock
+    global _local_duckdb
     
     if _local_duckdb is None:
         raise RuntimeError("Local DuckDB not initialized")
     
-    # Always create fresh cursor to ensure visibility of recent writes
-    # Cursor creation is fast (~0.01-0.1ms) and ensures data consistency
-    with _local_duckdb_lock:
-        return _local_duckdb.cursor()
+    # CRITICAL: Create cursor WITHOUT lock - cursors are read-only snapshots
+    # and can be created concurrently. The lock is only needed for WRITES.
+    # This prevents deadlocks and memory corruption (segfaults).
+    # Cursor creation is fast (~0.01-0.1ms) and thread-safe for reads.
+    return _local_duckdb.cursor()
 
 
 # =============================================================================
@@ -184,6 +185,9 @@ def background_writer():
     
     This runs continuously, processing writes from the queue.
     Ensures no write conflicts and all jobs see consistent data.
+    
+    CRITICAL: This thread must NEVER crash - it's the only way writes happen.
+    All exceptions are caught and logged, but the thread continues running.
     """
     global _local_duckdb, _write_queue_stats
     
@@ -192,9 +196,17 @@ def background_writer():
     
     batch_writes = []
     last_batch_time = time.time()
+    consecutive_errors = 0
+    max_consecutive_errors = 100  # After 100 consecutive errors, log warning
     
     while _writer_running.is_set():
         try:
+            # Check if database connection is still valid
+            if _local_duckdb is None:
+                logger.error("Local DuckDB connection is None! Write queue cannot proceed.")
+                time.sleep(1)  # Wait before retrying
+                continue
+            
             # Try to get a write operation (short timeout to check running flag)
             try:
                 func, args, kwargs = _write_queue.get(timeout=0.1)
@@ -219,23 +231,47 @@ def background_writer():
                 continue
             
             # Execute all writes in batch with lock
-            with _local_duckdb_lock:
-                for func, args, kwargs in batch_writes:
-                    try:
-                        func(*args, **kwargs)
-                        _write_queue_stats['total_writes'] += 1
-                    except Exception as e:
-                        _write_queue_stats['failed_writes'] += 1
-                        logger.error(f"Write queue operation failed: {e}", exc_info=True)
-                        logger.error(f"  Function: {func.__name__ if hasattr(func, '__name__') else str(func)}")
+            try:
+                with _local_duckdb_lock:
+                    for func, args, kwargs in batch_writes:
+                        try:
+                            func(*args, **kwargs)
+                            _write_queue_stats['total_writes'] += 1
+                            consecutive_errors = 0  # Reset error counter on success
+                        except Exception as e:
+                            _write_queue_stats['failed_writes'] += 1
+                            consecutive_errors += 1
+                            logger.error(f"Write queue operation failed: {e}", exc_info=True)
+                            logger.error(f"  Function: {func.__name__ if hasattr(func, '__name__') else str(func)}")
+                            
+                            # If we have too many consecutive errors, something is seriously wrong
+                            if consecutive_errors >= max_consecutive_errors:
+                                logger.critical(f"Write queue has {consecutive_errors} consecutive errors! Database may be corrupted.")
+                                consecutive_errors = 0  # Reset to avoid spam
+            except Exception as lock_error:
+                # Lock acquisition failed - this is serious
+                logger.error(f"Failed to acquire database lock in write queue: {lock_error}", exc_info=True)
+                consecutive_errors += 1
             
             batch_writes.clear()
             last_batch_time = time.time()
             _write_queue_stats['queue_size'] = _write_queue.qsize()
                 
+        except KeyboardInterrupt:
+            # Allow clean shutdown
+            logger.info("Write queue processor received interrupt signal")
+            break
         except Exception as e:
+            # Catch ANY exception to prevent thread crash
+            consecutive_errors += 1
             logger.error(f"Write queue processor error: {e}", exc_info=True)
             batch_writes.clear()
+            
+            # If we have too many consecutive errors, wait a bit before retrying
+            if consecutive_errors >= 10:
+                logger.warning(f"Write queue has {consecutive_errors} consecutive errors, waiting 1s before retry...")
+                time.sleep(1)
+                consecutive_errors = 0  # Reset after wait
     
     logger.info("Write queue processor stopped")
 
@@ -422,16 +458,27 @@ def init_local_duckdb():
     """Initialize local in-memory DuckDB for trading decisions."""
     global _local_duckdb
     
-    logger.info("Initializing local in-memory DuckDB...")
-    _local_duckdb = duckdb.connect(":memory:")
-    
-    # CRITICAL: Set timezone to UTC for all timestamps
-    # DuckDB defaults to system timezone (CET/UTC+1), we need UTC
     try:
-        _local_duckdb.execute("SET TimeZone='UTC'")
-        logger.info("Set DuckDB timezone to UTC in master2")
+        logger.info("Initializing local in-memory DuckDB...")
+        _local_duckdb = duckdb.connect(":memory:")
+        
+        # CRITICAL: Set timezone to UTC for all timestamps
+        # DuckDB defaults to system timezone (CET/UTC+1), we need UTC
+        try:
+            _local_duckdb.execute("SET TimeZone='UTC'")
+            logger.info("Set DuckDB timezone to UTC in master2")
+        except Exception as e:
+            logger.warning(f"Failed to set UTC timezone in master2: {e}")
+        
+        # Verify connection is working
+        test_result = _local_duckdb.execute("SELECT 1").fetchone()
+        if test_result is None:
+            raise RuntimeError("DuckDB connection test failed")
+        
     except Exception as e:
-        logger.warning(f"Failed to set UTC timezone in master2: {e}")
+        logger.error(f"Failed to initialize local DuckDB: {e}", exc_info=True)
+        _local_duckdb = None
+        raise  # Re-raise to prevent startup with broken database
     
     # Create essential tables for trading
     schemas = [
@@ -735,6 +782,7 @@ def init_local_duckdb():
     _local_duckdb.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tracking_wallet ON follow_the_goat_tracking(wallet_address)")
     _local_duckdb.execute("CREATE INDEX IF NOT EXISTS idx_pattern_filters_project_id ON pattern_config_filters(project_id)")
     _local_duckdb.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_profiles_state_threshold ON wallet_profiles_state(threshold)")
+    _local_duckdb.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_trade_threshold ON wallet_profiles(trade_id, threshold)")
     
     # CRITICAL: Register this connection into the pool so that all modules
     # using get_duckdb("central") will use THIS in-memory DB with the data.
@@ -881,6 +929,10 @@ def create_local_api() -> FastAPI:
             }
         
         try:
+            # Use read_only=True to get a fresh cursor (non-blocking reads)
+            # This avoids deadlocks with the write queue
+            from core.database import get_duckdb
+            
             tables = {}
             table_names = [
                 "prices", "cycle_tracker", "price_analysis", "wallet_profiles",
@@ -888,13 +940,24 @@ def create_local_api() -> FastAPI:
                 "order_book_features"
             ]
             
-            with _local_duckdb_lock:
-                for table in table_names:
-                    try:
-                        result = _local_duckdb.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
-                        tables[table] = result[0] if result else 0
-                    except:
-                        tables[table] = 0
+            # Use read_only=True for non-blocking reads (doesn't need write lock)
+            try:
+                with get_duckdb("central", read_only=True) as cursor:
+                    for table in table_names:
+                        try:
+                            result = cursor.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                            tables[table] = result[0] if result else 0
+                        except:
+                            tables[table] = 0
+            except Exception as db_error:
+                # Fallback: return basic health without table counts
+                logger.warning(f"Health check DB query failed: {db_error}")
+                return {
+                    "status": "degraded",
+                    "engine_running": True,
+                    "message": f"DB query failed: {str(db_error)}",
+                    "timestamp": datetime.now().isoformat()
+                }
             
             return {
                 "status": "ok",
@@ -1545,6 +1608,109 @@ def create_local_api() -> FastAPI:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/query_sql")
+    async def query_sql(request: QueryRequest):
+        """
+        Execute user-provided SQL query (read-only for SQL tester).
+        Returns results with columns for display.
+        """
+        global _local_duckdb
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        # Security: Only SELECT queries allowed
+        sql_upper = request.sql.strip().upper()
+        if not (sql_upper.startswith("SELECT") or sql_upper.startswith("WITH")):
+            raise HTTPException(status_code=400, detail="Only SELECT queries allowed")
+        
+        try:
+            # Add row limit if not present (max 1000 rows)
+            sql = request.sql.strip()
+            if "LIMIT" not in sql_upper:
+                sql += " LIMIT 1000"
+            
+            cursor = get_thread_cursor()
+            results = cursor.execute(sql).fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            
+            # Serialize results properly
+            serialized_rows = []
+            for row in results:
+                serialized_row = []
+                for value in row:
+                    if isinstance(value, (datetime, date)):
+                        serialized_row.append(value.isoformat())
+                    elif isinstance(value, (int, float, str, bool, type(None))):
+                        serialized_row.append(value)
+                    else:
+                        serialized_row.append(str(value))
+                serialized_rows.append(serialized_row)
+            
+            return {
+                "success": True,
+                "columns": columns,
+                "rows": serialized_rows,
+                "count": len(serialized_rows)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Query error: {str(e)}")
+    
+    @app.get("/schema")
+    async def get_schema():
+        """
+        Get complete database schema (all tables and their columns).
+        Returns table names with column details.
+        """
+        global _local_duckdb
+        
+        if _local_duckdb is None:
+            raise HTTPException(status_code=503, detail="Local DuckDB not initialized")
+        
+        try:
+            cursor = get_thread_cursor()
+            
+            # Get all tables
+            tables_result = cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'main' 
+                ORDER BY table_name
+            """).fetchall()
+            
+            schema = {}
+            for (table_name,) in tables_result:
+                # Get columns for each table
+                columns_result = cursor.execute(f"""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table_name}' 
+                    ORDER BY ordinal_position
+                """).fetchall()
+                
+                # Get row count for each table
+                try:
+                    count_result = cursor.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+                    row_count = count_result[0] if count_result else 0
+                except:
+                    row_count = 0
+                
+                schema[table_name] = {
+                    "columns": [
+                        {"name": col, "type": dtype} 
+                        for col, dtype in columns_result
+                    ],
+                    "row_count": row_count
+                }
+            
+            return {
+                "success": True,
+                "schema": schema,
+                "table_count": len(schema)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Schema error: {str(e)}")
     
     @app.get("/price/{token}")
     async def get_current_price(token: str = "SOL"):
@@ -2455,7 +2621,12 @@ def stop_local_api():
 
 
 def _fetch_table_data(client, table: str, hours: int, limit: int) -> tuple:
-    """Fetch data for a single table (for parallel execution)."""
+    """
+    Fetch data for a single table (for parallel execution).
+    
+    Args:
+        limit: Maximum records to fetch (None = no limit, gets all data)
+    """
     try:
         start_time = time.time()
         records = client.get_backfill(table, hours=hours, limit=limit)
@@ -2914,15 +3085,15 @@ def backfill_from_data_engine(hours: int = 24):
     # NOTE: follow_the_goat_plays is NOT included here - loaded from PostgreSQL above
     # NOTE: cycle_tracker IS backfilled from master.py where it's now computed incrementally
     tables_to_backfill = [
-        ("prices", 10000),
-        ("price_points", 10000),
-        ("cycle_tracker", 1000),  # Copy cycles computed by master.py
-        ("follow_the_goat_buyins", 5000),
-        ("sol_stablecoin_trades", 20000),
-        ("wallet_profiles", 10000),
-        ("buyin_trail_minutes", 10000),
-        ("order_book_features", 50000),  # Higher limit for order book data
-        ("whale_movements", 10000),  # Whale activity data for trail generation
+        ("prices", None),  # No limit - get all 24h data
+        ("price_points", None),
+        ("cycle_tracker", None),  # Copy all cycles computed by master.py
+        ("follow_the_goat_buyins", None),
+        ("sol_stablecoin_trades", None),  # No limit - get all trades in 24h window
+        ("wallet_profiles", None),
+        ("buyin_trail_minutes", None),
+        ("order_book_features", None),  # Get all order book data
+        ("whale_movements", None),  # Get all whale activity
     ]
     
     total_loaded = 0
@@ -3067,8 +3238,26 @@ def sync_new_data_from_engine():
     This is much faster than time-based backfill for real-time trading.
     
     CRITICAL FOR TRADING: Uses PyArrow batch insert for maximum speed.
+    
+    ERROR HANDLING: If master.py is down or unreachable, this function
+    gracefully handles the error and continues. The sync will resume
+    automatically when master.py comes back online.
     """
     global _data_client, _local_duckdb, _local_duckdb_lock, _last_synced_ids
+    
+    # Check if data client is available before attempting sync
+    if _data_client is None:
+        logger.debug("Data client not initialized, skipping sync")
+        return
+    
+    # Check if master.py is reachable
+    try:
+        if not _data_client.is_available():
+            logger.debug("Data Engine API not available, skipping sync")
+            return
+    except Exception as e:
+        logger.debug(f"Failed to check Data Engine availability: {e}")
+        return
     
     # Tables to sync - ordered by priority for trading decisions
     # prices & order_book_features are most critical for trading signals
@@ -3080,10 +3269,20 @@ def sync_new_data_from_engine():
             since_id = _last_synced_ids.get(table, 0)
             
             # Get only NEW records since last sync
-            records, max_id = _data_client.get_new_since_id(table, since_id=since_id, limit=1000)
+            try:
+                records, max_id = _data_client.get_new_since_id(table, since_id=since_id, limit=1000)
+            except Exception as fetch_error:
+                # Connection error - master.py might be down
+                logger.debug(f"Failed to fetch {table} from Data Engine: {fetch_error}")
+                continue  # Skip this table, try next one
             
             if not records:
                 continue
+            
+            # Check if database is still valid before queuing writes
+            if _local_duckdb is None:
+                logger.error("Local DuckDB is None! Cannot queue writes.")
+                return
             
             # Special handling for cycle_tracker: use INSERT OR REPLACE to handle updates
             # (cycles can be updated when cycle_end_time is set, not just inserted)
@@ -3101,8 +3300,12 @@ def sync_new_data_from_engine():
                 logger.debug(f"Queued {len(records)} records from {table} (max_id: {max_id})")
                 
         except Exception as e:
-            # Only log at debug level to avoid spam (sync runs every 1s)
-            logger.debug(f"Sync error for {table}: {e}")
+            # Log at debug level to avoid spam (sync runs every 1s)
+            # But log at warning level if it's a critical error
+            if "Connection" in str(e) or "timeout" in str(e).lower():
+                logger.debug(f"Sync error for {table} (connection issue): {e}")
+            else:
+                logger.warning(f"Sync error for {table}: {e}", exc_info=True)
 
 
 def sync_prices_to_price_points():
@@ -3125,10 +3328,10 @@ def sync_prices_to_price_points():
             """).fetchone()
             last_price_point_id = result[0] if result else 0
         
-        # Get latest prices.id that we've already synced
+        # Get latest prices.id that we've already synced (ts_idx stores prices.id)
         with _local_duckdb_lock:
             result = _local_duckdb.execute("""
-                SELECT COALESCE(MAX(id), 0) as max_prices_id 
+                SELECT COALESCE(MAX(ts_idx), 0) as max_prices_id 
                 FROM price_points 
                 WHERE ts_idx IS NOT NULL
             """).fetchone()
@@ -3175,104 +3378,123 @@ def sync_prices_to_price_points():
 @track_job("train_validator", "Validator training cycle (every 15s)")
 def run_train_validator():
     """Run a single validator training cycle."""
-    enabled = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Train validator disabled via TRAIN_VALIDATOR_ENABLED=0")
-        return
-    
-    trading_path = PROJECT_ROOT / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from train_validator import run_training_cycle
-    
-    success = run_training_cycle()
-    if not success:
-        logger.warning("Train validator cycle failed")
+    try:
+        enabled = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Train validator disabled via TRAIN_VALIDATOR_ENABLED=0")
+            return
+        
+        trading_path = PROJECT_ROOT / "000trading"
+        if str(trading_path) not in sys.path:
+            sys.path.insert(0, str(trading_path))
+        from train_validator import run_training_cycle
+        
+        success = run_training_cycle()
+        if not success:
+            logger.warning("Train validator cycle failed")
+    except Exception as e:
+        logger.error(f"Train validator job error: {e}", exc_info=True)
 
 
 @track_job("follow_the_goat", "Wallet tracker cycle (every 1s)")
 def run_follow_the_goat():
     """Run a single wallet tracking cycle."""
-    enabled = os.getenv("FOLLOW_THE_GOAT_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Follow the goat disabled via FOLLOW_THE_GOAT_ENABLED=0")
-        return
-    
-    trading_path = PROJECT_ROOT / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from follow_the_goat import run_single_cycle
-    
-    trades_found = run_single_cycle()
-    if trades_found:
-        logger.debug("Follow the goat: new trades processed")
+    try:
+        enabled = os.getenv("FOLLOW_THE_GOAT_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Follow the goat disabled via FOLLOW_THE_GOAT_ENABLED=0")
+            return
+        
+        trading_path = PROJECT_ROOT / "000trading"
+        if str(trading_path) not in sys.path:
+            sys.path.insert(0, str(trading_path))
+        from follow_the_goat import run_single_cycle
+        
+        trades_found = run_single_cycle()
+        if trades_found:
+            logger.debug("Follow the goat: new trades processed")
+    except Exception as e:
+        logger.error(f"Follow the goat job error: {e}", exc_info=True)
 
 
 @track_job("trailing_stop_seller", "Trailing stop seller (every 1s)")
 def run_trailing_stop_seller():
     """Run a single trailing stop monitoring cycle."""
-    enabled = os.getenv("TRAILING_STOP_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Trailing stop seller disabled via TRAILING_STOP_ENABLED=0")
-        return
-    
-    trading_path = PROJECT_ROOT / "000trading"
-    if str(trading_path) not in sys.path:
-        sys.path.insert(0, str(trading_path))
-    from sell_trailing_stop import run_single_cycle
-    
-    positions_checked = run_single_cycle()
-    if positions_checked > 0:
-        logger.debug(f"Trailing stop: checked {positions_checked} position(s)")
+    try:
+        enabled = os.getenv("TRAILING_STOP_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Trailing stop seller disabled via TRAILING_STOP_ENABLED=0")
+            return
+        
+        trading_path = PROJECT_ROOT / "000trading"
+        if str(trading_path) not in sys.path:
+            sys.path.insert(0, str(trading_path))
+        from sell_trailing_stop import run_single_cycle
+        
+        positions_checked = run_single_cycle()
+        if positions_checked > 0:
+            logger.debug(f"Trailing stop: checked {positions_checked} position(s)")
+    except Exception as e:
+        logger.error(f"Trailing stop seller job error: {e}", exc_info=True)
 
 
 @track_job("update_potential_gains", "Update potential gains (every 15s)")
 def run_update_potential_gains():
     """Update potential_gains for buyins with completed price cycles."""
-    enabled = os.getenv("UPDATE_POTENTIAL_GAINS_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Update potential gains disabled via UPDATE_POTENTIAL_GAINS_ENABLED=0")
-        return
-    
-    data_feeds_path = PROJECT_ROOT / "000data_feeds" / "6_update_potential_gains"
-    if str(data_feeds_path) not in sys.path:
-        sys.path.insert(0, str(data_feeds_path))
-    from update_potential_gains import run as update_gains
-    
-    result = update_gains()
-    if result.get('updated', 0) > 0:
-        logger.debug(f"Potential gains: updated {result['updated']} records")
+    try:
+        enabled = os.getenv("UPDATE_POTENTIAL_GAINS_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Update potential gains disabled via UPDATE_POTENTIAL_GAINS_ENABLED=0")
+            return
+        
+        data_feeds_path = PROJECT_ROOT / "000data_feeds" / "6_update_potential_gains"
+        if str(data_feeds_path) not in sys.path:
+            sys.path.insert(0, str(data_feeds_path))
+        from update_potential_gains import run as update_gains
+        
+        result = update_gains()
+        if result.get('updated', 0) > 0:
+            logger.debug(f"Potential gains: updated {result['updated']} records")
+    except Exception as e:
+        logger.error(f"Update potential gains job error: {e}", exc_info=True)
 
 
 @track_job("create_new_patterns", "Auto-generate filter patterns (every 5 min)")
 def run_create_new_patterns():
     """Auto-generate filter patterns from trade data analysis."""
-    enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Create new patterns disabled via CREATE_NEW_PATTERNS_ENABLED=0")
-        return
-    
-    patterns_path = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns"
-    if str(patterns_path) not in sys.path:
-        sys.path.insert(0, str(patterns_path))
-    from create_new_paterns import run as run_pattern_generator
-    
-    result = run_pattern_generator()
-    if result.get('success'):
-        logger.info(f"Pattern generation: {result.get('suggestions_count', 0)} suggestions, "
-                    f"{result.get('combinations_count', 0)} combinations, "
-                    f"{result.get('filters_synced', 0)} filters synced")
-    else:
-        logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
+    try:
+        enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Create new patterns disabled via CREATE_NEW_PATTERNS_ENABLED=0")
+            return
+        
+        patterns_path = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns"
+        if str(patterns_path) not in sys.path:
+            sys.path.insert(0, str(patterns_path))
+        from create_new_paterns import run as run_pattern_generator
+        
+        result = run_pattern_generator()
+        if result.get('success'):
+            logger.info(f"Pattern generation: {result.get('suggestions_count', 0)} suggestions, "
+                        f"{result.get('combinations_count', 0)} combinations, "
+                        f"{result.get('filters_synced', 0)} filters synced")
+        else:
+            logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
+    except Exception as e:
+        logger.error(f"Create new patterns job error: {e}", exc_info=True)
 
 
 @track_job("sync_from_engine", "Sync data from Data Engine (every 1s)")
 def run_sync_from_engine():
     """Sync NEW data from the Data Engine API (incremental sync by ID)."""
-    sync_new_data_from_engine()
-    
-    # After syncing prices, also sync to price_points table for legacy compatibility
-    sync_prices_to_price_points()
+    try:
+        sync_new_data_from_engine()
+        
+        # After syncing prices, also sync to price_points table for legacy compatibility
+        sync_prices_to_price_points()
+    except Exception as e:
+        # Don't let sync failures crash the scheduler
+        logger.debug(f"Sync job error (non-critical): {e}")
 
 
 @track_job("create_wallet_profiles", "Build wallet profiles (every 2s)")
@@ -3292,27 +3514,27 @@ def run_create_wallet_profiles():
     """
     global _local_duckdb, _local_duckdb_lock, _data_client
     
-    enabled = os.getenv("CREATE_WALLET_PROFILES_ENABLED", "1") == "1"
-    if not enabled:
-        logger.debug("Wallet profiles disabled via CREATE_WALLET_PROFILES_ENABLED=0")
-        return
-    
-    if _local_duckdb is None:
-        logger.warning("Local DuckDB not initialized - skipping profile creation")
-        return
-    
-    profiles_path = PROJECT_ROOT / "000data_feeds" / "5_create_profiles"
-    if str(profiles_path) not in sys.path:
-        sys.path.insert(0, str(profiles_path))
-    from create_profiles import build_profiles_for_local_duckdb
-    
     try:
+        enabled = os.getenv("CREATE_WALLET_PROFILES_ENABLED", "1") == "1"
+        if not enabled:
+            logger.debug("Wallet profiles disabled via CREATE_WALLET_PROFILES_ENABLED=0")
+            return
+        
+        if _local_duckdb is None:
+            logger.warning("Local DuckDB not initialized - skipping profile creation")
+            return
+        
+        profiles_path = PROJECT_ROOT / "000data_feeds" / "5_create_profiles"
+        if str(profiles_path) not in sys.path:
+            sys.path.insert(0, str(profiles_path))
+        from create_profiles import build_profiles_for_local_duckdb
+        
         # Pass data_client so profiles are pushed to Data Engine API (for website)
         processed = build_profiles_for_local_duckdb(_local_duckdb, _local_duckdb_lock, _data_client)
         if processed > 0:
             logger.debug(f"Wallet profiles: created {processed} profiles")
     except Exception as e:
-        logger.error(f"Wallet profiles error: {e}")
+        logger.error(f"Wallet profiles error: {e}", exc_info=True)
 
 
 @track_job("cleanup_wallet_profiles", "Clean up old profiles (every hour)")
@@ -3322,20 +3544,20 @@ def run_cleanup_wallet_profiles():
     """
     global _local_duckdb, _local_duckdb_lock
     
-    if _local_duckdb is None:
-        return
-    
-    profiles_path = PROJECT_ROOT / "000data_feeds" / "5_create_profiles"
-    if str(profiles_path) not in sys.path:
-        sys.path.insert(0, str(profiles_path))
-    from create_profiles import cleanup_old_profiles_local
-    
     try:
+        if _local_duckdb is None:
+            return
+        
+        profiles_path = PROJECT_ROOT / "000data_feeds" / "5_create_profiles"
+        if str(profiles_path) not in sys.path:
+            sys.path.insert(0, str(profiles_path))
+        from create_profiles import cleanup_old_profiles_local
+        
         deleted = cleanup_old_profiles_local(_local_duckdb, hours=24, lock=_local_duckdb_lock)
         if deleted > 0:
             logger.info(f"Cleaned up {deleted} old wallet profiles")
     except Exception as e:
-        logger.error(f"Wallet profiles cleanup error: {e}")
+        logger.error(f"Wallet profiles cleanup error: {e}", exc_info=True)
 
 
 @track_job("export_job_status", "Export job status to file (every 5s)")
@@ -3390,22 +3612,22 @@ def run_process_price_cycles():
     All cycle data stays in master2's local DuckDB and is served via Local API (port 5052).
     Website queries master2 directly - no need to sync back to master.py.
     """
-    enabled = os.getenv("PRICE_CYCLES_ENABLED", "1") == "1"
-    if not enabled:
-        return
-    
-    cycles_path = PROJECT_ROOT / "000data_feeds" / "2_create_price_cycles"
-    if str(cycles_path) not in sys.path:
-        sys.path.insert(0, str(cycles_path))
-    from create_price_cycles import process_price_cycles
-    
     try:
+        enabled = os.getenv("PRICE_CYCLES_ENABLED", "1") == "1"
+        if not enabled:
+            return
+        
+        cycles_path = PROJECT_ROOT / "000data_feeds" / "2_create_price_cycles"
+        if str(cycles_path) not in sys.path:
+            sys.path.insert(0, str(cycles_path))
+        from create_price_cycles import process_price_cycles
+        
         processed = process_price_cycles()
         if processed > 0:
             logger.debug(f"Price cycles: processed {processed} price points")
         
     except Exception as e:
-        logger.error(f"Price cycles error: {e}")
+        logger.error(f"Price cycles error: {e}", exc_info=True)
 
 
 # =============================================================================
@@ -3625,10 +3847,16 @@ def main():
     # =====================================================
     logger.info("-" * 60)
     logger.info("STEP 3: Backfilling 24 hours of historical data...")
-    if not backfill_from_data_engine(hours=24):
-        logger.error("Failed to backfill data - master.py may not be running!")
-        logger.error("Please start master.py first, then restart master2.py")
-        return
+    try:
+        if not backfill_from_data_engine(hours=24):
+            logger.warning("Backfill returned False - master.py may not be running or has no data")
+            logger.warning("Master2 will continue but may have limited data until master.py is available")
+            # Don't return - allow master2 to start even without backfill
+            # The sync job will fetch data once master.py is available
+    except Exception as e:
+        logger.error(f"Backfill failed with exception: {e}", exc_info=True)
+        logger.warning("Master2 will continue but may have limited data until master.py is available")
+        # Don't return - allow master2 to start even if backfill fails
 
     # =====================================================
     # STEP 3.5: Start Local API Server (port 5052)

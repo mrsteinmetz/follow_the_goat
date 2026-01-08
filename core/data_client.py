@@ -218,30 +218,32 @@ class DataClient:
             raise ConnectionError(f"Query failed: {e}")
     
     def get_backfill(
-        self, 
-        table: str, 
+        self,
+        table: str,
         hours: int = None,
         minutes: int = None,
-        limit: int = 10000
+        limit: int = None  # Changed: None means no limit
     ) -> List[Dict[str, Any]]:
         """
         Get historical data for backfill on startup.
-        
+
         This is typically used by master2.py to load recent data when starting.
         Use hours for startup backfill, minutes for continuous sync.
-        
+
         Args:
             table: Table name
             hours: Hours of data to retrieve (1-24, for startup backfill)
             minutes: Minutes of data to retrieve (1-60, for continuous sync)
-            limit: Maximum records to return (default: 10000)
-        
+            limit: Maximum records to return (None = no limit, gets ALL data in time window)
+
         Returns:
             List of records from the specified time range
         """
         try:
             # Build params - use minutes for short intervals, hours for longer
-            params = {"limit": limit}
+            params = {}
+            if limit is not None:
+                params["limit"] = limit
             if minutes is not None:
                 params["minutes"] = minutes
             elif hours is not None:

@@ -6,7 +6,7 @@ Migrated from: 000old_code/solana_node/analyze/profiles_v2/create_profiles.py
 Builds wallet profiles by joining:
 - sol_stablecoin_trades (buy trades from wallets) - FROM DUCKDB
 - cycle_tracker (completed price cycles) - FROM DUCKDB
-- prices (to get trade entry price) - FROM DUCKDB (Jupiter prices)
+- price_points (to get trade entry price) - FROM DUCKDB (synced from Jupiter prices)
 
 Writes results to:
 - In-memory DuckDB (via master2.py local instance or TradingDataEngine)
@@ -36,7 +36,12 @@ import time
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb, duckdb_execute_write
+from core.database import (
+    get_duckdb,
+    duckdb_execute_write,
+    get_postgres,
+    write_batch_to_postgres_async,
+)
 from core.config import settings
 from features.price_api.schema import (
     SCHEMA_SOL_STABLECOIN_TRADES,
@@ -51,7 +56,6 @@ logger = logging.getLogger("wallet_profiles")
 # --- Configuration ---
 MIN_BUYS = 3  # Minimum buy trades to qualify a wallet
 BATCH_SIZE = 50000  # Large DuckDB/Arrow batch to cut iterations
-PRICE_TOKEN = 'SOL'  # Token for price lookups in prices table
 
 # All thresholds from cycle_tracker (matching create_price_cycles.py)
 # Temporarily narrowed to 0.3 to reduce runtime
@@ -59,11 +63,64 @@ THRESHOLDS = [0.3]
 
 
 # =============================================================================
-# State Management (DuckDB only - no MySQL)
+# State Management (DuckDB + PostgreSQL for persistence)
 # =============================================================================
 
+def _pg_get_last_processed_id(threshold: float) -> Optional[int]:
+    """Best-effort read of wallet profile state from PostgreSQL."""
+    try:
+        with get_postgres() as pg_conn:
+            if not pg_conn:
+                return None
+            with pg_conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT last_trade_id 
+                    FROM wallet_profiles_state 
+                    WHERE threshold = %s
+                    """,
+                    [float(threshold)]
+                )
+                result = cursor.fetchone()
+                return int(result['last_trade_id']) if result else None
+    except Exception as e:
+        logger.debug(f"PostgreSQL state read failed (non-blocking): {e}")
+        return None
+
+
+def _pg_update_last_processed_id(threshold: float, last_trade_id: int) -> None:
+    """Best-effort upsert of wallet profile state into PostgreSQL."""
+    try:
+        with get_postgres() as pg_conn:
+            if not pg_conn:
+                return
+            with pg_conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS wallet_profiles_state (
+                        id SERIAL PRIMARY KEY,
+                        threshold DECIMAL(5,2) NOT NULL UNIQUE,
+                        last_trade_id BIGINT NOT NULL DEFAULT 0,
+                        last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    INSERT INTO wallet_profiles_state (threshold, last_trade_id, last_updated)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (threshold) DO UPDATE SET
+                        last_trade_id = EXCLUDED.last_trade_id,
+                        last_updated = NOW()
+                """, [float(threshold), int(last_trade_id)])
+    except Exception as e:
+        logger.debug(f"PostgreSQL state write skipped: {e}")
+
+
 def get_last_processed_id(threshold: float) -> int:
-    """Get the last processed trade ID for a threshold from DuckDB."""
+    """Get the last processed trade ID for a threshold (PostgreSQL first)."""
+    pg_value = _pg_get_last_processed_id(threshold)
+    if pg_value is not None:
+        return pg_value
+    
     try:
         # Ensure table exists (write operation via queue)
         duckdb_execute_write("central", """
@@ -88,7 +145,8 @@ def get_last_processed_id(threshold: float) -> int:
 
 
 def update_last_processed_id(threshold: float, last_trade_id: int):
-    """Update the last processed trade ID for a threshold in DuckDB."""
+    """Update the last processed trade ID for a threshold in DuckDB and PostgreSQL."""
+    _pg_update_last_processed_id(threshold, last_trade_id)
     try:
         # Ensure table exists (write operation via queue)
         duckdb_execute_write("central", """
@@ -176,7 +234,7 @@ def build_profiles_batch_duckdb(
     This is the FAST path - single query that does:
     1. Filters eligible wallets (MIN_BUYS requirement)
     2. Joins trades with completed cycles
-    3. Gets entry price from prices table (Jupiter SOL prices)
+    3. Gets entry price from price_points table (synced from Jupiter SOL prices)
     
     Args:
         threshold: Price cycle threshold (e.g., 0.3 for 0.3%)
@@ -190,7 +248,7 @@ def build_profiles_batch_duckdb(
     def _execute_query(connection):
         # Single efficient query that does all the work in DuckDB
         # Uses a CTE for eligible wallets to avoid large IN clause
-        # NOTE: Uses 'prices' table (not 'price_points') for Jupiter SOL prices
+        # NOTE: Uses 'price_points' table (synced from prices) for SOL price lookups
         result = connection.execute("""
             WITH eligible_wallets AS (
                 SELECT wallet_address
@@ -227,17 +285,16 @@ def build_profiles_batch_duckdb(
                 ORDER BY t.id ASC
                 LIMIT ?
             ),
-            -- Get entry price: first price from 'prices' table after trade_timestamp
-            -- Uses Jupiter SOL prices (token = 'SOL', ts = timestamp, price = value)
+            -- Get entry price: first price_point after trade_timestamp
+            -- Uses price_points table (synced from prices, created_at = timestamp, value = price)
             trades_with_prices AS (
                 SELECT 
                     twc.*,
                     (
-                        SELECT p.price 
-                        FROM prices p 
-                        WHERE p.ts > twc.trade_timestamp 
-                        AND p.token = ?
-                        ORDER BY p.ts ASC 
+                        SELECT pp.value 
+                        FROM price_points pp 
+                        WHERE pp.created_at > twc.trade_timestamp 
+                        ORDER BY pp.id ASC 
                         LIMIT 1
                     ) as entry_price
                 FROM trades_with_cycles twc
@@ -245,7 +302,7 @@ def build_profiles_batch_duckdb(
             SELECT *
             FROM trades_with_prices
             WHERE entry_price IS NOT NULL
-        """, [MIN_BUYS, threshold, latest_cycle_end, last_trade_id, batch_size, PRICE_TOKEN]).fetchall()
+        """, [MIN_BUYS, threshold, latest_cycle_end, last_trade_id, batch_size]).fetchall()
         
         # Get column names
         columns = [desc[0] for desc in connection.description]
@@ -342,6 +399,34 @@ def build_profiles_for_threshold(threshold: float) -> int:
     return inserted
 
 
+def _prepare_pg_profiles(profiles: List[Dict], starting_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Shape profile rows for PostgreSQL writes."""
+    pg_rows: List[Dict[str, Any]] = []
+    for i, profile in enumerate(profiles):
+        assigned_id = profile.get('id') if starting_id is None else starting_id + i
+        if assigned_id is None:
+            assigned_id = i
+        pg_rows.append({
+            'id': assigned_id,
+            'wallet_address': profile['wallet_address'],
+            'threshold': profile['threshold'],
+            'trade_id': profile['trade_id'],
+            'trade_timestamp': profile['trade_timestamp'],
+            'price_cycle': profile['price_cycle'],
+            'price_cycle_start_time': profile['price_cycle_start_time'],
+            'price_cycle_end_time': profile['price_cycle_end_time'],
+            'trade_entry_price_org': profile['trade_entry_price_org'],
+            'stablecoin_amount': profile['stablecoin_amount'],
+            'trade_entry_price': profile['trade_entry_price'],
+            'sequence_start_price': profile['sequence_start_price'],
+            'highest_price_reached': profile['highest_price_reached'],
+            'lowest_price_reached': profile['lowest_price_reached'],
+            'long_short': profile['long_short'],
+            'short': profile['short'],
+        })
+    return pg_rows
+
+
 def insert_profiles_batch(profiles: List[Dict]) -> int:
     """
     Insert profiles into DuckDB.
@@ -362,6 +447,7 @@ def insert_profiles_batch(profiles: List[Dict]) -> int:
         
         # Prepare batch insert data
         batch_data = []
+        pg_rows = _prepare_pg_profiles(profiles, next_id)
         for i, profile in enumerate(profiles):
             batch_data.append([
                 next_id + i,
@@ -398,6 +484,7 @@ def insert_profiles_batch(profiles: List[Dict]) -> int:
         queue_write_sync(_batch_insert, _local_duckdb, batch_data)
         duckdb_ok = True
         inserted_count = len(batch_data)
+        write_batch_to_postgres_async("wallet_profiles", pg_rows)
     except Exception as e:
         logger.error(f"DuckDB insert failed: {e}")
     
@@ -527,6 +614,9 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     def _get_last_id(threshold):
         """Get last processed trade_id from LOCAL DuckDB (master2 in-memory)."""
         try:
+            pg_value = _pg_get_last_processed_id(threshold)
+            if pg_value is not None:
+                return pg_value
             # Use local DuckDB for state tracking (NO PostgreSQL)
             result = local_conn.execute(
                 "SELECT last_trade_id FROM wallet_profiles_state WHERE threshold = ?",
@@ -547,6 +637,7 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     def _update_last_id_local(conn, threshold, last_id):
         """Update last processed trade_id in LOCAL DuckDB (master2 in-memory)."""
         try:
+            _pg_update_last_processed_id(threshold, last_id)
             # Use local DuckDB for state tracking (NO PostgreSQL)
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
@@ -765,6 +856,8 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
                 if lock:
                     lock.release()
             insert_elapsed = time.time() - insert_start
+            if inserted > 0:
+                write_batch_to_postgres_async("wallet_profiles", _prepare_pg_profiles(profiles))
             logger.info(
                 f"Threshold {threshold}: insert took {insert_elapsed:.3f}s "
                 f"for {inserted} profiles ({(inserted/insert_elapsed) if insert_elapsed else 0:.0f} r/s)"

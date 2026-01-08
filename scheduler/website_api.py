@@ -1338,6 +1338,74 @@ def execute_query():
 
 
 # =============================================================================
+# SQL TESTER ENDPOINTS
+# =============================================================================
+
+@app.route('/query_sql', methods=['POST'])
+@engine_required
+def execute_sql_query():
+    """
+    Execute user-provided SQL query (read-only) - proxies to master2's DuckDB.
+    
+    For SQL Tester feature - allows users to run SELECT queries against master2's database.
+    """
+    import requests
+    
+    data = request.get_json() or {}
+    
+    try:
+        response = requests.post(
+            f"{MASTER2_LOCAL_API_URL}/query_sql",
+            json=data,
+            timeout=30
+        )
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        logger.error(f"Error executing SQL query: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/schema', methods=['GET'])
+@engine_required
+def get_database_schema():
+    """
+    Get complete database schema (all tables and columns) - proxies to master2's DuckDB.
+    
+    For SQL Tester feature - shows users what tables and columns are available.
+    """
+    import requests
+    
+    # Cache schema for 30 seconds (it doesn't change frequently)
+    cache_key = 'schema'
+    cached = _cache.get(cache_key)
+    if cached:
+        return jsonify(cached)
+    
+    try:
+        response = requests.get(
+            f"{MASTER2_LOCAL_API_URL}/schema",
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            _cache.set(cache_key, data, ttl=30)
+            return jsonify(data), response.status_code
+        else:
+            return jsonify(response.json()), response.status_code
+            
+    except Exception as e:
+        logger.error(f"Error fetching database schema: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 

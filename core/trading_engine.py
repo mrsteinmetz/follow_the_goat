@@ -626,6 +626,7 @@ class TradingDataEngine:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_order_book_features_symbol ON order_book_features(symbol)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_profiles_ts ON wallet_profiles(trade_timestamp)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_wallet_profiles_wallet ON wallet_profiles(wallet_address)")
+        self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_trade_threshold ON wallet_profiles(trade_id, threshold)")
         # Trading tables
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_buyins_play ON follow_the_goat_buyins(play_id)")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_buyins_status ON follow_the_goat_buyins(our_status)")

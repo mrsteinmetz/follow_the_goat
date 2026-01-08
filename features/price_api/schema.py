@@ -209,6 +209,7 @@ CREATE INDEX IF NOT EXISTS idx_wallet_profiles_threshold ON wallet_profiles(thre
 CREATE INDEX IF NOT EXISTS idx_wallet_profiles_trade_timestamp ON wallet_profiles(trade_timestamp);
 CREATE INDEX IF NOT EXISTS idx_wallet_profiles_price_cycle ON wallet_profiles(price_cycle);
 CREATE INDEX IF NOT EXISTS idx_wallet_profiles_short ON wallet_profiles(short);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_trade_threshold ON wallet_profiles(trade_id, threshold);
 """
 
 # =============================================================================

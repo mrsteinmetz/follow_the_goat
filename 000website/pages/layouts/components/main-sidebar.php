@@ -104,6 +104,14 @@
                                 </a>
                             </li>
 
+                            <!-- SQL Tester -->
+                            <li class="slide">
+                                <a href="/pages/features/sql-tester/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><rect x="32" y="48" width="192" height="160" rx="8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16" opacity="0.2"/><rect x="32" y="48" width="192" height="160" rx="8" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="64" y1="108" x2="192" y2="108" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><line x1="64" y1="148" x2="128" y2="148" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">SQL Tester</span>
+                                    <span class="badge bg-info-transparent ms-auto">New</span>
+                                </a>
+                            </li>
 
                               <!-- Start::slide__category -->
                               <li class="slide__category"><span class="category-name">Data Streams</span></li>

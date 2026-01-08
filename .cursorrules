@@ -299,9 +299,54 @@ follow_the_goat_buyins (price_cycle field references cycle id)
 
 ### 4. Hot/Cold Storage Pattern
 ```python
-# Example: price_points (hot) + price_points_archive (cold)
+# Example: prices (hot) + prices_archive (cold in PostgreSQL)
 # Data older than 24 hours is moved from hot to cold storage
 ```
+
+### 🚨 CRITICAL: Price Tables - `prices` vs `price_points` 🚨
+
+**USE `prices` TABLE - This is the PRIMARY price data source!**
+
+| Table | Status | Schema | Usage |
+|-------|--------|--------|-------|
+| `prices` | **PRIMARY** ✅ | `id, ts, token, price` | ALL new code should use this |
+| `price_points` | **LEGACY** ❌ | `id, ts_idx, coin_id, value` | Old code only - DO NOT USE |
+
+**The `prices` table:**
+- Populated by master.py (Jupiter price fetcher every 1 second)
+- Synced to master2.py via API
+- Contains SOL, BTC, ETH prices with token name
+
+**Correct Query Pattern:**
+```python
+# ✅ CORRECT: Use prices table with token filter
+with get_duckdb("central", read_only=True) as cursor:
+    result = cursor.execute("""
+        SELECT price, ts FROM prices 
+        WHERE token = 'SOL' 
+        ORDER BY id DESC LIMIT 1
+    """).fetchone()
+    current_price = result[0] if result else None
+
+# ✅ CORRECT: Count check for data readiness
+result = cursor.execute("SELECT COUNT(*) FROM prices WHERE token = 'SOL'").fetchone()
+has_data = result[0] >= 10 if result else False
+```
+
+**WRONG Pattern (NEVER USE):**
+```python
+# ❌ WRONG: price_points is legacy and may be empty
+result = cursor.execute("SELECT COUNT(*) FROM price_points WHERE coin_id = 5").fetchone()
+
+# ❌ WRONG: Using coin_id instead of token
+result = cursor.execute("SELECT value FROM price_points WHERE coin_id = 5").fetchone()
+```
+
+**Why this matters:**
+- `price_points` was used in the old MySQL-based system
+- The new architecture uses `prices` table directly
+- `price_points` may be empty or stale - it's only kept for legacy compatibility
+- Checking `price_points` for data readiness will FAIL even when `prices` has 10,000+ records
 
 **CRITICAL: Cycle Retention Must Match Trade Lifetime**
 - **Trades**: 72-hour hot storage retention (`trades_hot_storage_hours`)

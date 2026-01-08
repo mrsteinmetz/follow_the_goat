@@ -37,7 +37,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, duckdb_execute_write
+from core.database import get_duckdb, duckdb_execute_write, get_postgres
 
 # Try to get TradingDataEngine for in-memory queries (when running under scheduler)
 def _get_engine_if_running():
@@ -208,6 +208,53 @@ class StepLogger:
 # DATABASE OPERATIONS
 # =============================================================================
 
+
+def _pg_execute(query: str, params: list) -> None:
+    """Best-effort helper for short PostgreSQL writes."""
+    try:
+        with get_postgres() as pg_conn:
+            if not pg_conn:
+                return
+            with pg_conn.cursor() as cursor:
+                cursor.execute(query, params)
+    except Exception as e:
+        logger.debug(f"PostgreSQL write skipped: {e}")
+
+
+def _pg_upsert_buyin(row: Dict[str, Any]) -> None:
+    """Insert or update a buyin row in PostgreSQL."""
+    if not row:
+        return
+    columns = list(row.keys())
+    values = [row[c] for c in columns]
+    placeholders = ", ".join(["%s"] * len(columns))
+    # Avoid empty update clause when only id is provided
+    update_columns = [col for col in columns if col != "id"]
+    if update_columns:
+        update_clause = ", ".join([f"{col} = EXCLUDED.{col}" for col in update_columns])
+    else:
+        update_clause = "id = EXCLUDED.id"
+    query = f"""
+        INSERT INTO follow_the_goat_buyins ({", ".join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT (id) DO UPDATE SET {update_clause}
+    """
+    _pg_execute(query, values)
+
+
+def _pg_update_buyin(buyin_id: int, fields: Dict[str, Any]) -> None:
+    """Update a buyin row in PostgreSQL by id."""
+    if not fields:
+        return
+    set_clause = ", ".join([f"{col} = %s" for col in fields.keys()])
+    params = list(fields.values()) + [buyin_id]
+    query = f"""
+        UPDATE follow_the_goat_buyins
+        SET {set_clause}
+        WHERE id = %s
+    """
+    _pg_execute(query, params)
+
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
     """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
     
@@ -295,109 +342,49 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
 def check_data_readiness() -> tuple[bool, str]:
     """Check if sufficient data exists to run a training cycle.
     
-    Uses TradingDataEngine if running (under scheduler), otherwise file-based DuckDB.
+    IMPORTANT: This function runs in master2.py context, so it MUST use
+    get_duckdb("central") which returns master2's local in-memory DuckDB.
     
-    Note: TradingDataEngine uses 'prices' table internally (mapped to 'price_points' in MySQL).
+    DO NOT use TradingDataEngine here - that only exists in master.py!
+    
+    The PRIMARY price table is `prices` (not `price_points` which is legacy).
     
     Returns:
         Tuple of (is_ready, reason_if_not_ready)
     """
-    engine = _get_engine_if_running()
-    logger.debug(f"check_data_readiness: engine={engine}")
+    # ALWAYS use get_duckdb("central") - this is master2's local DuckDB
+    # DO NOT use TradingDataEngine - it's only in master.py!
+    logger.debug("Checking data readiness using get_duckdb('central')")
     
-    if engine is not None:
-        # Use TradingDataEngine (in-memory, no locking)
-        # Note: Engine uses 'prices' table, not 'price_points'
-        logger.debug("Using TradingDataEngine for data readiness check")
-        try:
-            # Check prices table (engine uses 'prices', maps to 'price_points' in MySQL)
-            result = engine.read("SELECT COUNT(*) as cnt FROM prices WHERE token = 'SOL'")
-            price_count = result[0]['cnt'] if result else 0
-            logger.debug(f"TradingDataEngine: prices count = {price_count}")
-            
-            if price_count < 10:
-                return False, f"Waiting for price data ({price_count}/10 points)"
-            
-            # Check order_book_features (optional for train_validator)
-            try:
-                result = engine.read("SELECT COUNT(*) as cnt FROM order_book_features")
-                ob_count = result[0]['cnt'] if result else 0
-                logger.debug(f"TradingDataEngine: order_book count = {ob_count}")
-                
-                if ob_count < 5:
-                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
-            except Exception as e:
-                logger.debug(f"TradingDataEngine order book check failed: {e} - continuing anyway for train_validator")
-            
-            return True, "Data ready (using TradingDataEngine)"
-            
-        except Exception as e:
-            logger.error(f"TradingDataEngine check failed: {e}")
-            return False, f"TradingDataEngine not ready: {e}"
-    
-    # Fallback to file-based DuckDB (standalone mode)
-    # NOTE: When running under master2.py, get_duckdb("central") returns master2's
-    # in-memory DuckDB which uses 'prices' table, not 'price_points'
-    logger.debug("Using get_duckdb('central') for data readiness check")
     try:
         with get_duckdb("central", read_only=True) as cursor:
-            # DEBUG: Check what kind of cursor we got
-            logger.debug(f"DEBUG: cursor type = {type(cursor).__name__}, cursor = {cursor}")
-            
-            # Try 'prices' table first (used by master2.py's local DuckDB)
-            try:
-                result = cursor.execute("""
-                    SELECT COUNT(*) FROM prices WHERE token = 'SOL'
-                """).fetchone()
-                price_count = result[0] if result else 0
-                logger.debug(f"Prices table check: price_count = {price_count}")
-                
-                if price_count >= 10:
-                    # Check order_book_features (optional for train_validator)
-                    try:
-                        result = cursor.execute("""
-                            SELECT COUNT(*) FROM order_book_features
-                        """).fetchone()
-                        ob_count = result[0] if result else 0
-                        logger.debug(f"Order book check: ob_count = {ob_count}")
-                        
-                        if ob_count < 5:
-                            logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
-                    except Exception as e:
-                        logger.debug(f"Order book check error: {e} - continuing anyway for train_validator")
-                    
-                    logger.info("Data ready (using local DuckDB 'prices' table)")
-                    return True, "Data ready (using local DuckDB 'prices' table)"
-                else:
-                    logger.debug(f"Not enough price data in 'prices' table: {price_count}/10")
-            except Exception as e:
-                # 'prices' table doesn't exist, try 'price_points' instead
-                logger.debug(f"Prices table check failed ({e}), trying price_points...")
-            
-            # Fallback: Check price_points (standalone file-based mode)
+            # Check `prices` table - this is the PRIMARY price data source
+            # Schema: id, ts, token, price
+            # Query: WHERE token = 'SOL' for SOL prices
             result = cursor.execute("""
-                SELECT COUNT(*) FROM price_points WHERE coin_id = 5
+                SELECT COUNT(*) FROM prices WHERE token = 'SOL'
             """).fetchone()
             price_count = result[0] if result else 0
-            logger.debug(f"Price_points table check: price_count = {price_count}")
+            logger.debug(f"Prices table check: {price_count} SOL prices")
             
             if price_count < 10:
-                return False, f"Waiting for price data ({price_count}/10 points)"
+                return False, f"Waiting for price data ({price_count}/10 prices)"
             
-            # Check order_book_features exists and has data (optional for train_validator)
+            # Check order_book_features (optional for train_validator)
             try:
                 result = cursor.execute("""
                     SELECT COUNT(*) FROM order_book_features
                 """).fetchone()
                 ob_count = result[0] if result else 0
-                logger.debug(f"Order book check (price_points mode): ob_count = {ob_count}")
+                logger.debug(f"Order book check: {ob_count} rows")
                 
                 if ob_count < 5:
-                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway for train_validator")
+                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway")
             except Exception as e:
-                logger.debug(f"Order book check error (price_points mode): {e} - continuing anyway for train_validator")
+                logger.debug(f"Order book check error: {e} - continuing anyway")
             
-            return True, "Data ready (using file DuckDB)"
+            logger.info(f"Data ready: {price_count} prices in master2's DuckDB")
+            return True, f"Data ready ({price_count} prices)"
             
     except Exception as e:
         logger.error(f"Database check error: {e}")
@@ -405,52 +392,25 @@ def check_data_readiness() -> tuple[bool, str]:
 
 
 def get_current_market_price() -> Optional[float]:
-    """Get current SOL price from prices table (TradingDataEngine) or price_points (file DuckDB)."""
-    engine = _get_engine_if_running()
+    """Get current SOL price from master2's local DuckDB.
     
+    IMPORTANT: Uses `prices` table (PRIMARY) - NOT `price_points` (legacy).
+    Schema: prices(id, ts, token, price)
+    Query: WHERE token = 'SOL' ORDER BY id DESC LIMIT 1
+    """
     try:
-        if engine is not None:
-            # TradingDataEngine uses 'prices' table with 'token' column and 'price' value
-            result = engine.read("""
+        with get_duckdb("central", read_only=True) as cursor:
+            result = cursor.execute("""
                 SELECT price
                 FROM prices
                 WHERE token = 'SOL'
                 ORDER BY id DESC
                 LIMIT 1
-            """)
+            """).fetchone()
             if result:
-                return float(result[0]['price'])
+                return float(result[0])
+            logger.warning("No SOL prices found in database")
             return None
-        else:
-            # When running under master2.py, get_duckdb("central") returns master2's
-            # in-memory DuckDB which uses 'prices' table, not 'price_points'
-            with get_duckdb("central", read_only=True) as cursor:
-                # Try 'prices' table first (used by master2.py's local DuckDB)
-                try:
-                    result = cursor.execute("""
-                        SELECT price
-                        FROM prices
-                        WHERE token = 'SOL'
-                        ORDER BY id DESC
-                        LIMIT 1
-                    """).fetchone()
-                    if result:
-                        return float(result[0])
-                except Exception:
-                    # 'prices' table doesn't exist, try 'price_points' instead
-                    pass
-                
-                # Fallback: File-based DuckDB uses 'price_points' table
-                result = cursor.execute("""
-                    SELECT value
-                    FROM price_points
-                    WHERE coin_id = 5
-                    ORDER BY id DESC
-                    LIMIT 1
-                """).fetchone()
-                if result:
-                    return float(result[0])
-                return None
                 
     except Exception as e:
         logger.error(f"Error getting current market price: {e}")
@@ -544,6 +504,26 @@ def insert_synthetic_buyin(
             our_entry_price  # Initialize higest_price_reached with entry price
         ], sync=True)
         logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
+        _pg_upsert_buyin({
+            'id': buyin_id,
+            'play_id': play_id,
+            'wallet_address': wallet_address,
+            'original_trade_id': 0,
+            'trade_signature': signature,
+            'block_timestamp': block_timestamp,
+            'quote_amount': 100.0,
+            'base_amount': our_entry_price if our_entry_price else 0.0,
+            'price': our_entry_price,
+            'direction': 'buy',
+            'our_entry_price': our_entry_price,
+            'live_trade': 0,
+            'price_cycle': price_cycle,
+            'entry_log': pre_insert_log,
+            'pattern_validator_log': None,
+            'our_status': 'validating',
+            'followed_at': block_timestamp,
+            'higest_price_reached': our_entry_price,
+        })
         
         step_logger.end(
             insert_token,
@@ -722,6 +702,15 @@ def update_validation_result(
             fresh_price = get_current_market_price()
             followed_at = datetime.now(timezone.utc).isoformat()
         
+        pg_fields = {
+            'pattern_validator_log': pattern_validator_log_json,
+            'our_status': new_status,
+        }
+        if followed_at:
+            pg_fields['followed_at'] = followed_at
+        if fresh_price is not None:
+            pg_fields['our_entry_price'] = fresh_price
+        
         # Update master2.py's local DuckDB via write queue
         if new_status == 'pending' and fresh_price:
             duckdb_execute_write("central", """
@@ -741,6 +730,8 @@ def update_validation_result(
                 SET pattern_validator_log = ?, our_status = ?
                 WHERE id = ?
             """, [pattern_validator_log_json, new_status, buyin_id])
+        
+        _pg_update_buyin(buyin_id, pg_fields)
         
         step_logger.end(
             update_token,
@@ -770,6 +761,7 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
             SET entry_log = ?
             WHERE id = ?
         """, [final_log_json, buyin_id])
+        _pg_update_buyin(buyin_id, {'entry_log': final_log_json})
         
     except Exception as e:
         logger.error(f"Error updating entry log for buy-in #{buyin_id}: {e}")
@@ -799,12 +791,21 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
                 SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
                 WHERE id = ?
             """, [error_log, entry_log, buyin_id])
+            _pg_update_buyin(buyin_id, {
+                'our_status': 'error',
+                'pattern_validator_log': error_log,
+                'entry_log': entry_log,
+            })
         else:
             duckdb_execute_write("central", """
                 UPDATE follow_the_goat_buyins
                 SET our_status = 'error', pattern_validator_log = ?
                 WHERE id = ?
             """, [error_log, buyin_id])
+            _pg_update_buyin(buyin_id, {
+                'our_status': 'error',
+                'pattern_validator_log': error_log,
+            })
         
         logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")
         
@@ -889,6 +890,10 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
                 SET our_status = 'error', pattern_validator_log = ?
                 WHERE id = ?
             """, [error_log, buyin_id])
+            _pg_update_buyin(buyin_id, {
+                'our_status': 'error',
+                'pattern_validator_log': error_log,
+            })
         
         logger.info(f"Cleaned up {len(stuck_ids)} stuck 'validating' trades")
         return len(stuck_ids)

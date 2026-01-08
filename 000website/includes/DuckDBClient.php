@@ -701,4 +701,27 @@ class DuckDBClient {
     public function getJobMetrics(float $hours = 1): ?array {
         return $this->get('/job_metrics', ['hours' => $hours]);
     }
+    
+    // =========================================================================
+    // SQL Tester
+    // =========================================================================
+    
+    /**
+     * Execute custom SQL query (read-only)
+     * 
+     * @param string $sql SQL query to execute (SELECT only)
+     * @return array|null Array with 'success', 'columns', 'rows', 'count' or null on error
+     */
+    public function executeSQL(string $sql): ?array {
+        return $this->post('/query_sql', ['sql' => $sql]);
+    }
+    
+    /**
+     * Get database schema (all tables and columns)
+     * 
+     * @return array|null Array with 'success', 'schema' (table => columns), 'table_count' or null on error
+     */
+    public function getSchema(): ?array {
+        return $this->get('/schema');
+    }
 }

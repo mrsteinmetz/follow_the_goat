@@ -1,18 +1,18 @@
 <?php
 /**
  * Goats (Plays) Page - Follow The Goat Trading Plays
- * Migrated to use DuckDBClient API
+ * Migrated to use DatabaseClient API
  */
 
-// --- Load DuckDB Client ---
-require_once __DIR__ . '/../includes/DuckDBClient.php';
+// --- Load Database Client ---
+require_once __DIR__ . '/../includes/DatabaseClient.php';
 
 // --- Base URL for v2 template ---
 $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
 $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . dirname(dirname($_SERVER['SCRIPT_NAME']));
 
 // --- Initialize API Client ---
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 
 $plays_data = [];
 $error_message = '';

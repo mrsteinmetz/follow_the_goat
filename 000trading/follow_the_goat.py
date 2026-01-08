@@ -54,7 +54,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, duckdb_insert, duckdb_update, get_trading_engine, duckdb_execute_write
+from core.database import get_postgres, postgres_insert, postgres_update, postgres_execute
 
 # Import our modules (direct imports after adding module dir to path)
 from trail_generator import generate_trail_payload, TrailError
@@ -493,7 +493,7 @@ class WalletFollower:
             cache_json = json.dumps(cache_data)
             
             # Update in DuckDB only (no MySQL writes) via write queue
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_plays
                 SET cashe_wallets_settings = ?
                 WHERE id = ?
@@ -865,7 +865,7 @@ class WalletFollower:
             # DuckDB upsert via write queue
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 INSERT INTO follow_the_goat_tracking 
                 (wallet_address, last_trade_id, last_checked_at)
                 VALUES (?, ?, ?)
@@ -999,9 +999,9 @@ class WalletFollower:
     def get_current_price_cycle(self, at_timestamp: Optional[datetime] = None) -> Optional[int]:
         """Get price cycle ID for a specific timestamp.
         
-        CRITICAL: Uses master2.py's local DuckDB (via get_duckdb("central")) 
+        CRITICAL: Uses master2.py's local DuckDB (via get_postgres()) 
         since cycles are computed locally by create_price_cycles.py in master2.py.
-        In master2.py context, get_duckdb("central") returns the registered local DuckDB.
+        In master2.py context, get_postgres() returns the registered local DuckDB.
         """
         if at_timestamp is None:
             at_timestamp = datetime.now(timezone.utc)
@@ -1009,7 +1009,7 @@ class WalletFollower:
         timestamp_str = at_timestamp.strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            # CRITICAL: Use get_duckdb("central") which returns master2.py's local DuckDB
+            # CRITICAL: Use get_postgres() which returns master2.py's local DuckDB
             # when running in master2.py context. Cycles are computed there by create_price_cycles.py
             with get_duckdb("central", read_only=True) as cursor:
                 result = cursor.execute("""
@@ -1211,7 +1211,7 @@ class WalletFollower:
                 logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
             else:
                 # Fallback to file-based DuckDB via write queue
-                duckdb_execute_write("central", """
+                postgres_execute("""
                     INSERT INTO follow_the_goat_buyins (
                         id, play_id, wallet_address, original_trade_id, trade_signature,
                         block_timestamp, quote_amount, base_amount, price, direction,
@@ -1311,7 +1311,7 @@ class WalletFollower:
             update_data['followed_at'] = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            duckdb_update(
+            postgres_update(
                 'follow_the_goat_buyins',
                 update_data,
                 {'id': buyin_id}
@@ -1328,7 +1328,7 @@ class WalletFollower:
             })
             
             entry_log = json.dumps(step_logger.to_json())
-            duckdb_update(
+            postgres_update(
                 'follow_the_goat_buyins',
                 {'entry_log': entry_log},
                 {'id': buyin_id}

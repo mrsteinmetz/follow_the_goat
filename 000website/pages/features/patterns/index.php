@@ -6,11 +6,11 @@
  * Uses DuckDB API for data operations (dual-writes to MySQL + DuckDB)
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -28,7 +28,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $project_description = trim($_POST['project_description'] ?? '');
         
         if (!empty($project_name)) {
-            $result = $duckdb->createPatternProject($project_name, $project_description ?: null);
+            $result = $db->createPatternProject($project_name, $project_description ?: null);
             if ($result && isset($result['success']) && $result['success']) {
                 $success_message = "Project '{$project_name}' created successfully!";
             } else {
@@ -40,7 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif ($action === 'delete_project') {
         $project_id = (int) ($_POST['project_id'] ?? 0);
         if ($project_id > 0) {
-            $result = $duckdb->deletePatternProject($project_id);
+            $result = $db->deletePatternProject($project_id);
             if ($result && isset($result['success']) && $result['success']) {
                 $success_message = 'Project deleted successfully.';
             } else {
@@ -65,12 +65,12 @@ if (isset($_GET['msg'])) {
 
 // Fetch all projects
 if ($use_duckdb) {
-    $response = $duckdb->getPatternProjects();
+    $response = $db->getPatternProjects();
     if ($response && isset($response['projects'])) {
         $projects = $response['projects'];
     }
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // --- Page Styles ---

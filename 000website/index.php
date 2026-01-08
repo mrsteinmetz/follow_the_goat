@@ -3,20 +3,20 @@
  * SOL Price Dashboard - Candlestick Chart with Price Cycles
  * Migrated from: 000old_code/solana_node/v2/index.php
  * 
- * This page displays the 24-hour SOL price chart using DuckDB data
+ * This page displays the 24-hour SOL price chart using PostgreSQL data
  * and shows price cycle analysis with configurable thresholds.
  */
 
 // Set timezone to UTC - all database timestamps are stored in UTC
 date_default_timezone_set('UTC');
 
-// --- DuckDB API Client ---
+// --- Database API Client ---
 // Port 5051 = Website API (can restart freely)
-// Port 5050 = Data Engine API (master.py, never restart)
-require_once __DIR__ . '/includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// Port 5052 = Trading Logic API (master2.py local API)
+require_once __DIR__ . '/includes/DatabaseClient.php';
+require_once __DIR__ . '/includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';  // Root of 000website
@@ -98,14 +98,14 @@ function aggregateToCandles(array $prices, float $intervalMinutes = 1): array {
 $data_source = "No Data";
 $error_message = null;
 
-if ($use_duckdb) {
-    $data_source = "DuckDB API";
+if ($api_available) {
+    $data_source = "PostgreSQL API";
     
     // DEBUG: Log the API call
     error_log("PRICE DEBUG: Requesting from $start_datetime to $end_datetime");
     
     // Try the 2-hour fallback FIRST (since we know data only goes back ~2 hours)
-    $price_response = $duckdb->getPricePoints($token, $fallback_start_datetime, $end_datetime);
+    $price_response = $db->getPricePoints($token, $fallback_start_datetime, $end_datetime);
     error_log("PRICE DEBUG: Fallback response - count=" . ($price_response['count'] ?? 'N/A') . ", total=" . ($price_response['total_available'] ?? 'N/A'));
     
     if ($price_response && isset($price_response['prices']) && count($price_response['prices']) > 0) {
@@ -115,13 +115,13 @@ if ($use_duckdb) {
     } else {
         // If fallback failed, try 24h (shouldn't happen, but for completeness)
         error_log("PRICE DEBUG: Fallback empty, trying 24h range");
-        $price_response = $duckdb->getPricePoints($token, $start_datetime, $end_datetime);
+        $price_response = $db->getPricePoints($token, $start_datetime, $end_datetime);
         if ($price_response && isset($price_response['prices'])) {
             $chart_data['prices'] = $price_response['prices'];
         }
     }
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // Aggregate prices into OHLC candles based on selected interval
@@ -133,9 +133,9 @@ $selected_cycle = null;
 $cycle_start_times = [];
 $all_cycles_for_display = []; // All cycles for initial display (not filtered by increase)
 
-if ($use_duckdb) {
+if ($api_available) {
     // Get cycle tracker data from API
-    $cycle_response = $duckdb->getCycleTracker($threshold, '24', 100);
+    $cycle_response = $db->getCycleTracker($threshold, '24', 100);
     
     if ($cycle_response && isset($cycle_response['cycles'])) {
         // Filter cycles: only show COMPLETED cycles (cycle_end_time IS NOT NULL) that meet the filters
@@ -176,7 +176,7 @@ if ($use_duckdb) {
         
         // If not found in filtered data, fetch it directly
         if (!$selected_cycle) {
-            $all_cycles = $duckdb->getCycleTracker(null, 'all', 1000);
+            $all_cycles = $db->getCycleTracker(null, 'all', 1000);
             if ($all_cycles && isset($all_cycles['cycles'])) {
                 foreach ($all_cycles['cycles'] as $cycle) {
                     if ($cycle['id'] == $price_cycle_id) {
@@ -198,23 +198,23 @@ if ($use_duckdb) {
 
 // --- Status Data ---
 $status_data = [
-    'api_status' => $use_duckdb ? 'connected' : 'disconnected',
+    'api_status' => $api_available ? 'connected' : 'disconnected',
     'last_price_time' => null,
     'price_count' => count($chart_data['prices']),
     'active_cycle' => null,
     'price_analysis' => null,
 ];
 
-if ($use_duckdb && !empty($chart_data['prices'])) {
+if ($api_available && !empty($chart_data['prices'])) {
     $last_price = end($chart_data['prices']);
     $status_data['last_price_time'] = $last_price['x'];
 }
 
 // Get latest price analysis time and active cycle
 // Optimize: Reuse cycle data if threshold is 0.3, otherwise fetch separately
-if ($use_duckdb) {
+if ($api_available) {
     // Get price analysis (lightweight query)
-    $analysis_response = $duckdb->getPriceAnalysis(5, '1', 1);
+    $analysis_response = $db->getPriceAnalysis(5, '1', 1);
     if ($analysis_response && isset($analysis_response['price_analysis']) && !empty($analysis_response['price_analysis'])) {
         $status_data['price_analysis'] = $analysis_response['price_analysis'][0]['created_at'] ?? null;
     }
@@ -225,7 +225,7 @@ if ($use_duckdb) {
         $status_data['active_cycle'] = $cycle_response['cycles'][0]['cycle_start_time'] ?? null;
     } else {
         // Only fetch if threshold is different
-        $active_cycle_response = $duckdb->getCycleTracker(0.3, '24', 1);
+        $active_cycle_response = $db->getCycleTracker(0.3, '24', 1);
         if ($active_cycle_response && isset($active_cycle_response['cycles']) && !empty($active_cycle_response['cycles'])) {
             $status_data['active_cycle'] = $active_cycle_response['cycles'][0]['cycle_start_time'] ?? null;
         }
@@ -235,8 +235,8 @@ if ($use_duckdb) {
 // --- Scheduler Status Data ---
 $scheduler_status = null;
 $scheduler_jobs = [];
-if ($use_duckdb) {
-    $scheduler_status = $duckdb->getSchedulerStatus();
+if ($api_available) {
+    $scheduler_status = $db->getSchedulerStatus();
     if ($scheduler_status && isset($scheduler_status['jobs'])) {
         // Convert object to array if needed, and ensure it's not empty
         $jobs = $scheduler_status['jobs'];
@@ -456,7 +456,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                     <!-- End::page-header -->
 
                     <!-- Data Source Badge -->
-                    <div class="data-source-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+                    <div class="data-source-badge" style="background: <?php echo $api_available ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
                         🦆 <?php echo $data_source; ?>
                     </div>
 
@@ -525,9 +525,9 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
 
                     <!-- Start:: Status Buttons -->
                     <div class="status-grid mb-3">
-                        <div id="apiStatusBtn" class="status-btn <?php echo $use_duckdb ? 'status-good' : 'status-bad'; ?>">
+                        <div id="apiStatusBtn" class="status-btn <?php echo $api_available ? 'status-good' : 'status-bad'; ?>">
                             <div class="status-title">API Status</div>
-                            <div class="status-info"><?php echo $use_duckdb ? 'Connected' : 'Disconnected'; ?></div>
+                            <div class="status-info"><?php echo $api_available ? 'Connected' : 'Disconnected'; ?></div>
                         </div>
                         <div id="priceDataBtn" class="status-btn <?php echo count($chart_data['prices']) > 0 ? 'status-good' : 'status-warning'; ?>">
                             <div class="status-title">Price Data</div>
@@ -797,7 +797,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                                     <div>
                                         <h6 class="mb-0">No Cycles Found</h6>
                                         <p class="mb-0">No completed price cycles found with ><?php echo htmlspecialchars($increase); ?>% increase for threshold <?php echo htmlspecialchars($threshold); ?>% in the last 24 hours.</p>
-                                        <?php if (!$use_duckdb): ?>
+                                        <?php if (!$api_available): ?>
                                         <p class="mb-0 mt-2"><strong>Tip:</strong> Make sure the scheduler is running: <code>python scheduler/master.py</code></p>
                                         <?php endif; ?>
                                     </div>
@@ -1290,7 +1290,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
              */
             async function refreshSchedulerStatus() {
                 try {
-                    const response = await fetch('<?php echo DUCKDB_API_URL; ?>/scheduler_status');
+                    const response = await fetch('<?php echo DATABASE_API_URL; ?>/scheduler_status');
                     if (!response.ok) {
                         console.error('Scheduler status API returned:', response.status, response.statusText);
                         return;

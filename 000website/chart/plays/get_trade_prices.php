@@ -12,9 +12,9 @@
 header('Content-Type: application/json');
 
 // Load DuckDB Client
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
 
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 
 // Validate API availability
 if (!$client->isAvailable()) {

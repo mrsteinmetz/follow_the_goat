@@ -54,7 +54,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, duckdb_execute_write
+from core.database import get_postgres, postgres_execute
 
 # =============================================================================
 # CONFIGURATION
@@ -193,14 +193,16 @@ class TrailingStopSeller:
             Current SOL price as float, or None if not found.
         """
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
+            with get_postgres() as conn:
+        with conn.cursor() as cursor:
+                cursor.execute("""
                     SELECT value as price, created_at, id
                     FROM price_points 
                     WHERE coin_id = 5
                     ORDER BY id DESC 
                     LIMIT 1
-                """).fetchone()
+                """)
+                result = cursor.fetchone()
                 
                 if result:
                     price = float(result[0])
@@ -217,7 +219,8 @@ class TrailingStopSeller:
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """Get all open positions that we're tracking (matching live_trade mode)."""
         try:
-            with get_duckdb("central", read_only=True) as cursor:
+            with get_postgres() as conn:
+        with conn.cursor() as cursor:
                 # Build query depending on monitoring filter
                 base_sql = """
                     SELECT 
@@ -246,7 +249,8 @@ class TrailingStopSeller:
                 
                 base_sql += " ORDER BY followed_at ASC"
                 
-                result = cursor.execute(base_sql).fetchall()
+                cursor.execute(base_sql)
+                result = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
                 
                 positions = [dict(zip(columns, row)) for row in result]
@@ -271,13 +275,15 @@ class TrailingStopSeller:
         
         # Cache miss or expired - fetch from database
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
+            with get_postgres() as conn:
+        with conn.cursor() as cursor:
+                cursor.execute("""
                     SELECT sell_logic
                     FROM follow_the_goat_plays
                     WHERE id = ?
                     LIMIT 1
-                """, [play_id]).fetchone()
+                """, [play_id])
+                result = cursor.fetchone()
                 
                 logic = None
                 if result and result[0]:
@@ -641,7 +647,7 @@ class TrailingStopSeller:
             ])
             ids_str = ", ".join(str(pid) for pid in position_ids)
             
-            duckdb_execute_write("central", f"""
+            postgres_execute(f"""
                 UPDATE follow_the_goat_buyins
                 SET current_price = CASE {case_clauses} END
                 WHERE id IN ({ids_str})
@@ -698,7 +704,7 @@ class TrailingStopSeller:
             
             # DuckDB-only insert for price_checks (MySQL synced on sell)
             try:
-                duckdb_execute_write("central", """
+                postgres_execute("""
                     INSERT INTO follow_the_goat_buyins_price_checks (
                         buyin_id, checked_at, current_price, entry_price, highest_price,
                         reference_price, gain_from_entry, drop_from_high, drop_from_entry,
@@ -752,7 +758,7 @@ class TrailingStopSeller:
             
             # Update DuckDB with sold status (no MySQL - all data in DuckDB)
             try:
-                duckdb_execute_write("central", """
+                postgres_execute("""
                     UPDATE follow_the_goat_buyins 
                     SET our_exit_price = ?,
                         our_exit_timestamp = ?,

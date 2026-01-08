@@ -37,7 +37,7 @@ class PostgresSettings:
     host: str = "127.0.0.1"
     user: str = "ftg_user"
     password: str = ""  # Set via DB_PASSWORD env var
-    database: str = "follow_the_goat_archive"
+    database: str = "solcatcher"
     port: int = 5432
     
     @classmethod
@@ -47,7 +47,7 @@ class PostgresSettings:
             host=os.getenv("DB_HOST", "127.0.0.1"),
             user=os.getenv("DB_USER", "ftg_user"),
             password=os.getenv("DB_PASSWORD", ""),
-            database=os.getenv("DB_DATABASE", "follow_the_goat_archive"),
+            database=os.getenv("DB_DATABASE", "solcatcher"),
             port=int(os.getenv("DB_PORT", "5432")),
         )
 

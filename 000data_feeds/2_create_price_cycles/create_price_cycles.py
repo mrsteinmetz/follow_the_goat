@@ -1,15 +1,15 @@
 """
-Price Cycle Analysis - Using TradingDataEngine (In-Memory DuckDB)
-=================================================================
+Price Cycle Analysis - PostgreSQL Only
+========================================
 Migrated from: 000old_code/solana_node/analyze/00price_analysis/price_analysis_simple.py
 
-Reads price data from TradingDataEngine and tracks price cycles at multiple 
-thresholds, writing results back to the TradingDataEngine.
+Reads price data from PostgreSQL and tracks price cycles at multiple 
+thresholds, writing results back to PostgreSQL.
 
 ARCHITECTURE:
-- ALL reads/writes go through TradingDataEngine (in-memory DuckDB)
-- Data is persisted to PostgreSQL via TradingDataEngine's sync mechanism
-- NO file-based DuckDB is used
+- ALL reads/writes go directly to PostgreSQL
+- No in-memory database or caching layer
+- Simple, reliable, persistent
 
 Thresholds: 0.2%, 0.25%, 0.3%, 0.35%, 0.4%, 0.45%, 0.5%
 Coin: SOL only (coin_id = 5)
@@ -30,45 +30,11 @@ import logging
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb, duckdb_execute_write
+from core.database import get_postgres, postgres_execute, postgres_query
 from core.config import settings
 
 # Configure logging
 logger = logging.getLogger("price_cycles")
-
-# Global reference to TradingDataEngine (set by master.py)
-_global_engine = None
-
-def set_engine(engine):
-    """Set the global TradingDataEngine for price cycles processing."""
-    global _global_engine
-    _global_engine = engine
-    logger.info("TradingDataEngine set for price cycles")
-
-def _get_connection(read_only=True):
-    """
-    Get a database connection for reads/writes.
-    
-    Uses TradingDataEngine (in-memory) when available (running under master.py),
-    otherwise falls back to get_duckdb("central").
-    """
-    global _global_engine
-    if _global_engine and hasattr(_global_engine, 'get_connection'):
-        return _global_engine.get_connection()
-    return get_duckdb("central", read_only=read_only)
-
-def _execute_write(sql: str, params: list):
-    """
-    Execute a write operation to TradingDataEngine (in-memory DuckDB).
-    
-    Uses the engine's execute() method for thread-safe writes.
-    """
-    global _global_engine
-    if _global_engine and hasattr(_global_engine, 'execute'):
-        _global_engine.execute(sql, params)
-    else:
-        # Fallback to the centralized write queue for thread safety
-        duckdb_execute_write("central", sql, params, sync=True)
 
 # --- Configuration ---
 THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
@@ -77,7 +43,7 @@ BATCH_SIZE = 100  # Process up to 100 price points per run
 
 
 # =============================================================================
-# Data Access Functions (Using DuckDB connection pool)
+# Data Access Functions (Using PostgreSQL)
 # =============================================================================
 
 def get_last_processed_price_point_id() -> tuple[Optional[int], int]:
@@ -91,27 +57,30 @@ def get_last_processed_price_point_id() -> tuple[Optional[int], int]:
     thresholds_with_data = 0
     last_id = None
     try:
-        with _get_connection(read_only=True) as conn:
-            result = conn.execute("""
-                SELECT COUNT(DISTINCT percent_threshold) 
-                FROM price_analysis 
-                WHERE coin_id = ?
-            """, [COIN_ID]).fetchone()
-            thresholds_with_data = result[0] if result else 0
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT COUNT(DISTINCT percent_threshold) 
+                    FROM price_analysis 
+                    WHERE coin_id = %s
+                """, [COIN_ID])
+                result = cursor.fetchone()
+                thresholds_with_data = result['count'] if result else 0
 
-            # If any threshold has no data, force a fresh start (recent window)
-            if thresholds_with_data < len(THRESHOLDS):
-                return None, thresholds_with_data
+                # If any threshold has no data, force a fresh start (recent window)
+                if thresholds_with_data < len(THRESHOLDS):
+                    return None, thresholds_with_data
 
-            result = conn.execute("""
-                SELECT MIN(max_price_point_id) FROM (
-                    SELECT MAX(price_point_id) AS max_price_point_id
-                    FROM price_analysis
-                    WHERE coin_id = ?
-                    GROUP BY percent_threshold
-                )
-            """, [COIN_ID]).fetchone()
-            last_id = int(result[0]) if result and result[0] is not None else None
+                cursor.execute("""
+                    SELECT MIN(max_price_point_id) as min_id FROM (
+                        SELECT MAX(price_point_id) AS max_price_point_id
+                        FROM price_analysis
+                        WHERE coin_id = %s
+                        GROUP BY percent_threshold
+                    ) sub
+                """, [COIN_ID])
+                result = cursor.fetchone()
+                last_id = int(result['min_id']) if result and result['min_id'] is not None else None
     except Exception as e:
         logger.debug(f"No previous data found: {e}")
         last_id = None
@@ -120,50 +89,54 @@ def get_last_processed_price_point_id() -> tuple[Optional[int], int]:
 
 
 def get_new_price_points(last_price_point_id: Optional[int], limit: int = BATCH_SIZE) -> List[Dict]:
-    """Get new price points from DuckDB using strictly increasing IDs."""
+    """Get new price points from PostgreSQL using strictly increasing IDs."""
     try:
-        with _get_connection(read_only=True) as conn:
-            if last_price_point_id is not None:
-                # Continue from the last processed ID
-                results = conn.execute("""
-                    SELECT id, ts, token, price
-                    FROM prices
-                    WHERE token = 'SOL' AND id > ?
-                    ORDER BY id ASC
-                    LIMIT ?
-                """, [last_price_point_id, limit]).fetchall()
-            else:
-                # FRESH START: Process recent data window to avoid blocking on startup
-                logger.info("Fresh start detected - processing recent price data (last 24 hours)")
-                results = conn.execute("""
-                    SELECT id, ts, token, price
-                    FROM prices
-                    WHERE token = 'SOL' AND ts >= NOW() - INTERVAL 24 HOUR
-                    ORDER BY id ASC
-                    LIMIT ?
-                """, [limit]).fetchall()
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                if last_price_point_id is not None:
+                    # Continue from the last processed ID
+                    cursor.execute("""
+                        SELECT id, timestamp as ts, token, price
+                        FROM prices
+                        WHERE token = 'SOL' AND id > %s
+                        ORDER BY id ASC
+                        LIMIT %s
+                    """, [last_price_point_id, limit])
+                else:
+                    # FRESH START: Process recent data window to avoid blocking on startup
+                    logger.info("Fresh start detected - processing recent price data (last 24 hours)")
+                    cursor.execute("""
+                        SELECT id, timestamp as ts, token, price
+                        FROM prices
+                        WHERE token = 'SOL' AND timestamp >= NOW() - INTERVAL '24 hours'
+                        ORDER BY id ASC
+                        LIMIT %s
+                    """, [limit])
 
-            return [
-                {'id': row[0], 'ts': row[1], 'token': row[2], 'price': float(row[3])}
-                for row in results
-            ]
+                results = cursor.fetchall()
+                return [
+                    {'id': row['id'], 'ts': row['ts'], 'token': row['token'], 'price': float(row['price'])}
+                    for row in results
+                ]
     except Exception as e:
         logger.error(f"Failed to get price points: {e}")
         return []
 
 
 def get_current_price() -> Optional[float]:
-    """Get the current SOL price from DuckDB."""
+    """Get the current SOL price from PostgreSQL."""
     try:
-        with _get_connection(read_only=True) as conn:
-            result = conn.execute("""
-                SELECT price, ts
-                FROM prices
-                WHERE token = 'SOL'
-                ORDER BY ts DESC
-                LIMIT 1
-            """).fetchone()
-            return float(result[0]) if result and result[0] else None
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT price, timestamp
+                    FROM prices
+                    WHERE token = 'SOL'
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                return float(result['price']) if result and result['price'] else None
     except Exception as e:
         logger.debug(f"Failed to get current price: {e}")
         return None
@@ -178,13 +151,13 @@ def get_threshold_states() -> Dict[float, Dict]:
     """
     states = {}
     try:
-        with _get_connection(read_only=True) as conn:
+        with get_postgres() as conn:
             for threshold in THRESHOLDS:
                 # STEP 1: Get the active cycle ID for this threshold
                 cycle_result = conn.execute("""
                     SELECT id, sequence_start_id, sequence_start_price
                     FROM cycle_tracker
-                    WHERE coin_id = ? AND threshold = ? AND cycle_end_time IS NULL
+                    WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
                     ORDER BY cycle_start_time DESC
                     LIMIT 1
                 """, [COIN_ID, threshold]).fetchone()
@@ -204,7 +177,7 @@ def get_threshold_states() -> Dict[float, Dict]:
                         highest_price_recorded,
                         lowest_price_recorded
                     FROM price_analysis 
-                    WHERE price_cycle = ? AND coin_id = ?
+                    WHERE price_cycle = %s AND coin_id = %s
                     ORDER BY id DESC
                     LIMIT 1
                 """, [active_cycle_id, COIN_ID]).fetchone()
@@ -218,7 +191,7 @@ def get_threshold_states() -> Dict[float, Dict]:
                     cycle_tracker_result = conn.execute("""
                         SELECT highest_price_reached, lowest_price_reached
                         FROM cycle_tracker
-                        WHERE id = ?
+                        WHERE id = %s
                     """, [active_cycle_id]).fetchone()
                     
                     if cycle_tracker_result:
@@ -252,10 +225,12 @@ def get_next_cycle_id() -> int:
     max_id = 0
     
     try:
-        with _get_connection(read_only=True) as conn:
-            result = conn.execute("SELECT MAX(id) as max_id FROM cycle_tracker").fetchone()
-            if result and result[0]:
-                max_id = result[0]
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT MAX(id) as max_id FROM cycle_tracker")
+                result = cursor.fetchone()
+                if result and result['max_id']:
+                    max_id = result['max_id']
     except:
         pass
     
@@ -267,10 +242,12 @@ def get_next_analysis_id() -> int:
     max_id = 0
     
     try:
-        with _get_connection(read_only=True) as conn:
-            result = conn.execute("SELECT MAX(id) as max_id FROM price_analysis").fetchone()
-            if result and result[0]:
-                max_id = result[0]
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT MAX(id) as max_id FROM price_analysis")
+                result = cursor.fetchone()
+                if result and result['max_id']:
+                    max_id = result['max_id']
     except:
         pass
     
@@ -280,10 +257,10 @@ def get_next_analysis_id() -> int:
 def get_active_cycle_for_threshold(threshold: float) -> Optional[int]:
     """Get the active cycle ID for a threshold (if any)."""
     try:
-        with _get_connection(read_only=True) as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT id FROM cycle_tracker
-                WHERE coin_id = ? AND threshold = ? AND cycle_end_time IS NULL
+                WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
                 ORDER BY cycle_start_time DESC
                 LIMIT 1
             """, [COIN_ID, threshold]).fetchone()
@@ -295,10 +272,10 @@ def get_active_cycle_for_threshold(threshold: float) -> Optional[int]:
 def close_all_active_cycles_for_threshold(threshold: float, end_time: datetime):
     """Close ALL active cycles for a threshold (cleanup duplicates)."""
     try:
-        _execute_write("""
+        postgres_execute("""
             UPDATE cycle_tracker 
             SET cycle_end_time = ?
-            WHERE coin_id = ? AND threshold = ? AND cycle_end_time IS NULL
+            WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
         """, [end_time, COIN_ID, threshold])
     except Exception as e:
         logger.debug(f"Failed to close active cycles for {threshold}%: {e}")
@@ -333,7 +310,7 @@ def create_new_cycle(
     cycle_id = get_next_cycle_id()
     
     try:
-        _execute_write("""
+        postgres_execute("""
             INSERT INTO cycle_tracker (
                 id, coin_id, threshold, cycle_start_time, cycle_end_time,
                 sequence_start_id, sequence_start_price, highest_price_reached,
@@ -359,9 +336,9 @@ def close_cycle(cycle_id: int, end_time: datetime):
     try:
         # CRITICAL VALIDATION: Prevent closing cycles with end_time < start_time
         # This was causing data corruption during initialization
-        with _get_connection(read_only=True) as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
-                SELECT cycle_start_time FROM cycle_tracker WHERE id = ?
+                SELECT cycle_start_time FROM cycle_tracker WHERE id = %s
             """, [cycle_id]).fetchone()
             
             if result:
@@ -370,8 +347,8 @@ def close_cycle(cycle_id: int, end_time: datetime):
                     logger.error(f"PREVENTED DATA CORRUPTION: Cycle #{cycle_id} end_time ({end_time}) < start_time ({start_time})")
                     return
         
-        _execute_write("""
-            UPDATE cycle_tracker SET cycle_end_time = ? WHERE id = ?
+        postgres_execute("""
+            UPDATE cycle_tracker SET cycle_end_time = ? WHERE id = %s
         """, [end_time, cycle_id])
         logger.debug(f"Closed cycle #{cycle_id}")
     except Exception as e:
@@ -387,14 +364,14 @@ def update_cycle_stats(
 ):
     """Update cycle statistics."""
     try:
-        _execute_write("""
+        postgres_execute("""
             UPDATE cycle_tracker SET
                 total_data_points = total_data_points + 1,
                 highest_price_reached = GREATEST(highest_price_reached, ?),
                 lowest_price_reached = LEAST(lowest_price_reached, ?),
                 max_percent_increase = GREATEST(max_percent_increase, ?),
                 max_percent_increase_from_lowest = GREATEST(max_percent_increase_from_lowest, ?)
-            WHERE id = ?
+            WHERE id = %s
         """, [highest_price, lowest_price, max_increase, max_from_lowest, cycle_id])
     except Exception as e:
         logger.debug(f"Cycle stats update skipped: {e}")
@@ -474,7 +451,7 @@ def insert_price_analysis_batch(records: List[tuple]) -> bool:
                 conn.unregister('_temp_price_analysis')
         else:
             # Fallback for standalone testing - use get_duckdb
-            with get_duckdb("central", read_only=False) as conn:
+            with get_postgres() as conn:
                 # Note: EngineConnectionWrapper may not support .register()
                 # Use individual inserts instead
                 for record in records:
@@ -495,7 +472,7 @@ def insert_price_analysis_batch(records: List[tuple]) -> bool:
         logger.warning("PyArrow not available, falling back to slower executemany()")
         try:
             for record in records:
-                _execute_write("""
+                postgres_execute("""
                     INSERT INTO price_analysis (
                         id, coin_id, price_point_id, sequence_start_id, sequence_start_price,
                         current_price, percent_threshold, percent_increase, highest_price_recorded,
@@ -676,7 +653,7 @@ def ensure_all_cycles_exist():
     # This ensures we have a valid reference point
     sequence_start_id = 1  # Default fallback
     try:
-        with _get_connection(read_only=True) as conn:
+        with get_postgres() as conn:
             # Use the latest ID from the prices table to align with processing cursor
             result = conn.execute("""
                 SELECT MAX(id) as max_id FROM prices WHERE token = 'SOL'
@@ -717,7 +694,7 @@ def cleanup_corrupted_cycles():
     """
     try:
         # First, count how many corrupted cycles exist
-        with _get_connection(read_only=True) as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT COUNT(*) FROM cycle_tracker
                 WHERE cycle_end_time IS NOT NULL
@@ -729,7 +706,7 @@ def cleanup_corrupted_cycles():
         if corrupted_count > 0:
             logger.warning(f"Found {corrupted_count} corrupted cycles (end_time < start_time) - deleting...")
             
-            _execute_write("""
+            postgres_execute("""
                 DELETE FROM cycle_tracker
                 WHERE cycle_end_time IS NOT NULL
                 AND cycle_end_time < cycle_start_time
@@ -757,11 +734,11 @@ def cleanup_duplicate_active_cycles():
         
         for threshold in thresholds:
             # Get all active cycles for this threshold
-            with _get_connection(read_only=True) as conn:
+            with get_postgres() as conn:
                 result = conn.execute("""
                     SELECT id, total_data_points, cycle_start_time
                     FROM cycle_tracker
-                    WHERE threshold = ? AND cycle_end_time IS NULL
+                    WHERE threshold = %s AND cycle_end_time IS NULL
                     ORDER BY total_data_points DESC, id ASC
                 """, [threshold]).fetchall()
             
@@ -775,10 +752,10 @@ def cleanup_duplicate_active_cycles():
                     start_time = row[2]
                     
                     # Close with the same start_time (it never really processed any data)
-                    _execute_write("""
+                    postgres_execute("""
                         UPDATE cycle_tracker
                         SET cycle_end_time = ?
-                        WHERE id = ?
+                        WHERE id = %s
                     """, [start_time, cycle_id])
                     
                     logger.info(f"  Closed duplicate cycle #{cycle_id} for threshold {threshold}%")

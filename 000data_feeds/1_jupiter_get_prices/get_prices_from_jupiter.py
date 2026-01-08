@@ -40,12 +40,11 @@ except ImportError:
 
 import requests
 import time
-import duckdb
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 
-from core.database import get_duckdb, get_trading_engine
+from core.database import get_postgres
 from core.config import settings
 
 # Configure logging
@@ -94,7 +93,7 @@ _backoff_seconds = 0
 _consecutive_errors = 0
 
 
-def init_legacy_database(con: duckdb.DuckDBPyConnection) -> None:
+def init_legacy_database(con) -> None:
     """Initialize DuckDB hot table (24hr fast storage).
     
     Uses the standard schema: id, ts_idx, coin_id, value, created_at
@@ -331,44 +330,29 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
     if not records:
         return 0, False, False
     
+    # Write directly to PostgreSQL (PostgreSQL-only architecture)
+    # According to .cursorrules, we use PostgreSQL only - no DuckDB/TradingDataEngine
     duckdb_success = False
     mysql_success = False
     
-    # HOT PATH: Write ONLY to TradingDataEngine (in-memory, instant)
-    # The engine handles background MySQL sync automatically
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            for ts_val, token, price in records:
-                engine.write('prices', {
-                    'ts': ts_val,
-                    'token': token,
-                    'price': price
-                })
+        from core.database import postgres_insert_many
+        price_records = [
+            {
+                'timestamp': ts_val,
+                'token': token,
+                'price': price,
+                'source': 'jupiter'
+            }
+            for ts_val, token, price in records
+        ]
+        inserted = postgres_insert_many('prices', price_records)
+        if inserted > 0:
             duckdb_success = True
-            mysql_success = True  # Engine handles MySQL sync in background
-            return len(records), duckdb_success, mysql_success
+            mysql_success = True
+            logger.debug(f"Wrote {inserted} prices directly to PostgreSQL")
     except Exception as e:
-        logger.debug(f"Engine write skipped: {e}")
-    
-    # FALLBACK: If engine not available, write to file-based DuckDB
-    # This path should rarely be hit when scheduler is running
-    if not duckdb_success:
-        try:
-            with get_duckdb("central") as conn:
-                conn.execute("CREATE TABLE IF NOT EXISTS price_points (id BIGINT PRIMARY KEY, ts_idx BIGINT, value DOUBLE, created_at TIMESTAMP, coin_id INTEGER)")
-                base_id = int(ts.timestamp() * 1000000)
-                for i, (ts_val, token, price) in enumerate(records):
-                    ts_idx = int(ts_val.timestamp() * 1000)
-                    coin_id = 5 if token == 'SOL' else (6 if token == 'BTC' else 7)
-                    unique_id = base_id + (coin_id * 100) + i
-                    conn.execute(
-                        "INSERT OR IGNORE INTO price_points (id, ts_idx, value, created_at, coin_id) VALUES (?, ?, ?, ?, ?)",
-                        [unique_id, ts_idx, price, ts_val, coin_id]
-                    )
-                duckdb_success = True
-        except Exception as e:
-            logger.error(f"Central DuckDB write error: {e}")
+        logger.error(f"PostgreSQL write error: {e}", exc_info=True)
     
     return len(records), duckdb_success, mysql_success
 

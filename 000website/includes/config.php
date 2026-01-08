@@ -11,11 +11,14 @@
 // Default to localhost for Windows-only setups
 define('WSL_HOST_IP', getenv('WSL_HOST_IP') ?: '172.19.254.84');
 
-// DuckDB API URL (Flask server running in WSL or Windows)
+// PostgreSQL API URL (Flask website_api.py server)
 // Use 127.0.0.1 for fastest local connections
 // Port 5051 = Website API (can restart freely)
-// Port 5050 = Data Engine API (master.py, never restart)
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
+// Port 5052 = Trading Logic API (master2.py local API)
+define('DATABASE_API_URL', 'http://127.0.0.1:5051');
+
+// Legacy alias for backward compatibility
+define('DUCKDB_API_URL', DATABASE_API_URL);
 
 // .NET Webhook API URL (running on Windows IIS)
 define('WEBHOOK_API_URL', 'http://195.201.84.5');

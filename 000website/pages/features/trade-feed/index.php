@@ -6,11 +6,11 @@
  * Highlights trades from wallets tracked by active plays.
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -36,14 +36,14 @@ $total_in_window = 0;
 $sync_diagnostic = null;
 if ($use_duckdb) {
     // Get recent trades (always 100)
-    $trades_response = $duckdb->getRecentTrades($display_limit, $minutes, 'buy');
+    $trades_response = $db->getRecentTrades($display_limit, $minutes, 'buy');
     if ($trades_response && isset($trades_response['trades'])) {
         $trades = $trades_response['trades'];
         $total_in_window = $trades_response['total_count'] ?? count($trades);
     }
     
     // Get tracked wallets from all active plays
-    $wallets_response = $duckdb->getTrackedWallets();
+    $wallets_response = $db->getTrackedWallets();
     if ($wallets_response && isset($wallets_response['all_wallets'])) {
         // Build a clean lookup - wallet addresses are case-sensitive
         $tracked_wallets = [];
@@ -54,9 +54,9 @@ if ($use_duckdb) {
     }
     
     // Get sync diagnostic to compare data sources
-    $sync_diagnostic = $duckdb->getTradesDiagnostic($minutes);
+    $sync_diagnostic = $db->getTradesDiagnostic($minutes);
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // Build wallet-to-plays lookup (wallet -> list of plays tracking it)
@@ -532,13 +532,13 @@ ob_start();
     <?php if ($sync_diagnostic && isset($sync_diagnostic['sources'])): ?>
     <?php
         $webhook_data = $sync_diagnostic['sources']['webhook_duckdb'] ?? [];
-        $duckdb_data = $sync_diagnostic['sources']['python_duckdb'] ?? [];
+        $db_data = $sync_diagnostic['sources']['python_duckdb'] ?? [];
         $sync_status = $sync_diagnostic['sync_status'] ?? [];
         
         $webhook_count = $webhook_data['last_' . $minutes . 'm'] ?? 0;
-        $duckdb_count = $duckdb_data['last_' . $minutes . 'm'] ?? 0;
+        $db_count = $db_data['last_' . $minutes . 'm'] ?? 0;
         $webhook_time = $webhook_data['response_time_ms'] ?? 0;
-        $duckdb_time = $duckdb_data['query_time_ms'] ?? 0;
+        $db_time = $db_data['query_time_ms'] ?? 0;
         
         $sync_lag = $sync_status['sync_lag'] ?? 0;
         $is_synced = $sync_status['synced'] ?? false;
@@ -553,8 +553,8 @@ ob_start();
                     <?php if ($webhook_ok): ?>
                     Webhook: <strong><?php echo number_format($webhook_count); ?></strong> 
                     <small class="text-muted">(<?php echo round($webhook_time); ?>ms)</small> →
-                    Local: <strong><?php echo number_format($duckdb_count); ?></strong>
-                    <small class="text-muted">(<?php echo round($duckdb_time); ?>ms)</small>
+                    Local: <strong><?php echo number_format($db_count); ?></strong>
+                    <small class="text-muted">(<?php echo round($db_time); ?>ms)</small>
                     <?php else: ?>
                     <span class="text-warning">⚠️ Webhook unavailable - using MySQL fallback (slower)</span>
                     <?php endif; ?>

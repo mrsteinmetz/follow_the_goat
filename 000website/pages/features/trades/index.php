@@ -4,11 +4,11 @@
  * Shows 100 recent trades and links to detail view with 15-minute trail data
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -25,7 +25,7 @@ $has_potential_gains = $_GET['has_potential_gains'] ?? null;
 
 // Fetch trades
 if ($use_duckdb) {
-    $response = $duckdb->getBuyins($play_id, $status, $hours, $limit);
+    $response = $db->getBuyins($play_id, $status, $hours, $limit);
     if ($response && isset($response['buyins'])) {
         $trades = $response['buyins'];
         
@@ -41,13 +41,13 @@ if ($use_duckdb) {
         }
     }
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // Fetch plays for filter dropdown
 $plays = [];
 if ($use_duckdb) {
-    $plays_response = $duckdb->getPlays();
+    $plays_response = $db->getPlays();
     if ($plays_response && isset($plays_response['plays'])) {
         $plays = $plays_response['plays'];
     }

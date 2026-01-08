@@ -6,11 +6,11 @@
  * Shows trade-to-cycle mappings with filtering by threshold and ordering.
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '../..';
@@ -26,15 +26,15 @@ $refresh_interval = isset($_GET['refresh']) ? intval($_GET['refresh']) : 30;
 $available_thresholds = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5];
 
 // --- Fetch Profile Data ---
-function fetchProfileData($duckdb, $threshold, $hours, $limit, $order_by) {
+function fetchProfileData($db, $threshold, $hours, $limit, $order_by) {
     $profiles = [];
     $error_message = null;
     $data_source = "No Data";
     $actual_source = null;
     $aggregated = false;
 
-    if ($duckdb->isAvailable()) {
-        $response = $duckdb->getProfiles($threshold, $hours, $limit, $order_by);
+    if ($db->isAvailable()) {
+        $response = $db->getProfiles($threshold, $hours, $limit, $order_by);
         
         if ($response && isset($response['profiles'])) {
             $profiles = $response['profiles'];
@@ -55,7 +55,7 @@ function fetchProfileData($duckdb, $threshold, $hours, $limit, $order_by) {
             $data_source = "No Data";
         }
     } else {
-        $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+        $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
     }
     
     return [
@@ -68,9 +68,9 @@ function fetchProfileData($duckdb, $threshold, $hours, $limit, $order_by) {
 }
 
 // --- Fetch Statistics ---
-function fetchProfileStats($duckdb, $threshold, $hours) {
-    if ($duckdb->isAvailable()) {
-        $response = $duckdb->getProfilesStats($threshold, $hours);
+function fetchProfileStats($db, $threshold, $hours) {
+    if ($db->isAvailable()) {
+        $response = $db->getProfilesStats($threshold, $hours);
         if ($response && isset($response['stats'])) {
             return $response['stats'];
         }
@@ -81,8 +81,8 @@ function fetchProfileStats($duckdb, $threshold, $hours) {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchProfileData($duckdb, $threshold_filter, $hours, $limit, $order_by);
-    $stats = fetchProfileStats($duckdb, $threshold_filter, $hours);
+    $result = fetchProfileData($db, $threshold_filter, $hours, $limit, $order_by);
+    $stats = fetchProfileStats($db, $threshold_filter, $hours);
     
     echo json_encode([
         'success' => true,
@@ -98,7 +98,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 }
 
 // Regular page load
-$result = fetchProfileData($duckdb, $threshold_filter, $hours, $limit, $order_by);
+$result = fetchProfileData($db, $threshold_filter, $hours, $limit, $order_by);
 $profiles = $result['profiles'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
@@ -106,7 +106,7 @@ $actual_source = $result['actual_source'];
 $aggregated = $result['aggregated'];
 
 // Fetch stats
-$stats = fetchProfileStats($duckdb, $threshold_filter, $hours);
+$stats = fetchProfileStats($db, $threshold_filter, $hours);
 $total_profiles = $stats['total_profiles'] ?? 0;
 $unique_wallets = $stats['unique_wallets'] ?? 0;
 $unique_cycles = $stats['unique_cycles'] ?? 0;

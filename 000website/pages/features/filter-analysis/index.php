@@ -6,11 +6,11 @@
  * Uses DuckDB API for data operations
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -82,9 +82,9 @@ function get_consistency_stars($pct) {
 
 // Fetch data from API
 if (!$use_duckdb) {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 } else {
-    $response = $duckdb->getFilterAnalysisDashboard();
+    $response = $db->getFilterAnalysisDashboard();
     if ($response && isset($response['success']) && $response['success']) {
         $suggestions = $response['suggestions'] ?? [];
         $summary = $response['summary'] ?? [];

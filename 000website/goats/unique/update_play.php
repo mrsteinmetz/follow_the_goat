@@ -1,11 +1,11 @@
 <?php
 /**
  * Update Play API - Handles POST requests to update play settings
- * Migrated to use DuckDBClient API
+ * Migrated to use DatabaseClient API
  */
 
-// --- Load DuckDB Client ---
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
+// --- Load Database Client ---
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
 
 // Only accept POST requests
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -183,7 +183,7 @@ $update_data = [
 ];
 
 // Initialize API client and make request
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 
 if (!$client->isAvailable()) {
     header('Location: index.php?id=' . $play_id . '&error=' . urlencode('API server is not available. Please ensure master.py is running.'));

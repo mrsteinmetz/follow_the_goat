@@ -30,7 +30,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb
+from core.database import get_postgres
 
 # Import trail generator (direct import after adding module dir to path)
 from trail_generator import (
@@ -126,7 +126,7 @@ def _merge_schema_dicts(base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict
 def _fetch_pattern_schema_from_db(play_id: int) -> Optional[Dict[str, Any]]:
     """Retrieve pattern schema JSON for a play from the database."""
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT pattern_validator, pattern_validator_enable
                 FROM follow_the_goat_plays
@@ -462,7 +462,7 @@ def _fetch_project_filters(project_id: int) -> List[Dict[str, Any]]:
     Filter data is synced from MySQL to DuckDB by the scheduler.
     """
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT id, name, section, minute, field_name, field_column, 
                        from_value, to_value, is_active
@@ -806,7 +806,7 @@ def save_filter_results_to_db(
                 ])
         
         if rows_to_insert:
-            with get_duckdb("central") as conn:
+            with get_postgres() as conn:
                 # Ensure table exists
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS trade_filter_results (

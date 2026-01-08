@@ -6,11 +6,11 @@
  * Shows average execution duration vs expected interval for each job.
  */
 
-// --- DuckDB API Client ---
+// --- Database API Client ---
 require_once __DIR__ . '/../../../includes/config.php';
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -29,17 +29,17 @@ $hours = $minutes / 60;  // Convert to hours for API call
 $refresh = max(10, min(120, $refresh));  // Min 10s refresh to avoid overloading
 
 // Fetch data
-if ($use_duckdb) {
+if ($api_available) {
     // Get job execution metrics (pass hours as float for sub-hour intervals)
-    $metrics_response = $duckdb->getJobMetrics((float)$hours);
+    $metrics_response = $db->getJobMetrics((float)$hours);
     if ($metrics_response && isset($metrics_response['jobs'])) {
         $metrics_data = $metrics_response['jobs'];
     }
     
     // Get scheduler status for uptime info
-    $scheduler_status = $duckdb->getSchedulerStatus();
+    $scheduler_status = $db->getSchedulerStatus();
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // Calculate summary stats
@@ -402,8 +402,8 @@ ob_start();
 ?>
 
 <!-- API Status Badge -->
-<div class="api-status-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
-    <?php echo $use_duckdb ? 'API Connected' : 'API Disconnected'; ?>
+<div class="api-status-badge" style="background: <?php echo $api_available ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+    <?php echo $api_available ? 'API Connected' : 'API Disconnected'; ?>
 </div>
 
 <div class="metrics-container">

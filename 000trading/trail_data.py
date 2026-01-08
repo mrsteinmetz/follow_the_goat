@@ -33,7 +33,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb
+from core.database import get_postgres
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -181,7 +181,7 @@ def ensure_trail_table_exists_duckdb() -> None:
     """Ensure the buyin_trail_minutes table exists in DuckDB."""
     from features.price_api.schema import SCHEMA_BUYIN_TRAIL_MINUTES
     
-    with get_duckdb("central") as conn:
+    with get_postgres() as conn:
         conn.execute(SCHEMA_BUYIN_TRAIL_MINUTES)
         logger.debug("Ensured buyin_trail_minutes table exists in DuckDB")
 
@@ -952,7 +952,7 @@ def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool
                 inserted_count += 1
         
         # Sync to ensure all writes complete
-        duckdb_execute_write("central", "SELECT 1", [], sync=True)
+        postgres_execute("SELECT 1", [], sync=True)
         
         logger.info(f"✓ Inserted {inserted_count} filter values for buyin_id={buyin_id}")
         return True
@@ -978,7 +978,7 @@ def get_trail_for_buyin(buyin_id: int) -> List[Dict[str, Any]]:
         List of dictionaries, one per minute (0-14), ordered by minute
     """
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT * FROM buyin_trail_minutes
                 WHERE buyin_id = ?
@@ -1010,7 +1010,7 @@ def get_trail_minute(buyin_id: int, minute: int) -> Optional[Dict[str, Any]]:
         return None
     
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT * FROM buyin_trail_minutes
                 WHERE buyin_id = ? AND minute = ?
@@ -1042,8 +1042,8 @@ def delete_trail_for_buyin(buyin_id: int) -> bool:
     mysql_success = False
     
     try:
-        with get_duckdb("central") as conn:
-            conn.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = ?", [buyin_id])
+        with get_postgres() as conn:
+            conn.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = %s", [buyin_id])
         duckdb_success = True
     except Exception as e:
         logger.warning(f"DuckDB delete failed for buyin_id={buyin_id}: {e}")

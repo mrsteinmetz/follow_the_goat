@@ -6,11 +6,11 @@
  * Uses DuckDB API for data operations (dual-writes to MySQL + DuckDB)
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -166,10 +166,10 @@ $dist_totals = [];
 
 // Check API availability
 if (!$use_duckdb) {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 } else {
     // Load project info
-    $project_response = $duckdb->getPatternProject($project_id);
+    $project_response = $db->getPatternProject($project_id);
     if (!$project_response || !isset($project_response['project'])) {
         header('Location: ./');
         exit;
@@ -209,7 +209,7 @@ if (!$use_duckdb) {
                 $prefix = SECTION_PREFIXES[$selected_section] ?? '';
                 $db_column = $prefix . $filter_field;
                 
-                $result = $duckdb->createPatternFilter([
+                $result = $db->createPatternFilter([
                     'project_id' => $project_id,
                     'name' => $filter_name,
                     'section' => $selected_section,
@@ -230,7 +230,7 @@ if (!$use_duckdb) {
         } elseif ($action === 'delete_filter') {
             $filter_id = (int) ($_POST['filter_id'] ?? 0);
             if ($filter_id > 0) {
-                $duckdb->deletePatternFilter($filter_id);
+                $db->deletePatternFilter($filter_id);
                 $filter_message = 'Filter rule deleted.';
             }
         } elseif ($action === 'toggle_filter') {
@@ -239,7 +239,7 @@ if (!$use_duckdb) {
                 // Find the filter and toggle it
                 foreach ($all_filters as $filter) {
                     if ($filter['id'] == $filter_id) {
-                        $duckdb->updatePatternFilter($filter_id, [
+                        $db->updatePatternFilter($filter_id, [
                             'is_active' => $filter['is_active'] ? 0 : 1
                         ]);
                         $filter_message = 'Filter rule toggled.';
@@ -255,14 +255,14 @@ if (!$use_duckdb) {
     }
     
     // Get section fields and types from API
-    $section_response = $duckdb->getTrailSections($selected_section);
+    $section_response = $db->getTrailSections($selected_section);
     if ($section_response && isset($section_response['fields'])) {
         $section_fields = $section_response['fields'];
         $field_types = $section_response['field_types'] ?? [];
     }
     
     // Get field statistics
-    $stats_response = $duckdb->getTrailFieldStats([
+    $stats_response = $db->getTrailFieldStats([
         'project_id' => $project_id,
         'section' => $selected_section,
         'minute' => $selected_minute,
@@ -278,7 +278,7 @@ if (!$use_duckdb) {
     }
     
     // Get gain distribution
-    $dist_response = $duckdb->getTrailGainDistribution([
+    $dist_response = $db->getTrailGainDistribution([
         'project_id' => $project_id,
         'minute' => $selected_minute,
         'status' => $selected_status,
@@ -294,7 +294,7 @@ if (!$use_duckdb) {
 
 // Refresh filters list after POST
 if (!empty($filter_message)) {
-    $project_response = $duckdb->getPatternProject($project_id);
+    $project_response = $db->getPatternProject($project_id);
     if ($project_response && isset($project_response['project'])) {
         $all_filters = $project_response['filters'] ?? [];
         $active_filters = array_filter($all_filters, function($f) {

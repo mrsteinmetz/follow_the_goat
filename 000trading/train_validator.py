@@ -37,7 +37,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_duckdb, duckdb_execute_write, get_postgres
+from core.database import get_postgres, postgres_execute, get_postgres
 
 # Try to get TradingDataEngine for in-memory queries (when running under scheduler)
 def _get_engine_if_running():
@@ -258,7 +258,7 @@ def _pg_update_buyin(buyin_id: int, fields: Dict[str, Any]) -> None:
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
     """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
     
-    Uses the in-memory engine for speed, with fallback to get_duckdb("central")
+    Uses the in-memory engine for speed, with fallback to get_postgres()
     when running under master2.py (which has its own local DuckDB with plays).
     """
     engine = _get_engine_if_running()
@@ -278,9 +278,9 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
             
             play = dict(result)
         else:
-            # Fallback to get_duckdb("central") - used when running under master2.py
+            # Fallback to get_postgres() - used when running under master2.py
             # master2.py loads plays from PostgreSQL into its local DuckDB and registers it as 'central'
-            logger.debug("TradingDataEngine not running - using get_duckdb('central') fallback")
+            logger.debug("TradingDataEngine not running - using get_postgres() fallback")
             with get_duckdb("central", read_only=True) as cursor:
                 result = cursor.execute("""
                     SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
@@ -343,7 +343,7 @@ def check_data_readiness() -> tuple[bool, str]:
     """Check if sufficient data exists to run a training cycle.
     
     IMPORTANT: This function runs in master2.py context, so it MUST use
-    get_duckdb("central") which returns master2's local in-memory DuckDB.
+    get_postgres() which returns master2's local in-memory DuckDB.
     
     DO NOT use TradingDataEngine here - that only exists in master.py!
     
@@ -352,9 +352,9 @@ def check_data_readiness() -> tuple[bool, str]:
     Returns:
         Tuple of (is_ready, reason_if_not_ready)
     """
-    # ALWAYS use get_duckdb("central") - this is master2's local DuckDB
+    # ALWAYS use get_postgres() - this is master2's local DuckDB
     # DO NOT use TradingDataEngine - it's only in master.py!
-    logger.debug("Checking data readiness using get_duckdb('central')")
+    logger.debug("Checking data readiness using get_postgres()")
     
     try:
         with get_duckdb("central", read_only=True) as cursor:
@@ -421,7 +421,7 @@ def get_current_price_cycle() -> Optional[int]:
     """
     Get current active price_cycle ID from cycle_tracker table.
     
-    CRITICAL: Uses master2.py's local DuckDB (via get_duckdb("central")) 
+    CRITICAL: Uses master2.py's local DuckDB (via get_postgres()) 
     since cycles are computed locally by create_price_cycles.py in master2.py.
     Returns the active cycle (cycle_end_time IS NULL) for threshold 0.3.
     """
@@ -435,7 +435,7 @@ def get_current_price_cycle() -> Optional[int]:
     """
     
     try:
-        # Use get_duckdb("central") which returns master2.py's local DuckDB
+        # Use get_postgres() which returns master2.py's local DuckDB
         # when running in master2.py context
         with get_duckdb("central", read_only=True) as cursor:
             result = cursor.execute(query).fetchone()
@@ -458,7 +458,7 @@ def insert_synthetic_buyin(
 ) -> Optional[int]:
     """Insert a synthetic buyin record for training.
     
-    CRITICAL: Always uses master2.py's local DuckDB (via get_duckdb("central"))
+    CRITICAL: Always uses master2.py's local DuckDB (via get_postgres())
     since price_cycle references cycle_tracker which lives in master2.py.
     """
     timestamp = int(time.time())
@@ -488,7 +488,7 @@ def insert_synthetic_buyin(
             buyin_id = result[0] if result else 1
         
         # Insert into master2.py's local DuckDB via write queue
-        duckdb_execute_write("central", """
+        postgres_execute("""
             INSERT INTO follow_the_goat_buyins (
                 id, play_id, wallet_address, original_trade_id, trade_signature,
                 block_timestamp, quote_amount, base_amount, price, direction,
@@ -713,19 +713,19 @@ def update_validation_result(
         
         # Update master2.py's local DuckDB via write queue
         if new_status == 'pending' and fresh_price:
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
                 WHERE id = ?
             """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
         elif new_status == 'pending':
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET pattern_validator_log = ?, our_status = ?, followed_at = ?
                 WHERE id = ?
             """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
         else:
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET pattern_validator_log = ?, our_status = ?
                 WHERE id = ?
@@ -756,7 +756,7 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
         final_log_json = json.dumps(step_logger.to_json())
         
         # Update master2.py's local DuckDB via write queue
-        duckdb_execute_write("central", """
+        postgres_execute("""
             UPDATE follow_the_goat_buyins
             SET entry_log = ?
             WHERE id = ?
@@ -786,7 +786,7 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
         
         # Update master2.py's local DuckDB via write queue
         if entry_log:
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
                 WHERE id = ?
@@ -797,7 +797,7 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
                 'entry_log': entry_log,
             })
         else:
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET our_status = 'error', pattern_validator_log = ?
                 WHERE id = ?
@@ -885,7 +885,7 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
         
         # Update master2.py's local DuckDB via write queue
         for buyin_id in stuck_ids:
-            duckdb_execute_write("central", """
+            postgres_execute("""
                 UPDATE follow_the_goat_buyins
                 SET our_status = 'error', pattern_validator_log = ?
                 WHERE id = ?

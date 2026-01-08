@@ -7,25 +7,25 @@
  * Data is sourced from DuckDB API (24hr hot storage).
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '../..';
 
 // --- Fetch Order Book Data via API ---
-function fetchOrderBookData($duckdb) {
+function fetchOrderBookData($db) {
     $orderbook_data = [];
     $error_message = null;
     $data_source = "No Data";
     $actual_source = null;
 
-    if ($duckdb->isAvailable()) {
+    if ($db->isAvailable()) {
         // Query order book features from the API using structured query
-        $response = $duckdb->query(
+        $response = $db->query(
             'order_book_features',
             [
                 'symbol', 'ts', 'best_bid', 'best_ask', 'mid_price',
@@ -63,7 +63,7 @@ function fetchOrderBookData($duckdb) {
             $data_source = "DuckDB API (No Data)";
         }
     } else {
-        $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+        $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
     }
     
     return [
@@ -77,8 +77,8 @@ function fetchOrderBookData($duckdb) {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchOrderBookData($duckdb);
-    $use_duckdb = $duckdb->isAvailable();
+    $result = fetchOrderBookData($db);
+    $use_duckdb = $db->isAvailable();
     
     // Build status data
     $status_data = [
@@ -93,17 +93,17 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     
     // Get latest price and cycle info for status buttons
     if ($use_duckdb) {
-        $price_response = $duckdb->getLatestPrices();
+        $price_response = $db->getLatestPrices();
         if ($price_response && isset($price_response['prices']['SOL'])) {
             $status_data['get_prices'] = $price_response['prices']['SOL']['ts'] ?? null;
         }
         
-        $analysis_response = $duckdb->getPriceAnalysis(5, '1', 1);
+        $analysis_response = $db->getPriceAnalysis(5, '1', 1);
         if ($analysis_response && isset($analysis_response['price_analysis']) && !empty($analysis_response['price_analysis'])) {
             $status_data['price_analysis'] = $analysis_response['price_analysis'][0]['created_at'] ?? null;
         }
         
-        $cycle_response = $duckdb->getCycleTracker(0.3, '24', 1);
+        $cycle_response = $db->getCycleTracker(0.3, '24', 1);
         if ($cycle_response && isset($cycle_response['cycles']) && !empty($cycle_response['cycles'])) {
             $status_data['active_cycle'] = $cycle_response['cycles'][0]['cycle_start_time'] ?? null;
         }
@@ -121,11 +121,11 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 }
 
 // Regular page load - fetch data normally
-$result = fetchOrderBookData($duckdb);
+$result = fetchOrderBookData($db);
 $orderbook_data = $result['orderbook_data'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
-$use_duckdb = $duckdb->isAvailable();
+$use_duckdb = $db->isAvailable();
 
 // --- Status Data ---
 $status_data = [
@@ -142,19 +142,19 @@ if (!empty($orderbook_data)) {
 // Get latest price and cycle info for status buttons
 if ($use_duckdb) {
     // Get latest price time from latest_prices endpoint
-    $price_response = $duckdb->getLatestPrices();
+    $price_response = $db->getLatestPrices();
     if ($price_response && isset($price_response['prices']['SOL'])) {
         $status_data['get_prices'] = $price_response['prices']['SOL']['ts'] ?? null;
     }
     
     // Get latest price analysis time
-    $analysis_response = $duckdb->getPriceAnalysis(5, '1', 1);
+    $analysis_response = $db->getPriceAnalysis(5, '1', 1);
     if ($analysis_response && isset($analysis_response['price_analysis']) && !empty($analysis_response['price_analysis'])) {
         $status_data['price_analysis'] = $analysis_response['price_analysis'][0]['created_at'] ?? null;
     }
     
     // Get active cycle
-    $cycle_response = $duckdb->getCycleTracker(0.3, '24', 1);
+    $cycle_response = $db->getCycleTracker(0.3, '24', 1);
     if ($cycle_response && isset($cycle_response['cycles']) && !empty($cycle_response['cycles'])) {
         $status_data['active_cycle'] = $cycle_response['cycles'][0]['cycle_start_time'] ?? null;
     }

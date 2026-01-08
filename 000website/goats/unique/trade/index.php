@@ -1,14 +1,14 @@
 <?php
 /**
  * Trade Details Page - Individual Trade View
- * Migrated to use DuckDBClient API
+ * Migrated to use DatabaseClient API
  */
 
 // Set timezone to UTC (server time) - never use browser time
 date_default_timezone_set('UTC');
 
-// --- Load DuckDB Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
+// --- Load Database Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
 // API Base URL - uses PHP proxy to reach Flask API on server
 $API_BASE = dirname($_SERVER["SCRIPT_NAME"]) . '/../../../api/proxy.php';
 
@@ -29,7 +29,7 @@ $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
 $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . dirname(dirname(dirname(dirname($_SERVER['SCRIPT_NAME']))));
 
 // --- Initialize API Client ---
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 $api_available = $client->isAvailable();
 
 $trade = null;

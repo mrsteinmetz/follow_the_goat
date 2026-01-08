@@ -2,8 +2,8 @@
 Core utilities for Follow The Goat project.
 """
 
-from .database import get_db, get_db_path, archive_old_data
+from .database import get_postgres, postgres_execute, postgres_query
 from .config import settings
 
-__all__ = ["get_db", "get_db_path", "archive_old_data", "settings"]
+__all__ = ["get_postgres", "postgres_execute", "postgres_query", "settings"]
 

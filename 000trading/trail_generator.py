@@ -38,7 +38,7 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import get_duckdb
+from core.database import get_postgres
 from core.webhook_client import WebhookClient
 from trail_data import insert_trail_data
 
@@ -153,7 +153,7 @@ def _execute_query(query: str, params: list = None, as_dict: bool = True, gracef
     
     # Finally, fallback to file-based DuckDB
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute(query, params or [])
             if as_dict:
                 columns = [desc[0] for desc in result.description]
@@ -245,7 +245,7 @@ def fetch_buyin(buyin_id: int) -> Dict[str, Any]:
     # PRIORITY 3: Fallback to file-based DuckDB
     if result is None:
         try:
-            with get_duckdb("central") as conn:
+            with get_postgres() as conn:
                 result = conn.execute("""
                     SELECT id, followed_at, fifteen_min_trail as existing_trail
                     FROM follow_the_goat_buyins
@@ -952,7 +952,7 @@ def fetch_price_movements(
         LIMIT 15
     """
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute(query_duckdb, [start_time, end_time, coin_id])
             columns = [desc[0] for desc in result.description]
             rows = result.fetchall()
@@ -989,7 +989,7 @@ def fetch_second_prices(
     
     # Fallback to file-based DuckDB price_points if prices table returned no results
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             result = conn.execute("""
                 SELECT created_at AS ts, value AS price
                 FROM price_points
@@ -1546,7 +1546,7 @@ def persist_trail_json_legacy(buyin_id: int, payload: Dict[str, Any]) -> None:
     
     # Write to DuckDB only (no MySQL)
     try:
-        with get_duckdb("central") as conn:
+        with get_postgres() as conn:
             conn.execute("""
                 UPDATE follow_the_goat_buyins
                 SET fifteen_min_trail = ?

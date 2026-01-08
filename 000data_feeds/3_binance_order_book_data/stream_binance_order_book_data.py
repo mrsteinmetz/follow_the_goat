@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Callable
 from collections import deque
 
-from core.database import get_trading_engine
+from core.database import postgres_insert
 from core.config import settings
 
 # Configure logging
@@ -199,13 +199,19 @@ class BinanceOrderBookCollector:
         bid_depth_bps_25 = _depth_within_bps(bids, mid_price, 25.0, True)
         ask_depth_bps_25 = _depth_within_bps(asks, mid_price, 25.0, False)
         
+        # Depth imbalance ratio (10bps)
+        depth_imbalance_10bps = (bid_depth_bps_10 - ask_depth_bps_10) / (bid_depth_bps_10 + ask_depth_bps_10) if (bid_depth_bps_10 + ask_depth_bps_10) > 0 else 0.0
+        
+        # VWAP within 10bps
+        vwap_10bps = (bid_vwap * bid_depth_10 + ask_vwap * ask_depth_10) / total_depth_10 if total_depth_10 > 0 else 0.0
+        
         # Net liquidity change over ~1 second
         net_liquidity_change_1s = None
         try:
             cutoff = orderbook_data['timestamp'] - timedelta(seconds=1)
             prev = None
             for f in reversed(self.features_buffer):
-                if f['ts'] <= cutoff:
+                if f.get('timestamp', f.get('ts', datetime.min)) <= cutoff:
                     prev = f
                     break
             if prev:
@@ -219,24 +225,20 @@ class BinanceOrderBookCollector:
         quote_asset = 'USDT' if self.symbol.endswith('USDT') else 'BUSD'
         
         features = {
-            'ts': orderbook_data['timestamp'],
-            'venue': venue,
-            'quote_asset': quote_asset,
-            'symbol': self.symbol,
-            'best_bid': best_bid,
-            'best_ask': best_ask,
+            'timestamp': orderbook_data['timestamp'],  # Changed from 'ts' to match table schema
             'mid_price': mid_price,
-            'absolute_spread': absolute_spread,
-            'relative_spread_bps': relative_spread_bps,
-            'bid_depth_10': bid_depth_10,
-            'ask_depth_10': ask_depth_10,
-            'total_depth_10': total_depth_10,
+            'spread_bps': relative_spread_bps,
+            'bid_liquidity': bid_depth_10,
+            'ask_liquidity': ask_depth_10,
             'volume_imbalance': volume_imbalance,
+            'depth_imbalance_ratio': depth_imbalance_10bps,
+            'microprice': microprice,
+            'vwap': vwap_10bps,
+            'total_depth_10': total_depth_10,
             'bid_vwap_10': bid_vwap,
             'ask_vwap_10': ask_vwap,
             'bid_slope': bid_slope,
             'ask_slope': ask_slope,
-            'microprice': microprice,
             'microprice_dev_bps': microprice_dev_bps,
             'bid_depth_bps_5': bid_depth_bps_5,
             'ask_depth_bps_5': ask_depth_bps_5,
@@ -253,14 +255,14 @@ class BinanceOrderBookCollector:
         return features
     
     def _write_to_engine(self, features: Dict) -> bool:
-        """Write features to TradingDataEngine (non-blocking)."""
+        """Write features to PostgreSQL."""
         try:
-            engine = get_trading_engine()
-            engine.write('order_book_features', features)
+            # Write to PostgreSQL
+            postgres_insert('order_book_features', features)
             self.stats['writes_queued'] += 1
             return True
         except Exception as e:
-            logger.error(f"Engine write error: {e}")
+            logger.error(f"PostgreSQL write error: {e}")
             self.stats['errors'] += 1
             return False
     
@@ -291,9 +293,9 @@ class BinanceOrderBookCollector:
                     
                     # Write to engine (non-blocking)
                     self._write_to_engine(features)
-                    
+
                     self.stats['websocket_messages'] += 1
-                    self.stats['last_update'] = features['ts']
+                    self.stats['last_update'] = features.get('timestamp', features.get('ts'))
                 
                 # Call user callback if provided
                 if callback_func:

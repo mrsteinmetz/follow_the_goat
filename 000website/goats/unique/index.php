@@ -1,7 +1,7 @@
 <?php
 /**
  * Unique Play Details - Follow The Goat Trading Play
- * Migrated to use DuckDBClient API
+ * Migrated to use DatabaseClient API
  */
 
 // Set timezone to UTC (server time) - never use browser time
@@ -11,12 +11,12 @@ date_default_timezone_set('UTC');
 $timing = [];
 $timing['script_start'] = microtime(true);
 
-// --- Load DuckDB Client ---
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
+// --- Load Database Client ---
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
 $timing['client_loaded'] = microtime(true);
 
 // --- Initialize API Client ---
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 $api_available = $client->isAvailable();
 // API Base URL - uses PHP proxy to reach Flask API on server
 $API_BASE = dirname($_SERVER["SCRIPT_NAME"]) . '/../../api/proxy.php';

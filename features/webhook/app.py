@@ -1,6 +1,6 @@
 """
 FastAPI webhook to receive QuickNode payloads and write directly to
-TradingDataEngine (DuckDB in-memory) with 24h hot storage.
+PostgreSQL with 24h hot storage.
 
 Designed to be tolerant of varying payload shapes. Any missing fields will
 be skipped, but the endpoint will still return 200 to avoid QuickNode
@@ -17,14 +17,14 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from core.database import get_trading_engine
+from core.database import get_postgres, postgres_insert
 from features.webhook.parser import parse_timestamp
 from features.webhook.models import TradePayload, WhalePayload
 
 logger = logging.getLogger("webhook_api")
 
 # File logging for webhook (placed in project-level logs/)
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 LOGS_DIR = PROJECT_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 log_file = LOGS_DIR / "webhook.log"
@@ -41,11 +41,14 @@ app = FastAPI(title="Follow The Goat - Webhook", version="1.0.0")
 # --------------------------------------------------------------------------- #
 
 
-def _engine():
-    engine = get_trading_engine()
-    if not engine or not getattr(engine, "_running", False):
-        raise HTTPException(status_code=503, detail="TradingDataEngine not running")
-    return engine
+def _check_db():
+    """Check if PostgreSQL is available."""
+    try:
+        with get_postgres() as conn:
+            return True
+    except Exception as e:
+        logger.error(f"PostgreSQL not available: {e}")
+        raise HTTPException(status_code=503, detail="PostgreSQL not available")
 
 
 def _next_id(engine, table: str) -> int:

@@ -6,11 +6,11 @@
  * Allows clicking on each trade to view detailed validation information.
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '../../..';
@@ -23,13 +23,13 @@ $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 200;
 $refresh_interval = isset($_GET['refresh']) ? intval($_GET['refresh']) : 30;
 
 // --- Fetch Trades Data ---
-function fetchTradesData($duckdb, $play_id, $status, $hours, $limit) {
+function fetchTradesData($db, $play_id, $status, $hours, $limit) {
     $trades = [];
     $error_message = null;
     $data_source = "No Data";
 
-    if ($duckdb->isAvailable()) {
-        $response = $duckdb->getBuyins($play_id, $status, $hours, $limit);
+    if ($db->isAvailable()) {
+        $response = $db->getBuyins($play_id, $status, $hours, $limit);
         
         if ($response && isset($response['buyins'])) {
             $trades = $response['buyins'];
@@ -38,7 +38,7 @@ function fetchTradesData($duckdb, $play_id, $status, $hours, $limit) {
             $data_source = "No Data";
         }
     } else {
-        $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+        $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
     }
     
     return [
@@ -49,9 +49,9 @@ function fetchTradesData($duckdb, $play_id, $status, $hours, $limit) {
 }
 
 // --- Fetch All Plays for Filter ---
-function fetchPlays($duckdb) {
-    if ($duckdb->isAvailable()) {
-        $response = $duckdb->getPlays();
+function fetchPlays($db) {
+    if ($db->isAvailable()) {
+        $response = $db->getPlays();
         if ($response && isset($response['plays'])) {
             return $response['plays'];
         }
@@ -62,7 +62,7 @@ function fetchPlays($duckdb) {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchTradesData($duckdb, $play_filter, $status_filter, $hours, $limit);
+    $result = fetchTradesData($db, $play_filter, $status_filter, $hours, $limit);
     
     echo json_encode([
         'success' => true,
@@ -80,7 +80,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail' && isset($_GET['buyin_id'
     $buyin_id = intval($_GET['buyin_id']);
     $source = $_GET['source'] ?? 'live';
     
-    $trade = $duckdb->getSingleBuyin($buyin_id, $source);
+    $trade = $db->getSingleBuyin($buyin_id, $source);
     
     echo json_encode([
         'success' => $trade !== null,
@@ -90,13 +90,13 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'detail' && isset($_GET['buyin_id'
 }
 
 // Regular page load
-$result = fetchTradesData($duckdb, $play_filter, $status_filter, $hours, $limit);
+$result = fetchTradesData($db, $play_filter, $status_filter, $hours, $limit);
 $trades = $result['trades'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
 
 // Fetch plays for filter dropdown
-$plays = fetchPlays($duckdb);
+$plays = fetchPlays($db);
 
 // Calculate stats
 $total_trades = count($trades);

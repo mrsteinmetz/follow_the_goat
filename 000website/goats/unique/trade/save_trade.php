@@ -1,11 +1,11 @@
 <?php
 /**
  * Save Trade API - Handles POST requests to update trade details
- * Migrated to use DuckDBClient API
+ * Migrated to use DatabaseClient API
  */
 
-// --- Load DuckDB Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
+// --- Load Database Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
 
 // Set response header
 header('Content-Type: application/json');
@@ -62,7 +62,7 @@ if (empty($valid_updates)) {
 }
 
 // Initialize API client
-$client = new DuckDBClient();
+$client = new DatabaseClient();
 
 if (!$client->isAvailable()) {
     echo json_encode(['success' => false, 'error' => 'API server is not available']);

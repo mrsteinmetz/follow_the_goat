@@ -1,0 +1,17 @@
+[Unit]
+Description=Follow The Goat - Website API
+After=network.target postgresql.service ftg-master2.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/follow_the_goat
+Environment="PATH=/root/follow_the_goat/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/root/follow_the_goat/venv/bin/python scheduler/website_api.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/root/follow_the_goat/logs/website_api.log
+StandardError=append:/root/follow_the_goat/logs/website_api_errors.log
+
+[Install]
+WantedBy=multi-user.target

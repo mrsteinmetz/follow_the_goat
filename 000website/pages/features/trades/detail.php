@@ -4,11 +4,11 @@
  * Shows complete trade information and loops through all 15 minutes of trail data
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -25,7 +25,7 @@ if (!$trade_id) {
     $error_message = 'Trade ID is required.';
 } elseif ($use_duckdb) {
     // Fetch trade details from live table (archive is deprecated)
-    $trade_response = $duckdb->getSingleBuyin($trade_id);
+    $trade_response = $db->getSingleBuyin($trade_id);
     
     if ($trade_response && isset($trade_response['buyin'])) {
         $trade = $trade_response['buyin'];
@@ -34,7 +34,7 @@ if (!$trade_id) {
     }
     
     // Fetch trail data
-    $trail_response = $duckdb->getTrailForBuyin($trade_id, $source);
+    $trail_response = $db->getTrailForBuyin($trade_id, $source);
     if ($trail_response && isset($trail_response['trail_data'])) {
         $trail_data = $trail_response['trail_data'];
         // Sort by minute to ensure proper ordering
@@ -43,7 +43,7 @@ if (!$trade_id) {
         });
     }
 } else {
-    $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
+    $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
 
 // --- Chart Field Configurations (must match JavaScript chartConfigs) ---

@@ -8,11 +8,11 @@
  * - View query results in a formatted table
  */
 
-// --- DuckDB API Client ---
+// --- Database API Client ---
 require_once __DIR__ . '/../../../includes/config.php';
-require_once __DIR__ . '/../../../includes/DuckDBClient.php';
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+require_once __DIR__ . '/../../../includes/DatabaseClient.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -30,12 +30,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sql_query'])) {
     
     if (empty($query_sql)) {
         $error_message = "Please enter a SQL query.";
-    } elseif (!$use_duckdb) {
-        $error_message = "DuckDB API is not available. Please start master2: python scheduler/master2.py";
+    } elseif (!$api_available) {
+        $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
     } else {
         // Execute query and measure time
         $start_time = microtime(true);
-        $response = $duckdb->executeSQL($query_sql);
+        $response = $db->executeSQL($query_sql);
         $execution_time = round((microtime(true) - $start_time) * 1000, 2); // Convert to ms
         
         if ($response && isset($response['success']) && $response['success']) {
@@ -48,8 +48,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sql_query'])) {
 }
 
 // Load schema data on page load
-if ($use_duckdb) {
-    $schema_response = $duckdb->getSchema();
+if ($api_available) {
+    $schema_response = $db->getSchema();
     if ($schema_response && isset($schema_response['success']) && $schema_response['success']) {
         $schema_data = $schema_response['schema'];
     }
@@ -318,8 +318,8 @@ ob_start();
 ?>
 
 <!-- API Status Badge -->
-<div class="api-status-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
-    <?php echo $use_duckdb ? 'API Connected' : 'API Disconnected'; ?>
+<div class="api-status-badge" style="background: <?php echo $api_available ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+    <?php echo $api_available ? 'API Connected' : 'API Disconnected'; ?>
 </div>
 
 <div class="sql-tester-container">
@@ -452,10 +452,10 @@ ob_start();
             </div>
         </div>
         <div class="card-body">
-            <?php if (!$use_duckdb): ?>
+            <?php if (!$api_available): ?>
             <div class="text-center text-muted p-4">
                 <i class="ri-error-warning-line" style="font-size: 2rem;"></i>
-                <p class="mb-0 mt-2">DuckDB API is not available</p>
+                <p class="mb-0 mt-2">Database API is not available</p>
                 <p class="mb-0 mt-1">Please start master2: <code>python scheduler/master2.py</code></p>
             </div>
             <?php elseif ($schema_data): ?>

@@ -6,23 +6,23 @@
  * Shows when cycles start, end, and their performance metrics.
  */
 
-// --- DuckDB API Client ---
-require_once __DIR__ . '/../../includes/DuckDBClient.php';
-define('DUCKDB_API_URL', 'http://127.0.0.1:5051');
-$duckdb = new DuckDBClient(DUCKDB_API_URL);
-$use_duckdb = $duckdb->isAvailable();
+// --- Database API Client ---
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
+require_once __DIR__ . '/../../includes/config.php';
+$db = new DatabaseClient(DATABASE_API_URL);
+$api_available = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '../..';
 
 // --- Parameters ---
 $threshold_filter = isset($_GET['threshold']) ? floatval($_GET['threshold']) : null;
-$hours = isset($_GET['hours']) ? $_GET['hours'] : '24';  // Default to 24h (uses DuckDB engine)
+$hours = isset($_GET['hours']) ? $_GET['hours'] : '24';  // Default to 24h
 $limit = isset($_GET['limit']) ? intval($_GET['limit']) : 50;
 $refresh_interval = isset($_GET['refresh']) ? intval($_GET['refresh']) : 30; // Default 30 seconds
 
 // --- Fetch Cycle Data ---
-function fetchCycleData($duckdb, $threshold, $hours, $limit) {
+function fetchCycleData($db, $threshold, $hours, $limit) {
     $cycles = [];
     $error_message = null;
     $data_source = "No Data";
@@ -30,8 +30,8 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
     $total_count = 0;
     $missing_cycles = 0;
 
-    if ($duckdb->isAvailable()) {
-        $response = $duckdb->getCycleTracker($threshold, $hours, $limit);
+    if ($db->isAvailable()) {
+        $response = $db->getCycleTracker($threshold, $hours, $limit);
         
         if ($response && isset($response['cycles'])) {
             $cycles = $response['cycles'];
@@ -47,13 +47,13 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
                     $data_source = "🗄️ MySQL";
                     break;
                 default:
-                    $data_source = "🦆 DuckDB";
+                    $data_source = "📊 PostgreSQL";
             }
         } else {
             $data_source = "No Data";
         }
     } else {
-        $error_message = "DuckDB API is not available. Please start the services: python scheduler/master2.py (and python scheduler/website_api.py)";
+        $error_message = "Website API is not available. Please start the APIs: python scheduler/master2.py and python scheduler/website_api.py";
     }
     
     return [
@@ -67,10 +67,10 @@ function fetchCycleData($duckdb, $threshold, $hours, $limit) {
 }
 
 // Fetch ALL cycles (no threshold filter) for the threshold range table
-function fetchAllCyclesForRangeTable($duckdb, $hours, $limit) {
-    if ($duckdb->isAvailable()) {
+function fetchAllCyclesForRangeTable($db, $hours, $limit) {
+    if ($db->isAvailable()) {
         // Fetch without threshold filter (null = all thresholds)
-        $response = $duckdb->getCycleTracker(null, $hours, $limit);
+        $response = $db->getCycleTracker(null, $hours, $limit);
         if ($response && isset($response['cycles'])) {
             return $response['cycles'];
         }
@@ -81,7 +81,7 @@ function fetchAllCyclesForRangeTable($duckdb, $hours, $limit) {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchCycleData($duckdb, $threshold_filter, $hours, $limit);
+    $result = fetchCycleData($db, $threshold_filter, $hours, $limit);
     
     echo json_encode([
         'success' => true,
@@ -97,7 +97,7 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 }
 
 // Regular page load
-$result = fetchCycleData($duckdb, $threshold_filter, $hours, $limit);
+$result = fetchCycleData($db, $threshold_filter, $hours, $limit);
 $cycles = $result['cycles'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
@@ -106,7 +106,7 @@ $total_count = $result['total_count'];
 $missing_cycles = $result['missing_cycles'];
 
 // Fetch ALL cycles for the threshold range table (ignoring threshold filter)
-$all_cycles_for_table = fetchAllCyclesForRangeTable($duckdb, $hours, 1000);
+$all_cycles_for_table = fetchAllCyclesForRangeTable($db, $hours, 1000);
 
 // Calculate stats
 $active_cycles = 0;

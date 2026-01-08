@@ -30,6 +30,7 @@ import signal
 import threading
 import atexit
 import subprocess
+import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -45,14 +46,11 @@ from apscheduler.executors.pool import ThreadPoolExecutor, ProcessPoolExecutor
 import logging
 import traceback
 
-from core.database import start_trading_engine, stop_trading_engine
+from core.database import get_postgres, postgres_execute, postgres_insert, cleanup_all_hot_tables, verify_tables_exist
 from core.config import settings
 
 # Import job status tracking from shared module (avoids circular imports with API)
 from scheduler.status import track_job, update_job_status, set_scheduler_start_time, stop_metrics_writer
-
-# Global reference to the trading engine
-_trading_engine = None
 
 # Global reference to Binance stream collector
 _binance_collector = None
@@ -65,6 +63,9 @@ _webhook_server = None
 
 # Global reference to PHP server process (port 8000)
 _php_server_process = None
+
+# Global list of background threads
+_threads = []
 
 # Global reference to the scheduler (for clean shutdown)
 _scheduler = None
@@ -205,11 +206,12 @@ if hasattr(threading, 'excepthook'):
 
 @track_job("fetch_jupiter_prices", "Fetch prices from Jupiter API (every 1s)")
 def fetch_jupiter_prices():
-    """Fetch prices from Jupiter API and store in DuckDB + MySQL."""
+    """Fetch prices from Jupiter API and store in PostgreSQL."""
     from get_prices_from_jupiter import fetch_and_store_once
-    count, duck_ok, mysql_ok = fetch_and_store_once()
-    if count > 0 and (not duck_ok or not mysql_ok):
-        logger.warning(f"Partial price write - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
+    # fetch_and_store_once returns (count, duckdb_success, mysql_success)
+    count, duckdb_ok, mysql_ok = fetch_and_store_once()
+    if count > 0 and not (duckdb_ok or mysql_ok):
+        logger.warning(f"Failed to write {count} prices to database")
 
 
 # NOTE: Cleanup/archive jobs REMOVED per user requirement
@@ -231,38 +233,25 @@ WEBHOOK_TRADES_URL = "http://195.201.84.5/api/trades"
 
 
 def _get_last_synced_trade_id() -> int:
-    """Get the last synced trade ID from TradingDataEngine (for startup recovery)."""
+    """Get the last synced trade ID from PostgreSQL (for startup recovery)."""
     global _last_synced_trade_id, _last_sync_initialized
     
     if _last_sync_initialized:
         return _last_synced_trade_id
     
     try:
-        from core.database import get_trading_engine
-        engine = get_trading_engine()
-        if engine and engine._running:
-            result = engine.read_one("SELECT COALESCE(MAX(id), 0) as max_id FROM sol_stablecoin_trades")
-            _last_synced_trade_id = result['max_id'] if result else 0
-            _last_sync_initialized = True
-            
-            # Also log how many trades are in the engine
-            count_result = engine.read_one("SELECT COUNT(*) as cnt FROM sol_stablecoin_trades")
-            trade_count = count_result['cnt'] if count_result else 0
-            logger.info(f"Trade sync initialized: last_id={_last_synced_trade_id}, existing_trades={trade_count}")
-            return _last_synced_trade_id
+        from core.database import postgres_query_one
+        result = postgres_query_one("SELECT COALESCE(MAX(id), 0) as max_id FROM sol_stablecoin_trades")
+        _last_synced_trade_id = result['max_id'] if result else 0
+        _last_sync_initialized = True
+        
+        # Also log how many trades are in PostgreSQL
+        count_result = postgres_query_one("SELECT COUNT(*) as cnt FROM sol_stablecoin_trades")
+        trade_count = count_result['cnt'] if count_result else 0
+        logger.info(f"Trade sync initialized: last_id={_last_synced_trade_id}, existing_trades={trade_count}")
+        return _last_synced_trade_id
     except Exception as e:
-        logger.warning(f"Engine not available for last trade ID: {e}")
-    
-    # Fallback to file-based DuckDB if engine not available
-    try:
-        from core.database import get_duckdb
-        with get_duckdb("central", read_only=True) as conn:
-            result = conn.execute("SELECT COALESCE(MAX(id), 0) FROM sol_stablecoin_trades").fetchone()
-            _last_synced_trade_id = result[0] if result else 0
-            _last_sync_initialized = True
-            logger.info(f"Trade sync initialized from file-DB: last_id={_last_synced_trade_id}")
-    except Exception as e:
-        logger.debug(f"Could not get last trade ID: {e}")
+        logger.warning(f"PostgreSQL not available for last trade ID: {e}")
         _last_synced_trade_id = 0
         _last_sync_initialized = True
     
@@ -303,16 +292,15 @@ def _normalize_trade_timestamp(ts_value):
 
 
 def _has_recent_trades(hours: int = 24) -> bool:
-    """Check if DuckDB already has trades within the last N hours."""
+    """Check if PostgreSQL already has trades within the last N hours."""
     try:
-        from core.database import get_duckdb
+        from core.database import postgres_query_one
         cutoff = datetime.utcnow() - timedelta(hours=hours)
-        with get_duckdb("central", read_only=True) as conn:
-            result = conn.execute(
-                "SELECT COUNT(*) FROM sol_stablecoin_trades WHERE trade_timestamp >= ?",
-                [cutoff],
-            ).fetchone()
-            return (result[0] if result else 0) > 0
+        result = postgres_query_one(
+            "SELECT COUNT(*) as cnt FROM sol_stablecoin_trades WHERE trade_timestamp >= %s",
+            [cutoff],
+        )
+        return (result['cnt'] if result else 0) > 0
     except Exception as e:
         logger.debug(f"Recent trade check failed: {e}")
         return False
@@ -361,133 +349,57 @@ def fetch_trades_last_24h_from_webhook(hours: int = 24, limit: int = 5000):
     return fetched
 
 
-def _insert_trades_into_duckdb(trades) -> int:
-    """Insert trades into DuckDB hot storage with dedupe."""
+def _insert_trades_into_postgres(trades) -> int:
+    """Insert trades into PostgreSQL with dedupe."""
     if not trades:
         return 0
 
-    from core.database import get_duckdb
-    from features.price_api.schema import SCHEMA_SOL_STABLECOIN_TRADES
+    from core.database import get_postgres
 
     try:
-        with get_duckdb("central") as conn:
-            conn.execute(SCHEMA_SOL_STABLECOIN_TRADES)
-            batch = []
-            now_ts = datetime.utcnow()
-            for row in trades:
-                try:
-                    batch.append(
-                        [
-                            row.get("id"),
-                            row.get("wallet_address"),
-                            row.get("signature"),
-                            _normalize_trade_timestamp(row.get("trade_timestamp")),
-                            row.get("stablecoin_amount"),
-                            row.get("sol_amount"),
-                            row.get("price"),
-                            row.get("direction"),
-                            row.get("perp_direction"),
-                            now_ts,
-                        ]
-                    )
-                except Exception:
-                    continue
-
-            if not batch:
-                return 0
-
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO sol_stablecoin_trades
-                (id, wallet_address, signature, trade_timestamp,
-                 stablecoin_amount, sol_amount, price, direction,
-                 perp_direction, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                batch,
-            )
-            return len(batch)
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                inserted = 0
+                now_ts = datetime.utcnow()
+                for row in trades:
+                    try:
+                        # Use ON CONFLICT DO NOTHING for deduplication
+                        cursor.execute(
+                            """
+                            INSERT INTO sol_stablecoin_trades
+                            (id, wallet_address, signature, trade_timestamp,
+                             stablecoin_amount, sol_amount, price, direction,
+                             perp_direction, created_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            [
+                                row.get("id"),
+                                row.get("wallet_address"),
+                                row.get("signature"),
+                                _normalize_trade_timestamp(row.get("trade_timestamp")),
+                                row.get("stablecoin_amount"),
+                                row.get("sol_amount"),
+                                row.get("price"),
+                                row.get("direction"),
+                                row.get("perp_direction"),
+                                now_ts,
+                            ],
+                        )
+                        if cursor.rowcount > 0:
+                            inserted += 1
+                    except Exception as e:
+                        logger.debug(f"Trade insert skip: {e}")
+                        continue
+                
+                return inserted
     except Exception as e:
-        logger.error(f"DuckDB backfill insert failed: {e}")
+        logger.error(f"PostgreSQL backfill insert failed: {e}")
         return 0
-
-
-def _insert_trades_into_engine(trades) -> int:
-    """Insert trades into TradingDataEngine (best-effort)."""
-    try:
-        from core.database import get_trading_engine
-
-        engine = get_trading_engine()
-        if not engine or not getattr(engine, "_running", False):
-            return 0
-    except Exception:
-        return 0
-
-    inserted = 0
-    now_ts = datetime.utcnow()
-    for row in trades:
-        try:
-            trade_id = row.get("id")
-            vals = [
-                trade_id,
-                row.get("wallet_address"),
-                row.get("signature"),
-                _normalize_trade_timestamp(row.get("trade_timestamp")),
-                row.get("stablecoin_amount"),
-                row.get("sol_amount"),
-                row.get("price"),
-                row.get("direction"),
-                row.get("perp_direction"),
-                now_ts,
-            ]
-            try:
-                engine.execute(
-                    """
-                    INSERT INTO sol_stablecoin_trades
-                    (id, wallet_address, signature, trade_timestamp,
-                     stablecoin_amount, sol_amount, price, direction,
-                     perp_direction, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    vals,
-                )
-                inserted += 1
-            except Exception as insert_err:
-                err_str = str(insert_err).lower()
-                if "duplicate" in err_str or "primary key" in err_str or "constraint" in err_str:
-                    engine.execute(
-                        """
-                        UPDATE sol_stablecoin_trades
-                        SET wallet_address = ?, signature = ?, trade_timestamp = ?,
-                            stablecoin_amount = ?, sol_amount = ?, price = ?,
-                            direction = ?, perp_direction = ?, created_at = ?
-                        WHERE id = ?
-                        """,
-                        [
-                            vals[1],
-                            vals[2],
-                            vals[3],
-                            vals[4],
-                            vals[5],
-                            vals[6],
-                            vals[7],
-                            vals[8],
-                            vals[9],
-                            trade_id,
-                        ],
-                    )
-                    inserted += 1
-                else:
-                    logger.debug(f"Engine insert failed for {trade_id}: {insert_err}")
-        except Exception as e:
-            logger.debug(f"Engine backfill skip: {e}")
-            continue
-
-    return inserted
 
 
 def run_startup_trade_backfill():
-    """Fetch last 24h trades from webhook and seed DuckDB (and engine)."""
+    """Fetch last 24h trades from webhook and seed PostgreSQL."""
     global _last_synced_trade_id, _last_sync_initialized
 
     try:
@@ -501,8 +413,7 @@ def run_startup_trade_backfill():
             logger.error("Startup backfill: webhook returned no trades")
             return
 
-        duckdb_inserted = _insert_trades_into_duckdb(trades)
-        engine_inserted = _insert_trades_into_engine(trades)
+        postgres_inserted = _insert_trades_into_postgres(trades)
         max_id = max((t.get("id", 0) or 0) for t in trades)
 
         if max_id > 0:
@@ -511,8 +422,7 @@ def run_startup_trade_backfill():
 
         logger.info(
             f"Startup backfill complete: fetched={len(trades)}, "
-            f"duckdb_inserted={duckdb_inserted}, engine_inserted={engine_inserted}, "
-            f"max_id={max_id}"
+            f"postgres_inserted={postgres_inserted}, max_id={max_id}"
         )
     except Exception as e:
         logger.error(f"Startup backfill failed: {e}")
@@ -551,7 +461,7 @@ def start_binance_stream_in_background(symbol: str = "SOLUSDT", mode: str = "con
     Start the Binance order book WebSocket stream.
     
     This runs as a continuous WebSocket connection, not an interval job.
-    Data is written to TradingDataEngine (in-memory DuckDB) with auto MySQL sync.
+    Data is written directly to PostgreSQL.
     """
     global _binance_collector
     
@@ -602,57 +512,13 @@ def stop_binance_stream():
 
 
 # =============================================================================
-# API SERVER (runs once at startup in background thread)
+# WEBHOOK API SERVER (runs once at startup in background thread)
 # =============================================================================
-
-def start_data_api_server(host: str = "0.0.0.0", port: int = 5050):
-    """
-    Start the FastAPI Data Engine API server.
-    
-    This is a MINIMAL API that provides core data access for:
-    - master2.py to sync data from the engine
-    - Direct data queries via /query endpoint
-    
-    NOTE: The website should connect to the Flask API (port 5051) which runs separately.
-    This separation ensures master.py never needs to restart for website changes.
-    
-    Endpoints:
-    - POST /insert - Queue write to DuckDB
-    - POST /query - Execute SELECT query
-    - GET /backfill/{table} - Get historical data for startup
-    - GET /health - Health check
-    """
-    global _data_api_server
-    
-    try:
-        from core.data_api import app as data_api_app
-        import uvicorn
-        
-        logger.info(f"Starting FastAPI Data Engine API on http://{host}:{port}")
-        config = uvicorn.Config(data_api_app, host=host, port=port, log_level="warning")
-        _data_api_server = uvicorn.Server(config)
-        _data_api_server.run()
-        
-    except Exception as e:
-        logger.error(f"Failed to start Data API server: {e}")
-
-
-def start_data_api_in_background(host: str = "0.0.0.0", port: int = 5050):
-    """Start the Data Engine API server in a background thread."""
-    api_thread = threading.Thread(
-        target=start_data_api_server,
-        args=(host, port),
-        name="FastAPI-Data-Engine",
-        daemon=True
-    )
-    api_thread.start()
-    logger.info(f"Data Engine API thread started on {host}:{port}")
-    return api_thread
-
 
 def start_webhook_api_server(host: str = "0.0.0.0", port: int = 8001):
     """
-    Start the FastAPI webhook server (QuickNode sink) in a background thread.
+    Start the FastAPI webhook server (QuickNode sink) - BLOCKING.
+    This runs in a background thread.
     """
     global _webhook_server
 
@@ -676,23 +542,9 @@ def start_webhook_api_in_background(host: str = "0.0.0.0", port: int = 8001):
         daemon=True
     )
     webhook_thread.start()
-    logger.info(f"Webhook API server thread started on {host}:{port}")
+    logger.info(f"✓ FastAPI webhook server started on {host}:{port} (background thread)")
+    _threads.append(webhook_thread)
     return webhook_thread
-
-
-def stop_data_api_server():
-    """Stop the FastAPI Data Engine server cleanly."""
-    global _data_api_server
-    
-    if _data_api_server is not None:
-        try:
-            logger.info("Stopping FastAPI Data Engine server...")
-            _data_api_server.should_exit = True
-            _data_api_server.force_exit = True
-            _data_api_server = None
-            logger.info("FastAPI Data Engine server stopped")
-        except Exception as e:
-            logger.error(f"Error stopping Data API server: {e}")
 
 
 # =============================================================================
@@ -785,10 +637,8 @@ def create_scheduler() -> BackgroundScheduler:
     Executors:
     - 'realtime': ThreadPoolExecutor(10) - Fast jobs (Jupiter prices, trade sync, price cycles)
     
-    ALL trading computation (cycles, profiles, trading logic) runs in master2.py.
-    This scheduler handles ONLY raw data ingestion.
-    
-    NOTE: No cleanup or archiving - data is written to both PostgreSQL and DuckDB directly.
+    ALL trading computation (profiles, trading logic) runs in master2.py.
+    This scheduler handles ONLY raw data ingestion to PostgreSQL.
     """
     # Configure executors for parallel job execution
     executors = {
@@ -853,6 +703,11 @@ def create_scheduler() -> BackgroundScheduler:
     # PRICE CYCLE ANALYSIS (runs every 2 seconds)
     # =====================================================
     
+    # DISABLED: Price cycles needs full PostgreSQL refactoring
+    # Will be fixed in a separate update
+    # TODO: Refactor create_price_cycles.py to use PostgreSQL cursor pattern
+    
+    '''
     # Import price cycles processor
     from sys import path as syspath
     from pathlib import Path
@@ -860,11 +715,11 @@ def create_scheduler() -> BackgroundScheduler:
     syspath.insert(0, str(project_root / "000data_feeds" / "2_create_price_cycles"))
     
     try:
-        from create_price_cycles import process_price_cycles as process_price_cycles_run, set_engine
-        
-        # Set the global engine for price cycles
-        set_engine(_trading_engine)
-        
+        # Import price cycle processor
+        from create_price_cycles import process_price_cycles as process_price_cycles_run
+
+        # Note: Price cycles now work with PostgreSQL directly (no engine needed)
+
         scheduler.add_job(
             func=process_price_cycles_run,
             trigger=IntervalTrigger(seconds=1),
@@ -876,6 +731,7 @@ def create_scheduler() -> BackgroundScheduler:
         logger.info("✓ Price cycles job registered")
     except ImportError as e:
         logger.warning(f"Price cycles module not available: {e}")
+    '''
     
     # =====================================================
     # LEGACY JOBS (for backward compatibility)
@@ -915,8 +771,8 @@ def create_scheduler() -> BackgroundScheduler:
 
 
 def main():
-    """Start the trading engine, API server, and scheduler."""
-    global _trading_engine, _scheduler
+    """Start the data ingestion services and scheduler."""
+    global _scheduler
     
     # =====================================================
     # SETUP SIGNAL HANDLERS FOR CLEAN SHUTDOWN
@@ -940,9 +796,7 @@ def main():
     logger.info("Starting Follow The Goat - Data Engine")
     logger.info("=" * 60)
     logger.info(f"Timezone: {settings.scheduler_timezone}")
-    logger.info(f"Hot storage: {settings.hot_storage_hours}h (general), {settings.trades_hot_storage_hours}h (trades)")
-    logger.info(f"PostgreSQL Archive: {settings.postgres.host}/{settings.postgres.database}")
-    logger.info(f"DuckDB Central: {settings.central_db_path}")
+    logger.info(f"PostgreSQL Database: {settings.postgres.host}:{settings.postgres.port}/{settings.postgres.database}")
     logger.info(f"Error Log: {ERROR_LOG_FILE}")
     logger.info("")
     logger.info("NOTE: Trading jobs run in master2.py (can restart independently)")
@@ -951,55 +805,31 @@ def main():
     set_scheduler_start_time()
     
     # =====================================================
-    # STEP 1: Start the TradingDataEngine (in-memory DuckDB)
+    # STEP 1: Verify PostgreSQL Connection and Schema
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 1: Starting TradingDataEngine (in-memory DuckDB)...")
-    _trading_engine = start_trading_engine()
+    logger.info("STEP 1: Verifying PostgreSQL connection and schema...")
     
-    # TODO: Register the engine so price cycles can access it via get_duckdb("central")
-    # For now, price cycles will need to be updated to work with the engine directly
+    try:
+        from core.database import verify_tables_exist
+        if not verify_tables_exist():
+            logger.error("PostgreSQL schema incomplete! Run scripts/postgres_schema.sql first.")
+            logger.error("Exiting...")
+            sys.exit(1)
+        logger.info("PostgreSQL schema verified successfully")
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        logger.error("Exiting...")
+        sys.exit(1)
     
     # Register shutdown handler for unexpected exits
     atexit.register(shutdown_all)
     
-    # Log engine stats
-    stats = _trading_engine.get_stats()
-    logger.info(f"Engine started - Tables loaded: {stats['table_counts']}")
-    
-    # Track trading engine status
-    update_job_status(
-        'trading_engine',
-        status='running',
-        description='TradingDataEngine (in-memory DuckDB)',
-        is_service=True
-    )
-    
     # =====================================================
-    # STEP 2: Start the FastAPI Data Engine (background thread)
+    # STEP 2: Start the FastAPI Webhook Server (QuickNode sink)
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 2: Starting FastAPI Data Engine API (port 5050)...")
-    # Listen on all interfaces so master2.py can connect
-    api_thread = start_data_api_in_background(host="0.0.0.0", port=5050)
-    
-    # Track API server status
-    update_job_status(
-        'data_api_server',
-        status='running',
-        description='FastAPI Data Engine API (port 5050)',
-        is_service=True
-    )
-    
-    # Give the API server a moment to start
-    import time
-    time.sleep(1)
-
-    # =====================================================
-    # STEP 2b: Start FastAPI Webhook Server (QuickNode sink)
-    # =====================================================
-    logger.info("-" * 60)
-    logger.info("STEP 2b: Starting FastAPI Webhook Server (port 8001)...")
+    logger.info("STEP 2: Starting FastAPI Webhook Server (port 8001)...")
     start_webhook_api_in_background(host="0.0.0.0", port=8001)
     
     update_job_status(
@@ -1010,13 +840,14 @@ def main():
     )
     
     # Give the webhook server a moment to start
+    import time
     time.sleep(1)
     
     # =====================================================
-    # STEP 2c: Start PHP Built-in Server (website)
+    # STEP 3: Start PHP Built-in Server (website)
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 2c: Starting PHP Built-in Server (port 8000)...")
+    logger.info("STEP 3: Starting PHP Built-in Server (port 8000)...")
     php_proc = start_php_server(host="0.0.0.0", port=8000)
     
     if php_proc:
@@ -1035,69 +866,34 @@ def main():
         )
     
     # =====================================================
-    # STEP 3: Start the Binance Order Book Stream
+    # STEP 4: Start the Binance Order Book Stream
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 3: Starting Binance Order Book Stream...")
+    logger.info("STEP 4: Starting Binance Order Book Stream...")
     binance_collector = start_binance_stream_in_background(symbol="SOLUSDT", mode="conservative")
     
     # Give the stream a moment to connect
     time.sleep(2)
     
     # =====================================================
-    # STEP 4: Initialize DuckDB tables and sync config from MySQL
+    # STEP 5: Initialize PostgreSQL tables and run backfills
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 4: Initializing DuckDB tables and syncing config...")
+    logger.info("STEP 5: Running startup backfills...")
     
-    # FIRST: Initialize ALL file-based DuckDB tables BEFORE any syncs
-    # This ensures follow_the_goat_tracking, follow_the_goat_buyins, etc. exist with correct schema
-    try:
-        from core.database import init_duckdb_tables
-        init_duckdb_tables("central")
-        logger.info("All file-based DuckDB tables initialized (including migrations)")
-    except Exception as e:
-        logger.error(f"Failed to initialize DuckDB tables: {e}")
-    
-    # Initialize pattern config tables before sync
-    try:
-        from features.price_api.schema import SCHEMA_PATTERN_CONFIG_PROJECTS, SCHEMA_PATTERN_CONFIG_FILTERS
-        from core.database import get_duckdb
-        with get_duckdb("central") as conn:
-            # Drop existing pattern_config_filters to ensure schema is up-to-date
-            # (new columns like exclude_mode need to be added)
-            conn.execute("DROP TABLE IF EXISTS pattern_config_filters")
-            conn.execute(SCHEMA_PATTERN_CONFIG_PROJECTS)
-            conn.execute(SCHEMA_PATTERN_CONFIG_FILTERS)
-        logger.info("Pattern config tables initialized (recreated)")
-    except Exception as e:
-        logger.error(f"Failed to initialize pattern config tables: {e}")
-    
-    # Backfill last 24h of trades from webhook so profiles have data immediately
+    # Backfill last 24h of trades from webhook
     try:
         run_startup_trade_backfill()
     except Exception as e:
         logger.error(f"Failed to run startup trade backfill: {e}")
-
-    # NOTE: TradingDataEngine handles in-memory tables for prices, orderbook, etc.
-    # File-based DuckDB tables are initialized above via init_duckdb_tables()
-    logger.info("Tables initialized (file-based + TradingDataEngine in-memory)")
     
-    # MySQL sync skipped (DuckDB-only mode; plays/config must be pre-cached)
-    
-    # Sync trades (critical for follow_the_goat DuckDB-only operation)
-    # Uses fast Webhook DuckDB→DuckDB path, falls back to MySQL
-    try:
-        sync_trades_from_webhook()
-        logger.info("Trades sync skipped (push-based FastAPI webhook)")
-    except Exception as e:
-        logger.error(f"Failed to sync trades on startup: {e}")
+    logger.info("Startup backfills complete")
     
     # =====================================================
-    # STEP 5: Create and start the scheduler
+    # STEP 6: Create and start the scheduler
     # =====================================================
     logger.info("-" * 60)
-    logger.info("STEP 5: Starting Scheduler...")
+    logger.info("STEP 6: Starting Scheduler...")
     _scheduler = create_scheduler()
     
     # Log executor configuration
@@ -1105,7 +901,7 @@ def main():
     logger.info("  - realtime (10 threads): Jupiter prices, trade sync, price cycles")
     logger.info("")
     logger.info("Trading jobs run in master2.py (can restart independently)")
-    logger.info("NOTE: No cleanup/archiving - data written to both PostgreSQL and DuckDB")
+    logger.info("All data written directly to PostgreSQL")
     
     # Log all registered jobs grouped by executor
     jobs = _scheduler.get_jobs()
@@ -1132,7 +928,7 @@ def main():
 
 def shutdown_all():
     """Gracefully shutdown all services in the correct order."""
-    global _trading_engine, _binance_collector, _scheduler
+    global _binance_collector, _scheduler
     
     logger.info("=" * 60)
     logger.info("SHUTTING DOWN - Please wait...")
@@ -1141,7 +937,7 @@ def shutdown_all():
     # 1. Stop the scheduler first (stops new jobs from running)
     if _scheduler is not None:
         try:
-            logger.info("[1/7] Stopping scheduler...")
+            logger.info("[1/5] Stopping scheduler...")
             _scheduler.shutdown(wait=False)
             _scheduler = None
             logger.info("      Scheduler stopped")
@@ -1149,36 +945,27 @@ def shutdown_all():
             logger.error(f"      Error stopping scheduler: {e}")
     
     # 2. Stop metrics writer
-    logger.info("[2/7] Stopping metrics writer...")
+    logger.info("[2/5] Stopping metrics writer...")
     stop_metrics_writer()
-    
-    # 3. Stop the Data API server
-    logger.info("[3/7] Stopping FastAPI Data Engine server...")
-    stop_data_api_server()
 
-    # 4. Stop webhook server
-    logger.info("[4/7] Stopping FastAPI webhook server...")
+    # 3. Stop webhook server
+    logger.info("[3/5] Stopping FastAPI webhook server...")
     stop_webhook_api()
     
-    # 5. Stop PHP server
-    logger.info("[5/7] Stopping PHP server...")
+    # 4. Stop PHP server
+    logger.info("[4/5] Stopping PHP server...")
     stop_php_server()
     
-    # 6. Stop Binance stream
+    # 5. Stop Binance stream
     if _binance_collector is not None:
-        logger.info("[6/7] Stopping Binance stream...")
+        logger.info("[5/5] Stopping Binance stream...")
         stop_binance_stream()
     else:
-        logger.info("[6/7] Binance stream not running")
+        logger.info("[5/5] Binance stream not running")
     
-    # 7. Stop the trading engine
-    if _trading_engine is not None:
-        logger.info("[7/7] Stopping TradingDataEngine...")
-        stop_trading_engine()
-        _trading_engine = None
-        logger.info("      TradingDataEngine stopped")
-    else:
-        logger.info("[7/7] TradingDataEngine not running")
+    # Close PostgreSQL connections
+    from core.database import close_all_postgres
+    close_all_postgres()
     
     logger.info("Note: Plays are preserved in config/plays_cache.json")
     

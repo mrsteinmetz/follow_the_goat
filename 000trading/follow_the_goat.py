@@ -1205,7 +1205,8 @@ class WalletFollower:
                     'live_trade': 1 if self.live_trade else 0,
                     'price_cycle': current_price_cycle,
                     'our_status': initial_status,
-                    'followed_at': block_timestamp_str
+                    'followed_at': block_timestamp_str,
+                    'higest_price_reached': our_entry_price  # Initialize with entry price
                 })
                 logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
             else:
@@ -1214,13 +1215,15 @@ class WalletFollower:
                     INSERT INTO follow_the_goat_buyins (
                         id, play_id, wallet_address, original_trade_id, trade_signature,
                         block_timestamp, quote_amount, base_amount, price, direction,
-                        our_entry_price, live_trade, price_cycle, our_status, followed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        our_entry_price, live_trade, price_cycle, our_status, followed_at,
+                        higest_price_reached
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
                     block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),
                     trade.get('price'), trade.get('direction', 'buy'), our_entry_price,
-                    1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str
+                    1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str,
+                    our_entry_price  # Initialize higest_price_reached with entry price
                 ])
                 logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
         except Exception as e:

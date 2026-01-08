@@ -21,12 +21,24 @@ $play_id = isset($_GET['play_id']) ? (int)$_GET['play_id'] : null;
 $status = $_GET['status'] ?? null;
 $hours = $_GET['hours'] ?? '24';
 $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 100;
+$has_potential_gains = $_GET['has_potential_gains'] ?? null;
 
 // Fetch trades
 if ($use_duckdb) {
     $response = $duckdb->getBuyins($play_id, $status, $hours, $limit);
     if ($response && isset($response['buyins'])) {
         $trades = $response['buyins'];
+        
+        // Filter by potential_gains if requested
+        if ($has_potential_gains === 'yes') {
+            $trades = array_filter($trades, function($trade) {
+                return isset($trade['potential_gains']) && $trade['potential_gains'] !== null;
+            });
+        } elseif ($has_potential_gains === 'no') {
+            $trades = array_filter($trades, function($trade) {
+                return !isset($trade['potential_gains']) || $trade['potential_gains'] === null;
+            });
+        }
     }
 } else {
     $error_message = "DuckDB API is not available. Please start the scheduler: python scheduler/master.py";
@@ -306,6 +318,15 @@ ob_start();
         </div>
         
         <div class="col-md-2">
+            <label for="has_potential_gains" class="form-label">Potential Gains</label>
+            <select name="has_potential_gains" id="has_potential_gains" class="form-select form-select-sm">
+                <option value="">All Trades</option>
+                <option value="yes" <?php echo $has_potential_gains === 'yes' ? 'selected' : ''; ?>>Has Potential Gains</option>
+                <option value="no" <?php echo $has_potential_gains === 'no' ? 'selected' : ''; ?>>No Potential Gains</option>
+            </select>
+        </div>
+        
+        <div class="col-md-2">
             <button type="submit" class="btn btn-primary btn-sm w-100">
                 <i class="ri-filter-line me-1"></i>Filter
             </button>
@@ -364,9 +385,11 @@ ob_start();
                         <th>ID</th>
                         <th>Play</th>
                         <th>Status</th>
+                        <th>Cycle ID</th>
                         <th>Entry Price</th>
                         <th>Current/Exit</th>
                         <th>P/L %</th>
+                        <th>Potential Gains</th>
                         <th>Wallet</th>
                         <th>Trail</th>
                         <th>Time</th>
@@ -415,6 +438,18 @@ ob_start();
                             </span>
                         </td>
                         <td>
+                            <?php 
+                            $cycle_id = $trade['price_cycle'] ?? null;
+                            if ($cycle_id !== null): 
+                            ?>
+                            <span class="badge bg-info-transparent" style="font-family: 'SF Mono', monospace;">
+                                #<?php echo $cycle_id; ?>
+                            </span>
+                            <?php else: ?>
+                            <span class="text-muted">-</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
                             <span class="price-value">
                                 $<?php echo number_format($entry_price, 4); ?>
                             </span>
@@ -439,6 +474,20 @@ ob_start();
                             </span>
                             <?php else: ?>
                             <span class="profit-zero">-</span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php 
+                            $potential_gains = $trade['potential_gains'] ?? null;
+                            if ($potential_gains !== null):
+                                $pg_class = $potential_gains > 0 ? 'profit-positive' : ($potential_gains < 0 ? 'profit-negative' : 'profit-zero');
+                                $pg_sign = $potential_gains > 0 ? '+' : '';
+                            ?>
+                            <span class="<?php echo $pg_class; ?>">
+                                <?php echo $pg_sign . number_format($potential_gains, 2); ?>%
+                            </span>
+                            <?php else: ?>
+                            <span class="text-muted" style="font-size: 0.7rem;">pending</span>
                             <?php endif; ?>
                         </td>
                         <td>

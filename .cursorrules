@@ -258,21 +258,103 @@ with get_duckdb("central") as conn:  # Missing read_only=True
 
 ### 2. Database: DuckDB + PostgreSQL
 - **DuckDB** - Hot storage (in-memory, fast access)
-  - master.py: TradingDataEngine (raw data)
-  - master2.py: Local instance (computed data + synced raw data)
+  - master.py: TradingDataEngine (raw data + price cycles)
+  - master2.py: Local instance (computed data + synced raw data + synced cycles)
 - **PostgreSQL** - Cold storage (archive only)
   - Archived data older than 24-72 hours
   - Used for historical analysis
 - All database setup is documented in `duckdb/ARCHITECTURE.md`
 
+### 3. Critical Data Flow: Price Cycles
+**Price cycles are created in master.py and synced to master2:**
 
-### 3. Hot/Cold Storage Pattern
+```
+master.py (Data Engine - port 5050)
+  ↓ creates (process_price_cycles job runs every 1s)
+cycle_tracker (in TradingDataEngine in-memory DuckDB)
+  ↓ syncs via HTTP API
+master2.py (Trading Logic - port 5052)
+  ↓ backfill on startup + continuous sync (every 1s)
+cycle_tracker (in master2's local in-memory DuckDB)
+  ↓ trades link to active cycles
+follow_the_goat_buyins (price_cycle field references cycle id)
+```
+
+**How cycles sync (THIS WORKS CORRECTLY - VERIFIED):**
+1. **On master2 startup:** `backfill_from_data_engine()` fetches all recent cycles via `/backfill/cycle_tracker?hours=24`
+2. **Every 1 second:** `sync_new_data_from_engine()` fetches new/updated cycles via `/sync/cycle_tracker?since_id=X`
+3. **Special handling:** Uses `INSERT OR REPLACE` (not `INSERT OR IGNORE`) because cycles UPDATE when they close
+
+**Verifying cycle sync is working:**
+- ✅ Check website: http://195.201.84.5/pages/cycles/ should show all cycles
+- ✅ Check master.py: `curl http://127.0.0.1:5050/health` → look for `cycle_tracker` count
+- ✅ Check master2 API: `curl http://127.0.0.1:5052/cycles` → should return cycles
+- ✅ If website shows cycles, sync is working (website queries master2's DuckDB)
+
+**Common misunderstandings to avoid:**
+- ❌ Don't use `/query` endpoint on master2 for verification - use the `/cycles` endpoint
+- ❌ Don't assume cycles are missing just because some API queries return 0 - check the website
+- ✅ The website cycles page is the source of truth for what's in master2's DuckDB
+
+
+### 4. Hot/Cold Storage Pattern
 ```python
 # Example: price_points (hot) + price_points_archive (cold)
 # Data older than 24 hours is moved from hot to cold storage
 ```
 
-### 4. Scheduling: APScheduler Only
+**CRITICAL: Cycle Retention Must Match Trade Lifetime**
+- **Trades**: 72-hour hot storage retention (`trades_hot_storage_hours`)
+- **Cycles**: 72-hour hot storage retention (MUST match trades - trades reference cycle_id)
+- **Other data**: 24-hour hot storage retention
+
+Price cycles NEVER last more than 2 hours, but they must persist for 72 hours so that trades can reference them throughout their entire lifecycle. The cleanup logic ensures `cycle_tracker` records are kept for 72 hours after `cycle_end_time`.
+
+**Why 72 hours for cycles?**
+- Trade is created with `price_cycle=123` (cycle is active)
+- Cycle closes after 30 minutes (`cycle_end_time` is set)
+- Trade may stay active (pending/sold) for up to 72 hours
+- `update_potential_gains.py` needs the cycle's `highest_price_reached` to calculate gains
+- If cycle was deleted before trade is processed, gains can't be calculated
+
+### 5. Orphaned Trades Pattern (Safety Mechanism)
+**Problem:** In rare cases, trades might reference cycles that are missing from master2's DuckDB (e.g., if cycle was archived before trade was sold, or during edge-case restart scenarios).
+
+**Solution:** Trades track their own `higest_price_reached` field as a fallback, allowing potential_gains calculation even without the cycle:
+
+```python
+# update_potential_gains.py handles two cases:
+
+# Case 1: Cycle exists - use cycle's highest_price_reached (PRIMARY METHOD)
+SELECT ((ct.highest_price_reached - buyins.our_entry_price) / buyins.our_entry_price) * 100
+FROM follow_the_goat_buyins buyins
+INNER JOIN cycle_tracker ct ON ct.id = buyins.price_cycle
+WHERE ct.cycle_end_time IS NOT NULL
+
+# Case 2: Cycle missing (orphaned) - use trade's own higest_price_reached (FALLBACK)
+SELECT ((buyins.higest_price_reached - buyins.our_entry_price) / buyins.our_entry_price) * 100
+FROM follow_the_goat_buyins buyins
+WHERE buyins.our_status IN ('sold', 'no_go')
+  AND buyins.higest_price_reached IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM cycle_tracker WHERE id = buyins.price_cycle)
+```
+
+**Note:** Under normal operation, all trades should have valid cycles. The orphaned case is a safety net.
+
+### 6. Understanding Master2 Restarts
+**What happens when master2.py restarts:**
+1. ✅ In-memory DuckDB is wiped (by design - `:memory:` connection)
+2. ✅ On startup, backfills last 24 hours of data from master.py:
+   - Prices, order book features, whale movements
+   - Cycles (all recent cycles are re-synced)
+   - SOL trades
+3. ✅ Continuous sync resumes (every 1 second) after initialization
+4. ✅ Trades start fresh (IDs restart from 1)
+5. ✅ Old trade IDs are not preserved (in-memory only)
+
+**This is normal and expected!** Master2 is designed to restart freely for code updates.
+
+### 7. Scheduling: APScheduler Only
 - **NEVER use .bat files** for scheduling Python scripts
 - Data ingestion jobs run in `scheduler/master.py`
 - Trading logic jobs run in `scheduler/master2.py`

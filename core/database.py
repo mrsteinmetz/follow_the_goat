@@ -392,14 +392,10 @@ def get_duckdb(name: str = "central", read_only: bool = False):
         read_only: If True, use thread-local cursor for concurrent reads.
                   If False (default), use connection with lock for writes.
     """
-    # Try to use TradingDataEngine first (in-memory, zero locks)
-    engine = _get_engine_if_running()
-    if engine is not None and name == "central":
-        # Use engine wrapper for central database
-        yield EngineConnectionWrapper(engine)
-        return
-    
-    # Check if this is a registered external connection
+    # Check if this is a registered external connection (e.g., master2's local DuckDB)
+    # This MUST take precedence so trading modules always use master2's in-memory DB
+    # instead of master.py's TradingDataEngine. Master2 is the source of truth for
+    # trading logic, so prefer the externally registered connection when present.
     if name in _pool._external_registered:
         # For READ operations with cursor factory, use thread-local cursor (no lock needed)
         if read_only:
@@ -421,6 +417,13 @@ def get_duckdb(name: str = "central", read_only: bool = False):
             # No lock available, yield connection directly (caller responsible for safety)
             yield conn
             return
+
+    # Try to use TradingDataEngine if available (master.py context)
+    engine = _get_engine_if_running()
+    if engine is not None and name == "central":
+        # Use engine wrapper for central database
+        yield EngineConnectionWrapper(engine)
+        return
     
     # Fallback to pooled DuckDB (standalone mode or non-central DB)
     # Get connection OUTSIDE try/except to avoid "generator didn't stop after throw()"
@@ -1143,13 +1146,16 @@ def archive_old_data(table_name: str, db_name: str = "central", hours: int = 24)
         return 0
     
     with get_duckdb(db_name) as conn:
-        # Special handling for cycle_tracker: only process completed cycles
+        # Special handling for cycle_tracker: use 72h retention (match trades)
+        # Trades can reference cycles for their entire lifecycle (up to 72h)
         if table_name == "cycle_tracker":
+            # Override hours to 72 for cycles (they MUST outlive the trades that reference them)
+            cycle_hours = 72
             # Select old completed cycles for archiving
             rows = conn.execute(f"""
                 SELECT * FROM {table_name}
                 WHERE cycle_end_time IS NOT NULL 
-                AND cycle_end_time < NOW() - INTERVAL {hours} HOUR
+                AND cycle_end_time < NOW() - INTERVAL {cycle_hours} HOUR
             """).fetchall()
             
             if rows:
@@ -1161,9 +1167,9 @@ def archive_old_data(table_name: str, db_name: str = "central", hours: int = 24)
                 conn.execute(f"""
                     DELETE FROM {table_name}
                     WHERE cycle_end_time IS NOT NULL 
-                    AND cycle_end_time < NOW() - INTERVAL {hours} HOUR
+                    AND cycle_end_time < NOW() - INTERVAL {cycle_hours} HOUR
                 """)
-                logger.info(f"Cleaned up {len(rows)} old completed cycles from {table_name}")
+                logger.info(f"Cleaned up {len(rows)} old completed cycles from {table_name} (72h retention)")
                 
                 # Queue for async PostgreSQL archive (fire-and-forget, never blocks)
                 _archive_to_postgres_async(table_name, rows_dict)

@@ -30,6 +30,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Set
 import logging
+import time
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -49,11 +50,12 @@ logger = logging.getLogger("wallet_profiles")
 
 # --- Configuration ---
 MIN_BUYS = 3  # Minimum buy trades to qualify a wallet
-BATCH_SIZE = 1000  # Process trades in batches (increased for DuckDB efficiency)
+BATCH_SIZE = 50000  # Large DuckDB/Arrow batch to cut iterations
 PRICE_TOKEN = 'SOL'  # Token for price lookups in prices table
 
 # All thresholds from cycle_tracker (matching create_price_cycles.py)
-THRESHOLDS = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+# Temporarily narrowed to 0.3 to reduce runtime
+THRESHOLDS = [0.3]
 
 
 # =============================================================================
@@ -705,62 +707,89 @@ def build_profiles_for_local_duckdb(local_conn, lock=None, data_client=None) -> 
     except Exception as e:
         logger.warning(f"State table creation: {e}")
     
-    # Process all thresholds
-    try:
-        if lock:
-            lock.acquire()
-        
-        for threshold in THRESHOLDS:
+    # Process all thresholds with minimal lock time to avoid blocking other jobs
+    for threshold in THRESHOLDS:
+        try:
+            # Get latest completed cycle end time (brief lock)
+            if lock:
+                lock.acquire()
             try:
-                # Get latest completed cycle end time (from DuckDB)
                 latest_cycle_end = _get_latest_cycle_end(local_conn, threshold)
-                if not latest_cycle_end:
-                    continue
-                
-                # Get last processed trade ID (from PostgreSQL)
+            finally:
+                if lock:
+                    lock.release()
+            
+            if not latest_cycle_end:
+                continue
+            
+            # Get last processed trade ID (brief lock)
+            if lock:
+                lock.acquire()
+            try:
                 last_trade_id = _get_last_id(threshold)
-                
-                # Build profiles using local connection
+            finally:
+                if lock:
+                    lock.release()
+            
+            # Build profiles using local connection (brief lock)
+            if lock:
+                lock.acquire()
+            try:
+                build_start = time.time()
                 profiles = build_profiles_batch_duckdb(
                     threshold, last_trade_id, latest_cycle_end, 
                     batch_size=BATCH_SIZE, conn=local_conn
                 )
-                
-                if not profiles:
-                    continue
-                
-                # Insert profiles into local DuckDB
-                inserted = _insert_profiles(local_conn, profiles)
-                
-                # DISABLED: Profiles should ONLY live in master2.py's local DuckDB
-                # Website queries master2 (port 5052) directly, NOT master.py (port 5050)
-                # Master.py should only have raw data ingestion (prices, trades, order book)
-                # 
-                # if data_client and profiles:
-                #     try:
-                #         data_client.insert_batch('wallet_profiles', api_profiles)
-                #         logger.debug(f"Pushed {len(api_profiles)} profiles to Data Engine API")
-                #     except Exception as api_err:
-                #         logger.warning(f"Failed to push profiles to API (non-critical): {api_err}")
-                
-                # Update state (in DuckDB)
-                if profiles:
-                    max_id = max(p['trade_id'] for p in profiles)
-                    _update_last_id_local(local_conn, threshold, max_id)
-                
-                total_inserted += inserted
-                if inserted > 0:
-                    logger.debug(f"Threshold {threshold}: inserted {inserted} profiles")
-                    
-            except Exception as e:
-                logger.error(f"Error processing threshold {threshold}: {e}")
-        
-        if total_inserted > 0:
-            logger.info(f"Inserted {total_inserted} profiles across all thresholds")
+            finally:
+                if lock:
+                    lock.release()
+            build_elapsed = time.time() - build_start
             
-    finally:
-        if lock:
-            lock.release()
+            if not profiles:
+                logger.info(f"Threshold {threshold}: build took {build_elapsed:.3f}s, no new profiles")
+                continue
+            
+            logger.info(
+                f"Threshold {threshold}: build took {build_elapsed:.3f}s, "
+                f"profiles={len(profiles)}, trade_id range "
+                f"{min(p['trade_id'] for p in profiles)}-{max(p['trade_id'] for p in profiles)}"
+            )
+            
+            # Insert profiles into local DuckDB (brief lock; PyArrow is fast)
+            if lock:
+                lock.acquire()
+            try:
+                insert_start = time.time()
+                inserted = _insert_profiles(local_conn, profiles)
+            finally:
+                if lock:
+                    lock.release()
+            insert_elapsed = time.time() - insert_start
+            logger.info(
+                f"Threshold {threshold}: insert took {insert_elapsed:.3f}s "
+                f"for {inserted} profiles ({(inserted/insert_elapsed) if insert_elapsed else 0:.0f} r/s)"
+            )
+            
+            # Update state (brief lock)
+            max_id = max(p['trade_id'] for p in profiles)
+            if lock:
+                lock.acquire()
+            try:
+                _update_last_id_local(local_conn, threshold, max_id)
+                total_inserted += inserted
+            finally:
+                if lock:
+                    lock.release()
+            
+            if inserted > 0:
+                logger.debug(f"Threshold {threshold}: inserted {inserted} profiles")
+                
+        except Exception as e:
+            logger.error(f"Error processing threshold {threshold}: {e}")
+            continue
+    
+    if total_inserted > 0:
+        logger.info(f"Inserted {total_inserted} profiles across all thresholds")
     
     return total_inserted
 

@@ -474,15 +474,18 @@ async def get_new_records(
         )
     
     try:
-        # Special handling for cycle_tracker: ALWAYS include ALL active cycles
+        # Special handling for cycle_tracker: ALWAYS include ALL active cycles + recently closed
         # This ensures master2 sees cycle closures (when cycle_end_time is set)
         # Regular sync only returns NEW records, but cycle closures UPDATE existing records
         if table == "cycle_tracker":
             # Get ALL active cycles (cycle_end_time IS NULL) regardless of ID
-            # Plus any new cycles (id > since_id)
+            # PLUS recently closed cycles (closed in last 24 hours) to catch updates
+            # PLUS any new cycles (id > since_id)
             results = engine.read(
                 f"""SELECT * FROM {table} 
-                    WHERE cycle_end_time IS NULL OR id > ? 
+                    WHERE cycle_end_time IS NULL 
+                       OR id > ? 
+                       OR (cycle_end_time IS NOT NULL AND cycle_end_time >= NOW() - INTERVAL 24 HOUR)
                     ORDER BY id ASC 
                     LIMIT ?""",
                 [since_id, limit]

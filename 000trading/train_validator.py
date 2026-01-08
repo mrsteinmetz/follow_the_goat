@@ -533,13 +533,15 @@ def insert_synthetic_buyin(
                 id, play_id, wallet_address, original_trade_id, trade_signature,
                 block_timestamp, quote_amount, base_amount, price, direction,
                 our_entry_price, swap_response, live_trade, price_cycle,
-                entry_log, pattern_validator_log, our_status, followed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry_log, pattern_validator_log, our_status, followed_at,
+                higest_price_reached
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [
             buyin_id, play_id, wallet_address, 0, signature,
             block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
             our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
-            pre_insert_log, None, 'validating', block_timestamp_str
+            pre_insert_log, None, 'validating', block_timestamp_str,
+            our_entry_price  # Initialize higest_price_reached with entry price
         ], sync=True)
         logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
         

@@ -37,6 +37,7 @@ Thumbs.db
 # Logs
 *.log
 *.log.*
+*_job_status.json
 
 # Parquet files
 *.parquet

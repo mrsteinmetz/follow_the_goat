@@ -1082,22 +1082,28 @@ class TradingDataEngine:
         with self._conn_lock:
             for table, ts_col in TIMESTAMP_COLUMNS.items():
                 try:
-                    # Special handling for cycle_tracker: use cycle_end_time and only delete completed cycles
+                    # Special handling for cycle_tracker: use 72h retention (must outlive trades)
+                    # Trades can reference cycles for up to 72h (trades_hot_storage_hours)
                     if table == "cycle_tracker":
+                        cycle_cutoff = datetime.now() - timedelta(hours=72)
                         result = self._conn.execute(
                             "DELETE FROM cycle_tracker WHERE cycle_end_time IS NOT NULL AND cycle_end_time < ? RETURNING id",
-                            [cutoff]
+                            [cycle_cutoff]
                         ).fetchall()
+                        deleted = len(result)
+                        if deleted > 0:
+                            total_deleted += deleted
+                            logger.debug(f"Cleaned up {deleted} old cycles from cycle_tracker (72h retention)")
                     else:
                         result = self._conn.execute(
                             f"DELETE FROM {table} WHERE {ts_col} < ? RETURNING id",
                             [cutoff]
                         ).fetchall()
                     
-                    deleted = len(result)
-                    if deleted > 0:
-                        total_deleted += deleted
-                        logger.debug(f"Cleaned up {deleted} old records from {table}")
+                        deleted = len(result)
+                        if deleted > 0:
+                            total_deleted += deleted
+                            logger.debug(f"Cleaned up {deleted} old records from {table}")
                 except Exception as e:
                     logger.debug(f"Cleanup error for {table}: {e}")
         

@@ -218,23 +218,447 @@ def get_price_points():
 
 @app.route('/plays', methods=['GET'])
 def get_plays():
-    """Get active plays."""
+    """Get all plays (both active and inactive)."""
     try:
         limit = min(int(request.args.get('limit', 100)), 1000)
+        active_only = request.args.get('active_only', 'false').lower() == 'true'
         
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                if active_only:
+                    cursor.execute("""
+                        SELECT * FROM follow_the_goat_plays
+                        WHERE is_active = 1
+                        ORDER BY id DESC LIMIT %s
+                    """, [limit])
+                else:
+                    # Return all plays (active and inactive)
+                    cursor.execute("""
+                        SELECT * FROM follow_the_goat_plays
+                        ORDER BY id DESC LIMIT %s
+                    """, [limit])
+                results = cursor.fetchall()
+        
+        return jsonify({'plays': results, 'count': len(results)})
+    except Exception as e:
+        logger.error(f"Get plays failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>', methods=['GET'])
+def get_single_play(play_id):
+    """Get a single play by ID."""
+    try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT * FROM follow_the_goat_plays
-                    WHERE is_active = TRUE
-                    ORDER BY id DESC LIMIT %s
-                """, [limit])
-                results = cursor.fetchall()
+                    WHERE id = %s
+                """, [play_id])
+                
+                result = cursor.fetchone()
         
-        return jsonify({'results': results, 'count': len(results)})
+        if result:
+            return jsonify({'play': result})
+        else:
+            return jsonify({'error': 'Play not found'}), 404
     except Exception as e:
-        logger.error(f"Get plays failed: {e}")
+        logger.error(f"Get single play failed: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>/for_edit', methods=['GET'])
+def get_play_for_edit(play_id):
+    """Get a single play with all fields for editing."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM follow_the_goat_plays
+                    WHERE id = %s
+                """, [play_id])
+                
+                result = cursor.fetchone()
+        
+        if result:
+            return jsonify({
+                'success': True,
+                'id': result['id'],
+                'name': result['name'],
+                'description': result['description'],
+                'find_wallets_sql': result.get('find_wallets_sql'),
+                'sell_logic': result.get('sell_logic'),
+                'max_buys_per_cycle': result.get('max_buys_per_cycle', 5),
+                'short_play': result.get('short_play', 0),
+                'trigger_on_perp': result.get('tricker_on_perp'),
+                'timing_conditions': result.get('timing_conditions'),
+                'bundle_trades': result.get('bundle_trades'),
+                'cashe_wallets': result.get('cashe_wallets'),
+                'project_ids': result.get('project_ids'),
+                'is_active': result.get('is_active', 1),
+                'sorting': result.get('sorting', 10),
+                'pattern_validator_enable': result.get('pattern_validator_enable', 0),
+                'pattern_update_by_ai': result.get('pattern_update_by_ai', 0)
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Play not found'}), 404
+    except Exception as e:
+        logger.error(f"Get play for edit failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>', methods=['PUT'])
+def update_play(play_id):
+    """Update a play."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        # Build dynamic UPDATE query based on provided fields
+        update_fields = []
+        params = []
+        
+        field_mappings = {
+            'name': 'name',
+            'description': 'description',
+            'find_wallets_sql': 'find_wallets_sql',
+            'sell_logic': 'sell_logic',
+            'max_buys_per_cycle': 'max_buys_per_cycle',
+            'short_play': 'short_play',
+            'trigger_on_perp': 'tricker_on_perp',
+            'timing_conditions': 'timing_conditions',
+            'bundle_trades': 'bundle_trades',
+            'cashe_wallets': 'cashe_wallets',
+            'project_ids': 'project_ids',
+            'is_active': 'is_active',
+            'sorting': 'sorting',
+            'pattern_validator_enable': 'pattern_validator_enable',
+            'pattern_update_by_ai': 'pattern_update_by_ai'
+        }
+        
+        for key, db_field in field_mappings.items():
+            if key in data:
+                value = data[key]
+                # Convert find_wallets_sql to JSON format if it's a string
+                if key == 'find_wallets_sql' and isinstance(value, str):
+                    value = {'query': value}
+                update_fields.append(f"{db_field} = %s")
+                params.append(value)
+        
+        if not update_fields:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+        
+        params.append(play_id)
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                query = f"""
+                    UPDATE follow_the_goat_plays
+                    SET {', '.join(update_fields)}
+                    WHERE id = %s
+                """
+                cursor.execute(query, params)
+                rows_affected = cursor.rowcount
+            conn.commit()
+        
+        if rows_affected > 0:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Play not found'}), 404
+    except Exception as e:
+        logger.error(f"Update play failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>', methods=['DELETE'])
+def delete_play(play_id):
+    """Delete a play."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    DELETE FROM follow_the_goat_plays
+                    WHERE id = %s
+                """, [play_id])
+                rows_affected = cursor.rowcount
+            conn.commit()
+        
+        if rows_affected > 0:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Play not found'}), 404
+    except Exception as e:
+        logger.error(f"Delete play failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>/performance', methods=['GET'])
+def get_play_performance(play_id):
+    """Get performance metrics for a single play."""
+    try:
+        hours = request.args.get('hours', 'all')
+        
+        # Build time filter
+        time_filter = ""
+        params = [play_id]
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                time_filter = "AND followed_at >= NOW() - INTERVAL '%s hours'"
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get active (pending) trades stats
+                cursor.execute(f"""
+                    SELECT 
+                        COUNT(*) as active_trades,
+                        AVG(CASE 
+                            WHEN our_entry_price > 0 AND current_price > 0 
+                            THEN ((current_price - our_entry_price) / our_entry_price) * 100 
+                            ELSE NULL 
+                        END) as active_avg_profit
+                    FROM follow_the_goat_buyins
+                    WHERE our_status = 'pending' AND play_id = %s {time_filter}
+                """, params)
+                live_result = cursor.fetchone()
+                
+                # Get no_go counts
+                cursor.execute(f"""
+                    SELECT COUNT(*) as no_go_count
+                    FROM follow_the_goat_buyins
+                    WHERE our_status = 'no_go' AND play_id = %s {time_filter}
+                """, params)
+                no_go_result = cursor.fetchone()
+                
+                # Get sold/completed trades stats
+                sold_filter = time_filter.replace('followed_at', 'our_exit_timestamp') if time_filter else ""
+                cursor.execute(f"""
+                    SELECT 
+                        SUM(our_profit_loss) as total_profit_loss,
+                        COUNT(CASE WHEN our_profit_loss > 0 THEN 1 END) as winning_trades,
+                        COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades
+                    FROM follow_the_goat_buyins
+                    WHERE our_status IN ('sold', 'completed') AND play_id = %s {sold_filter}
+                """, params)
+                sold_result = cursor.fetchone()
+        
+        return jsonify({
+            'success': True,
+            'total_profit_loss': float(sold_result.get('total_profit_loss') or 0) if sold_result else 0,
+            'winning_trades': int(sold_result.get('winning_trades') or 0) if sold_result else 0,
+            'losing_trades': int(sold_result.get('losing_trades') or 0) if sold_result else 0,
+            'total_no_gos': int(no_go_result.get('no_go_count') or 0) if no_go_result else 0,
+            'active_trades': int(live_result.get('active_trades') or 0) if live_result else 0,
+            'active_avg_profit': float(live_result.get('active_avg_profit')) if live_result and live_result.get('active_avg_profit') else None
+        })
+    except Exception as e:
+        logger.error(f"Get play performance failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays', methods=['POST'])
+def create_play():
+    """Create a new play in PostgreSQL."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data provided'}), 400
+        
+        # Required fields
+        required = ['name', 'description', 'find_wallets_sql']
+        for field in required:
+            if field not in data:
+                return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO follow_the_goat_plays (
+                        name, description, find_wallets_sql, sell_logic, 
+                        max_buys_per_cycle, short_play, tricker_on_perp, 
+                        timing_conditions, bundle_trades, cashe_wallets, 
+                        project_ids, is_active, sorting, 
+                        pattern_validator_enable, pattern_update_by_ai
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    ) RETURNING id
+                """, [
+                    data['name'],
+                    data['description'],
+                    {'query': data['find_wallets_sql']},
+                    data.get('sell_logic', {'tolerance_rules': {'increases': [], 'decreases': []}}),
+                    data.get('max_buys_per_cycle', 5),
+                    data.get('short_play', 0),
+                    data.get('trigger_on_perp', {'mode': 'any'}),
+                    data.get('timing_conditions', {'enabled': False}),
+                    data.get('bundle_trades', {'enabled': False}),
+                    data.get('cashe_wallets', {'enabled': False}),
+                    data.get('project_ids', []) if data.get('project_ids') else None,
+                    1,  # is_active = 1
+                    10,
+                    0,
+                    0
+                ])
+                result = cursor.fetchone()
+                new_id = result['id'] if result else None
+            conn.commit()
+        
+        return jsonify({'success': True, 'id': new_id})
+    except Exception as e:
+        logger.error(f"Create play failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays/<int:play_id>/duplicate', methods=['POST'])
+def duplicate_play(play_id):
+    """Duplicate a play with a new name."""
+    try:
+        data = request.get_json() or {}
+        new_name = data.get('new_name')
+        
+        if not new_name:
+            return jsonify({'success': False, 'error': 'new_name is required'}), 400
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get original play
+                cursor.execute("""
+                    SELECT * FROM follow_the_goat_plays WHERE id = %s
+                """, [play_id])
+                original = cursor.fetchone()
+                
+                if not original:
+                    return jsonify({'success': False, 'error': 'Play not found'}), 404
+                
+                # Create duplicate
+                cursor.execute("""
+                    INSERT INTO follow_the_goat_plays (
+                        name, description, find_wallets_sql, sell_logic,
+                        max_buys_per_cycle, short_play, tricker_on_perp,
+                        timing_conditions, bundle_trades, cashe_wallets,
+                        project_ids, is_active, sorting,
+                        pattern_validator_enable, pattern_update_by_ai,
+                        pattern_validator, cashe_wallets_settings
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    ) RETURNING id
+                """, [
+                    new_name,
+                    original.get('description'),
+                    original.get('find_wallets_sql'),
+                    original.get('sell_logic'),
+                    original.get('max_buys_per_cycle', 5),
+                    original.get('short_play', 0),
+                    original.get('tricker_on_perp'),
+                    original.get('timing_conditions'),
+                    original.get('bundle_trades'),
+                    original.get('cashe_wallets'),
+                    original.get('project_ids'),
+                    1,  # is_active = 1
+                    original.get('sorting', 10),
+                    original.get('pattern_validator_enable', 0),
+                    original.get('pattern_update_by_ai', 0),
+                    original.get('pattern_validator'),
+                    original.get('cashe_wallets_settings')
+                ])
+                result = cursor.fetchone()
+                new_id = result['id'] if result else None
+            conn.commit()
+        
+        return jsonify({'success': True, 'new_id': new_id})
+    except Exception as e:
+        logger.error(f"Duplicate play failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/plays/performance', methods=['GET'])
+def get_all_plays_performance():
+    """Get performance metrics for all plays (both active and inactive)."""
+    try:
+        hours = request.args.get('hours', 'all')
+        active_only = request.args.get('active_only', 'false').lower() == 'true'
+        
+        # Build time filters
+        time_filter = ""
+        params = []
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                time_filter = "AND followed_at >= NOW() - INTERVAL '%s hours'"
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        plays_data = {}
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get all play IDs (or just active ones if requested)
+                if active_only:
+                    cursor.execute("SELECT id FROM follow_the_goat_plays WHERE is_active = 1")
+                else:
+                    cursor.execute("SELECT id FROM follow_the_goat_plays")
+                play_ids = [row['id'] for row in cursor.fetchall()]
+                
+                for play_id in play_ids:
+                    # Get active (pending) trades stats
+                    query_params = [play_id] + params
+                    cursor.execute(f"""
+                        SELECT 
+                            COUNT(*) as active_trades,
+                            AVG(CASE 
+                                WHEN our_entry_price > 0 AND current_price > 0 
+                                THEN ((current_price - our_entry_price) / our_entry_price) * 100 
+                                ELSE NULL 
+                            END) as active_avg_profit
+                        FROM follow_the_goat_buyins
+                        WHERE our_status = 'pending' AND play_id = %s {time_filter}
+                    """, query_params)
+                    live_result = cursor.fetchone()
+                    
+                    # Get no_go counts
+                    cursor.execute(f"""
+                        SELECT COUNT(*) as no_go_count
+                        FROM follow_the_goat_buyins
+                        WHERE our_status = 'no_go' AND play_id = %s {time_filter}
+                    """, query_params)
+                    no_go_result = cursor.fetchone()
+                    
+                    # Get sold/completed trades stats
+                    sold_filter = time_filter.replace('followed_at', 'our_exit_timestamp') if time_filter else ""
+                    cursor.execute(f"""
+                        SELECT 
+                            SUM(our_profit_loss) as total_profit_loss,
+                            COUNT(CASE WHEN our_profit_loss > 0 THEN 1 END) as winning_trades,
+                            COUNT(CASE WHEN our_profit_loss < 0 THEN 1 END) as losing_trades
+                        FROM follow_the_goat_buyins
+                        WHERE our_status IN ('sold', 'completed') AND play_id = %s {sold_filter}
+                    """, query_params)
+                    sold_result = cursor.fetchone()
+                    
+                    # Combine stats - use string keys for JavaScript compatibility
+                    plays_data[str(play_id)] = {
+                        'total_profit_loss': float(sold_result.get('total_profit_loss') or 0) if sold_result else 0,
+                        'winning_trades': int(sold_result.get('winning_trades') or 0) if sold_result else 0,
+                        'losing_trades': int(sold_result.get('losing_trades') or 0) if sold_result else 0,
+                        'total_no_gos': int(no_go_result.get('no_go_count') or 0) if no_go_result else 0,
+                        'active_trades': int(live_result.get('active_trades') or 0) if live_result else 0,
+                        'active_avg_profit': float(live_result.get('active_avg_profit')) if live_result and live_result.get('active_avg_profit') else None
+                    }
+        
+        return jsonify({
+            'success': True,
+            'plays': plays_data
+        })
+    except Exception as e:
+        logger.error(f"Get plays performance failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/buyins', methods=['GET'])
@@ -243,26 +667,59 @@ def get_buyins():
     try:
         limit = min(int(request.args.get('limit', 100)), 1000)
         status_filter = request.args.get('status')
+        play_id = request.args.get('play_id')
+        hours = request.args.get('hours')
+        
+        # Build WHERE clause conditions
+        where_conditions = []
+        params = []
+        
+        if status_filter:
+            where_conditions.append("our_status = %s")
+            params.append(status_filter)
+        
+        if play_id:
+            where_conditions.append("play_id = %s")
+            params.append(int(play_id))
+        
+        if hours and hours != 'all':
+            try:
+                hours_int = int(hours)
+                where_conditions.append("followed_at >= NOW() - INTERVAL '%s hours'")
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        # Build the WHERE clause
+        where_clause = ""
+        if where_conditions:
+            where_clause = "WHERE " + " AND ".join(where_conditions)
         
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                if status_filter:
-                    cursor.execute("""
-                        SELECT * FROM follow_the_goat_buyins
-                        WHERE our_status = %s
-                        ORDER BY id DESC LIMIT %s
-                    """, [status_filter, limit])
-                else:
-                    cursor.execute("""
-                        SELECT * FROM follow_the_goat_buyins
-                        ORDER BY id DESC LIMIT %s
-                    """, [limit])
-                
+                query = f"""
+                    SELECT * FROM follow_the_goat_buyins
+                    {where_clause}
+                    ORDER BY id DESC LIMIT %s
+                """
+                params.append(limit)
+                cursor.execute(query, params)
                 results = cursor.fetchall()
+                
+                # Get total count
+                count_query = f"SELECT COUNT(*) as count FROM follow_the_goat_buyins {where_clause}"
+                cursor.execute(count_query, params[:-1])  # Exclude limit from count query
+                count_result = cursor.fetchone()
+                total_count = count_result['count'] if count_result else 0
         
-        return jsonify({'results': results, 'count': len(results)})
+        return jsonify({
+            'buyins': results,
+            'results': results,  # For backward compatibility
+            'count': len(results),
+            'total': total_count
+        })
     except Exception as e:
-        logger.error(f"Get buyins failed: {e}")
+        logger.error(f"Get buyins failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -286,6 +743,42 @@ def get_single_buyin(buyin_id):
     except Exception as e:
         logger.error(f"Get single buyin failed: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/buyins/cleanup_no_gos', methods=['DELETE'])
+def cleanup_no_gos():
+    """Delete all no_go trades older than 24 hours from PostgreSQL."""
+    try:
+        deleted_count = 0
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Count before delete
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM follow_the_goat_buyins 
+                    WHERE our_status = 'no_go' 
+                    AND followed_at < NOW() - INTERVAL '24 hours'
+                """)
+                result = cursor.fetchone()
+                deleted_count = result['count'] if result else 0
+                
+                if deleted_count > 0:
+                    # Delete from PostgreSQL
+                    cursor.execute("""
+                        DELETE FROM follow_the_goat_buyins 
+                        WHERE our_status = 'no_go' 
+                        AND followed_at < NOW() - INTERVAL '24 hours'
+                    """)
+            conn.commit()
+        
+        return jsonify({
+            'success': True,
+            'deleted': deleted_count,
+            'message': f'Deleted {deleted_count} no_go trades older than 24 hours'
+        })
+    except Exception as e:
+        logger.error(f"Cleanup no-gos failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/profiles', methods=['GET'])

@@ -8,7 +8,7 @@
 require_once __DIR__ . '/../../../includes/DatabaseClient.php';
 require_once __DIR__ . '/../../../includes/config.php';
 $db = new DatabaseClient(DATABASE_API_URL);
-$api_available = $db->isAvailable();
+$use_duckdb = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';
@@ -26,8 +26,8 @@ $has_potential_gains = $_GET['has_potential_gains'] ?? null;
 // Fetch trades
 if ($use_duckdb) {
     $response = $db->getBuyins($play_id, $status, $hours, $limit);
-    if ($response && isset($response['buyins'])) {
-        $trades = $response['buyins'];
+    if ($response && isset($response['results'])) {
+        $trades = $response['results'];
         
         // Filter by potential_gains if requested
         if ($has_potential_gains === 'yes') {
@@ -48,8 +48,8 @@ if ($use_duckdb) {
 $plays = [];
 if ($use_duckdb) {
     $plays_response = $db->getPlays();
-    if ($plays_response && isset($plays_response['plays'])) {
-        $plays = $plays_response['plays'];
+    if ($plays_response && isset($plays_response['results'])) {
+        $plays = $plays_response['results'];
     }
 }
 

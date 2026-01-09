@@ -67,103 +67,42 @@ def _get_engine_if_running():
 
 
 def _execute_query(query: str, params: list = None, as_dict: bool = True, graceful: bool = True):
-    """Execute a query using master2's DuckDB, HTTP API, TradingDataEngine, or file-based DuckDB.
+    """Execute a query directly against PostgreSQL.
     
-    Priority:
-    1. master2's _local_duckdb (MAIN database with all data - when running in master2 process)
-    2. master2's HTTP API (port 5052 - when running standalone)
-    3. TradingDataEngine (master.py's in-memory DB)
-    4. File-based DuckDB (fallback - usually empty)
+    PostgreSQL-only architecture - no DuckDB fallback needed.
     
     Args:
-        query: SQL query (use ? for placeholders - DuckDB format)
+        query: SQL query (use ? for placeholders - will be converted to %s)
         params: Query parameters
         as_dict: If True, return list of dicts; if False, return list of tuples
-        graceful: If True, return empty list on table-not-found errors instead of raising
+        graceful: If True, return empty list on errors instead of raising
     
     Returns:
         List of dicts (if as_dict=True) or list of tuples
     """
-    # First, try to get master2's local DuckDB (the MAIN database)
-    try:
-        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
-        local_db = get_local_duckdb()
-        if local_db is not None:
-            with _local_duckdb_lock:
-                result = local_db.execute(query, params or [])
-                if as_dict:
-                    columns = [desc[0] for desc in result.description]
-                    rows = result.fetchall()
-                    return [dict(zip(columns, row)) for row in rows]
-                return result.fetchall()
-    except (ImportError, AttributeError):
-        # master2 not available or not initialized yet
-        pass
-    except Exception as e:
-        error_msg = str(e).lower()
-        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
-            logger.debug(f"Table not found in master2 DB (graceful mode): {e}")
-            return []
-        # If it's a real error, log it but continue to fallback
-        logger.warning(f"Error querying master2 DB, will try HTTP API: {e}")
-    
-    # Second, try master2's HTTP API (for standalone execution)
-    try:
-        import requests
-        # Substitute params into query (simple replacement for ? placeholders)
-        formatted_query = query
-        if params:
-            for param in params:
-                if isinstance(param, str):
-                    formatted_query = formatted_query.replace('?', f"'{param}'", 1)
-                elif hasattr(param, 'isoformat'):  # datetime objects
-                    formatted_query = formatted_query.replace('?', f"'{param.isoformat()}'", 1)
-                else:
-                    formatted_query = formatted_query.replace('?', str(param), 1)
-        
-        resp = requests.post(
-            "http://127.0.0.1:5052/query",
-            json={"sql": formatted_query},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success"):
-                results = data.get("results", [])
-                if as_dict:
-                    return results
-                return [tuple(r.values()) for r in results] if results else []
-    except Exception as e:
-        logger.debug(f"master2 HTTP API query failed: {e}")
-    
-    # Third, try TradingDataEngine (master.py's in-memory DB)
-    engine = _get_engine_if_running()
-    try:
-        if engine is not None:
-            results = engine.read(query, params or [])
-            if as_dict:
-                return results
-            return [tuple(r.values()) for r in results] if results else []
-    except Exception as e:
-        error_msg = str(e).lower()
-        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
-            logger.debug(f"Table not found in engine (graceful mode): {e}")
-            return []
-        logger.warning(f"Error querying engine, will try file DB: {e}")
-    
-    # Finally, fallback to file-based DuckDB
     try:
         with get_postgres() as conn:
-            result = conn.execute(query, params or [])
-            if as_dict:
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-                return [dict(zip(columns, row)) for row in rows]
-            return result.fetchall()
+            with conn.cursor() as cursor:
+                # Convert DuckDB-style ? placeholders to PostgreSQL %s
+                pg_query = query.replace('?', '%s')
+                cursor.execute(pg_query, params or [])
+                
+                if as_dict:
+                    results = cursor.fetchall()
+                    return results if results else []
+                
+                # For non-dict format, convert dicts to tuples
+                rows = cursor.fetchall()
+                return [tuple(r.values()) for r in rows] if rows else []
+                
     except Exception as e:
         error_msg = str(e).lower()
-        if graceful and ("does not exist" in error_msg or "no such table" in error_msg):
+        if graceful and ("does not exist" in error_msg or "relation" in error_msg):
             logger.debug(f"Table not found (graceful mode): {e}")
+            return []
+        
+        logger.error(f"PostgreSQL query failed: {e}", exc_info=True)
+        if graceful:
             return []
         raise
 if not logger.handlers:
@@ -199,70 +138,31 @@ class TrailColumnMissingError(TrailError):
 # =============================================================================
 
 def fetch_buyin(buyin_id: int) -> Dict[str, Any]:
-    """Return buy-in metadata needed for the trail from DuckDB (fast).
+    """Return buy-in metadata needed for the trail from PostgreSQL.
     
-    Uses DuckDB for speed - MySQL is only for storage.
-    DuckDB uses 'fifteen_min_trail' column name.
+    PostgreSQL-only architecture.
     """
-    result = None
-    
-    # PRIORITY 1: Try master2's local DuckDB
     try:
-        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
-        local_db = get_local_duckdb()
-        if local_db is not None:
-            with _local_duckdb_lock:
-                res = local_db.execute("""
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
                     SELECT id, followed_at, fifteen_min_trail as existing_trail
                     FROM follow_the_goat_buyins
-                    WHERE id = ?
+                    WHERE id = %s
                     LIMIT 1
-                """, [buyin_id]).fetchone()
-                if res:
-                    result = res
-    except (ImportError, AttributeError):
-        pass
+                """, [buyin_id])
+                result = cursor.fetchone()
     except Exception as e:
-        logger.debug(f"master2 DB fetch_buyin failed: {e}")
-    
-    # PRIORITY 2: Try HTTP API
-    if result is None:
-        try:
-            import requests
-            resp = requests.post(
-                "http://127.0.0.1:5052/query",
-                json={"sql": f"SELECT id, followed_at, fifteen_min_trail as existing_trail FROM follow_the_goat_buyins WHERE id = {buyin_id} LIMIT 1"},
-                timeout=10
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("success") and data.get("results"):
-                    row_data = data["results"][0]
-                    result = (row_data.get("id"), row_data.get("followed_at"), row_data.get("existing_trail"))
-        except Exception as e:
-            logger.debug(f"HTTP API fetch_buyin failed: {e}")
-    
-    # PRIORITY 3: Fallback to file-based DuckDB
-    if result is None:
-        try:
-            with get_postgres() as conn:
-                result = conn.execute("""
-                    SELECT id, followed_at, fifteen_min_trail as existing_trail
-                    FROM follow_the_goat_buyins
-                    WHERE id = ?
-                    LIMIT 1
-                """, [buyin_id]).fetchone()
-        except Exception as e:
-            raise TrailError(f"Failed to fetch buyin #{buyin_id}: {e}")
+        raise TrailError(f"Failed to fetch buyin #{buyin_id}: {e}")
     
     if not result:
         raise BuyinNotFoundError(f"Buy-in #{buyin_id} not found")
     
-    # DuckDB returns tuple, convert to dict
+    # PostgreSQL RealDictCursor returns dict
     row = {
-        'id': result[0],
-        'followed_at': result[1],
-        'existing_trail': result[2]
+        'id': result.get('id'),
+        'followed_at': result.get('followed_at'),
+        'existing_trail': result.get('existing_trail')
     }
     
     # Parse followed_at if it's a string (handles ISO format from inserts)
@@ -293,47 +193,44 @@ def fetch_order_book_signals(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch order book signals from DuckDB/TradingDataEngine with computed metrics."""
-    # DuckDB query for order book data with minute aggregation
+    """Fetch order book signals from PostgreSQL with computed metrics."""
+    # PostgreSQL query for order book data with minute aggregation
+    # Note: order_book_features doesn't have a symbol column, it's SOL/USDT only
+    # Available columns: mid_price, spread_bps, bid/ask_liquidity, volume_imbalance, etc.
     query = """
         WITH minute_aggregates AS (
             SELECT 
-                DATE_TRUNC('minute', ts) AS minute_timestamp,
-                symbol,
-                LAST(mid_price ORDER BY ts) AS mid_price,
-                LAST(best_bid ORDER BY ts) AS best_bid,
-                LAST(best_ask ORDER BY ts) AS best_ask,
-                LAST(microprice ORDER BY ts) AS microprice,
-                AVG(volume_imbalance) AS volume_imbalance,
-                AVG(relative_spread_bps) AS relative_spread_bps,
-                AVG(microprice_dev_bps) AS microprice_dev_bps,
-                AVG(bid_depth_10) AS bid_depth_10,
-                AVG(ask_depth_10) AS ask_depth_10,
-                AVG(total_depth_10) AS total_depth_10,
-                AVG(bid_depth_bps_10) AS bid_depth_bps_10,
-                AVG(ask_depth_bps_10) AS ask_depth_bps_10,
-                AVG(bid_slope) AS bid_slope,
-                AVG(ask_slope) AS ask_slope,
-                AVG(bid_vwap_10) AS bid_vwap_10,
-                AVG(ask_vwap_10) AS ask_vwap_10,
-                SUM(COALESCE(net_liquidity_change_1s, 0)) AS net_liquidity_change_sum,
+                DATE_TRUNC('minute', timestamp) AS minute_timestamp,
+                CAST((ARRAY_AGG(mid_price ORDER BY timestamp DESC))[1] AS NUMERIC) AS mid_price,
+                CAST((ARRAY_AGG(microprice ORDER BY timestamp DESC))[1] AS NUMERIC) AS microprice,
+                CAST(AVG(volume_imbalance) AS NUMERIC) AS volume_imbalance,
+                CAST(AVG(spread_bps) AS NUMERIC) AS relative_spread_bps,
+                CAST(AVG(microprice_dev_bps) AS NUMERIC) AS microprice_dev_bps,
+                CAST(AVG(bid_liquidity) AS NUMERIC) AS bid_depth_10,
+                CAST(AVG(ask_liquidity) AS NUMERIC) AS ask_depth_10,
+                CAST(AVG(total_depth_10) AS NUMERIC) AS total_depth_10,
+                CAST(AVG(bid_depth_bps_10) AS NUMERIC) AS bid_depth_bps_10,
+                CAST(AVG(ask_depth_bps_10) AS NUMERIC) AS ask_depth_bps_10,
+                CAST(AVG(bid_slope) AS NUMERIC) AS bid_slope,
+                CAST(AVG(ask_slope) AS NUMERIC) AS ask_slope,
+                CAST(AVG(bid_vwap_10) AS NUMERIC) AS bid_vwap_10,
+                CAST(AVG(ask_vwap_10) AS NUMERIC) AS ask_vwap_10,
+                CAST(SUM(COALESCE(net_liquidity_change_1s, 0)) AS NUMERIC) AS net_liquidity_change_sum,
                 COUNT(*) AS sample_count,
-                MIN(ts) AS period_start,
-                MAX(ts) AS period_end
+                MIN(timestamp) AS period_start,
+                MAX(timestamp) AS period_end
             FROM order_book_features
-            WHERE symbol = ?
-                AND ts >= ?
-                AND ts <= ?
-            GROUP BY DATE_TRUNC('minute', ts), symbol
+            WHERE timestamp >= ?
+                AND timestamp <= ?
+            GROUP BY DATE_TRUNC('minute', timestamp)
         ),
         numbered_minutes AS (
             SELECT *,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY minute_timestamp) AS row_num
+                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
             FROM minute_aggregates
         )
         SELECT 
             m0.minute_timestamp,
-            m0.symbol,
             m0.mid_price,
             m0.row_num AS minute_number,
             ROUND(((m0.mid_price - COALESCE(m1.mid_price, m0.mid_price)) / 
@@ -362,30 +259,24 @@ def fetch_order_book_signals(
             EXTRACT(EPOCH FROM (m0.period_end - m0.period_start)) AS coverage_seconds
         FROM numbered_minutes m0
         LEFT JOIN numbered_minutes m1 
-            ON m0.symbol = m1.symbol 
-            AND m0.row_num > 1
+            ON m0.row_num > 1
             AND m1.row_num = m0.row_num - 1
         LEFT JOIN numbered_minutes m2
-            ON m0.symbol = m2.symbol 
-            AND m0.row_num > 2
+            ON m0.row_num > 2
             AND m2.row_num = m0.row_num - 2
         LEFT JOIN numbered_minutes m3
-            ON m0.symbol = m3.symbol 
-            AND m0.row_num > 3
+            ON m0.row_num > 3
             AND m3.row_num = m0.row_num - 3
         LEFT JOIN numbered_minutes m5
-            ON m0.symbol = m5.symbol 
-            AND m0.row_num > 5
+            ON m0.row_num > 5
             AND m5.row_num = m0.row_num - 5
         LEFT JOIN numbered_minutes m10
-            ON m0.symbol = m10.symbol 
-            AND m0.row_num > 10
+            ON m0.row_num > 10
             AND m10.row_num = m0.row_num - 10
-        WHERE m0.symbol = ?
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
         """
-    return _execute_query(query, [symbol, start_time, end_time, symbol])
+    return _execute_query(query, [start_time, end_time])
 
 
 def fetch_transactions(
@@ -751,24 +642,24 @@ def fetch_price_movements(
         token: Token symbol for DuckDB (SOL, BTC, ETH)
         coin_id: Coin ID for legacy price_points (1=BTC, 2=ETH, 5=SOL)
     """
-    # Query for prices table (modern format: ts, token, price)
+    # Query for prices table (modern format: timestamp, token, price)
     query_prices = """
         WITH minute_aggregates AS (
             SELECT 
-                DATE_TRUNC('minute', ts) AS minute_timestamp,
-                MIN(price) AS low_price,
-                MAX(price) AS high_price,
-                AVG(price) AS avg_price,
-                FIRST(price ORDER BY ts ASC) AS true_open,
-                LAST(price ORDER BY ts ASC) AS true_close,
-                MAX(price) - MIN(price) AS price_range,
-                STDDEV(price) AS price_stddev,
+                DATE_TRUNC('minute', timestamp) AS minute_timestamp,
+                CAST(MIN(price) AS NUMERIC) AS low_price,
+                CAST(MAX(price) AS NUMERIC) AS high_price,
+                CAST(AVG(price) AS NUMERIC) AS avg_price,
+                CAST((ARRAY_AGG(price ORDER BY timestamp ASC))[1] AS NUMERIC) AS true_open,
+                CAST((ARRAY_AGG(price ORDER BY timestamp DESC))[1] AS NUMERIC) AS true_close,
+                CAST(MAX(price) - MIN(price) AS NUMERIC) AS price_range,
+                CAST(STDDEV(price) AS NUMERIC) AS price_stddev,
                 COUNT(*) AS price_updates
             FROM prices
-            WHERE ts >= ?
-                AND ts <= ?
+            WHERE timestamp >= ?
+                AND timestamp <= ?
                 AND token = ?
-            GROUP BY DATE_TRUNC('minute', ts)
+            GROUP BY DATE_TRUNC('minute', timestamp)
         ),
         numbered_minutes AS (
             SELECT *,
@@ -826,75 +717,31 @@ def fetch_price_movements(
         LIMIT 15
     """
     
-    # PRIORITY 1: Try master2's local DuckDB (has synced prices table with SOL, BTC, ETH)
-    try:
-        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
-        local_db = get_local_duckdb()
-        if local_db is not None:
-            with _local_duckdb_lock:
-                result = local_db.execute(query_prices, [start_time, end_time, token])
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-                if rows:
-                    logger.debug(f"Got {len(rows)} price movements from master2 local DB for {token}")
-                    return [dict(zip(columns, row)) for row in rows]
-    except (ImportError, AttributeError):
-        pass  # master2 not available
-    except Exception as e:
-        logger.debug(f"master2 DB query failed for {token}: {e}")
+    # Use _execute_query which now directly queries PostgreSQL
+    results = _execute_query(query_prices, [start_time, end_time, token])
+    if results:
+        logger.debug(f"Got {len(results)} price movements from PostgreSQL for {token}")
+        return results
     
-    # PRIORITY 2: Try master2's HTTP API (for standalone execution)
-    try:
-        import requests
-        # Format the query with parameters
-        formatted_query = query_prices
-        for param in [start_time, end_time, token]:
-            if isinstance(param, str):
-                formatted_query = formatted_query.replace('?', f"'{param}'", 1)
-            elif hasattr(param, 'isoformat'):  # datetime
-                formatted_query = formatted_query.replace('?', f"'{param.isoformat()}'", 1)
-            else:
-                formatted_query = formatted_query.replace('?', str(param), 1)
-        
-        resp = requests.post(
-            "http://127.0.0.1:5052/query",
-            json={"sql": formatted_query},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("success") and data.get("results"):
-                logger.debug(f"Got {len(data['results'])} price movements from master2 HTTP API for {token}")
-                return data["results"]
-    except Exception as e:
-        logger.debug(f"master2 HTTP API query failed for {token}: {e}")
-    
-    # PRIORITY 3: Try TradingDataEngine (master.py's in-memory DB)
-    engine = _get_engine_if_running()
-    if engine is not None:
-        results = _execute_query(query_prices, [start_time, end_time, token])
-        if results:
-            return results
-    
-    # Fallback: file-based DuckDB price_points (fast)
-    # DuckDB uses strftime() for date formatting
+    # Fallback: PostgreSQL price_points table (legacy)
+    # PostgreSQL uses TO_CHAR() for date formatting
     query_duckdb = """
         WITH minute_aggregates AS (
             SELECT 
-                strftime(created_at, '%Y-%m-%d %H:%M:00') AS minute_timestamp,
-                MIN(value) AS low_price,
-                MAX(value) AS high_price,
-                AVG(value) AS avg_price,
-                FIRST(value ORDER BY created_at ASC) AS true_open,
-                LAST(value ORDER BY created_at DESC) AS true_close,
-                MAX(value) - MIN(value) AS price_range,
-                STDDEV(value) AS price_stddev,
+                TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:00') AS minute_timestamp,
+                CAST(MIN(value) AS NUMERIC) AS low_price,
+                CAST(MAX(value) AS NUMERIC) AS high_price,
+                CAST(AVG(value) AS NUMERIC) AS avg_price,
+                CAST((ARRAY_AGG(value ORDER BY created_at ASC))[1] AS NUMERIC) AS true_open,
+                CAST((ARRAY_AGG(value ORDER BY created_at DESC))[1] AS NUMERIC) AS true_close,
+                CAST(MAX(value) - MIN(value) AS NUMERIC) AS price_range,
+                CAST(STDDEV(value) AS NUMERIC) AS price_stddev,
                 COUNT(*) AS price_updates
             FROM price_points
-            WHERE created_at >= ?
-                AND created_at <= ?
-                AND coin_id = ?
-            GROUP BY strftime(created_at, '%Y-%m-%d %H:%M:00')
+            WHERE created_at >= %s
+                AND created_at <= %s
+                AND coin_id = %s
+            GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:00')
         ),
         numbered_minutes AS (
             SELECT *,
@@ -953,12 +800,13 @@ def fetch_price_movements(
     """
     try:
         with get_postgres() as conn:
-            result = conn.execute(query_duckdb, [start_time, end_time, coin_id])
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            return [dict(zip(columns, row)) for row in rows]
+            with conn.cursor() as cursor:
+                cursor.execute(query_duckdb, [start_time, end_time, coin_id])
+                rows = cursor.fetchall()
+                # RealDictCursor returns dicts directly
+                return rows if rows else []
     except Exception as e:
-        logger.error("DuckDB price_movements query failed for %s (coin_id=%s): %s", token, coin_id, e)
+        logger.error("PostgreSQL price_movements query failed for %s (coin_id=%s): %s", token, coin_id, e)
         return []
 
 
@@ -972,10 +820,10 @@ def fetch_second_prices(
     """
     # First try the prices table (via _execute_query which handles HTTP API)
     query = """
-        SELECT ts AS ts, price AS price
+        SELECT timestamp AS ts, price AS price
         FROM prices
-        WHERE ts >= ? AND ts <= ? AND token = ?
-        ORDER BY ts ASC
+        WHERE timestamp >= ? AND timestamp <= ? AND token = ?
+        ORDER BY timestamp ASC
     """
     results = _execute_query(query, [start_time, end_time, "SOL"])
     
@@ -987,21 +835,21 @@ def fetch_second_prices(
             df["price"] = df["price"].astype(float)
             return df
     
-    # Fallback to file-based DuckDB price_points if prices table returned no results
+    # Fallback to PostgreSQL price_points if prices table returned no results
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT created_at AS ts, value AS price
-                FROM price_points
-                WHERE created_at >= ? AND created_at <= ?
-                    AND coin_id = 5
-                ORDER BY created_at ASC
-            """, [start_time, end_time])
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            fallback_results = [dict(zip(columns, row)) for row in rows]
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT created_at AS ts, value AS price
+                    FROM price_points
+                    WHERE created_at >= %s AND created_at <= %s
+                        AND coin_id = 5
+                    ORDER BY created_at ASC
+                """, [start_time, end_time])
+                fallback_results = cursor.fetchall()
+                # RealDictCursor returns dicts directly
     except Exception as e:
-        logger.error("DuckDB second_prices query failed: %s", e)
+        logger.error("PostgreSQL second_prices query failed: %s", e)
         fallback_results = []
     
     if not fallback_results:
@@ -1544,16 +1392,18 @@ def persist_trail_json_legacy(buyin_id: int, payload: Dict[str, Any]) -> None:
     
     trail_json = json.dumps(serializable_payload, ensure_ascii=True)
     
-    # Write to DuckDB only (no MySQL)
+    # Write to PostgreSQL only
     try:
         with get_postgres() as conn:
-            conn.execute("""
-                UPDATE follow_the_goat_buyins
-                SET fifteen_min_trail = ?
-                WHERE id = ?
-            """, [trail_json, buyin_id])
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    UPDATE follow_the_goat_buyins
+                    SET fifteen_min_trail = %s
+                    WHERE id = %s
+                """, [trail_json, buyin_id])
+            conn.commit()
     except Exception as e:
-        logger.warning(f"DuckDB trail persist failed: {e}")
+        logger.warning(f"PostgreSQL trail persist failed: {e}")
 
 
 # =============================================================================

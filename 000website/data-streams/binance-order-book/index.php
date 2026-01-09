@@ -47,6 +47,10 @@ function fetchOrderBookData($db) {
             
             // Format data source display name
             switch ($actual_source) {
+                case 'postgres':
+                case 'postgresql':
+                    $data_source = "🐘 PostgreSQL";
+                    break;
                 case 'engine':
                     $data_source = "🦆 In-Memory DuckDB (TradingDataEngine)";
                     break;
@@ -57,10 +61,10 @@ function fetchOrderBookData($db) {
                     $data_source = "🗄️ MySQL (Historical)";
                     break;
                 default:
-                    $data_source = "🦆 DuckDB API";
+                    $data_source = "API Connected";
             }
         } else {
-            $data_source = "DuckDB API (No Data)";
+            $data_source = "API (No Data)";
         }
     } else {
         $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";

@@ -652,8 +652,12 @@ def create_scheduler() -> BackgroundScheduler:
         'misfire_grace_time': 30 # Allow 30s grace for misfires
     }
     
+    # CRITICAL: Force UTC timezone for all operations
+    # Even though settings.scheduler_timezone defaults to UTC,
+    # we explicitly use pytz.UTC to ensure no system timezone interference
+    import pytz
     scheduler = BackgroundScheduler(
-        timezone=settings.scheduler_timezone,
+        timezone=pytz.UTC,
         executors=executors,
         job_defaults=job_defaults
     )
@@ -703,35 +707,31 @@ def create_scheduler() -> BackgroundScheduler:
     # PRICE CYCLE ANALYSIS (runs every 2 seconds)
     # =====================================================
     
-    # DISABLED: Price cycles needs full PostgreSQL refactoring
-    # Will be fixed in a separate update
-    # TODO: Refactor create_price_cycles.py to use PostgreSQL cursor pattern
-    
-    '''
     # Import price cycles processor
-    from sys import path as syspath
-    from pathlib import Path
-    project_root = Path(__file__).parent.parent
-    syspath.insert(0, str(project_root / "000data_feeds" / "2_create_price_cycles"))
+    sys.path.insert(0, str(PROJECT_ROOT / "000data_feeds" / "2_create_price_cycles"))
     
     try:
-        # Import price cycle processor
         from create_price_cycles import process_price_cycles as process_price_cycles_run
 
-        # Note: Price cycles now work with PostgreSQL directly (no engine needed)
+        @track_job("process_price_cycles", "Process price cycles (PostgreSQL)")
+        def process_price_cycles_job():
+            """Process price cycles and track cycle states."""
+            try:
+                process_price_cycles_run()
+            except Exception as e:
+                logger.error(f"Price cycles error: {e}", exc_info=True)
 
         scheduler.add_job(
-            func=process_price_cycles_run,
-            trigger=IntervalTrigger(seconds=1),
+            func=process_price_cycles_job,
+            trigger=IntervalTrigger(seconds=2),
             id="process_price_cycles",
-            name="Process price cycles (every 1s)",
+            name="Process price cycles (every 2s)",
             replace_existing=True,
             executor='realtime',
         )
         logger.info("✓ Price cycles job registered")
     except ImportError as e:
         logger.warning(f"Price cycles module not available: {e}")
-    '''
     
     # =====================================================
     # LEGACY JOBS (for backward compatibility)

@@ -37,7 +37,7 @@ MODULE_DIR = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(MODULE_DIR))
 
-from core.database import get_postgres, postgres_execute, get_postgres
+from core.database import get_postgres
 
 # Try to get TradingDataEngine for in-memory queries (when running under scheduler)
 def _get_engine_if_running():
@@ -256,45 +256,27 @@ def _pg_update_buyin(buyin_id: int, fields: Dict[str, Any]) -> None:
     _pg_execute(query, params)
 
 def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
-    """Fetch play configuration from TradingDataEngine (in-memory DuckDB).
+    """Fetch play configuration from PostgreSQL.
     
-    Uses the in-memory engine for speed, with fallback to get_postgres()
-    when running under master2.py (which has its own local DuckDB with plays).
+    Queries the follow_the_goat_plays table directly from PostgreSQL.
     """
-    engine = _get_engine_if_running()
-    
     try:
-        if engine is not None:
-            # Use TradingDataEngine (in-memory, zero locks)
-            result = engine.read_one("""
-                SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
-                FROM follow_the_goat_plays
-                WHERE id = ?
-            """, [play_id])
-            
-            if not result:
-                logger.error(f"Play #{play_id} not found in TradingDataEngine")
-                return None
-            
-            play = dict(result)
-        else:
-            # Fallback to get_postgres() - used when running under master2.py
-            # master2.py loads plays from PostgreSQL into its local DuckDB and registers it as 'central'
-            logger.debug("TradingDataEngine not running - using get_postgres() fallback")
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
                     SELECT id, name, pattern_validator_enable, pattern_validator, project_ids
                     FROM follow_the_goat_plays
-                    WHERE id = ?
-                """, [play_id]).fetchone()
+                    WHERE id = %s
+                """, [play_id])
+                
+                result = cursor.fetchone()
                 
                 if not result:
-                    logger.error(f"Play #{play_id} not found in DuckDB")
+                    logger.error(f"Play #{play_id} not found in PostgreSQL")
                     return None
                 
-                # Convert tuple to dict with column names
-                columns = ['id', 'name', 'pattern_validator_enable', 'pattern_validator', 'project_ids']
-                play = dict(zip(columns, result))
+                # Result is already a dict (RealDictCursor)
+                play = dict(result)
         
         # Parse pattern validator config
         pattern_validator_raw = play.get('pattern_validator')
@@ -330,7 +312,7 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
         else:
             play['project_ids'] = []
         
-        logger.debug(f"Loaded play #{play_id}: {play.get('name')} (from DuckDB)")
+        logger.debug(f"Loaded play #{play_id}: {play.get('name')} (from PostgreSQL)")
         
         return play
             
@@ -342,49 +324,46 @@ def get_play_config(play_id: int) -> Optional[Dict[str, Any]]:
 def check_data_readiness() -> tuple[bool, str]:
     """Check if sufficient data exists to run a training cycle.
     
-    IMPORTANT: This function runs in master2.py context, so it MUST use
-    get_postgres() which returns master2's local in-memory DuckDB.
-    
-    DO NOT use TradingDataEngine here - that only exists in master.py!
-    
+    Queries PostgreSQL directly for price and order book data.
     The PRIMARY price table is `prices` (not `price_points` which is legacy).
     
     Returns:
         Tuple of (is_ready, reason_if_not_ready)
     """
-    # ALWAYS use get_postgres() - this is master2's local DuckDB
-    # DO NOT use TradingDataEngine - it's only in master.py!
-    logger.debug("Checking data readiness using get_postgres()")
+    logger.debug("Checking data readiness using PostgreSQL")
     
     try:
-        with get_duckdb("central", read_only=True) as cursor:
-            # Check `prices` table - this is the PRIMARY price data source
-            # Schema: id, ts, token, price
-            # Query: WHERE token = 'SOL' for SOL prices
-            result = cursor.execute("""
-                SELECT COUNT(*) FROM prices WHERE token = 'SOL'
-            """).fetchone()
-            price_count = result[0] if result else 0
-            logger.debug(f"Prices table check: {price_count} SOL prices")
-            
-            if price_count < 10:
-                return False, f"Waiting for price data ({price_count}/10 prices)"
-            
-            # Check order_book_features (optional for train_validator)
-            try:
-                result = cursor.execute("""
-                    SELECT COUNT(*) FROM order_book_features
-                """).fetchone()
-                ob_count = result[0] if result else 0
-                logger.debug(f"Order book check: {ob_count} rows")
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Check `prices` table - this is the PRIMARY price data source
+                # Schema: id, timestamp, token, price
+                # Query: WHERE token = 'SOL' for SOL prices
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM prices WHERE token = 'SOL'
+                """)
+                result = cursor.fetchone()
+                price_count = result['count'] if result else 0
+                logger.debug(f"Prices table check: {price_count} SOL prices")
                 
-                if ob_count < 5:
-                    logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway")
-            except Exception as e:
-                logger.debug(f"Order book check error: {e} - continuing anyway")
-            
-            logger.info(f"Data ready: {price_count} prices in master2's DuckDB")
-            return True, f"Data ready ({price_count} prices)"
+                if price_count < 10:
+                    return False, f"Waiting for price data ({price_count}/10 prices)"
+                
+                # Check order_book_features (optional for train_validator)
+                try:
+                    cursor.execute("""
+                        SELECT COUNT(*) as count FROM order_book_features
+                    """)
+                    result = cursor.fetchone()
+                    ob_count = result['count'] if result else 0
+                    logger.debug(f"Order book check: {ob_count} rows")
+                    
+                    if ob_count < 5:
+                        logger.info(f"Order book data limited ({ob_count}/5 rows) - continuing anyway")
+                except Exception as e:
+                    logger.debug(f"Order book check error: {e} - continuing anyway")
+                
+                logger.info(f"Data ready: {price_count} prices in PostgreSQL")
+                return True, f"Data ready ({price_count} prices)"
             
     except Exception as e:
         logger.error(f"Database check error: {e}")
@@ -392,25 +371,27 @@ def check_data_readiness() -> tuple[bool, str]:
 
 
 def get_current_market_price() -> Optional[float]:
-    """Get current SOL price from master2's local DuckDB.
+    """Get current SOL price from PostgreSQL.
     
-    IMPORTANT: Uses `prices` table (PRIMARY) - NOT `price_points` (legacy).
-    Schema: prices(id, ts, token, price)
-    Query: WHERE token = 'SOL' ORDER BY id DESC LIMIT 1
+    Uses `prices` table (PRIMARY) - NOT `price_points` (legacy).
+    Schema: prices(id, timestamp, token, price)
+    Query: WHERE token = 'SOL' ORDER BY timestamp DESC LIMIT 1
     """
     try:
-        with get_duckdb("central", read_only=True) as cursor:
-            result = cursor.execute("""
-                SELECT price
-                FROM prices
-                WHERE token = 'SOL'
-                ORDER BY id DESC
-                LIMIT 1
-            """).fetchone()
-            if result:
-                return float(result[0])
-            logger.warning("No SOL prices found in database")
-            return None
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT price
+                    FROM prices
+                    WHERE token = 'SOL'
+                    ORDER BY timestamp DESC
+                    LIMIT 1
+                """)
+                result = cursor.fetchone()
+                if result:
+                    return float(result['price'])
+                logger.warning("No SOL prices found in database")
+                return None
                 
     except Exception as e:
         logger.error(f"Error getting current market price: {e}")
@@ -419,10 +400,8 @@ def get_current_market_price() -> Optional[float]:
 
 def get_current_price_cycle() -> Optional[int]:
     """
-    Get current active price_cycle ID from cycle_tracker table.
+    Get current active price_cycle ID from cycle_tracker table in PostgreSQL.
     
-    CRITICAL: Uses master2.py's local DuckDB (via get_postgres()) 
-    since cycles are computed locally by create_price_cycles.py in master2.py.
     Returns the active cycle (cycle_end_time IS NULL) for threshold 0.3.
     """
     query = """
@@ -435,13 +414,13 @@ def get_current_price_cycle() -> Optional[int]:
     """
     
     try:
-        # Use get_postgres() which returns master2.py's local DuckDB
-        # when running in master2.py context
-        with get_duckdb("central", read_only=True) as cursor:
-            result = cursor.execute(query).fetchone()
-            if result:
-                return result[0]
-            return None
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query)
+                result = cursor.fetchone()
+                if result:
+                    return result['id']
+                return None
                 
     except Exception as e:
         logger.error(f"Error getting current price_cycle: {e}")
@@ -464,7 +443,10 @@ def insert_synthetic_buyin(
     timestamp = int(time.time())
     wallet_address = f"TRAINING_TEST_{timestamp}"
     signature = f"training_sig_{timestamp}"
-    block_timestamp = datetime.now(timezone.utc)
+    # CRITICAL: Use naive UTC timestamp for PostgreSQL TIMESTAMP column
+    # PostgreSQL TIMESTAMP (without time zone) stores naive datetimes
+    # We generate UTC time and strip timezone info for storage
+    block_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
     block_timestamp_str = block_timestamp.strftime('%Y-%m-%d %H:%M:%S')
     
     pre_insert_log = json.dumps(step_logger.to_json())
@@ -482,28 +464,14 @@ def insert_synthetic_buyin(
     buyin_id = None
     
     try:
-        # Get next ID from master2.py's local DuckDB
-        with get_duckdb("central", read_only=True) as cursor:
-            result = cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM follow_the_goat_buyins").fetchone()
-            buyin_id = result[0] if result else 1
+        # Get next ID from PostgreSQL
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 as next_id FROM follow_the_goat_buyins")
+                result = cursor.fetchone()
+                buyin_id = result['next_id'] if result else 1
         
-        # Insert into master2.py's local DuckDB via write queue
-        postgres_execute("""
-            INSERT INTO follow_the_goat_buyins (
-                id, play_id, wallet_address, original_trade_id, trade_signature,
-                block_timestamp, quote_amount, base_amount, price, direction,
-                our_entry_price, swap_response, live_trade, price_cycle,
-                entry_log, pattern_validator_log, our_status, followed_at,
-                higest_price_reached
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [
-            buyin_id, play_id, wallet_address, 0, signature,
-            block_timestamp_str, 100.0, our_entry_price if our_entry_price else 0.0,
-            our_entry_price, 'buy', our_entry_price, None, 0, price_cycle,
-            pre_insert_log, None, 'validating', block_timestamp_str,
-            our_entry_price  # Initialize higest_price_reached with entry price
-        ], sync=True)
-        logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
+        # Insert into PostgreSQL
         _pg_upsert_buyin({
             'id': buyin_id,
             'play_id': play_id,
@@ -525,11 +493,15 @@ def insert_synthetic_buyin(
             'higest_price_reached': our_entry_price,
         })
         
+        logger.debug(f"PostgreSQL insert successful, buyin_id={buyin_id}")
+        
         step_logger.end(
             insert_token,
             {
                 'buyin_id': buyin_id,
-                'wallet_address': wallet_address
+                'wallet_address': wallet_address,
+                'our_entry_price': our_entry_price,
+                'price_cycle': price_cycle
             }
         )
         
@@ -700,7 +672,10 @@ def update_validation_result(
         fresh_price = None
         if new_status == 'pending':
             fresh_price = get_current_market_price()
-            followed_at = datetime.now(timezone.utc).isoformat()
+            # CRITICAL: Store timestamp in UTC, not local time
+            # Use .replace(tzinfo=None) to store as naive UTC timestamp
+            # PostgreSQL TIMESTAMP columns store naive datetimes, so we convert UTC to naive
+            followed_at = datetime.now(timezone.utc).replace(tzinfo=None)
         
         pg_fields = {
             'pattern_validator_log': pattern_validator_log_json,
@@ -711,26 +686,7 @@ def update_validation_result(
         if fresh_price is not None:
             pg_fields['our_entry_price'] = fresh_price
         
-        # Update master2.py's local DuckDB via write queue
-        if new_status == 'pending' and fresh_price:
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET pattern_validator_log = ?, our_status = ?, followed_at = ?, our_entry_price = ?
-                WHERE id = ?
-            """, [pattern_validator_log_json, new_status, followed_at, fresh_price, buyin_id])
-        elif new_status == 'pending':
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET pattern_validator_log = ?, our_status = ?, followed_at = ?
-                WHERE id = ?
-            """, [pattern_validator_log_json, new_status, followed_at, buyin_id])
-        else:
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET pattern_validator_log = ?, our_status = ?
-                WHERE id = ?
-            """, [pattern_validator_log_json, new_status, buyin_id])
-        
+        # Update PostgreSQL
         _pg_update_buyin(buyin_id, pg_fields)
         
         step_logger.end(
@@ -750,17 +706,12 @@ def update_validation_result(
 def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
     """Update the entry log with final step logger data.
     
-    CRITICAL: Always uses master2.py's local DuckDB (via duckdb_execute_write).
+    Updates PostgreSQL with the complete entry log.
     """
     try:
         final_log_json = json.dumps(step_logger.to_json())
         
-        # Update master2.py's local DuckDB via write queue
-        postgres_execute("""
-            UPDATE follow_the_goat_buyins
-            SET entry_log = ?
-            WHERE id = ?
-        """, [final_log_json, buyin_id])
+        # Update PostgreSQL
         _pg_update_buyin(buyin_id, {'entry_log': final_log_json})
         
     except Exception as e:
@@ -770,7 +721,7 @@ def update_entry_log(buyin_id: int, step_logger: StepLogger) -> None:
 def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[StepLogger] = None) -> None:
     """Mark a buyin as 'error' status when validation pipeline fails.
     
-    CRITICAL: Always uses master2.py's local DuckDB (via duckdb_execute_write).
+    Updates PostgreSQL with error status and logs.
     """
     try:
         error_log = json.dumps({
@@ -779,33 +730,18 @@ def mark_buyin_as_error(buyin_id: int, error_reason: str, step_logger: Optional[
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
         
-        # Update entry_log if step_logger provided
-        entry_log = None
-        if step_logger:
-            entry_log = json.dumps(step_logger.to_json())
+        # Build update fields
+        update_fields = {
+            'our_status': 'error',
+            'pattern_validator_log': error_log,
+        }
         
-        # Update master2.py's local DuckDB via write queue
-        if entry_log:
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET our_status = 'error', pattern_validator_log = ?, entry_log = ?
-                WHERE id = ?
-            """, [error_log, entry_log, buyin_id])
-            _pg_update_buyin(buyin_id, {
-                'our_status': 'error',
-                'pattern_validator_log': error_log,
-                'entry_log': entry_log,
-            })
-        else:
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET our_status = 'error', pattern_validator_log = ?
-                WHERE id = ?
-            """, [error_log, buyin_id])
-            _pg_update_buyin(buyin_id, {
-                'our_status': 'error',
-                'pattern_validator_log': error_log,
-            })
+        # Update entry_log if step_logger provided
+        if step_logger:
+            update_fields['entry_log'] = json.dumps(step_logger.to_json())
+        
+        # Update PostgreSQL
+        _pg_update_buyin(buyin_id, update_fields)
         
         logger.info(f"Marked buyin #{buyin_id} as 'error': {error_reason}")
         
@@ -850,7 +786,7 @@ _stats = TrainingStats()
 def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
     """Clean up trades stuck in 'validating' status for too long.
     
-    CRITICAL: Always uses master2.py's local DuckDB for both reads and writes.
+    Uses PostgreSQL directly to find and update stuck trades.
     
     Args:
         max_age_seconds: Max seconds a trade can be in 'validating' status (default: 2 minutes)
@@ -861,19 +797,22 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
     try:
         cutoff_time = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
         
-        # Find stuck trades in master2.py's local DuckDB
-        with get_duckdb("central", read_only=True) as cursor:
-            raw_result = cursor.execute("""
-                SELECT id, followed_at
-                FROM follow_the_goat_buyins
-                WHERE our_status = 'validating'
-                  AND followed_at < ?
-            """, [cutoff_time]).fetchall()
-            
-            if not raw_result:
-                return 0
-            
-            stuck_ids = [row[0] for row in raw_result]
+        # Find stuck trades in PostgreSQL
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, followed_at
+                    FROM follow_the_goat_buyins
+                    WHERE our_status = 'validating'
+                      AND followed_at < %s
+                """, [cutoff_time])
+                
+                raw_result = cursor.fetchall()
+                
+                if not raw_result:
+                    return 0
+                
+                stuck_ids = [row['id'] for row in raw_result]
         
         logger.warning(f"Found {len(stuck_ids)} trades stuck in 'validating' status: {stuck_ids}")
         
@@ -883,13 +822,8 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
         
-        # Update master2.py's local DuckDB via write queue
+        # Update PostgreSQL
         for buyin_id in stuck_ids:
-            postgres_execute("""
-                UPDATE follow_the_goat_buyins
-                SET our_status = 'error', pattern_validator_log = ?
-                WHERE id = ?
-            """, [error_log, buyin_id])
             _pg_update_buyin(buyin_id, {
                 'our_status': 'error',
                 'pattern_validator_log': error_log,

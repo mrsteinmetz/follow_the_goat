@@ -36,20 +36,7 @@ import time
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.database import (
-    get_duckdb,
-    duckdb_execute_write,
-    get_postgres,
-    write_batch_to_postgres_async,
-)
-from core.config import settings
-from features.price_api.schema import (
-    SCHEMA_SOL_STABLECOIN_TRADES,
-    SCHEMA_CYCLE_TRACKER,
-    SCHEMA_PRICE_POINTS,
-    SCHEMA_WALLET_PROFILES,
-)
-
+from core.database import get_postgres
 # Configure logging
 logger = logging.getLogger("wallet_profiles")
 
@@ -536,29 +523,207 @@ def process_wallet_profiles() -> int:
     Main entry point for the scheduler.
     Process trades and build wallet profiles for all thresholds.
     
-    PERFORMANCE: All reads from DuckDB (local, columnar, fast JOINs).
+    UPDATED FOR POSTGRESQL: Reads from PostgreSQL instead of DuckDB.
     
     Returns:
         Total number of profiles inserted across all thresholds
     """
-    # Ensure tables exist
-    ensure_duckdb_tables()
-    
-    # Process each threshold
     total_inserted = 0
+    
     for threshold in THRESHOLDS:
         try:
-            inserted = build_profiles_for_threshold(threshold)
+            inserted = build_profiles_for_threshold_postgres(threshold)
             if inserted > 0:
                 total_inserted += inserted
-                logger.debug(f"Threshold {threshold}: inserted {inserted} profiles")
+                logger.info(f"Threshold {threshold}: inserted {inserted} profiles")
         except Exception as e:
-            logger.error(f"Error processing threshold {threshold}: {e}")
+            logger.error(f"Error processing threshold {threshold}: {e}", exc_info=True)
     
     if total_inserted > 0:
         logger.info(f"Inserted {total_inserted} profiles across all thresholds")
     
     return total_inserted
+
+
+def build_profiles_for_threshold_postgres(threshold: float) -> int:
+    """
+    Build wallet profiles for a specific threshold using PostgreSQL directly.
+    
+    Returns number of profiles inserted.
+    """
+    try:
+        # Get last processed trade ID from state
+        last_trade_id = _pg_get_last_processed_id(threshold)
+        if last_trade_id is None:
+            last_trade_id = 0
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get latest completed cycle end time
+                cursor.execute("""
+                    SELECT MAX(cycle_end_time) as max_end
+                    FROM cycle_tracker
+                    WHERE threshold = %s AND cycle_end_time IS NOT NULL
+                """, [float(threshold)])
+                result = cursor.fetchone()
+                latest_cycle_end = result['max_end'] if result and result['max_end'] else None
+                
+                if not latest_cycle_end:
+                    logger.debug(f"No completed cycles for threshold {threshold}")
+                    return 0
+                
+                # Build profiles using single efficient query
+                cursor.execute("""
+                    WITH eligible_wallets AS (
+                        SELECT wallet_address
+                        FROM sol_stablecoin_trades
+                        WHERE direction = 'buy'
+                        GROUP BY wallet_address
+                        HAVING COUNT(id) >= %s
+                    ),
+                    trades_with_cycles AS (
+                        SELECT 
+                            t.id as trade_id,
+                            t.wallet_address,
+                            t.trade_timestamp,
+                            t.price as trade_price,
+                            t.stablecoin_amount,
+                            COALESCE(t.perp_direction, '') as perp_direction,
+                            c.id as cycle_id,
+                            c.cycle_start_time,
+                            c.cycle_end_time,
+                            c.sequence_start_price,
+                            c.highest_price_reached,
+                            c.lowest_price_reached
+                        FROM sol_stablecoin_trades t
+                        INNER JOIN eligible_wallets ew ON t.wallet_address = ew.wallet_address
+                        INNER JOIN cycle_tracker c ON (
+                            c.threshold = %s
+                            AND c.cycle_start_time <= t.trade_timestamp
+                            AND c.cycle_end_time >= t.trade_timestamp
+                            AND c.cycle_end_time IS NOT NULL
+                        )
+                        WHERE t.direction = 'buy'
+                        AND t.trade_timestamp <= %s
+                        AND t.id > %s
+                        ORDER BY t.id ASC
+                        LIMIT %s
+                    ),
+                    trades_with_prices AS (
+                        SELECT 
+                            twc.*,
+                            (
+                                SELECT p.price 
+                                FROM prices p 
+                                WHERE p.token = 'SOL'
+                                AND p.timestamp > twc.trade_timestamp 
+                                ORDER BY p.timestamp ASC 
+                                LIMIT 1
+                            ) as entry_price
+                        FROM trades_with_cycles twc
+                    )
+                    SELECT *
+                    FROM trades_with_prices
+                    WHERE entry_price IS NOT NULL
+                """, [MIN_BUYS, float(threshold), latest_cycle_end, last_trade_id, BATCH_SIZE])
+                
+                results = cursor.fetchall()
+        
+        if not results:
+            return 0
+        
+        # Build profile records
+        profiles = []
+        for record in results:
+            perp_direction = record.get('perp_direction', '')
+            if perp_direction == 'long':
+                short_value = 0
+            elif perp_direction == 'short':
+                short_value = 1
+            else:
+                short_value = 2
+            
+            profiles.append({
+                'wallet_address': record['wallet_address'],
+                'threshold': threshold,
+                'trade_id': record['trade_id'],
+                'trade_timestamp': record['trade_timestamp'],
+                'price_cycle': record['cycle_id'],
+                'price_cycle_start_time': record['cycle_start_time'],
+                'price_cycle_end_time': record['cycle_end_time'],
+                'trade_entry_price_org': float(record['trade_price']) if record['trade_price'] else 0,
+                'stablecoin_amount': record['stablecoin_amount'],
+                'trade_entry_price': float(record['entry_price']),
+                'sequence_start_price': float(record['sequence_start_price']),
+                'highest_price_reached': float(record['highest_price_reached']),
+                'lowest_price_reached': float(record['lowest_price_reached']),
+                'long_short': perp_direction,
+                'short': short_value
+            })
+        
+        # Insert profiles into PostgreSQL
+        inserted = insert_profiles_batch_postgres(profiles)
+        
+        # Update state
+        if profiles:
+            max_id = max(p['trade_id'] for p in profiles)
+            _pg_update_last_processed_id(threshold, max_id)
+        
+        return inserted
+        
+    except Exception as e:
+        logger.error(f"Failed to build profiles for threshold {threshold}: {e}", exc_info=True)
+        return 0
+
+
+def insert_profiles_batch_postgres(profiles: List[Dict]) -> int:
+    """
+    Insert profiles into PostgreSQL.
+    Returns number of records inserted.
+    """
+    if not profiles:
+        return 0
+    
+    try:
+        # Prepare batch insert data
+        batch_data = []
+        for profile in profiles:
+            batch_data.append((
+                profile['wallet_address'],
+                profile['threshold'],
+                profile['trade_id'],
+                profile['trade_timestamp'],
+                profile['price_cycle'],
+                profile['price_cycle_start_time'],
+                profile['price_cycle_end_time'],
+                profile['trade_entry_price_org'],
+                profile['stablecoin_amount'],
+                profile['trade_entry_price'],
+                profile['sequence_start_price'],
+                profile['highest_price_reached'],
+                profile['lowest_price_reached'],
+                profile['long_short'],
+                profile['short'],
+            ))
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Use executemany for batch insert
+                cursor.executemany("""
+                    INSERT INTO wallet_profiles 
+                    (wallet_address, threshold, trade_id, trade_timestamp, price_cycle,
+                     price_cycle_start_time, price_cycle_end_time, trade_entry_price_org,
+                     stablecoin_amount, trade_entry_price, sequence_start_price,
+                     highest_price_reached, lowest_price_reached, long_short, short)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, batch_data)
+        
+        return len(batch_data)
+        
+    except Exception as e:
+        logger.error(f"PostgreSQL insert failed: {e}", exc_info=True)
+        return 0
 
 
 def run_continuous(interval_seconds: int = 5):

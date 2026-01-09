@@ -194,8 +194,8 @@ class TrailingStopSeller:
         """
         try:
             with get_postgres() as conn:
-        with conn.cursor() as cursor:
-                cursor.execute("""
+                with conn.cursor() as cursor:
+                    cursor.execute("""
                     SELECT value as price, created_at, id
                     FROM price_points 
                     WHERE coin_id = 5
@@ -220,9 +220,9 @@ class TrailingStopSeller:
         """Get all open positions that we're tracking (matching live_trade mode)."""
         try:
             with get_postgres() as conn:
-        with conn.cursor() as cursor:
-                # Build query depending on monitoring filter
-                base_sql = """
+                with conn.cursor() as cursor:
+                    # Build query depending on monitoring filter
+                    base_sql = """
                     SELECT 
                         id,
                         play_id,
@@ -276,8 +276,8 @@ class TrailingStopSeller:
         # Cache miss or expired - fetch from database
         try:
             with get_postgres() as conn:
-        with conn.cursor() as cursor:
-                cursor.execute("""
+                with conn.cursor() as cursor:
+                    cursor.execute("""
                     SELECT sell_logic
                     FROM follow_the_goat_plays
                     WHERE id = ?

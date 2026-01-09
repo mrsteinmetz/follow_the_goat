@@ -80,36 +80,63 @@ def health_check():
 
 @app.route('/cycle_tracker', methods=['GET'])
 def get_cycle_tracker():
-    """Get price cycles."""
+    """Get price cycles (with PHP-compatible response format)."""
     try:
         limit = min(int(request.args.get('limit', 100)), 1000)
-        status_filter = request.args.get('status')
+        threshold = request.args.get('threshold')
+        hours = request.args.get('hours', '24')
+        
+        # Build WHERE clause conditions
+        where_conditions = []
+        params = []
+        
+        # Filter by threshold if specified
+        if threshold:
+            where_conditions.append("threshold = %s")
+            params.append(float(threshold))
+        
+        # Filter by time if specified and not 'all'
+        if hours and hours != 'all':
+            try:
+                hours_int = int(hours)
+                where_conditions.append("created_at >= NOW() - INTERVAL '%s hours'")
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        # Build the WHERE clause
+        where_clause = ""
+        if where_conditions:
+            where_clause = "WHERE " + " AND ".join(where_conditions)
         
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                if status_filter == 'active':
-                    cursor.execute("""
-                        SELECT * FROM cycle_tracker
-                        WHERE cycle_end_time IS NULL
-                        ORDER BY id DESC LIMIT %s
-                    """, [limit])
-                elif status_filter == 'completed':
-                    cursor.execute("""
-                        SELECT * FROM cycle_tracker
-                        WHERE cycle_end_time IS NOT NULL
-                        ORDER BY id DESC LIMIT %s
-                    """, [limit])
-                else:
-                    cursor.execute("""
-                        SELECT * FROM cycle_tracker
-                        ORDER BY id DESC LIMIT %s
-                    """, [limit])
+                # Get cycles
+                query = f"""
+                    SELECT * FROM cycle_tracker
+                    {where_clause}
+                    ORDER BY id DESC LIMIT %s
+                """
+                params.append(limit)
+                cursor.execute(query, params)
+                cycles = cursor.fetchall()
                 
-                results = cursor.fetchall()
+                # Get total count
+                count_query = f"SELECT COUNT(*) as count FROM cycle_tracker {where_clause}"
+                cursor.execute(count_query, params[:-1])  # Exclude limit from count query
+                count_result = cursor.fetchone()
+                total_count = count_result['count'] if count_result else 0
         
-        return jsonify({'results': results, 'count': len(results)})
+        # Format response for PHP compatibility
+        return jsonify({
+            'cycles': cycles,
+            'count': len(cycles),
+            'total_count': total_count,
+            'missing_cycles': 0,  # Could calculate sequence gaps if needed
+            'source': 'postgresql'
+        })
     except Exception as e:
-        logger.error(f"Get cycles failed: {e}")
+        logger.error(f"Get cycles failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -199,7 +226,7 @@ def get_plays():
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT * FROM follow_the_goat_plays
-                    WHERE active = TRUE
+                    WHERE is_active = TRUE
                     ORDER BY id DESC LIMIT %s
                 """, [limit])
                 results = cursor.fetchall()
@@ -239,23 +266,108 @@ def get_buyins():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/profiles', methods=['GET'])
-def get_profiles():
-    """Get wallet profiles."""
+@app.route('/buyins/<int:buyin_id>', methods=['GET'])
+def get_single_buyin(buyin_id):
+    """Get a single buyin by ID."""
     try:
-        limit = min(int(request.args.get('limit', 100)), 1000)
-        
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT * FROM wallet_profiles
-                    ORDER BY score DESC LIMIT %s
-                """, [limit])
+                    SELECT * FROM follow_the_goat_buyins
+                    WHERE id = %s
+                """, [buyin_id])
+                
+                result = cursor.fetchone()
+        
+        if result:
+            return jsonify({'buyin': result})
+        else:
+            return jsonify({'error': 'Buyin not found'}), 404
+    except Exception as e:
+        logger.error(f"Get single buyin failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/profiles', methods=['GET'])
+def get_profiles():
+    """Get wallet profiles aggregated by wallet address."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+        threshold = request.args.get('threshold')
+        hours = request.args.get('hours', '24')
+        order_by = request.args.get('order_by', 'recent')
+        
+        # Build WHERE clause conditions
+        where_conditions = []
+        params = []
+        
+        # Filter by threshold if specified
+        if threshold:
+            where_conditions.append("threshold = %s")
+            params.append(float(threshold))
+        
+        # Filter by time if specified and not 'all'
+        if hours and hours != 'all':
+            try:
+                hours_int = int(hours)
+                where_conditions.append("trade_timestamp >= NOW() - INTERVAL '%s hours'")
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        # Build the WHERE clause
+        where_clause = ""
+        if where_conditions:
+            where_clause = "WHERE " + " AND ".join(where_conditions)
+        
+        # Determine ORDER BY clause
+        order_clause = "ORDER BY latest_trade DESC"  # Default: most recent
+        if order_by == 'avg_gain':
+            order_clause = "ORDER BY avg_potential_gain DESC"
+        elif order_by == 'trade_count':
+            order_clause = "ORDER BY trade_count DESC"
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Aggregate profiles by wallet address
+                query = f"""
+                    SELECT 
+                        wallet_address,
+                        COUNT(*) as trade_count,
+                        AVG(
+                            CASE 
+                                WHEN highest_price_reached > 0 AND trade_entry_price > 0 
+                                THEN ((highest_price_reached - trade_entry_price) / trade_entry_price * 100)
+                                ELSE 0 
+                            END
+                        ) as avg_potential_gain,
+                        SUM(stablecoin_amount) as total_invested,
+                        SUM(CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price * 100) < COALESCE(%s, threshold) THEN 1 ELSE 0 END) as trades_below_threshold,
+                        SUM(CASE WHEN ((highest_price_reached - trade_entry_price) / trade_entry_price * 100) >= COALESCE(%s, threshold) THEN 1 ELSE 0 END) as trades_at_above_threshold,
+                        MAX(trade_timestamp) as latest_trade,
+                        AVG(threshold) as threshold
+                    FROM wallet_profiles
+                    {where_clause}
+                    GROUP BY wallet_address
+                    {order_clause}
+                    LIMIT %s
+                """
+                
+                # Add threshold params for the COALESCE comparisons
+                threshold_val = float(threshold) if threshold else 0.3
+                query_params = [threshold_val, threshold_val] + params + [limit]
+                
+                cursor.execute(query, query_params)
                 results = cursor.fetchall()
         
-        return jsonify({'results': results, 'count': len(results)})
+        return jsonify({
+            'profiles': results,
+            'count': len(results),
+            'source': 'postgres',
+            'aggregated': True
+        })
     except Exception as e:
-        logger.error(f"Get profiles failed: {e}")
+        logger.error(f"Get profiles failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -263,21 +375,58 @@ def get_profiles():
 def get_profile_stats():
     """Get wallet profile statistics."""
     try:
+        threshold = request.args.get('threshold')
+        hours = request.args.get('hours', '24')
+        
+        # Build WHERE clause conditions
+        where_conditions = []
+        params = []
+        
+        # Filter by threshold if specified
+        if threshold:
+            where_conditions.append("threshold = %s")
+            params.append(float(threshold))
+        
+        # Filter by time if specified and not 'all'
+        if hours and hours != 'all':
+            try:
+                hours_int = int(hours)
+                where_conditions.append("trade_timestamp >= NOW() - INTERVAL '%s hours'")
+                params.append(hours_int)
+            except ValueError:
+                pass
+        
+        # Build the WHERE clause
+        where_clause = ""
+        if where_conditions:
+            where_clause = "WHERE " + " AND ".join(where_conditions)
+        
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("""
+                query = f"""
                     SELECT 
                         COUNT(*) as total_profiles,
-                        AVG(score) as avg_score,
-                        MAX(score) as max_score,
-                        COUNT(CASE WHEN score > 70 THEN 1 END) as high_performers
+                        COUNT(DISTINCT wallet_address) as unique_wallets,
+                        COUNT(DISTINCT price_cycle) as unique_cycles,
+                        SUM(stablecoin_amount) as total_invested,
+                        AVG(trade_entry_price) as avg_entry_price
                     FROM wallet_profiles
-                """)
+                    {where_clause}
+                """
+                cursor.execute(query, params)
                 result = cursor.fetchone()
         
-        return jsonify(result)
+        return jsonify({
+            'stats': result if result else {
+                'total_profiles': 0,
+                'unique_wallets': 0,
+                'unique_cycles': 0,
+                'total_invested': 0,
+                'avg_entry_price': 0
+            }
+        })
     except Exception as e:
-        logger.error(f"Get profile stats failed: {e}")
+        logger.error(f"Get profile stats failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -331,27 +480,290 @@ def get_scheduler_status():
 
 
 # =============================================================================
-# QUERY ENDPOINT (DEBUGGING)
+# ORDER BOOK ENDPOINTS
 # =============================================================================
 
-@app.route('/query', methods=['POST'])
-def query_sql():
-    """Execute arbitrary SQL query (read-only for security)."""
+@app.route('/order_book_features', methods=['GET'])
+def get_order_book_features():
+    """Get order book features with PHP-compatible column names."""
     try:
-        sql = request.json.get('sql', '').strip()
-        
-        # Security: only allow SELECT
-        if not sql.upper().startswith('SELECT'):
-            return jsonify({'error': 'Only SELECT queries allowed'}), 400
+        limit = min(int(request.args.get('limit', 100)), 5000)
         
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(sql)
+                # Calculate best_bid and best_ask from JSON arrays
+                cursor.execute("""
+                    SELECT 
+                        id,
+                        'SOLUSDT' AS symbol,
+                        timestamp AS ts,
+                        CAST((bids_json::json->0->>0) AS DOUBLE PRECISION) AS best_bid,
+                        CAST((asks_json::json->0->>0) AS DOUBLE PRECISION) AS best_ask,
+                        mid_price,
+                        spread_bps AS relative_spread_bps,
+                        bid_liquidity AS bid_depth_10,
+                        ask_liquidity AS ask_depth_10,
+                        total_depth_10,
+                        volume_imbalance,
+                        bid_slope,
+                        ask_slope,
+                        bid_depth_bps_5,
+                        ask_depth_bps_5,
+                        bid_depth_bps_10,
+                        ask_depth_bps_10,
+                        bid_depth_bps_25,
+                        ask_depth_bps_25,
+                        net_liquidity_change_1s,
+                        microprice,
+                        microprice_dev_bps,
+                        source
+                    FROM order_book_features
+                    ORDER BY timestamp DESC
+                    LIMIT %s
+                """, [limit])
                 results = cursor.fetchall()
         
-        return jsonify({'results': results, 'count': len(results)})
+        return jsonify({
+            'results': results,
+            'count': len(results),
+            'source': 'postgres'
+        })
     except Exception as e:
-        logger.error(f"Query failed: {e}")
+        logger.error(f"Get order book features failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# WHALE ACTIVITY & TRANSACTIONS ENDPOINTS
+# =============================================================================
+
+@app.route('/whale_movements', methods=['GET'])
+def get_whale_movements():
+    """Get whale-sized trades (transactions > $10,000) from PostgreSQL."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 5000)
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get large trades with whale classification
+                cursor.execute("""
+                    SELECT 
+                        signature,
+                        wallet_address,
+                        trade_timestamp AS timestamp,
+                        direction,
+                        stablecoin_amount,
+                        price AS sol_price_at_trade,
+                        sol_amount,
+                        CASE 
+                            WHEN stablecoin_amount >= 100000 THEN 'MEGA_WHALE'
+                            WHEN stablecoin_amount >= 50000 THEN 'LARGE_WHALE'
+                            WHEN stablecoin_amount >= 25000 THEN 'WHALE'
+                            ELSE 'MODERATE_WHALE'
+                        END AS whale_type,
+                        stablecoin_amount AS abs_change,
+                        0 AS fee_paid,
+                        sol_amount AS current_balance,
+                        sol_amount AS previous_balance,
+                        0 AS sol_change
+                    FROM sol_stablecoin_trades
+                    WHERE stablecoin_amount > 10000
+                    ORDER BY trade_timestamp DESC
+                    LIMIT %s
+                """, [limit])
+                results = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'count': len(results),
+            'source': 'postgres'
+        })
+    except Exception as e:
+        logger.error(f"Get whale movements failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/trades', methods=['GET'])
+def get_trades():
+    """Get all stablecoin trades from PostgreSQL."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 5000)
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        signature,
+                        wallet_address,
+                        trade_timestamp,
+                        direction,
+                        stablecoin_amount,
+                        price AS sol_price_at_trade,
+                        sol_amount
+                    FROM sol_stablecoin_trades
+                    ORDER BY trade_timestamp DESC
+                    LIMIT %s
+                """, [limit])
+                results = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'results': results,
+            'count': len(results),
+            'source': 'postgres'
+        })
+    except Exception as e:
+        logger.error(f"Get trades failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
+# TRAIL DATA ENDPOINTS
+# =============================================================================
+
+@app.route('/trail/buyin/<int:buyin_id>', methods=['GET'])
+def get_trail_for_buyin(buyin_id):
+    """Get 15-minute trail data for a specific buyin."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM buyin_trail_minutes
+                    WHERE buyin_id = %s
+                    ORDER BY minute ASC
+                """, [buyin_id])
+                
+                results = cursor.fetchall()
+        
+        return jsonify({
+            'trail_data': results,
+            'count': len(results),
+            'source': 'postgres'
+        })
+    except Exception as e:
+        logger.error(f"Get trail for buyin failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# QUERY ENDPOINT (STRUCTURED + RAW SQL)
+# =============================================================================
+
+@app.route('/query', methods=['POST'])
+def query():
+    """Execute query - supports both structured params and raw SQL."""
+    try:
+        data = request.json or {}
+        
+        # Check if this is a raw SQL query
+        if 'sql' in data:
+            sql = data.get('sql', '').strip()
+            
+            # Security: only allow SELECT
+            if not sql.upper().startswith('SELECT'):
+                return jsonify({'error': 'Only SELECT queries allowed'}), 400
+            
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql)
+                    results = cursor.fetchall()
+            
+            return jsonify({'results': results, 'count': len(results)})
+        
+        # Otherwise, handle structured query (for PHP DatabaseClient compatibility)
+        table = data.get('table')
+        if not table:
+            return jsonify({'error': 'table parameter required'}), 400
+        
+        columns = data.get('columns', ['*'])
+        where = data.get('where')
+        order_by = data.get('order_by')
+        limit = min(int(data.get('limit', 100)), 5000)
+        
+        # Special handling for order_book_features - map column names
+        column_mappings = {}
+        if table == 'order_book_features':
+            column_mappings = {
+                'ts': 'timestamp',
+                'symbol': "'SOLUSDT'",  # Hardcoded since we only track SOLUSDT
+                'relative_spread_bps': 'spread_bps',
+                'bid_depth_10': 'bid_liquidity',
+                'ask_depth_10': 'ask_liquidity',
+                'best_bid': "CAST((bids_json::json->0->>0) AS DOUBLE PRECISION)",
+                'best_ask': "CAST((asks_json::json->0->>0) AS DOUBLE PRECISION)"
+            }
+        
+        # Build query
+        if columns == ['*'] or not columns:
+            columns_str = '*'
+        else:
+            # Sanitize and map column names
+            safe_columns = []
+            for col in columns:
+                if isinstance(col, str) and col.replace('_', '').isalnum():
+                    # Apply column mapping if exists
+                    mapped_col = column_mappings.get(col, col)
+                    # Add alias if it was mapped
+                    if col in column_mappings and not mapped_col.startswith('CAST'):
+                        safe_columns.append(f"{mapped_col} AS {col}")
+                    elif col in column_mappings and mapped_col.startswith('CAST'):
+                        safe_columns.append(f"{mapped_col} AS {col}")
+                    else:
+                        safe_columns.append(col)
+            columns_str = ', '.join(safe_columns) if safe_columns else '*'
+        
+        query_parts = [f"SELECT {columns_str} FROM {table}"]
+        params = []
+        
+        # Add WHERE clause if provided
+        if where:
+            where_conditions = []
+            for key, value in where.items():
+                # Sanitize key
+                if isinstance(key, str) and key.replace('_', '').isalnum():
+                    where_conditions.append(f"{key} = %s")
+                    params.append(value)
+            
+            if where_conditions:
+                query_parts.append("WHERE " + " AND ".join(where_conditions))
+        
+        # Add ORDER BY
+        if order_by:
+            # Basic sanitization - only allow alphanumeric, underscore, space, comma, ASC, DESC
+            if isinstance(order_by, str):
+                cleaned = order_by.replace('ASC', '').replace('DESC', '').replace(',', '').replace(' ', '').replace('_', '')
+                if cleaned.isalnum():
+                    # Apply column mapping for order_by field
+                    order_by_mapped = order_by
+                    for alias, real_col in column_mappings.items():
+                        if order_by.startswith(alias):
+                            # Replace only if it's not a complex expression
+                            if not real_col.startswith('CAST'):
+                                order_by_mapped = order_by.replace(alias, real_col, 1)
+                            break
+                    query_parts.append(f"ORDER BY {order_by_mapped}")
+        
+        # Add LIMIT
+        query_parts.append(f"LIMIT %s")
+        params.append(limit)
+        
+        sql = ' '.join(query_parts)
+        logger.debug(f"Executing query: {sql} with params: {params}")
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                results = cursor.fetchall()
+        
+        return jsonify({
+            'results': results,
+            'count': len(results),
+            'source': 'postgres'
+        })
+        
+    except Exception as e:
+        logger.error(f"Query failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 

@@ -32,7 +32,7 @@ class DatabaseClient {
     /**
      * Make a GET request to the API
      */
-    private function get(string $endpoint, array $params = []): ?array {
+    public function get(string $endpoint, array $params = []): ?array {
         $url = $this->apiBaseUrl . $endpoint;
         if (!empty($params)) {
             $url .= '?' . http_build_query($params);

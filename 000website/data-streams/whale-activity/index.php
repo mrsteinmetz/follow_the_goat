@@ -1,64 +1,52 @@
 <?php
 /**
  * Whale Activity Page - Live Whale Movements
- * Displays real-time whale wallet activity from .NET Webhook DuckDB In-Memory API.
+ * Displays real-time whale wallet activity from PostgreSQL via website_api.py
  * 
- * Data Source: .NET Webhook at 195.201.84.5/api/whale-movements
- * This reads from the in-memory DuckDB (24hr hot storage)
+ * Data Source: PostgreSQL via website_api.py (port 5051)
  */
 
-// --- Webhook API URL (FastAPI on 8001) ---
-define('WEBHOOK_API_URL', 'http://127.0.0.1:8001/webhook');
+require_once __DIR__ . '/../../includes/config.php';
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
 
 // --- Base URL for template ---
 $baseUrl = '../..';
 
-// --- Check if webhook API is available ---
-function isWebhookAvailable() {
-    $ch = curl_init(WEBHOOK_API_URL . '/health');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    return $httpCode === 200;
-}
+// --- Initialize Database Client ---
+$dbClient = new DatabaseClient();
 
-$use_duckdb = isWebhookAvailable();
-
-// --- Fetch Whale Data via .NET Webhook API ---
-function fetchWhaleData() {
+// --- Fetch Whale Data from PostgreSQL ---
+function fetchWhaleData($dbClient) {
     $whale_data = [];
     $error_message = null;
     $data_source = "No Data";
     $actual_source = null;
 
-    $ch = curl_init(WEBHOOK_API_URL . '/api/whale-movements?limit=100');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/json']);
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-    
-    if ($httpCode === 200 && $response) {
-        $data = json_decode($response, true);
+    try {
+        // Call website_api.py /whale_movements endpoint
+        $result = $dbClient->get('/whale_movements?limit=100');
         
-        if ($data && isset($data['success']) && $data['success'] === true) {
-            $whale_data = $data['results'] ?? [];
-            $actual_source = $data['source'] ?? 'duckdb_inmemory';
-            $data_source = "🦆 DuckDB In-Memory";
+        if ($result && isset($result['success']) && $result['success'] === true) {
+            $whale_data = $result['results'] ?? [];
+            $actual_source = $result['source'] ?? 'postgres';
+            
+            // Determine source display
+            switch ($actual_source) {
+                case 'postgres':
+                case 'postgresql':
+                    $data_source = "🐘 PostgreSQL";
+                    break;
+                default:
+                    $data_source = "Unknown Source";
+            }
         } else {
-            $error_message = $data['error'] ?? 'Unknown error from API';
+            $error_message = $result['error'] ?? 'Unknown error from API';
             $data_source = "API Error";
         }
-    } else {
-        $error_message = "Webhook API is not available. Error: " . ($curlError ?: "HTTP $httpCode");
+    } catch (Exception $e) {
+        $error_message = "API connection failed: " . $e->getMessage();
         $data_source = "Offline";
+        $actual_source = null;
     }
     
     return [
@@ -72,36 +60,17 @@ function fetchWhaleData() {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchWhaleData();
-    $use_duckdb = isWebhookAvailable();
+    $result = fetchWhaleData($dbClient);
     
     // Build status data
     $status_data = [
-        'api_status' => $use_duckdb ? 'connected' : 'disconnected',
+        'api_status' => 'connected',
         'whale_records' => count($result['whale_data']),
         'last_update' => null,
     ];
     
     if (!empty($result['whale_data'])) {
         $status_data['last_update'] = $result['whale_data'][0]['timestamp'] ?? null;
-    }
-    
-    // Get health data from webhook for additional status
-    if ($use_duckdb) {
-        $ch = curl_init(WEBHOOK_API_URL . '/health');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        $healthResponse = curl_exec($ch);
-        curl_close($ch);
-        
-        if ($healthResponse) {
-            $healthData = json_decode($healthResponse, true);
-            if ($healthData && isset($healthData['duckdb'])) {
-                $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-                $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
-            }
-        }
     }
     
     echo json_encode([
@@ -116,39 +85,21 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 }
 
 // Regular page load - fetch data normally
-$result = fetchWhaleData();
+$result = fetchWhaleData($dbClient);
 $whale_data = $result['whale_data'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
-$use_duckdb = isWebhookAvailable();
+$actual_source = $result['actual_source'];
 
 // --- Status Data ---
 $status_data = [
-    'api_status' => $use_duckdb ? 'connected' : 'disconnected',
+    'api_status' => 'connected',
     'whale_records' => count($whale_data),
     'last_update' => null,
 ];
 
 if (!empty($whale_data)) {
     $status_data['last_update'] = $whale_data[0]['timestamp'] ?? null;
-}
-
-// Get health data from webhook for additional status
-if ($use_duckdb) {
-    $ch = curl_init(WEBHOOK_API_URL . '/health');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    $healthResponse = curl_exec($ch);
-    curl_close($ch);
-    
-    if ($healthResponse) {
-        $healthData = json_decode($healthResponse, true);
-        if ($healthData && isset($healthData['duckdb'])) {
-            $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-            $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
-        }
-    }
 }
 
 $json_status_data = json_encode($status_data);
@@ -304,6 +255,8 @@ $json_whale_data = json_encode($whale_data);
         border-radius: 4px;
         font-size: 11px;
         font-weight: 600;
+        background: rgb(var(--success-rgb));
+        color: white;
     }
     .live-indicator {
         display: inline-flex;
@@ -343,7 +296,7 @@ $json_whale_data = json_encode($whale_data);
                     <!-- End::page-header -->
 
                     <!-- Data Source Badge -->
-                    <div id="dataSourceBadge" class="data-source-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+                    <div id="dataSourceBadge" class="data-source-badge">
                         <?php echo $data_source; ?>
                     </div>
 
@@ -393,7 +346,7 @@ $json_whale_data = json_encode($whale_data);
                             <div class="card custom-card">
                                 <div class="card-header">
                                     <div class="card-title">
-                                        <i class="ti ti-whale me-2"></i>Recent Whale Movements
+                                        <i class="ti ti-whale me-2"></i>Recent Whale Movements (>$10k USD)
                                     </div>
                                     <div class="ms-auto d-flex gap-2 align-items-center">
                                         <span class="badge bg-info-transparent" id="recordCount"><?php echo count($whale_data); ?> Records</span>
@@ -410,32 +363,31 @@ $json_whale_data = json_encode($whale_data);
                                                 // Determine whale type class
                                                 $whale_class = 'whale-normal';
                                                 $whale_badge_class = 'bg-info-transparent';
-                                                $whale_type_normalized = str_replace(' ', '_', strtoupper($row['whale_type'] ?? 'UNKNOWN'));
+                                                $whale_type = $row['whale_type'] ?? 'MODERATE_WHALE';
                                                 
-                                                if (stripos($row['whale_type'] ?? '', 'MEGA') !== false) {
+                                                if (stripos($whale_type, 'MEGA') !== false) {
                                                     $whale_class = 'whale-mega';
                                                     $whale_badge_class = 'bg-warning-transparent';
-                                                } elseif (stripos($row['whale_type'] ?? '', 'LARGE') !== false) {
+                                                } elseif (stripos($whale_type, 'LARGE') !== false) {
                                                     $whale_class = 'whale-large';
                                                     $whale_badge_class = 'bg-primary-transparent';
-                                                } elseif (stripos($row['whale_type'] ?? '', 'MODERATE') !== false) {
+                                                } elseif (stripos($whale_type, 'WHALE') !== false && stripos($whale_type, 'MODERATE') === false) {
+                                                    $whale_class = 'whale-normal';
+                                                    $whale_badge_class = 'bg-info-transparent';
+                                                } elseif (stripos($whale_type, 'MODERATE') !== false) {
                                                     $whale_class = 'whale-moderate';
                                                     $whale_badge_class = 'bg-secondary-transparent';
                                                 }
                                                 
-                                                // Check if mega transaction (>100 SOL change)
-                                                $sol_change = floatval($row['sol_change'] ?? 0);
-                                                $is_mega_tx = abs($sol_change) > 100;
-                                                $sol_class = $sol_change >= 0 ? 'text-success' : 'text-danger';
-                                                
-                                                // Check if large balance (>50k SOL)
-                                                $current_balance = floatval($row['current_balance'] ?? 0);
-                                                $is_large_balance = $current_balance > 50000;
+                                                // Format amounts
+                                                $stablecoin_amount = floatval($row['stablecoin_amount'] ?? 0);
+                                                $sol_amount = floatval($row['sol_amount'] ?? 0);
+                                                $sol_price = floatval($row['sol_price_at_trade'] ?? 0);
                                                 
                                                 // Direction badge
                                                 $direction_lower = strtolower($row['direction'] ?? 'unknown');
-                                                $direction_badge_class = $direction_lower === 'in' ? 'bg-success-transparent' : 'bg-danger-transparent';
-                                                $direction_text = $direction_lower === 'in' ? 'RECEIVING' : 'SENDING';
+                                                $direction_badge_class = $direction_lower === 'buy' ? 'bg-success-transparent' : 'bg-danger-transparent';
+                                                $direction_text = $direction_lower === 'buy' ? 'BUYING' : 'SELLING';
                                             ?>
                                             <div class="card custom-card whale-card <?php echo $whale_class; ?>" data-signature="<?php echo htmlspecialchars($row['signature'] ?? ''); ?>">
                                                 <div class="card-body">
@@ -450,34 +402,34 @@ $json_whale_data = json_encode($whale_data);
                                                         </div>
                                                         <div class="col-md-2 text-center">
                                                             <div class="text-muted fs-12 mb-1">Whale Type</div>
-                                                            <span class="badge <?php echo $whale_badge_class; ?>"><?php echo htmlspecialchars($whale_type_normalized); ?></span>
+                                                            <span class="badge <?php echo $whale_badge_class; ?>"><?php echo htmlspecialchars($whale_type); ?></span>
                                                         </div>
                                                         <div class="col-md-3 text-end">
-                                                            <div class="text-muted fs-12 mb-1">SOL Change</div>
-                                                            <div class="fw-semibold <?php echo $sol_class; ?> <?php echo $is_mega_tx ? 'fs-16' : ''; ?>">
-                                                                <?php echo ($sol_change >= 0 ? '+' : '') . number_format($sol_change, 2); ?> SOL
+                                                            <div class="text-muted fs-12 mb-1">Trade Value (USD)</div>
+                                                            <div class="fw-semibold text-primary fs-16">
+                                                                $<?php echo number_format($stablecoin_amount, 2); ?>
                                                             </div>
                                                         </div>
                                                         <div class="col-md-3 text-end">
-                                                            <div class="text-muted fs-12 mb-1">Current Balance</div>
-                                                            <div class="fw-semibold <?php echo $is_large_balance ? 'text-success' : ''; ?>">
-                                                                <?php echo number_format($current_balance, 2); ?> SOL
+                                                            <div class="text-muted fs-12 mb-1">SOL Amount</div>
+                                                            <div class="fw-semibold">
+                                                                <?php echo number_format($sol_amount, 2); ?> SOL
                                                             </div>
                                                         </div>
                                                     </div>
                                                     
                                                     <div class="whale-details-grid">
                                                         <div class="whale-detail-item">
-                                                            <div class="whale-label">Previous Balance</div>
-                                                            <div class="whale-value mono-cell"><?php echo number_format(floatval($row['previous_balance'] ?? 0), 2); ?> SOL</div>
+                                                            <div class="whale-label">SOL Price</div>
+                                                            <div class="whale-value mono-cell">$<?php echo number_format($sol_price, 2); ?></div>
                                                         </div>
                                                         <div class="whale-detail-item">
-                                                            <div class="whale-label">Absolute Change</div>
-                                                            <div class="whale-value mono-cell"><?php echo number_format(floatval($row['abs_change'] ?? 0), 2); ?> SOL</div>
+                                                            <div class="whale-label">USD Value</div>
+                                                            <div class="whale-value mono-cell">$<?php echo number_format($stablecoin_amount, 2); ?></div>
                                                         </div>
                                                         <div class="whale-detail-item">
-                                                            <div class="whale-label">Fee Paid</div>
-                                                            <div class="whale-value mono-cell"><?php echo number_format(floatval($row['fee_paid'] ?? 0), 6); ?> SOL</div>
+                                                            <div class="whale-label">SOL Volume</div>
+                                                            <div class="whale-value mono-cell"><?php echo number_format($sol_amount, 4); ?> SOL</div>
                                                         </div>
                                                         <div class="whale-detail-item">
                                                             <div class="whale-label">Wallet Address</div>
@@ -513,9 +465,8 @@ $json_whale_data = json_encode($whale_data);
                                         <?php else: ?>
                                             <div class="d-flex flex-column align-items-center py-5">
                                                 <i class="ti ti-database-off fs-1 text-muted mb-2"></i>
-                                                <h6 class="text-muted mb-1">No whale activity data in DuckDB hot storage</h6>
-                                                <p class="text-muted mb-0 fs-13">Data will appear as new whale movements arrive via QuickNode.</p>
-                                                <p class="text-muted mb-0 fs-12 mt-2">DuckDB in-memory stores last 24 hours only.</p>
+                                                <h6 class="text-muted mb-1">No whale activity data available</h6>
+                                                <p class="text-muted mb-0 fs-13">Whale trades (>$10k) will appear as they arrive via QuickNode.</p>
                                             </div>
                                         <?php endif; ?>
                                     </div>
@@ -557,9 +508,8 @@ $json_whale_data = json_encode($whale_data);
                 });
             }
             
-            // Status refresh functionality - Always use UTC time
+            // Status refresh functionality
             function refreshStatus(statusData) {
-                // Get current time in UTC milliseconds
                 const nowUtc = Date.now();
                 
                 function updateButton(btnId, infoId, timestamp) {
@@ -574,8 +524,6 @@ $json_whale_data = json_encode($whale_data);
                         return;
                     }
                     
-                    // Parse timestamp - if no timezone specified, treat as local time (CET)
-                    // Don't force UTC by adding 'Z' - let browser parse as local time
                     const dataTime = new Date(timestamp).getTime();
                     const diffMs = nowUtc - dataTime;
                     const diffSecs = Math.floor(diffMs / 1000);
@@ -623,6 +571,9 @@ $json_whale_data = json_encode($whale_data);
                 } else if (type.includes('LARGE')) {
                     rowClass = 'whale-large';
                     badgeClass = 'bg-primary-transparent';
+                } else if (type.includes('WHALE') && !type.includes('MODERATE')) {
+                    rowClass = 'whale-normal';
+                    badgeClass = 'bg-info-transparent';
                 } else if (type.includes('MODERATE')) {
                     rowClass = 'whale-moderate';
                     badgeClass = 'bg-secondary-transparent';
@@ -655,9 +606,8 @@ $json_whale_data = json_encode($whale_data);
                     container.innerHTML = `
                         <div class="d-flex flex-column align-items-center py-5">
                             <i class="ti ti-database-off fs-1 text-muted mb-2"></i>
-                            <h6 class="text-muted mb-1">No whale activity data in DuckDB hot storage</h6>
-                            <p class="text-muted mb-0 fs-13">Data will appear as new whale movements arrive via QuickNode.</p>
-                            <p class="text-muted mb-0 fs-12 mt-2">DuckDB in-memory stores last 24 hours only.</p>
+                            <h6 class="text-muted mb-1">No whale activity data available</h6>
+                            <p class="text-muted mb-0 fs-13">Whale trades (>$10k) will appear as they arrive via QuickNode.</p>
                         </div>
                     `;
                     return;
@@ -671,12 +621,12 @@ $json_whale_data = json_encode($whale_data);
                     const isNew = !lastSignatures.has(row.signature);
                     
                     const { rowClass, badgeClass } = getWhaleTypeClasses(row.whale_type);
-                    const whaleTypeNormalized = (row.whale_type || 'UNKNOWN').replace(/ /g, '_').toUpperCase();
+                    const whaleType = row.whale_type || 'MODERATE_WHALE';
                     
                     // Direction handling
-                    const direction = (row.direction || 'out').toLowerCase();
-                    const directionBadgeClass = direction === 'in' ? 'bg-success-transparent' : 'bg-danger-transparent';
-                    const directionText = direction === 'in' ? 'RECEIVING' : 'SENDING';
+                    const direction = (row.direction || 'sell').toLowerCase();
+                    const directionBadgeClass = direction === 'buy' ? 'bg-success-transparent' : 'bg-danger-transparent';
+                    const directionText = direction === 'buy' ? 'BUYING' : 'SELLING';
                     
                     const timestamp = new Date(row.timestamp).toLocaleString('en-US', {
                         month: 'short',
@@ -692,17 +642,9 @@ $json_whale_data = json_encode($whale_data);
                     const sig = row.signature || '';
                     const sigShort = sig.length > 10 ? sig.substring(0, 6) + '...' + sig.substring(sig.length - 4) : sig;
                     
-                    // SOL change handling
-                    const solChange = parseFloat(row.sol_change || 0);
-                    const absSolChange = Math.abs(solChange);
-                    const isMegaTx = absSolChange > 100;
-                    const solChangeClass = solChange >= 0 ? 'text-success' : 'text-danger';
-                    const solChangePrefix = solChange >= 0 ? '+' : '';
-                    
-                    // Balance handling
-                    const currentBalance = parseFloat(row.current_balance || 0);
-                    const isLargeBalance = currentBalance > 50000;
-                    const balanceClass = isLargeBalance ? 'text-success' : '';
+                    const stablecoinAmount = parseFloat(row.stablecoin_amount || 0);
+                    const solAmount = parseFloat(row.sol_amount || 0);
+                    const solPrice = parseFloat(row.sol_price_at_trade || 0);
                     
                     cards.push(`
                         <div class="card custom-card whale-card ${rowClass} ${isNew ? 'new-row' : ''}" data-signature="${sig}">
@@ -718,34 +660,34 @@ $json_whale_data = json_encode($whale_data);
                                     </div>
                                     <div class="col-md-2 text-center">
                                         <div class="text-muted fs-12 mb-1">Whale Type</div>
-                                        <span class="badge ${badgeClass}">${whaleTypeNormalized}</span>
+                                        <span class="badge ${badgeClass}">${whaleType}</span>
                                     </div>
                                     <div class="col-md-3 text-end">
-                                        <div class="text-muted fs-12 mb-1">SOL Change</div>
-                                        <div class="fw-semibold ${solChangeClass} ${isMegaTx ? 'fs-16' : ''}">
-                                            ${solChangePrefix}${formatNumber(solChange, 2)} SOL
+                                        <div class="text-muted fs-12 mb-1">Trade Value (USD)</div>
+                                        <div class="fw-semibold text-primary fs-16">
+                                            $${formatNumber(stablecoinAmount, 2)}
                                         </div>
                                     </div>
                                     <div class="col-md-3 text-end">
-                                        <div class="text-muted fs-12 mb-1">Current Balance</div>
-                                        <div class="fw-semibold ${balanceClass}">
-                                            ${formatNumber(currentBalance, 2)} SOL
+                                        <div class="text-muted fs-12 mb-1">SOL Amount</div>
+                                        <div class="fw-semibold">
+                                            ${formatNumber(solAmount, 2)} SOL
                                         </div>
                                     </div>
                                 </div>
                                 
                                 <div class="whale-details-grid">
                                     <div class="whale-detail-item">
-                                        <div class="whale-label">Previous Balance</div>
-                                        <div class="whale-value mono-cell">${formatNumber(row.previous_balance, 2)} SOL</div>
+                                        <div class="whale-label">SOL Price</div>
+                                        <div class="whale-value mono-cell">$${formatNumber(solPrice, 2)}</div>
                                     </div>
                                     <div class="whale-detail-item">
-                                        <div class="whale-label">Absolute Change</div>
-                                        <div class="whale-value mono-cell">${formatNumber(row.abs_change, 2)} SOL</div>
+                                        <div class="whale-label">USD Value</div>
+                                        <div class="whale-value mono-cell">$${formatNumber(stablecoinAmount, 2)}</div>
                                     </div>
                                     <div class="whale-detail-item">
-                                        <div class="whale-label">Fee Paid</div>
-                                        <div class="whale-value mono-cell">${formatNumber(row.fee_paid, 6)} SOL</div>
+                                        <div class="whale-label">SOL Volume</div>
+                                        <div class="whale-value mono-cell">${formatNumber(solAmount, 4)} SOL</div>
                                     </div>
                                     <div class="whale-detail-item">
                                         <div class="whale-label">Wallet Address</div>
@@ -785,14 +727,13 @@ $json_whale_data = json_encode($whale_data);
                 
                 badge.textContent = dataSource || 'No Data';
                 
-                if (actualSource === 'engine') {
-                    badge.style.background = 'rgb(var(--success-rgb))';
-                } else if (actualSource === 'duckdb') {
-                    badge.style.background = 'rgb(var(--info-rgb))';
-                } else if (actualSource === 'mysql') {
-                    badge.style.background = 'rgb(var(--warning-rgb))';
-                } else {
-                    badge.style.background = 'rgb(var(--danger-rgb))';
+                switch(actualSource) {
+                    case 'postgres':
+                    case 'postgresql':
+                        badge.style.background = 'rgb(var(--success-rgb))';
+                        break;
+                    default:
+                        badge.style.background = 'rgb(var(--danger-rgb))';
                 }
             }
             
@@ -821,8 +762,8 @@ $json_whale_data = json_encode($whale_data);
             // Initial status refresh
             refreshStatus(window.statusData);
             
-            // Refresh data every 1 second
-            setInterval(fetchWhaleData, 1000);
+            // Refresh data every 2 seconds
+            setInterval(fetchWhaleData, 2000);
             
             // Also refresh status every 5 seconds (for time-based updates)
             setInterval(() => refreshStatus(window.statusData), 5000);
@@ -834,4 +775,3 @@ $json_whale_data = json_encode($whale_data);
 <!-- This code use for render base file -->
 <?php include __DIR__ . '/../../pages/layouts/base.php'; ?>
 <!-- This code use for render base file -->
-

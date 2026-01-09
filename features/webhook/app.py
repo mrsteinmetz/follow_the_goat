@@ -1,10 +1,11 @@
 """
-FastAPI webhook to receive QuickNode payloads and write directly to
-PostgreSQL with 24h hot storage.
+FastAPI webhook to receive QuickNode payloads and write directly to PostgreSQL.
 
 Designed to be tolerant of varying payload shapes. Any missing fields will
 be skipped, but the endpoint will still return 200 to avoid QuickNode
 retries failing the pipeline.
+
+Architecture: PostgreSQL-only (no in-memory caching)
 """
 
 from datetime import datetime
@@ -51,145 +52,130 @@ def _check_db():
         raise HTTPException(status_code=503, detail="PostgreSQL not available")
 
 
-def _next_id(engine, table: str) -> int:
-    result = engine.read_one(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table}")
-    return int(result["next_id"]) if result else 1
+def _next_id(table: str) -> int:
+    """Get next available ID for a table."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table}")
+                result = cursor.fetchone()
+                return int(result['next_id']) if result else 1
+    except Exception as e:
+        logger.error(f"Failed to get next ID for {table}: {e}")
+        return 1
 
 
 def _upsert_trade(payload: TradePayload) -> int:
-    """Insert trade into DuckDB AND queue for PostgreSQL (dual-write)."""
-    engine = _engine()
-    trade_id = payload.id or _next_id(engine, "sol_stablecoin_trades")
+    """Insert trade into PostgreSQL."""
+    trade_id = payload.id or _next_id("sol_stablecoin_trades")
     ts = parse_timestamp(payload.trade_timestamp) or datetime.utcnow()
     created_at = datetime.utcnow()
     
-    # Write to DuckDB (fast, in-memory)
-    engine.execute(
-        """
-        INSERT OR REPLACE INTO sol_stablecoin_trades
-        (id, wallet_address, signature, trade_timestamp,
-         stablecoin_amount, sol_amount, price, direction,
-         perp_direction, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            trade_id,
-            payload.wallet_address,
-            payload.signature,
-            ts,
-            payload.stablecoin_amount,
-            payload.sol_amount,
-            payload.price,
-            payload.direction,
-            payload.perp_direction,
-            created_at,
-        ],
-    )
-    
-    # DUAL-WRITE: Queue for async PostgreSQL (fire-and-forget, never blocks)
+    # Write directly to PostgreSQL
     try:
-        from core.database import write_to_postgres_async
-        write_to_postgres_async("sol_stablecoin_trades", {
-            "id": trade_id,
-            "wallet_address": payload.wallet_address,
-            "signature": payload.signature,
-            "trade_timestamp": ts,
-            "stablecoin_amount": payload.stablecoin_amount,
-            "sol_amount": payload.sol_amount,
-            "price": payload.price,
-            "direction": payload.direction,
-            "perp_direction": payload.perp_direction,
-            "created_at": created_at,
-        })
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO sol_stablecoin_trades
+                    (id, wallet_address, signature, trade_timestamp,
+                     stablecoin_amount, sol_amount, price, direction,
+                     perp_direction, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        wallet_address = EXCLUDED.wallet_address,
+                        signature = EXCLUDED.signature,
+                        trade_timestamp = EXCLUDED.trade_timestamp,
+                        stablecoin_amount = EXCLUDED.stablecoin_amount,
+                        sol_amount = EXCLUDED.sol_amount,
+                        price = EXCLUDED.price,
+                        direction = EXCLUDED.direction,
+                        perp_direction = EXCLUDED.perp_direction
+                    """,
+                    [
+                        trade_id,
+                        payload.wallet_address,
+                        payload.signature,
+                        ts,
+                        payload.stablecoin_amount,
+                        payload.sol_amount,
+                        payload.price,
+                        payload.direction,
+                        payload.perp_direction,
+                        created_at,
+                    ],
+                )
     except Exception as e:
-        # PostgreSQL write is optional - don't fail the trade if it errors
-        logger.debug(f"PostgreSQL dual-write skipped for trade {trade_id}: {e}")
+        logger.error(f"Trade upsert failed for trade {trade_id}: {e}")
+        raise
     
     return trade_id
 
 
 def _upsert_whale(payload: WhalePayload) -> int:
-    """Insert whale movement into DuckDB AND queue for PostgreSQL (dual-write)."""
-    engine = _engine()
-    whale_id = payload.id or _next_id(engine, "whale_movements")
+    """Insert whale movement into PostgreSQL."""
+    whale_id = payload.id or _next_id("whale_movements")
     ts = parse_timestamp(payload.timestamp) or datetime.utcnow()
     received_at = parse_timestamp(payload.received_at) or datetime.utcnow()
     created_at = datetime.utcnow()
     
-    # Write to DuckDB (fast, in-memory)
-    engine.execute(
-        """
-        INSERT OR REPLACE INTO whale_movements
-        (id, signature, wallet_address, whale_type, current_balance,
-         sol_change, abs_change, percentage_moved, direction, action,
-         movement_significance, previous_balance, fee_paid, block_time,
-         timestamp, received_at, slot, has_perp_position, perp_platform,
-         perp_direction, perp_size, perp_leverage, perp_entry_price,
-         raw_data_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            whale_id,
-            payload.signature,
-            payload.wallet_address,
-            payload.whale_type,
-            payload.current_balance,
-            payload.sol_change,
-            payload.abs_change,
-            payload.percentage_moved,
-            payload.direction,
-            payload.action,
-            payload.movement_significance,
-            payload.previous_balance,
-            payload.fee_paid,
-            payload.block_time,
-            ts,
-            received_at,
-            payload.slot,
-            payload.has_perp_position,
-            payload.perp_platform,
-            payload.perp_direction,
-            payload.perp_size,
-            payload.perp_leverage,
-            payload.perp_entry_price,
-            payload.raw_data_json,
-            created_at,
-        ],
-    )
-    
-    # DUAL-WRITE: Queue for async PostgreSQL (fire-and-forget, never blocks)
+    # Write directly to PostgreSQL
     try:
-        from core.database import write_to_postgres_async
-        write_to_postgres_async("whale_movements", {
-            "id": whale_id,
-            "signature": payload.signature,
-            "wallet_address": payload.wallet_address,
-            "whale_type": payload.whale_type,
-            "current_balance": payload.current_balance,
-            "sol_change": payload.sol_change,
-            "abs_change": payload.abs_change,
-            "percentage_moved": payload.percentage_moved,
-            "direction": payload.direction,
-            "action": payload.action,
-            "movement_significance": payload.movement_significance,
-            "previous_balance": payload.previous_balance,
-            "fee_paid": payload.fee_paid,
-            "block_time": payload.block_time,
-            "timestamp": ts,
-            "received_at": received_at,
-            "slot": payload.slot,
-            "has_perp_position": payload.has_perp_position,
-            "perp_platform": payload.perp_platform,
-            "perp_direction": payload.perp_direction,
-            "perp_size": payload.perp_size,
-            "perp_leverage": payload.perp_leverage,
-            "perp_entry_price": payload.perp_entry_price,
-            "raw_data_json": payload.raw_data_json,
-            "created_at": created_at,
-        })
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO whale_movements
+                    (id, signature, wallet_address, whale_type, current_balance,
+                     sol_change, abs_change, percentage_moved, direction, action,
+                     movement_significance, previous_balance, fee_paid, block_time,
+                     timestamp, received_at, slot, has_perp_position, perp_platform,
+                     perp_direction, perp_size, perp_leverage, perp_entry_price,
+                     raw_data_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        signature = EXCLUDED.signature,
+                        wallet_address = EXCLUDED.wallet_address,
+                        whale_type = EXCLUDED.whale_type,
+                        current_balance = EXCLUDED.current_balance,
+                        sol_change = EXCLUDED.sol_change,
+                        abs_change = EXCLUDED.abs_change,
+                        percentage_moved = EXCLUDED.percentage_moved,
+                        direction = EXCLUDED.direction,
+                        action = EXCLUDED.action,
+                        movement_significance = EXCLUDED.movement_significance
+                    """,
+                    [
+                        whale_id,
+                        payload.signature,
+                        payload.wallet_address,
+                        payload.whale_type,
+                        payload.current_balance,
+                        payload.sol_change,
+                        payload.abs_change,
+                        payload.percentage_moved,
+                        payload.direction,
+                        payload.action,
+                        payload.movement_significance,
+                        payload.previous_balance,
+                        payload.fee_paid,
+                        payload.block_time,
+                        ts,
+                        received_at,
+                        payload.slot,
+                        payload.has_perp_position,
+                        payload.perp_platform,
+                        payload.perp_direction,
+                        payload.perp_size,
+                        payload.perp_leverage,
+                        payload.perp_entry_price,
+                        payload.raw_data_json,
+                        created_at,
+                    ],
+                )
     except Exception as e:
-        # PostgreSQL write is optional - don't fail the whale if it errors
-        logger.debug(f"PostgreSQL dual-write skipped for whale {whale_id}: {e}")
+        logger.error(f"Whale upsert failed for whale {whale_id}: {e}")
+        raise
     
     return whale_id
 
@@ -359,28 +345,39 @@ async def webhook_whale(payload: Union[Dict[str, Any], List[Dict[str, Any]]]):
 @app.get("/webhook/health")
 async def webhook_health():
     try:
-        engine = _engine()
-        trades = engine.read_one("SELECT COUNT(*) AS cnt FROM sol_stablecoin_trades")
-        whales = engine.read_one("SELECT COUNT(*) AS cnt FROM whale_movements")
+        _check_db()  # Verify PostgreSQL is available
         
-        # Get first (oldest) transaction timestamp
-        first_trade = engine.read_one(
-            "SELECT trade_timestamp FROM sol_stablecoin_trades ORDER BY trade_timestamp ASC LIMIT 1"
-        )
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get trade count
+                cursor.execute("SELECT COUNT(*) AS cnt FROM sol_stablecoin_trades")
+                trades_result = cursor.fetchone()
+                trades_count = trades_result['cnt'] if trades_result else 0
+                
+                # Get whale count
+                cursor.execute("SELECT COUNT(*) AS cnt FROM whale_movements")
+                whales_result = cursor.fetchone()
+                whales_count = whales_result['cnt'] if whales_result else 0
+                
+                # Get first (oldest) transaction timestamp
+                cursor.execute(
+                    "SELECT trade_timestamp FROM sol_stablecoin_trades ORDER BY trade_timestamp ASC LIMIT 1"
+                )
+                first_trade = cursor.fetchone()
         
         return {
             "status": "ok",
             "timestamp": datetime.utcnow().isoformat(),
-            "duckdb": {
-                "trades_in_hot_storage": trades["cnt"] if trades else 0,
-                "whale_movements_in_hot_storage": whales["cnt"] if whales else 0,
-                "first_trade_timestamp": first_trade["trade_timestamp"].isoformat() if first_trade and first_trade.get("trade_timestamp") else None,
-                "retention": "24 hours",
+            "postgresql": {
+                "trades": trades_count,
+                "whale_movements": whales_count,
+                "first_trade_timestamp": first_trade['trade_timestamp'].isoformat() if first_trade and first_trade.get('trade_timestamp') else None,
             },
         }
     except HTTPException as e:
         raise e
     except Exception as e:
+        logger.error(f"Health check failed: {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
@@ -391,36 +388,48 @@ async def api_trades(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ):
-    engine = _engine()
+    _check_db()  # Verify PostgreSQL is available
+    
     where_clauses: List[str] = []
+    params = []
+    
     if after_id is not None:
-        where_clauses.append(f"id > {after_id}")
+        where_clauses.append("id > %s")
+        params.append(after_id)
     if start:
         ts = parse_timestamp(start)
         if ts:
-            where_clauses.append(f"trade_timestamp >= '{ts}'")
+            where_clauses.append("trade_timestamp >= %s")
+            params.append(ts)
     if end:
         ts = parse_timestamp(end)
         if ts:
-            where_clauses.append(f"trade_timestamp <= '{ts}'")
+            where_clauses.append("trade_timestamp <= %s")
+            params.append(ts)
+    
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     max_limit = 5000 if after_id is not None else 1000
     limit_val = min(limit or max_limit, max_limit)
-    rows = engine.read(
-        f"""
-        SELECT id, wallet_address, signature, trade_timestamp,
-               stablecoin_amount, sol_amount, price, direction,
-               perp_direction, created_at
-        FROM sol_stablecoin_trades
-        {where_sql}
-        ORDER BY trade_timestamp DESC, id DESC
-        LIMIT ?
-        """,
-        [limit_val],
-    )
+    
+    with get_postgres() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT id, wallet_address, signature, trade_timestamp,
+                       stablecoin_amount, sol_amount, price, direction,
+                       perp_direction, created_at
+                FROM sol_stablecoin_trades
+                {where_sql}
+                ORDER BY trade_timestamp DESC, id DESC
+                LIMIT %s
+                """,
+                params + [limit_val],
+            )
+            rows = cursor.fetchall()
+    
     return {
         "success": True,
-        "source": "trading_engine",
+        "source": "postgresql",
         "count": len(rows),
         "results": rows,
         "max_id": max((r["id"] for r in rows), default=after_id or 0),
@@ -433,36 +442,47 @@ async def api_whales(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ):
-    engine = _engine()
+    _check_db()  # Verify PostgreSQL is available
+    
     where_clauses: List[str] = []
+    params = []
+    
     if start:
         ts = parse_timestamp(start)
         if ts:
-            where_clauses.append(f"timestamp >= '{ts}'")
+            where_clauses.append("timestamp >= %s")
+            params.append(ts)
     if end:
         ts = parse_timestamp(end)
         if ts:
-            where_clauses.append(f"timestamp <= '{ts}'")
+            where_clauses.append("timestamp <= %s")
+            params.append(ts)
+    
     where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
     limit_val = min(limit or 100, 1000)
-    rows = engine.read(
-        f"""
-        SELECT id, signature, wallet_address, whale_type, current_balance,
-               sol_change, abs_change, percentage_moved, direction, action,
-               movement_significance, previous_balance, fee_paid, block_time,
-               timestamp, received_at, slot, has_perp_position, perp_platform,
-               perp_direction, perp_size, perp_leverage, perp_entry_price,
-               raw_data_json, created_at
-        FROM whale_movements
-        {where_sql}
-        ORDER BY timestamp DESC
-        LIMIT ?
-        """,
-        [limit_val],
-    )
+    
+    with get_postgres() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT id, signature, wallet_address, whale_type, current_balance,
+                       sol_change, abs_change, percentage_moved, direction, action,
+                       movement_significance, previous_balance, fee_paid, block_time,
+                       timestamp, received_at, slot, has_perp_position, perp_platform,
+                       perp_direction, perp_size, perp_leverage, perp_entry_price,
+                       raw_data_json, created_at
+                FROM whale_movements
+                {where_sql}
+                ORDER BY timestamp DESC
+                LIMIT %s
+                """,
+                params + [limit_val],
+            )
+            rows = cursor.fetchall()
+    
     return {
         "success": True,
-        "source": "trading_engine",
+        "source": "postgresql",
         "count": len(rows),
         "results": rows,
     }

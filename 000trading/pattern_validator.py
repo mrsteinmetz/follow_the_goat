@@ -127,18 +127,21 @@ def _fetch_pattern_schema_from_db(play_id: int) -> Optional[Dict[str, Any]]:
     """Retrieve pattern schema JSON for a play from the database."""
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT pattern_validator, pattern_validator_enable
-                FROM follow_the_goat_plays
-                WHERE id = ?
-            """, [play_id]).fetchone()
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT pattern_validator, pattern_validator_enable
+                    FROM follow_the_goat_plays
+                    WHERE id = %s
+                """, [play_id])
+                
+                result = cursor.fetchone()
             
             if not result:
                 logger.info("Play %s not found while loading pattern schema", play_id)
                 return None
             
-            raw_schema = result[0]
-            enable_flag = result[1] if len(result) > 1 else 0
+            raw_schema = result.get('pattern_validator')
+            enable_flag = result.get('pattern_validator_enable', 0)
             
             if enable_flag != 1:
                 logger.debug("Pattern schema disabled for play %s (enable flag=%s)", play_id, enable_flag)
@@ -463,16 +466,17 @@ def _fetch_project_filters(project_id: int) -> List[Dict[str, Any]]:
     """
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT id, name, section, minute, field_name, field_column, 
-                       from_value, to_value, is_active
-                FROM pattern_config_filters
-                WHERE project_id = ? AND is_active = 1
-                ORDER BY id ASC
-            """, [project_id])
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            return [dict(zip(columns, row)) for row in rows]
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, name, section, minute, field_name, field_column, 
+                           from_value, to_value, is_active
+                    FROM pattern_config_filters
+                    WHERE project_id = %s AND is_active = 1
+                    ORDER BY id ASC
+                """, [project_id])
+                rows = cursor.fetchall()
+                # RealDictCursor returns dicts directly
+                return rows if rows else []
     except Exception as e:
         logger.error("Failed to fetch project filters for project_id=%s: %s", project_id, e)
         return []

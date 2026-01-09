@@ -144,7 +144,7 @@ def get_current_price() -> Optional[float]:
 
 def get_threshold_states() -> Dict[float, Dict]:
     """
-    Load current state for each threshold from DuckDB.
+    Load current state for each threshold from PostgreSQL.
     
     CRITICAL: Always uses the ACTIVE cycle for each threshold from cycle_tracker.
     This ensures we never write to closed cycles after a restart or cycle reset.
@@ -152,63 +152,67 @@ def get_threshold_states() -> Dict[float, Dict]:
     states = {}
     try:
         with get_postgres() as conn:
-            for threshold in THRESHOLDS:
-                # STEP 1: Get the active cycle ID for this threshold
-                cycle_result = conn.execute("""
-                    SELECT id, sequence_start_id, sequence_start_price
-                    FROM cycle_tracker
-                    WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
-                    ORDER BY cycle_start_time DESC
-                    LIMIT 1
-                """, [COIN_ID, threshold]).fetchone()
-                
-                if not cycle_result:
-                    # No active cycle exists for this threshold (shouldn't happen after ensure_all_cycles_exist)
-                    continue
-                
-                active_cycle_id = cycle_result[0]
-                sequence_start_id = cycle_result[1]
-                sequence_start_price = float(cycle_result[2])
-                
-                # STEP 2: Get the latest price analysis for this active cycle
-                # This gives us the current highest/lowest prices
-                analysis_result = conn.execute("""
-                    SELECT 
-                        highest_price_recorded,
-                        lowest_price_recorded
-                    FROM price_analysis 
-                    WHERE price_cycle = %s AND coin_id = %s
-                    ORDER BY id DESC
-                    LIMIT 1
-                """, [active_cycle_id, COIN_ID]).fetchone()
-                
-                if analysis_result:
-                    # Use the tracked highest/lowest from price_analysis
-                    highest_price = float(analysis_result[0])
-                    lowest_price = float(analysis_result[1])
-                else:
-                    # No price_analysis records yet for this cycle - use cycle_tracker values
-                    cycle_tracker_result = conn.execute("""
-                        SELECT highest_price_reached, lowest_price_reached
+            with conn.cursor() as cursor:
+                for threshold in THRESHOLDS:
+                    # STEP 1: Get the active cycle ID for this threshold
+                    cursor.execute("""
+                        SELECT id, sequence_start_id, sequence_start_price
                         FROM cycle_tracker
-                        WHERE id = %s
-                    """, [active_cycle_id]).fetchone()
+                        WHERE coin_id = %s AND threshold = %s AND cycle_end_time IS NULL
+                        ORDER BY cycle_start_time DESC
+                        LIMIT 1
+                    """, [COIN_ID, threshold])
+                    cycle_result = cursor.fetchone()
                     
-                    if cycle_tracker_result:
-                        highest_price = float(cycle_tracker_result[0])
-                        lowest_price = float(cycle_tracker_result[1])
+                    if not cycle_result:
+                        # No active cycle exists for this threshold (shouldn't happen after ensure_all_cycles_exist)
+                        continue
+                    
+                    active_cycle_id = cycle_result['id']
+                    sequence_start_id = cycle_result['sequence_start_id']
+                    sequence_start_price = float(cycle_result['sequence_start_price'])
+                    
+                    # STEP 2: Get the latest price analysis for this active cycle
+                    # This gives us the current highest/lowest prices
+                    cursor.execute("""
+                        SELECT 
+                            highest_price_recorded,
+                            lowest_price_recorded
+                        FROM price_analysis 
+                        WHERE price_cycle = %s AND coin_id = %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                    """, [active_cycle_id, COIN_ID])
+                    analysis_result = cursor.fetchone()
+                    
+                    if analysis_result:
+                        # Use the tracked highest/lowest from price_analysis
+                        highest_price = float(analysis_result['highest_price_recorded'])
+                        lowest_price = float(analysis_result['lowest_price_recorded'])
                     else:
-                        # Fallback to sequence_start_price
-                        highest_price = sequence_start_price
-                        lowest_price = sequence_start_price
-                
-                states[threshold] = {
-                    'sequence_start_id': sequence_start_id,
-                    'sequence_start_price': sequence_start_price,
-                    'highest_price_recorded': highest_price,
-                    'lowest_price_recorded': lowest_price,
-                    'price_cycle': active_cycle_id
-                }
+                        # No price_analysis records yet for this cycle - use cycle_tracker values
+                        cursor.execute("""
+                            SELECT highest_price_reached, lowest_price_reached
+                            FROM cycle_tracker
+                            WHERE id = %s
+                        """, [active_cycle_id])
+                        cycle_tracker_result = cursor.fetchone()
+                        
+                        if cycle_tracker_result:
+                            highest_price = float(cycle_tracker_result['highest_price_reached'])
+                            lowest_price = float(cycle_tracker_result['lowest_price_reached'])
+                        else:
+                            # Fallback to sequence_start_price
+                            highest_price = sequence_start_price
+                            lowest_price = sequence_start_price
+                    
+                    states[threshold] = {
+                        'sequence_start_id': sequence_start_id,
+                        'sequence_start_price': sequence_start_price,
+                        'highest_price_recorded': highest_price,
+                        'lowest_price_recorded': lowest_price,
+                        'price_cycle': active_cycle_id
+                    }
                 
     except Exception as e:
         logger.error(f"Failed to load threshold states: {e}")
@@ -258,13 +262,15 @@ def get_active_cycle_for_threshold(threshold: float) -> Optional[int]:
     """Get the active cycle ID for a threshold (if any)."""
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT id FROM cycle_tracker
-                WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
-                ORDER BY cycle_start_time DESC
-                LIMIT 1
-            """, [COIN_ID, threshold]).fetchone()
-            return result[0] if result else None
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id FROM cycle_tracker
+                    WHERE coin_id = %s AND threshold = %s AND cycle_end_time IS NULL
+                    ORDER BY cycle_start_time DESC
+                    LIMIT 1
+                """, [COIN_ID, threshold])
+                result = cursor.fetchone()
+                return result['id'] if result else None
     except:
         return None
 
@@ -274,8 +280,8 @@ def close_all_active_cycles_for_threshold(threshold: float, end_time: datetime):
     try:
         postgres_execute("""
             UPDATE cycle_tracker 
-            SET cycle_end_time = ?
-            WHERE coin_id = %s AND threshold = ? AND cycle_end_time IS NULL
+            SET cycle_end_time = %s
+            WHERE coin_id = %s AND threshold = %s AND cycle_end_time IS NULL
         """, [end_time, COIN_ID, threshold])
     except Exception as e:
         logger.debug(f"Failed to close active cycles for {threshold}%: {e}")
@@ -316,7 +322,7 @@ def create_new_cycle(
                 sequence_start_id, sequence_start_price, highest_price_reached,
                 lowest_price_reached, max_percent_increase, max_percent_increase_from_lowest,
                 total_data_points, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (id) DO NOTHING
         """, [
             cycle_id, COIN_ID, threshold, start_time, None,
@@ -337,18 +343,20 @@ def close_cycle(cycle_id: int, end_time: datetime):
         # CRITICAL VALIDATION: Prevent closing cycles with end_time < start_time
         # This was causing data corruption during initialization
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT cycle_start_time FROM cycle_tracker WHERE id = %s
-            """, [cycle_id]).fetchone()
-            
-            if result:
-                start_time = result[0]
-                if end_time < start_time:
-                    logger.error(f"PREVENTED DATA CORRUPTION: Cycle #{cycle_id} end_time ({end_time}) < start_time ({start_time})")
-                    return
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT cycle_start_time FROM cycle_tracker WHERE id = %s
+                """, [cycle_id])
+                result = cursor.fetchone()
+                
+                if result:
+                    start_time = result['cycle_start_time']
+                    if end_time < start_time:
+                        logger.error(f"PREVENTED DATA CORRUPTION: Cycle #{cycle_id} end_time ({end_time}) < start_time ({start_time})")
+                        return
         
         postgres_execute("""
-            UPDATE cycle_tracker SET cycle_end_time = ? WHERE id = %s
+            UPDATE cycle_tracker SET cycle_end_time = %s WHERE id = %s
         """, [end_time, cycle_id])
         logger.debug(f"Closed cycle #{cycle_id}")
     except Exception as e:
@@ -367,10 +375,10 @@ def update_cycle_stats(
         postgres_execute("""
             UPDATE cycle_tracker SET
                 total_data_points = total_data_points + 1,
-                highest_price_reached = GREATEST(highest_price_reached, ?),
-                lowest_price_reached = LEAST(lowest_price_reached, ?),
-                max_percent_increase = GREATEST(max_percent_increase, ?),
-                max_percent_increase_from_lowest = GREATEST(max_percent_increase_from_lowest, ?)
+                highest_price_reached = GREATEST(highest_price_reached, %s),
+                lowest_price_reached = LEAST(lowest_price_reached, %s),
+                max_percent_increase = GREATEST(max_percent_increase, %s),
+                max_percent_increase_from_lowest = GREATEST(max_percent_increase_from_lowest, %s)
             WHERE id = %s
         """, [highest_price, lowest_price, max_increase, max_from_lowest, cycle_id])
     except Exception as e:
@@ -383,111 +391,33 @@ def update_cycle_stats(
 
 def insert_price_analysis_batch(records: List[tuple]) -> bool:
     """
-    Batch insert price analysis records to DuckDB using PyArrow for maximum speed.
+    Batch insert price analysis records to PostgreSQL.
     
-    PyArrow achieves ~1000x faster inserts than executemany():
-    - executemany: ~70,000 records in 10-20 minutes
-    - PyArrow: ~70,000 records in 0.5-1 second
-    
-    IMPORTANT: Writes go to FILE-BASED DuckDB for persistence and webpage visibility.
+    Uses executemany for efficient batch inserts.
     """
     if not records:
         return True
     
     try:
-        import pyarrow as pa
-        import pandas as pd
-        from datetime import datetime
-        
-        # Convert records (tuples) to DataFrame for PyArrow conversion
-        columns = [
-            'id', 'coin_id', 'price_point_id', 'sequence_start_id', 'sequence_start_price',
-            'current_price', 'percent_threshold', 'percent_increase', 'highest_price_recorded',
-            'lowest_price_recorded', 'procent_change_from_highest_price_recorded',
-            'percent_increase_from_lowest', 'price_cycle', 'created_at'
-        ]
-        
-        # Convert to dict for pandas (columnar format)
-        data_dict = {col: [] for col in columns}
-        for record in records:
-            for i, col in enumerate(columns):
-                data_dict[col].append(record[i])
-        
-        # Create pandas DataFrame (fast for PyArrow conversion)
-        df = pd.DataFrame(data_dict)
-        
-        # Convert to PyArrow Table with explicit schema
-        schema = pa.schema([
-            pa.field('id', pa.int64()),
-            pa.field('coin_id', pa.int32()),
-            pa.field('price_point_id', pa.int64()),
-            pa.field('sequence_start_id', pa.int64()),
-            pa.field('sequence_start_price', pa.float64()),
-            pa.field('current_price', pa.float64()),
-            pa.field('percent_threshold', pa.float64()),
-            pa.field('percent_increase', pa.float64()),
-            pa.field('highest_price_recorded', pa.float64()),
-            pa.field('lowest_price_recorded', pa.float64()),
-            pa.field('procent_change_from_highest_price_recorded', pa.float64()),
-            pa.field('percent_increase_from_lowest', pa.float64()),
-            pa.field('price_cycle', pa.int64()),
-            pa.field('created_at', pa.timestamp('us')),
-        ])
-        
-        # Convert datetime column if needed
-        if df['created_at'].dtype == 'object':
-            df['created_at'] = pd.to_datetime(df['created_at'])
-        
-        arrow_table = pa.Table.from_pandas(df, schema=schema)
-        
-        # Insert using TradingDataEngine's connection (in-memory DuckDB)
-        # Use engine.get_connection() which provides raw DuckDB access for PyArrow
-        global _global_engine
-        if _global_engine and hasattr(_global_engine, 'get_connection'):
-            with _global_engine.get_connection() as conn:
-                conn.register('_temp_price_analysis', arrow_table)
-                cols_str = ', '.join(columns)
-                conn.execute(f"INSERT INTO price_analysis ({cols_str}) SELECT {cols_str} FROM _temp_price_analysis")
-                conn.unregister('_temp_price_analysis')
-        else:
-            # Fallback for standalone testing - use get_duckdb
-            with get_postgres() as conn:
-                # Note: EngineConnectionWrapper may not support .register()
-                # Use individual inserts instead
-                for record in records:
-                    conn.execute("""
-                        INSERT INTO price_analysis (
-                            id, coin_id, price_point_id, sequence_start_id, sequence_start_price,
-                            current_price, percent_threshold, percent_increase, highest_price_recorded,
-                            lowest_price_recorded, procent_change_from_highest_price_recorded,
-                            percent_increase_from_lowest, price_cycle, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, list(record))
-        
-        logger.debug(f"PyArrow insert complete: {len(records)} price_analysis records")
-        return True
-        
-    except ImportError:
-        # Fallback to executemany if PyArrow not available
-        logger.warning("PyArrow not available, falling back to slower executemany()")
-        try:
-            for record in records:
-                postgres_execute("""
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Use executemany for batch insert
+                cursor.executemany("""
                     INSERT INTO price_analysis (
                         id, coin_id, price_point_id, sequence_start_id, sequence_start_price,
                         current_price, percent_threshold, percent_increase, highest_price_recorded,
                         lowest_price_recorded, procent_change_from_highest_price_recorded,
                         percent_increase_from_lowest, price_cycle, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, list(record))
-            return True
-        except Exception as e:
-            logger.error(f"Price analysis insert failed: {e}")
-            return False
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO NOTHING
+                """, [list(record) for record in records])
+        
+        logger.debug(f"Batch insert complete: {len(records)} price_analysis records")
+        return True
             
     except Exception as e:
         import traceback
-        logger.error(f"Price analysis PyArrow insert failed: {e}")
+        logger.error(f"Price analysis batch insert failed: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         return False
 
@@ -654,19 +584,22 @@ def ensure_all_cycles_exist():
     sequence_start_id = 1  # Default fallback
     try:
         with get_postgres() as conn:
-            # Use the latest ID from the prices table to align with processing cursor
-            result = conn.execute("""
-                SELECT MAX(id) as max_id FROM prices WHERE token = 'SOL'
-            """).fetchone()
-            if result and result[0]:
-                sequence_start_id = result[0]
-            else:
-                # Fallback: use count from prices table as approximation
-                result = conn.execute("""
-                    SELECT COUNT(*) as cnt FROM prices WHERE token = 'SOL'
-                """).fetchone()
-                if result and result[0]:
-                    sequence_start_id = result[0]
+            with conn.cursor() as cursor:
+                # Use the latest ID from the prices table to align with processing cursor
+                cursor.execute("""
+                    SELECT MAX(id) as max_id FROM prices WHERE token = 'SOL'
+                """)
+                result = cursor.fetchone()
+                if result and result['max_id']:
+                    sequence_start_id = result['max_id']
+                else:
+                    # Fallback: use count from prices table as approximation
+                    cursor.execute("""
+                        SELECT COUNT(*) as cnt FROM prices WHERE token = 'SOL'
+                    """)
+                    result = cursor.fetchone()
+                    if result and result['cnt']:
+                        sequence_start_id = result['cnt']
     except Exception as e:
         logger.debug(f"Could not determine sequence_start_id: {e}, using default")
     
@@ -695,13 +628,15 @@ def cleanup_corrupted_cycles():
     try:
         # First, count how many corrupted cycles exist
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT COUNT(*) FROM cycle_tracker
-                WHERE cycle_end_time IS NOT NULL
-                AND cycle_end_time < cycle_start_time
-            """).fetchone()
-            
-            corrupted_count = result[0] if result else 0
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT COUNT(*) as count FROM cycle_tracker
+                    WHERE cycle_end_time IS NOT NULL
+                    AND cycle_end_time < cycle_start_time
+                """)
+                result = cursor.fetchone()
+                
+                corrupted_count = result['count'] if result else 0
         
         if corrupted_count > 0:
             logger.warning(f"Found {corrupted_count} corrupted cycles (end_time < start_time) - deleting...")
@@ -712,7 +647,7 @@ def cleanup_corrupted_cycles():
                 AND cycle_end_time < cycle_start_time
             """, [])
             
-            logger.info(f"✓ Deleted {corrupted_count} corrupted cycles from master.py TradingDataEngine")
+            logger.info(f"✓ Deleted {corrupted_count} corrupted cycles")
     except Exception as e:
         logger.error(f"Failed to cleanup corrupted cycles: {e}")
 
@@ -735,26 +670,28 @@ def cleanup_duplicate_active_cycles():
         for threshold in thresholds:
             # Get all active cycles for this threshold
             with get_postgres() as conn:
-                result = conn.execute("""
-                    SELECT id, total_data_points, cycle_start_time
-                    FROM cycle_tracker
-                    WHERE threshold = %s AND cycle_end_time IS NULL
-                    ORDER BY total_data_points DESC, id ASC
-                """, [threshold]).fetchall()
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, total_data_points, cycle_start_time
+                        FROM cycle_tracker
+                        WHERE threshold = %s AND cycle_end_time IS NULL
+                        ORDER BY total_data_points DESC, id ASC
+                    """, [threshold])
+                    result = cursor.fetchall()
             
             if len(result) > 1:
                 # Keep the first one (most data points), close the rest
-                keep_cycle_id = result[0][0]
+                keep_cycle_id = result[0]['id']
                 logger.warning(f"Threshold {threshold}%: Found {len(result)} active cycles - keeping #{keep_cycle_id}, closing {len(result)-1} duplicates")
                 
                 for row in result[1:]:
-                    cycle_id = row[0]
-                    start_time = row[2]
+                    cycle_id = row['id']
+                    start_time = row['cycle_start_time']
                     
                     # Close with the same start_time (it never really processed any data)
                     postgres_execute("""
                         UPDATE cycle_tracker
-                        SET cycle_end_time = ?
+                        SET cycle_end_time = %s
                         WHERE id = %s
                     """, [start_time, cycle_id])
                     

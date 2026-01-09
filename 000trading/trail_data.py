@@ -178,12 +178,14 @@ WHALE_ACTIVITY_FIELDS = {
 # =============================================================================
 
 def ensure_trail_table_exists_duckdb() -> None:
-    """Ensure the buyin_trail_minutes table exists in DuckDB."""
+    """Ensure the buyin_trail_minutes table exists in PostgreSQL."""
     from features.price_api.schema import SCHEMA_BUYIN_TRAIL_MINUTES
     
     with get_postgres() as conn:
-        conn.execute(SCHEMA_BUYIN_TRAIL_MINUTES)
-        logger.debug("Ensured buyin_trail_minutes table exists in DuckDB")
+        with conn.cursor() as cursor:
+            cursor.execute(SCHEMA_BUYIN_TRAIL_MINUTES)
+        conn.commit()
+        logger.debug("Ensured buyin_trail_minutes table exists in PostgreSQL")
 
 
 def ensure_trail_table_exists_mysql() -> None:
@@ -370,9 +372,8 @@ def ensure_trail_table_exists_mysql() -> None:
 
 
 def ensure_trail_tables_exist() -> None:
-    """Ensure the buyin_trail_minutes table exists in DuckDB."""
-    ensure_trail_table_exists_duckdb()
-    # MySQL table creation removed
+    """Ensure the buyin_trail_minutes table exists in PostgreSQL."""
+    ensure_trail_table_exists_duckdb()  # Name kept for compatibility, but uses PostgreSQL
 
 
 # =============================================================================
@@ -696,9 +697,7 @@ def _get_all_columns() -> List[str]:
 
 
 def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
-    """Insert trail rows into DuckDB.
-    
-    CRITICAL: Uses master2's write queue for thread-safe writes.
+    """Insert trail rows into PostgreSQL.
     
     Args:
         buyin_id: The buyin ID (used for logging)
@@ -712,57 +711,56 @@ def insert_trail_rows_duckdb(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
     
     columns = _get_all_columns()
     col_list = ", ".join(columns)
-    placeholders = ", ".join(["?" for _ in columns])
+    placeholders = ", ".join(["%s" for _ in columns])
     
-    # Use the write queue registered by master2
     try:
-        from core.database import duckdb_execute_write
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Check if data already exists first
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM buyin_trail_minutes WHERE buyin_id = %s",
+                    [buyin_id]
+                )
+                existing = cursor.fetchone()
+                existing_count = existing['count'] if existing else 0
+                
+                if existing_count > 0:
+                    logger.debug(f"Trail data already exists for buyin_id={buyin_id}, skipping")
+                    return True
+                
+                # Insert all rows
+                inserted_count = 0
+                for row in rows:
+                    # Convert numpy types to Python native types
+                    values = []
+                    for col in columns:
+                        val = row.get(col)
+                        # Convert numpy types to Python native types
+                        if val is not None and hasattr(val, 'item'):
+                            val = val.item()  # Convert numpy scalar to Python scalar
+                        values.append(val)
+                    
+                    cursor.execute(
+                        f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
+                        values
+                    )
+                    inserted_count += 1
+                
+                conn.commit()
+                
+                # Verify
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM buyin_trail_minutes WHERE buyin_id = %s",
+                    [buyin_id]
+                )
+                verify = cursor.fetchone()
+                verify_count = verify['count'] if verify else 0
         
-        # Check if data already exists first (read operation)
-        with get_duckdb("central", read_only=True) as cursor:
-            existing = cursor.execute(
-                "SELECT COUNT(*) FROM buyin_trail_minutes WHERE buyin_id = ?",
-                [buyin_id]
-            ).fetchone()
-            existing_count = existing[0] if existing else 0
-            
-            if existing_count > 0:
-                logger.debug(f"Trail data already exists for buyin_id={buyin_id}, skipping")
-                return True
-        
-        # Insert rows via write queue (thread-safe, non-blocking)
-        inserted_count = 0
-        for row in rows:
-            values = [row.get(col) for col in columns]
-            duckdb_execute_write(
-                "central",
-                f"INSERT INTO buyin_trail_minutes ({col_list}) VALUES ({placeholders})",
-                values,
-                sync=False  # Non-blocking for speed
-            )
-            inserted_count += 1
-        
-        # Final sync write to ensure completion
-        duckdb_execute_write(
-            "central",
-            "SELECT 1",  # Dummy query to ensure all previous writes complete
-            [],
-            sync=True
-        )
-        
-        # Verify
-        with get_duckdb("central", read_only=True) as cursor:
-            verify = cursor.execute(
-                "SELECT COUNT(*) FROM buyin_trail_minutes WHERE buyin_id = ?",
-                [buyin_id]
-            ).fetchone()
-            verify_count = verify[0] if verify else 0
-        
-        logger.info(f"✅ PERSISTED via write queue: {inserted_count} trail rows for buyin_id={buyin_id}, verified: {verify_count}")
+        logger.info(f"✅ PERSISTED to PostgreSQL: {inserted_count} trail rows for buyin_id={buyin_id}, verified: {verify_count}")
         return True
             
     except Exception as e:
-        logger.error(f"Failed to write trail data via write queue for buyin_id={buyin_id}: {e}")
+        logger.error(f"Failed to write trail data to PostgreSQL for buyin_id={buyin_id}: {e}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return False
@@ -786,7 +784,7 @@ def insert_trail_rows_mysql(buyin_id: int, rows: List[Dict[str, Any]]) -> bool:
 
 
 def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
-    """Insert trail data for a buyin into DuckDB.
+    """Insert trail data for a buyin into PostgreSQL.
     
     This is the main entry point for persisting trail data.
     
@@ -795,7 +793,7 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
         trail_payload: The trail data payload from generate_trail_payload()
         
     Returns:
-        True if DuckDB insert succeeded, False otherwise
+        True if PostgreSQL insert succeeded, False otherwise
     """
     # Ensure tables exist
     ensure_trail_tables_exist()
@@ -807,10 +805,10 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
         logger.warning(f"No rows generated for buyin_id={buyin_id}")
         return False
     
-    # Insert into DuckDB (primary and only database)
-    duckdb_success = insert_trail_rows_duckdb(buyin_id, rows)
+    # Insert into PostgreSQL (primary and only database)
+    postgres_success = insert_trail_rows_duckdb(buyin_id, rows)
     
-    if duckdb_success:
+    if postgres_success:
         logger.info(f"✓ Inserted {len(rows)} trail rows for buyin_id={buyin_id}")
     else:
         logger.error(f"✗ Failed to insert trail rows for buyin_id={buyin_id}")
@@ -820,7 +818,7 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
     if filter_success:
         logger.debug(f"✓ Inserted filter values for buyin_id={buyin_id}")
     
-    return duckdb_success
+    return postgres_success
 
 
 # =============================================================================
@@ -902,19 +900,19 @@ def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool
     filterable_columns = _get_filterable_columns()
     
     try:
-        from core.database import duckdb_execute_write
-        
         # Check if data already exists
-        with get_duckdb("central", read_only=True) as cursor:
-            existing = cursor.execute(
-                "SELECT COUNT(*) FROM trade_filter_values WHERE buyin_id = ?",
-                [buyin_id]
-            ).fetchone()
-            existing_count = existing[0] if existing else 0
-            
-            if existing_count > 0:
-                logger.debug(f"Filter values already exist for buyin_id={buyin_id}, skipping")
-                return True
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) as count FROM trade_filter_values WHERE buyin_id = %s",
+                    [buyin_id]
+                )
+                existing = cursor.fetchone()
+                existing_count = existing['count'] if existing else 0
+                
+                if existing_count > 0:
+                    logger.debug(f"Filter values already exist for buyin_id={buyin_id}, skipping")
+                    return True
         
         # Generate unique IDs using timestamp
         import time
@@ -923,36 +921,35 @@ def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool
         
         # Convert each wide row to multiple normalized rows
         inserted_count = 0
-        for row in wide_rows:
-            minute = row.get("minute", 0)
-            
-            for col_name in filterable_columns:
-                value = row.get(col_name)
-                
-                # Skip null values to save space
-                if value is None:
-                    continue
-                
-                # Skip non-numeric values
-                if not isinstance(value, (int, float)):
-                    continue
-                
-                section = _get_section_for_column(col_name)
-                
-                # Insert the normalized row
-                duckdb_execute_write(
-                    "central",
-                    """INSERT INTO trade_filter_values 
-                       (id, buyin_id, minute, filter_name, filter_value, section)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    [base_id + id_counter, buyin_id, minute, col_name, float(value), section],
-                    sync=False
-                )
-                id_counter += 1
-                inserted_count += 1
         
-        # Sync to ensure all writes complete
-        postgres_execute("SELECT 1", [], sync=True)
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                for row in wide_rows:
+                    minute = row.get("minute", 0)
+                    
+                    for col_name in filterable_columns:
+                        value = row.get(col_name)
+                        
+                        # Skip null values to save space
+                        if value is None:
+                            continue
+                        
+                        # Skip non-numeric values
+                        if not isinstance(value, (int, float)):
+                            continue
+                        
+                        section = _get_section_for_column(col_name)
+                        
+                        # Insert the normalized row
+                        cursor.execute("""
+                            INSERT INTO trade_filter_values 
+                            (id, buyin_id, minute, filter_name, filter_value, section)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                        """, [base_id + id_counter, buyin_id, minute, col_name, float(value), section])
+                        id_counter += 1
+                        inserted_count += 1
+                
+                conn.commit()
         
         logger.info(f"✓ Inserted {inserted_count} filter values for buyin_id={buyin_id}")
         return True
@@ -979,16 +976,16 @@ def get_trail_for_buyin(buyin_id: int) -> List[Dict[str, Any]]:
     """
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT * FROM buyin_trail_minutes
-                WHERE buyin_id = ?
-                ORDER BY minute ASC
-            """, [buyin_id])
-            
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            
-            return [dict(zip(columns, row)) for row in rows]
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM buyin_trail_minutes
+                    WHERE buyin_id = %s
+                    ORDER BY minute ASC
+                """, [buyin_id])
+                
+                rows = cursor.fetchall()
+                # RealDictCursor returns dicts directly
+                return rows if rows else []
             
     except Exception as e:
         logger.error(f"Failed to get trail for buyin_id={buyin_id}: {e}")
@@ -1011,18 +1008,16 @@ def get_trail_minute(buyin_id: int, minute: int) -> Optional[Dict[str, Any]]:
     
     try:
         with get_postgres() as conn:
-            result = conn.execute("""
-                SELECT * FROM buyin_trail_minutes
-                WHERE buyin_id = ? AND minute = ?
-                LIMIT 1
-            """, [buyin_id, minute])
-            
-            columns = [desc[0] for desc in result.description]
-            row = result.fetchone()
-            
-            if row:
-                return dict(zip(columns, row))
-            return None
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM buyin_trail_minutes
+                    WHERE buyin_id = %s AND minute = %s
+                    LIMIT 1
+                """, [buyin_id, minute])
+                
+                row = cursor.fetchone()
+                # RealDictCursor returns dict directly
+                return row if row else None
             
     except Exception as e:
         logger.error(f"Failed to get trail minute for buyin_id={buyin_id}, minute={minute}: {e}")
@@ -1043,10 +1038,12 @@ def delete_trail_for_buyin(buyin_id: int) -> bool:
     
     try:
         with get_postgres() as conn:
-            conn.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = %s", [buyin_id])
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM buyin_trail_minutes WHERE buyin_id = %s", [buyin_id])
+            conn.commit()
         duckdb_success = True
     except Exception as e:
-        logger.warning(f"DuckDB delete failed for buyin_id={buyin_id}: {e}")
+        logger.warning(f"PostgreSQL delete failed for buyin_id={buyin_id}: {e}")
     
     return duckdb_success
 

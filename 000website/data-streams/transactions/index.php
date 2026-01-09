@@ -1,34 +1,22 @@
 <?php
 /**
  * Transactions Page - Live Transaction Feed
- * Displays real-time stablecoin transactions from .NET Webhook DuckDB In-Memory API.
+ * Displays real-time stablecoin transactions from PostgreSQL via website_api.py
  * 
- * Data Source: .NET Webhook at 195.201.84.5/api/trades
- * This reads from the in-memory DuckDB (24hr hot storage)
+ * Data Source: PostgreSQL via website_api.py (port 5051)
  */
 
-// --- Webhook API URL (FastAPI on 8001) ---
-define('WEBHOOK_API_URL', 'http://127.0.0.1:8001/webhook');
+require_once __DIR__ . '/../../includes/config.php';
+require_once __DIR__ . '/../../includes/DatabaseClient.php';
 
 // --- Base URL for template ---
 $baseUrl = '../..';
 
-// --- Check if webhook API is available ---
-function isWebhookAvailable() {
-    $ch = curl_init(WEBHOOK_API_URL . '/health');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    return $httpCode === 200;
-}
+// --- Initialize Database Client ---
+$dbClient = new DatabaseClient();
 
-$use_duckdb = isWebhookAvailable();
-
-// --- Fetch Transactions Data via .NET Webhook API ---
-function fetchTransactionsData() {
+// --- Fetch Transactions Data from PostgreSQL ---
+function fetchTransactionsData($dbClient) {
     $transactions_data = [];
     $volume_data = [
         'total_volume' => 0,
@@ -45,28 +33,26 @@ function fetchTransactionsData() {
     $data_source = "No Data";
     $actual_source = null;
 
-    $ch = curl_init(WEBHOOK_API_URL . '/api/trades?limit=30');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Accept: application/json']);
-    
-    $response = curl_exec($ch);
-    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $curlError = curl_error($ch);
-    curl_close($ch);
-    
-    if ($httpCode === 200 && $response) {
-        $data = json_decode($response, true);
+    try {
+        // Call website_api.py /trades endpoint
+        $result = $dbClient->get('/trades?limit=30');
         
-        if ($data && isset($data['success']) && $data['success'] === true) {
-            $transactions_data = $data['results'] ?? [];
-            $actual_source = $data['source'] ?? 'duckdb_inmemory';
-            $data_source = "🦆 DuckDB In-Memory";
+        if ($result && isset($result['success']) && $result['success'] === true) {
+            $transactions_data = $result['results'] ?? [];
+            $actual_source = $result['source'] ?? 'postgres';
             
-            $largest = 0;
+            // Determine source display
+            switch ($actual_source) {
+                case 'postgres':
+                case 'postgresql':
+                    $data_source = "🐘 PostgreSQL";
+                    break;
+                default:
+                    $data_source = "Unknown Source";
+            }
             
             // Calculate volume from fetched transactions
+            $largest = 0;
             foreach ($transactions_data as $tx) {
                 $amount = floatval($tx['stablecoin_amount'] ?? 0);
                 $direction = strtolower($tx['direction'] ?? '');
@@ -88,13 +74,20 @@ function fetchTransactionsData() {
                 ? $volume_data['total_volume'] / count($transactions_data) 
                 : 0;
             $stats_data['largest_tx'] = $largest;
+            $stats_data['total_in_db'] = $result['count'] ?? 0;
+            
+            // First transaction is oldest in the list
+            if (!empty($transactions_data)) {
+                $stats_data['first_transaction'] = $transactions_data[count($transactions_data) - 1]['trade_timestamp'] ?? null;
+            }
         } else {
-            $error_message = $data['error'] ?? 'Unknown error from API';
+            $error_message = $result['error'] ?? 'Unknown error from API';
             $data_source = "API Error";
         }
-    } else {
-        $error_message = "Webhook API is not available. Error: " . ($curlError ?: "HTTP $httpCode");
+    } catch (Exception $e) {
+        $error_message = "API connection failed: " . $e->getMessage();
         $data_source = "Offline";
+        $actual_source = null;
     }
     
     return [
@@ -110,40 +103,17 @@ function fetchTransactionsData() {
 // Check if this is an AJAX request for data refresh
 if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
     header('Content-Type: application/json');
-    $result = fetchTransactionsData();
-    $use_duckdb = isWebhookAvailable();
+    $result = fetchTransactionsData($dbClient);
     
     // Build status data
     $status_data = [
-        'api_status' => $use_duckdb ? 'connected' : 'disconnected',
+        'api_status' => 'connected',
         'tx_records' => count($result['transactions_data']),
         'last_update' => null,
     ];
     
     if (!empty($result['transactions_data'])) {
         $status_data['last_update'] = $result['transactions_data'][0]['trade_timestamp'] ?? null;
-    }
-    
-    // Get health data from webhook for additional status
-    if ($use_duckdb) {
-        $ch = curl_init(WEBHOOK_API_URL . '/health');
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        $healthResponse = curl_exec($ch);
-        curl_close($ch);
-        
-        if ($healthResponse) {
-            $healthData = json_decode($healthResponse, true);
-            if ($healthData && isset($healthData['duckdb'])) {
-                $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-                $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
-                
-                // Get total count and first transaction timestamp from database
-                $result['stats_data']['total_in_db'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-                $result['stats_data']['first_transaction'] = $healthData['duckdb']['first_trade_timestamp'] ?? null;
-            }
-        }
     }
     
     echo json_encode([
@@ -160,45 +130,23 @@ if (isset($_GET['ajax']) && $_GET['ajax'] === 'refresh') {
 }
 
 // Regular page load - fetch data normally
-$result = fetchTransactionsData();
+$result = fetchTransactionsData($dbClient);
 $transactions_data = $result['transactions_data'];
 $volume_data = $result['volume_data'];
 $stats_data = $result['stats_data'];
 $error_message = $result['error_message'];
 $data_source = $result['data_source'];
-$use_duckdb = isWebhookAvailable();
+$actual_source = $result['actual_source'];
 
 // --- Status Data ---
 $status_data = [
-    'api_status' => $use_duckdb ? 'connected' : 'disconnected',
+    'api_status' => 'connected',
     'tx_records' => count($transactions_data),
     'last_update' => null,
 ];
 
 if (!empty($transactions_data)) {
     $status_data['last_update'] = $transactions_data[0]['trade_timestamp'] ?? null;
-}
-
-// Get health data from webhook for additional status
-if ($use_duckdb) {
-    $ch = curl_init(WEBHOOK_API_URL . '/health');
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
-    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-    $healthResponse = curl_exec($ch);
-    curl_close($ch);
-    
-    if ($healthResponse) {
-        $healthData = json_decode($healthResponse, true);
-        if ($healthData && isset($healthData['duckdb'])) {
-            $status_data['duckdb_trades'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-            $status_data['duckdb_whale'] = $healthData['duckdb']['whale_movements_in_hot_storage'] ?? 0;
-            
-            // Get total count and first transaction timestamp from database
-            $stats_data['total_in_db'] = $healthData['duckdb']['trades_in_hot_storage'] ?? 0;
-            $stats_data['first_transaction'] = $healthData['duckdb']['first_trade_timestamp'] ?? null;
-        }
-    }
 }
 
 $json_status_data = json_encode($status_data);
@@ -321,6 +269,8 @@ $json_stats_data = json_encode($stats_data);
         border-radius: 4px;
         font-size: 11px;
         font-weight: 600;
+        background: rgb(var(--success-rgb));
+        color: white;
     }
     .live-indicator {
         display: inline-flex;
@@ -367,7 +317,7 @@ $json_stats_data = json_encode($stats_data);
                     <!-- End::page-header -->
 
                     <!-- Data Source Badge -->
-                    <div id="dataSourceBadge" class="data-source-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+                    <div id="dataSourceBadge" class="data-source-badge">
                         <?php echo $data_source; ?>
                     </div>
 
@@ -424,7 +374,7 @@ $json_stats_data = json_encode($stats_data);
                         <div id="txStatusBtn" class="status-btn <?php echo count($transactions_data) > 0 ? 'status-good' : 'status-warning'; ?>">
                             <div class="status-title">Transaction Stream</div>
                             <div class="status-info" id="txStatusInfo">
-                                <?php echo count($transactions_data) > 0 ? count($transactions_data) . 's ago' : 'No Data'; ?>
+                                <?php echo count($transactions_data) > 0 ? 'Active' : 'No Data'; ?>
                             </div>
                         </div>
                         <div id="totalInDbBtn" class="status-btn status-good">
@@ -536,9 +486,8 @@ $json_stats_data = json_encode($stats_data);
                                                         <td colspan="5" class="text-center py-4">
                                                             <div class="d-flex flex-column align-items-center">
                                                                 <i class="ti ti-database-off fs-1 text-muted mb-2"></i>
-                                                                <h6 class="text-muted mb-1">No transactions in DuckDB hot storage</h6>
+                                                                <h6 class="text-muted mb-1">No transactions available</h6>
                                                                 <p class="text-muted mb-0 fs-13">Data will appear as new trades arrive via QuickNode.</p>
-                                                                <p class="text-muted mb-0 fs-12 mt-2">DuckDB in-memory stores last 24 hours only.</p>
                                                             </div>
                                                         </td>
                                                     </tr>
@@ -589,9 +538,8 @@ $json_stats_data = json_encode($stats_data);
                 return parseInt(num || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
             }
             
-            // Status refresh functionality - Always use UTC time
+            // Status refresh functionality
             function refreshStatus(statusData) {
-                // Get current time in UTC milliseconds
                 const nowUtc = Date.now();
                 
                 function updateButton(btnId, infoId, timestamp) {
@@ -606,8 +554,6 @@ $json_stats_data = json_encode($stats_data);
                         return;
                     }
                     
-                    // Parse timestamp - if no timezone specified, treat as local time (CET)
-                    // Don't force UTC by adding 'Z' - let browser parse as local time
                     const dataTime = new Date(timestamp).getTime();
                     const diffMs = nowUtc - dataTime;
                     const diffSecs = Math.floor(diffMs / 1000);
@@ -754,14 +700,13 @@ $json_stats_data = json_encode($stats_data);
                 
                 badge.textContent = dataSource || 'No Data';
                 
-                if (actualSource === 'engine') {
-                    badge.style.background = 'rgb(var(--success-rgb))';
-                } else if (actualSource === 'duckdb') {
-                    badge.style.background = 'rgb(var(--info-rgb))';
-                } else if (actualSource === 'mysql') {
-                    badge.style.background = 'rgb(var(--warning-rgb))';
-                } else {
-                    badge.style.background = 'rgb(var(--danger-rgb))';
+                switch(actualSource) {
+                    case 'postgres':
+                    case 'postgresql':
+                        badge.style.background = 'rgb(var(--success-rgb))';
+                        break;
+                    default:
+                        badge.style.background = 'rgb(var(--danger-rgb))';
                 }
             }
             
@@ -843,8 +788,8 @@ $json_stats_data = json_encode($stats_data);
             refreshStatus(window.statusData);
             updateStatsDisplay(window.statsData);
             
-            // Refresh data every 1 second
-            setInterval(refreshTransactions, 1000);
+            // Refresh data every 2 seconds
+            setInterval(refreshTransactions, 2000);
             
             // Also refresh status every 5 seconds (for time-based updates)
             setInterval(() => {
@@ -859,5 +804,3 @@ $json_stats_data = json_encode($stats_data);
 <!-- This code use for render base file -->
 <?php include __DIR__ . '/../../pages/layouts/base.php'; ?>
 <!-- This code use for render base file -->
-
-

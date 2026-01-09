@@ -421,6 +421,26 @@ def run_create_new_patterns():
         logger.error(f"Create new patterns job error: {e}", exc_info=True)
 
 
+@track_job("create_profiles", "Build wallet profiles (every 30s)")
+def run_create_profiles():
+    """Build wallet profiles from trades and price cycles."""
+    try:
+        enabled = os.getenv("CREATE_PROFILES_ENABLED", "1") == "1"
+        if not enabled:
+            return
+        
+        profiles_path = PROJECT_ROOT / "000data_feeds" / "5_create_profiles"
+        if str(profiles_path) not in sys.path:
+            sys.path.insert(0, str(profiles_path))
+        from create_profiles import process_wallet_profiles
+        
+        inserted = process_wallet_profiles()
+        if inserted > 0:
+            logger.info(f"Created {inserted} new wallet profiles")
+    except Exception as e:
+        logger.error(f"Create profiles job error: {e}", exc_info=True)
+
+
 @track_job("export_job_status", "Export job status to file (every 5s)")
 def export_job_status_to_file():
     """Export current job status to JSON file for website_api.py to read."""
@@ -464,8 +484,12 @@ def create_scheduler() -> BackgroundScheduler:
         'misfire_grace_time': 30
     }
     
+    # CRITICAL: Force UTC timezone for all operations
+    # Even though settings.scheduler_timezone defaults to UTC,
+    # we explicitly use pytz.UTC to ensure no system timezone interference
+    import pytz
     scheduler = BackgroundScheduler(
-        timezone=settings.scheduler_timezone,
+        timezone=pytz.UTC,
         executors=executors,
         job_defaults=job_defaults
     )
@@ -511,6 +535,14 @@ def create_scheduler() -> BackgroundScheduler:
         trigger=IntervalTrigger(minutes=5),
         id="create_new_patterns",
         name="Create New Patterns",
+        executor='heavy'
+    )
+    
+    scheduler.add_job(
+        func=run_create_profiles,
+        trigger=IntervalTrigger(seconds=30),
+        id="create_profiles",
+        name="Create Wallet Profiles",
         executor='heavy'
     )
     

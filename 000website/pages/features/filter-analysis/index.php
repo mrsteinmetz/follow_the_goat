@@ -47,6 +47,7 @@ $error_message = '';
 $auto_filter_settings = [];
 $scheduler_stats = ['runs_today' => 0, 'last_run' => null, 'avg_filters' => 0];
 $rolling_avgs = [];
+$play_updates = [];
 
 // Helper functions
 function get_effectiveness_class($bad_removed, $good_kept) {
@@ -81,7 +82,7 @@ function get_consistency_stars($pct) {
 }
 
 // Fetch data from API
-if (!$use_duckdb) {
+if (!$api_available) {
     $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 } else {
     $response = $db->getFilterAnalysisDashboard();
@@ -96,6 +97,7 @@ if (!$use_duckdb) {
         $auto_filter_settings = $response['settings'] ?? [];
         $scheduler_stats = $response['scheduler_stats'] ?? $scheduler_stats;
         $rolling_avgs = $response['rolling_avgs'] ?? [];
+        $play_updates = $response['play_updates'] ?? [];
     } else {
         $error_message = $response['error'] ?? 'Failed to fetch filter analysis data';
     }
@@ -316,8 +318,8 @@ ob_start();
 ?>
 
 <!-- API Status Badge -->
-<div class="api-status-badge" style="background: <?php echo $use_duckdb ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
-    🦆 <?php echo $use_duckdb ? 'API Connected' : 'API Disconnected'; ?>
+<div class="api-status-badge" style="background: <?php echo $api_available ? 'rgb(var(--success-rgb))' : 'rgb(var(--danger-rgb))'; ?>; color: white;">
+    🦆 <?php echo $api_available ? 'API Connected' : 'API Disconnected'; ?>
 </div>
 
 <!-- Page Header -->
@@ -403,6 +405,65 @@ ob_start();
         </div>
     </div>
 </div>
+
+<!-- AI Play Updates Section -->
+<?php if (!empty($play_updates)): ?>
+<div class="card custom-card mb-3">
+    <div class="card-header">
+        <h6 class="mb-0"><i class="ri-robot-line me-1"></i>Auto-Updated Plays</h6>
+        <p class="text-muted mb-0 mt-1 small">Plays automatically updated with filter patterns by the AI system</p>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-striped table-hover">
+                <thead>
+                    <tr>
+                        <th>Play ID</th>
+                        <th>Play Name</th>
+                        <th>Project</th>
+                        <th>Patterns</th>
+                        <th>Filters</th>
+                        <th>Updated</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($play_updates as $update): ?>
+                    <tr>
+                        <td><span class="badge bg-primary-transparent">#<?php echo $update['play_id']; ?></span></td>
+                        <td><strong><?php echo htmlspecialchars($update['play_name']); ?></strong></td>
+                        <td>
+                            <span class="badge bg-info-transparent">
+                                <?php echo htmlspecialchars($update['project_name'] ?? 'AutoFilters'); ?> 
+                                (ID: <?php echo $update['project_id']; ?>)
+                            </span>
+                        </td>
+                        <td><span class="badge bg-success-transparent"><?php echo $update['pattern_count'] ?? 0; ?> patterns</span></td>
+                        <td><span class="badge bg-warning-transparent"><?php echo $update['filters_applied'] ?? 0; ?> filters</span></td>
+                        <td><small class="text-muted"><?php echo $update['updated_at']; ?></small></td>
+                        <td>
+                            <?php 
+                            $statusClass = $update['status'] === 'success' ? 'success' : 'danger';
+                            $statusIcon = $update['status'] === 'success' ? 'check-line' : 'close-line';
+                            ?>
+                            <span class="badge bg-<?php echo $statusClass; ?>-transparent">
+                                <i class="ri-<?php echo $statusIcon; ?> me-1"></i><?php echo ucfirst($update['status']); ?>
+                            </span>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        </div>
+        <div class="alert alert-info-transparent mt-3 mb-0">
+            <i class="ri-information-line me-1"></i>
+            <strong>How it works:</strong> Plays with <code>pattern_update_by_ai=1</code> are automatically updated 
+            to use the latest auto-generated filter patterns from the AutoFilters project. This happens every time 
+            the filter analysis runs (every 5-15 minutes).
+        </div>
+    </div>
+</div>
+<?php endif; ?>
 
 <?php if ($error_message): ?>
 <div class="alert alert-danger alert-dismissible fade show" role="alert">

@@ -5,20 +5,20 @@ Auto Pattern Filter Generator
 Analyzes trade data to find optimal filter combinations that maximize
 bad trade removal while preserving good trades.
 
-Migrated from: 000old_code/solana_node/chart/build_pattern_config/auto_filter_scheduler.py
-
 This script:
-1. Loads trade data from in-memory TradingDataEngine (follow_the_goat_buyins + buyin_trail_minutes)
+1. Loads trade data from PostgreSQL (follow_the_goat_buyins + trade_filter_values)
 2. Analyzes each filter field to find optimal ranges
 3. Generates filter combinations using a greedy algorithm
 4. Syncs best filters to pattern_config_filters
 5. Updates plays with pattern_update_by_ai=1
 
+PERFORMANCE: Uses PostgreSQL pivot (crosstab) to avoid loading millions of rows into Python.
+
 Usage:
     # Run standalone
     python create_new_paterns.py
     
-    # Integrated via scheduler/master.py (runs every 15 minutes)
+    # Integrated via scheduler/master2.py (runs every 5 minutes)
 """
 
 import json
@@ -37,51 +37,40 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.trading_engine import get_engine
-from core.database import get_duckdb
+from core.database import get_postgres
 
 # Setup logging
 logger = logging.getLogger("create_new_patterns")
 
 
-def _get_local_duckdb():
-    """Get master2's local DuckDB connection for reading trade data."""
-    try:
-        from scheduler.master2 import get_local_duckdb, _local_duckdb_lock
-        local_db = get_local_duckdb()
-        if local_db is not None:
-            return local_db, _local_duckdb_lock
-    except (ImportError, AttributeError):
-        pass
-    return None, None
-
-
-def _read_from_local_db(query: str, params: list = None) -> list:
-    """Execute a read query on master2's local DuckDB.
+def _read_from_postgres(query: str, params: list = None) -> list:
+    """Execute a read query on PostgreSQL.
     
     Returns list of dictionaries.
     """
-    local_db, lock = _get_local_duckdb()
-    
-    if local_db is not None:
-        try:
-            with lock:
-                result = local_db.execute(query, params or [])
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-                return [dict(zip(columns, row)) for row in rows]
-        except Exception as e:
-            logger.warning(f"Local DuckDB query failed: {e}")
-    
-    # Fallback to get_duckdb("central")
     try:
-        with get_duckdb("central", read_only=True) as cursor:
-            result = cursor.execute(query, params or [])
-            columns = [desc[0] for desc in result.description]
-            rows = result.fetchall()
-            return [dict(zip(columns, row)) for row in rows]
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, params or [])
+                results = cursor.fetchall()
+                return results
     except Exception as e:
-        logger.warning(f"DuckDB query failed: {e}")
+        logger.warning(f"PostgreSQL query failed: {e}")
         return []
+
+
+def _get_filter_columns(hours: int) -> List[str]:
+    """Get distinct filter names from trade_filter_values for recent trades."""
+    query = """
+        SELECT DISTINCT tfv.filter_name
+        FROM trade_filter_values tfv
+        INNER JOIN follow_the_goat_buyins b ON b.id = tfv.buyin_id
+        WHERE b.potential_gains IS NOT NULL
+          AND b.followed_at >= NOW() - INTERVAL '%s hours'
+        ORDER BY tfv.filter_name
+    """
+    results = _read_from_postgres(query, [hours])
+    return [r['filter_name'] for r in results] if results else []
 
 # Config file path
 CONFIG_FILE = Path(__file__).parent / "config.json"
@@ -136,78 +125,82 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     """
     Load trade data by joining follow_the_goat_buyins with trade_filter_values.
     
-    Uses the normalized trade_filter_values table and pivots it to wide format.
-    Only includes trades with potential_gains IS NOT NULL (resolved outcomes).
-    
-    OPTIMIZED: Uses DuckDB's native PIVOT for better performance with large datasets.
+    OPTIMIZED: Does the pivot directly in PostgreSQL using conditional aggregation,
+    avoiding loading millions of rows into Python memory.
     
     Args:
-        engine: TradingDataEngine instance (used for fallback, primary source is local DuckDB)
+        engine: TradingDataEngine instance (not used, kept for compatibility)
         hours: Number of hours to look back
         
     Returns:
         DataFrame with trade data and all trail minute features (pivoted to wide format)
     """
-    # Use a single optimized query with DuckDB's PIVOT function
-    # This is MUCH faster than loading separately and pivoting in Python
-    query = f"""
-        WITH trades AS (
-            SELECT 
-                id as trade_id,
-                play_id,
-                wallet_address,
-                followed_at,
-                potential_gains,
-                our_status
-            FROM follow_the_goat_buyins
-            WHERE potential_gains IS NOT NULL
-              AND followed_at >= NOW() - INTERVAL {hours} HOUR
+    import time
+    start_time = time.time()
+    
+    # Step 1: Get distinct filter columns (fast query)
+    logger.info("  Getting distinct filter columns...")
+    filter_columns = _get_filter_columns(hours)
+    
+    if not filter_columns:
+        logger.warning("No filter columns found")
+        return pd.DataFrame()
+    
+    logger.info(f"  Found {len(filter_columns)} filter columns in {time.time() - start_time:.1f}s")
+    
+    # Step 2: Build pivoted query using conditional aggregation
+    # This is MUCH faster than loading all rows and pivoting in Python
+    pivot_columns = []
+    for col in filter_columns:
+        # Use MAX with FILTER for conditional aggregation (PostgreSQL 9.4+)
+        safe_col = col.replace("'", "''")  # Escape single quotes
+        pivot_columns.append(
+            f"MAX(tfv.filter_value) FILTER (WHERE tfv.filter_name = '{safe_col}') AS \"{col}\""
         )
+    
+    pivot_sql = ",\n                ".join(pivot_columns)
+    
+    query = f"""
         SELECT 
-            t.*,
+            b.id as trade_id,
+            b.play_id,
+            b.followed_at,
+            b.potential_gains,
+            b.our_status,
             tfv.minute,
-            tfv.filter_name,
-            tfv.filter_value
-        FROM trades t
-        INNER JOIN trade_filter_values tfv ON t.trade_id = tfv.buyin_id
-        ORDER BY t.trade_id, tfv.minute, tfv.filter_name
+            {pivot_sql}
+        FROM follow_the_goat_buyins b
+        INNER JOIN trade_filter_values tfv ON tfv.buyin_id = b.id
+        WHERE b.potential_gains IS NOT NULL
+          AND b.followed_at >= NOW() - INTERVAL '{hours} hours'
+        GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute
+        ORDER BY b.id, tfv.minute
     """
     
-    # Use local DuckDB with read_only cursor for optimal performance
-    results = _read_from_local_db(query)
+    # Step 3: Execute pivoted query
+    logger.info("  Executing pivoted query in PostgreSQL...")
+    query_start = time.time()
+    results = _read_from_postgres(query, [])
     
     if not results:
         logger.warning("No trade data found with resolved outcomes")
         return pd.DataFrame()
     
-    # Convert to DataFrame - pandas will be faster for the pivot operation
+    logger.info(f"  Query returned {len(results)} rows in {time.time() - query_start:.1f}s")
+    
+    # Step 4: Convert to DataFrame (already pivoted, no need for pandas pivot)
     df = pd.DataFrame(results)
     
-    if len(df) == 0:
-        return pd.DataFrame()
+    # Convert numeric columns
+    for col in filter_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # Pivot to wide format: each filter_name becomes a column
-    # Use pandas pivot_table with observed=True for better memory efficiency
-    try:
-        pivot_df = df.pivot_table(
-            index=['trade_id', 'minute', 'play_id', 'wallet_address', 'followed_at', 'potential_gains', 'our_status'],
-            columns='filter_name',
-            values='filter_value',
-            aggfunc='first',
-            observed=True  # Memory optimization
-        ).reset_index()
-        
-        # Flatten column names
-        pivot_df.columns.name = None
-        
-        unique_trades = pivot_df['trade_id'].nunique()
-        logger.info(f"Loaded {len(pivot_df)} rows ({unique_trades} unique trades) from last {hours} hours")
-        
-        return pivot_df
-        
-    except Exception as e:
-        logger.error(f"Failed to pivot data: {e}")
-        return pd.DataFrame()
+    unique_trades = df['trade_id'].nunique()
+    total_time = time.time() - start_time
+    logger.info(f"  Loaded {len(df)} rows ({unique_trades} unique trades) in {total_time:.1f}s total")
+    
+    return df
 
 
 def get_filterable_columns(df: pd.DataFrame) -> List[str]:
@@ -880,35 +873,33 @@ def get_or_create_auto_project(engine) -> int:
     """Get or create the AutoFilters project."""
     project_name = CONFIG.get('auto_project_name', 'AutoFilters')
     
-    # Check if project exists
-    results = engine.read(
-        "SELECT id FROM follow_the_goat_plays WHERE name = ?",
-        [project_name]
-    )
-    
-    # For now, we'll create the project in pattern_config_projects if it doesn't exist
-    # This is a simplified approach - in production you might want to sync with MySQL
-    
     # Check pattern_config_projects table
     try:
-        results = engine.read(
-            "SELECT id FROM pattern_config_projects WHERE name = ?",
-            [project_name]
-        )
-        if results:
-            return results[0][0]
-    except Exception:
-        pass
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM pattern_config_projects WHERE name = %s",
+                    [project_name]
+                )
+                result = cursor.fetchone()
+                if result:
+                    return result['id']
+    except Exception as e:
+        logger.warning(f"Could not query pattern_config_projects: {e}")
     
     # Create project
     try:
-        max_id_result = engine.read("SELECT COALESCE(MAX(id), 0) + 1 FROM pattern_config_projects")
-        new_id = max_id_result[0][0] if max_id_result else 1
-        
-        engine.execute(f"""
-            INSERT INTO pattern_config_projects (id, name, description)
-            VALUES ({new_id}, '{project_name}', 'Auto-generated filters updated every 15 minutes based on trade analysis')
-        """)
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM pattern_config_projects")
+                max_id_result = cursor.fetchone()
+                new_id = max_id_result['coalesce'] if max_id_result else 1
+                
+                cursor.execute("""
+                    INSERT INTO pattern_config_projects (id, name, description)
+                    VALUES (%s, %s, %s)
+                """, [new_id, project_name, 'Auto-generated filters updated every 15 minutes based on trade analysis'])
+            conn.commit()
         
         logger.info(f"Created new AutoFilters project: id={new_id}")
         return new_id
@@ -939,7 +930,10 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
     
     # Clear existing filters for this project
     try:
-        engine.execute(f"DELETE FROM pattern_config_filters WHERE project_id = {project_id}")
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM pattern_config_filters WHERE project_id = %s", [project_id])
+            conn.commit()
     except Exception as e:
         logger.warning(f"Could not clear existing filters: {e}")
     
@@ -947,19 +941,27 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
     filters_inserted = 0
     for i, f in enumerate(best_combo['filters'], 1):
         try:
-            engine.write('pattern_config_filters', {
-                'id': i + (project_id * 1000),  # Ensure unique ID
-                'project_id': project_id,
-                'name': f"Auto: {f['column_name']}",
-                'section': f.get('section', get_section_from_column(f['column_name'])),
-                'minute': f.get('minute_analyzed', 0),
-                'field_name': f.get('field_name', get_field_name_from_column(f['column_name'])),
-                'field_column': f['column_name'],
-                'from_value': f['from_value'],
-                'to_value': f['to_value'],
-                'include_null': 0,
-                'is_active': 1,
-            })
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        INSERT INTO pattern_config_filters
+                        (id, project_id, name, section, minute, field_name, field_column,
+                         from_value, to_value, include_null, is_active)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, [
+                        i + (project_id * 1000),  # Ensure unique ID
+                        project_id,
+                        f"Auto: {f['column_name']}",
+                        f.get('section', get_section_from_column(f['column_name'])),
+                        f.get('minute_analyzed', 0),
+                        f.get('field_name', get_field_name_from_column(f['column_name'])),
+                        f['column_name'],
+                        f['from_value'],
+                        f['to_value'],
+                        0,  # include_null = SMALLINT
+                        1   # is_active = SMALLINT
+                    ])
+                conn.commit()
             filters_inserted += 1
             logger.info(f"  Added filter: {f['column_name']} [{f['from_value']:.6f} - {f['to_value']:.6f}]")
         except Exception as e:
@@ -973,33 +975,62 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
     }
 
 
-def update_ai_plays(engine, project_id: int) -> int:
-    """Update all plays with pattern_update_by_ai=1 to use the AutoFilters project."""
+def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0) -> int:
+    """Update all plays with pattern_update_by_ai=1 to use the AutoFilters project and log updates."""
     try:
         # Get plays with AI updates enabled
-        results = engine.read(
-            "SELECT id, name FROM follow_the_goat_plays WHERE pattern_update_by_ai = 1"
-        )
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, name FROM follow_the_goat_plays WHERE pattern_update_by_ai = 1"
+                )
+                plays = cursor.fetchall()
         
-        if not results:
+        if not plays:
             logger.info("No AI-enabled plays to update")
             return 0
         
-        plays = results
         project_ids_json = json.dumps([project_id])
+        project_name = CONFIG.get('auto_project_name', 'AutoFilters')
         
         updated_count = 0
-        for play_id, play_name in plays:
+        for play in plays:
+            play_id = play['id']
+            play_name = play['name']
             try:
-                engine.execute(f"""
-                    UPDATE follow_the_goat_plays 
-                    SET project_ids = '{project_ids_json}' 
-                    WHERE id = {play_id} AND pattern_update_by_ai = 1
-                """)
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        # Update the play
+                        cursor.execute("""
+                            UPDATE follow_the_goat_plays 
+                            SET project_ids = %s 
+                            WHERE id = %s AND pattern_update_by_ai = 1
+                        """, [project_ids_json, play_id])
+                        
+                        # Log the update to ai_play_updates table
+                        cursor.execute("""
+                            INSERT INTO ai_play_updates 
+                            (play_id, play_name, project_id, project_name, pattern_count, filters_applied, run_id, status)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """, [play_id, play_name, project_id, project_name, pattern_count, pattern_count, run_id, 'success'])
+                    conn.commit()
+                
                 updated_count += 1
                 logger.info(f"  Updated play #{play_id} ({play_name}) with project_ids=[{project_id}]")
             except Exception as e:
                 logger.error(f"Failed to update play {play_id}: {e}")
+                # Log failure
+                try:
+                    with get_postgres() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute("""
+                                INSERT INTO ai_play_updates 
+                                (play_id, play_name, project_id, project_name, pattern_count, filters_applied, run_id, status)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """, [play_id, play_name, project_id, project_name, 0, 0, run_id, 'failed'])
+                        conn.commit()
+                except:
+                    pass
         
         logger.info(f"Updated {updated_count} AI-enabled plays with AutoFilters project")
         return updated_count
@@ -1123,7 +1154,8 @@ def run() -> Dict[str, Any]:
         
         # Step 6: Update AI-enabled plays
         logger.info("\n[Step 6/6] Updating AI-enabled plays...")
-        result['plays_updated'] = update_ai_plays(engine, project_id)
+        filters_synced = result.get('filters_synced', 0)
+        result['plays_updated'] = update_ai_plays(engine, project_id, run_id, filters_synced)
         
         result['success'] = True
         

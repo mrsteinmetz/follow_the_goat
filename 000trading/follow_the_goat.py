@@ -358,21 +358,20 @@ class WalletFollower:
         return 'any'
     
     def get_all_plays(self, log_summary: bool = True) -> List[Dict[str, Any]]:
-        """Fetch all active plays from DuckDB."""
+        """Fetch all active plays from PostgreSQL."""
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
-                    SELECT id, name, find_wallets_sql, max_buys_per_cycle,
-                           pattern_validator_enable, pattern_validator,
-                           tricker_on_perp, bundle_trades, 
-                           cashe_wallets, cashe_wallets_settings,
-                           project_ids, is_active
-                    FROM follow_the_goat_plays
-                    WHERE is_active = 1
-                """)
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-                plays = [dict(zip(columns, row)) for row in rows]
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, name, find_wallets_sql, max_buys_per_cycle,
+                               pattern_validator_enable, pattern_validator,
+                               tricker_on_perp, bundle_trades, 
+                               cashe_wallets, cashe_wallets_settings,
+                               project_ids, is_active
+                        FROM follow_the_goat_plays
+                        WHERE is_active = 1
+                    """)
+                    plays = cursor.fetchall()
             
             if not plays:
                 logger.warning("No active plays found in follow_the_goat_plays")
@@ -584,14 +583,11 @@ class WalletFollower:
                     # Use in-memory engine for fastest reads
                     results = engine.read(query_duckdb)
                 else:
-                    # Fallback to file-based DuckDB
-                    with get_duckdb("central", read_only=True) as cursor:
-                        raw_results = cursor.execute(query_duckdb).fetchall()
-                        if raw_results:
-                            columns = [desc[0] for desc in cursor.description]
-                            results = [dict(zip(columns, row)) for row in raw_results]
-                        else:
-                            results = []
+                    # Fallback to PostgreSQL
+                    with get_postgres() as conn:
+                        with conn.cursor() as cursor:
+                            cursor.execute(query_duckdb)
+                            results = cursor.fetchall()
                 
                 initial_wallet_addresses = [
                     r.get('wallet_address') for r in results if r.get('wallet_address')
@@ -680,19 +676,20 @@ class WalletFollower:
         # DuckDB query - simplified for speed
         # Find wallets that traded together within the time window
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                # Get recent buy trades from target wallets
-                result = cursor.execute(f"""
-                    SELECT wallet_address, trade_timestamp, 
-                           EPOCH(trade_timestamp) AS ts_unix
-                    FROM sol_stablecoin_trades
-                    WHERE trade_timestamp >= NOW() - INTERVAL {window_seconds} SECOND
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    # Get recent buy trades from target wallets
+                    cursor.execute(f"""
+                        SELECT wallet_address, trade_timestamp, 
+                               EXTRACT(EPOCH FROM trade_timestamp) AS ts_unix
+                        FROM sol_stablecoin_trades
+                    WHERE trade_timestamp >= NOW() - INTERVAL '{window_seconds} seconds'
                       AND direction = 'buy'
                       AND wallet_address IN ({wallet_list})
                       {perp_condition}
                     ORDER BY trade_timestamp DESC
                 """)
-                trades = result.fetchall()
+                    trades = cursor.fetchall()
             
             if not trades:
                 logger.info(f"Play #{play_id}: Bundle filter found no qualifying clusters")
@@ -843,17 +840,19 @@ class WalletFollower:
         pass
     
     def get_last_processed_trade_id(self, wallet_address: str) -> int:
-        """Get the last trade ID we processed for this wallet (from DuckDB)."""
+        """Get the last trade ID we processed for this wallet (from PostgreSQL)."""
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
-                    SELECT last_trade_id 
-                    FROM follow_the_goat_tracking 
-                    WHERE wallet_address = ?
-                """, [wallet_address]).fetchone()
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT last_trade_id 
+                        FROM follow_the_goat_tracking 
+                        WHERE wallet_address = %s
+                    """, [wallet_address])
+                    result = cursor.fetchone()
             
             if result:
-                return result[0] if result[0] else 0
+                return result['last_trade_id'] if result.get('last_trade_id') else 0
             return 0
         except Exception as e:
             logger.debug(f"Error getting last trade ID: {e}")
@@ -918,22 +917,21 @@ class WalletFollower:
             except Exception as e:
                 logger.debug(f"Engine read failed, falling back to file-DB: {e}")
             
-            # Fallback to file-based DuckDB if engine didn't return results
+            # Fallback to PostgreSQL if engine didn't return results
             if not all_trades:
-                with get_duckdb("central", read_only=True) as cursor:
-                    result = cursor.execute(f"""
-                        SELECT id, signature, trade_timestamp, stablecoin_amount, sol_amount, 
-                               price, direction, wallet_address, perp_direction
-                        FROM sol_stablecoin_trades 
-                        WHERE wallet_address IN ({wallet_list})
-                          AND direction = 'buy' 
-                          AND id > ?
-                          AND trade_timestamp >= NOW() - INTERVAL 5 MINUTE
-                        ORDER BY wallet_address, id ASC
-                    """, [min_last_id])
-                    columns = [desc[0] for desc in result.description]
-                    rows = result.fetchall()
-                    all_trades = [dict(zip(columns, row)) for row in rows]
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(f"""
+                            SELECT id, signature, trade_timestamp, stablecoin_amount, sol_amount, 
+                                   price, direction, wallet_address, perp_direction
+                            FROM sol_stablecoin_trades 
+                            WHERE wallet_address IN ({wallet_list})
+                              AND direction = 'buy' 
+                              AND id > %s
+                              AND trade_timestamp >= NOW() - INTERVAL '5 minutes'
+                            ORDER BY wallet_address, id ASC
+                        """, [min_last_id])
+                        all_trades = cursor.fetchall()
             
             # Filter by per-wallet last_id
             filtered_trades = []
@@ -978,19 +976,21 @@ class WalletFollower:
     # =========================================================================
     
     def get_current_market_price(self) -> Optional[float]:
-        """Get current SOL price from price_points table."""
+        """Get current SOL price from prices table."""
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
-                    SELECT value, id, created_at 
-                    FROM price_points 
-                    WHERE coin_id = 5
-                    ORDER BY id DESC 
-                    LIMIT 1
-                """).fetchone()
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT price
+                        FROM prices 
+                        WHERE token = 'SOL'
+                        ORDER BY id DESC 
+                        LIMIT 1
+                    """)
+                    result = cursor.fetchone()
             
             if result:
-                return float(result[0])
+                return float(result['price'])
             return None
         except Exception as e:
             logger.error(f"Error getting market price: {e}")
@@ -1009,21 +1009,22 @@ class WalletFollower:
         timestamp_str = at_timestamp.strftime('%Y-%m-%d %H:%M:%S')
         
         try:
-            # CRITICAL: Use get_postgres() which returns master2.py's local DuckDB
-            # when running in master2.py context. Cycles are computed there by create_price_cycles.py
-            with get_duckdb("central", read_only=True) as cursor:
-                result = cursor.execute("""
-                    SELECT id, cycle_start_time, cycle_end_time 
-                    FROM cycle_tracker
-                    WHERE threshold = 0.3
-                      AND cycle_start_time <= ?
-                      AND (cycle_end_time IS NULL OR cycle_end_time > ?)
-                    ORDER BY id DESC
-                    LIMIT 1
-                """, [timestamp_str, timestamp_str]).fetchone()
-                
-                if result:
-                    cycle_id = result[0]
+            # Get current price cycle from PostgreSQL
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT id, cycle_start_time, cycle_end_time 
+                        FROM cycle_tracker
+                        WHERE threshold = 0.3
+                          AND cycle_start_time <= %s
+                          AND (cycle_end_time IS NULL OR cycle_end_time > %s)
+                        ORDER BY id DESC
+                        LIMIT 1
+                    """, [timestamp_str, timestamp_str])
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        cycle_id = result['id']
                     cycle_start = result[1] if len(result) > 1 else None
                     
                     # Log cycle age if it's suspiciously old (>1 hour)
@@ -1076,21 +1077,23 @@ class WalletFollower:
             return True, "no_cycle"
         
         try:
-            with get_duckdb("central", read_only=True) as cursor:
-                # Check wallet already bought in this cycle
-                result = cursor.execute("""
-                    SELECT COUNT(*) as wallet_buy_count
-                    FROM follow_the_goat_buyins
-                    WHERE play_id = ?
-                      AND price_cycle = ?
-                      AND wallet_address = ?
-                """, [play_id, price_cycle, wallet_address]).fetchone()
-                
-                wallet_buy_count = result[0] if result else 0
-                
-                if wallet_buy_count > 0:
-                    logger.debug(f"Play #{play_id}: Wallet {wallet_address[:8]}... already bought in cycle {price_cycle}")
-                    return False, "wallet_already_bought"
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    # Check wallet already bought in this cycle
+                    cursor.execute("""
+                        SELECT COUNT(*) as wallet_buy_count
+                        FROM follow_the_goat_buyins
+                        WHERE play_id = %s
+                          AND price_cycle = %s
+                          AND wallet_address = %s
+                    """, [play_id, price_cycle, wallet_address])
+                    result = cursor.fetchone()
+                    
+                    wallet_buy_count = result['wallet_buy_count'] if result else 0
+                    
+                    if wallet_buy_count > 0:
+                        logger.debug(f"Play #{play_id}: Wallet {wallet_address[:8]}... already bought in cycle {price_cycle}")
+                        return False, "wallet_already_bought"
                 
                 # Check total buys in cycle
                 result = cursor.execute("""

@@ -948,6 +948,284 @@ def get_patterns():
 
 
 # =============================================================================
+# PATTERN PROJECT ENDPOINTS
+# =============================================================================
+
+@app.route('/patterns/projects', methods=['GET'])
+def get_pattern_projects():
+    """Get all pattern config projects with filter counts."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT 
+                        p.id, p.name, p.description, p.created_at, p.updated_at,
+                        COUNT(f.id) as filter_count,
+                        COUNT(CASE WHEN f.is_active = 1 THEN 1 END) as active_filter_count
+                    FROM pattern_config_projects p
+                    LEFT JOIN pattern_config_filters f ON f.project_id = p.id
+                    GROUP BY p.id, p.name, p.description, p.created_at, p.updated_at
+                    ORDER BY p.updated_at DESC
+                """)
+                results = cursor.fetchall()
+        
+        return jsonify({'projects': results, 'count': len(results)})
+    except Exception as e:
+        logger.error(f"Get pattern projects failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/patterns/projects', methods=['POST'])
+def create_pattern_project():
+    """Create a new pattern config project."""
+    try:
+        data = request.get_json() or {}
+        name = data.get('name', '').strip()
+        description = data.get('description', '').strip() or None
+        
+        if not name:
+            return jsonify({'success': False, 'error': 'Project name is required'}), 400
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO pattern_config_projects (name, description, created_at, updated_at)
+                    VALUES (%s, %s, NOW(), NOW())
+                    RETURNING id
+                """, [name, description])
+                result = cursor.fetchone()
+                new_id = result['id'] if result else None
+            conn.commit()
+        
+        return jsonify({'success': True, 'id': new_id})
+    except Exception as e:
+        logger.error(f"Create pattern project failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['GET'])
+def get_pattern_project(project_id):
+    """Get a single pattern config project by ID with its filters."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get project
+                cursor.execute("""
+                    SELECT id, name, description, created_at, updated_at
+                    FROM pattern_config_projects
+                    WHERE id = %s
+                """, [project_id])
+                project = cursor.fetchone()
+                
+                if not project:
+                    return jsonify({'error': 'Project not found'}), 404
+                
+                # Get filters for this project
+                cursor.execute("""
+                    SELECT * FROM pattern_config_filters
+                    WHERE project_id = %s
+                    ORDER BY id DESC
+                """, [project_id])
+                filters = cursor.fetchall()
+        
+        return jsonify({
+            'project': project,
+            'filters': filters
+        })
+    except Exception as e:
+        logger.error(f"Get pattern project failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>', methods=['DELETE'])
+def delete_pattern_project(project_id):
+    """Delete a pattern config project and all its filters."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Delete filters first
+                cursor.execute("""
+                    DELETE FROM pattern_config_filters
+                    WHERE project_id = %s
+                """, [project_id])
+                
+                # Delete project
+                cursor.execute("""
+                    DELETE FROM pattern_config_projects
+                    WHERE id = %s
+                """, [project_id])
+                rows_deleted = cursor.rowcount
+            conn.commit()
+        
+        if rows_deleted > 0:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Project not found'}), 404
+    except Exception as e:
+        logger.error(f"Delete pattern project failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/projects/<int:project_id>/filters', methods=['GET'])
+def get_pattern_project_filters(project_id):
+    """Get all filters for a pattern config project."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT * FROM pattern_config_filters
+                    WHERE project_id = %s
+                    ORDER BY id DESC
+                """, [project_id])
+                results = cursor.fetchall()
+        
+        return jsonify({'filters': results, 'count': len(results)})
+    except Exception as e:
+        logger.error(f"Get pattern filters failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# =============================================================================
+# PATTERN FILTER ENDPOINTS
+# =============================================================================
+
+@app.route('/patterns/filters', methods=['POST'])
+def create_pattern_filter():
+    """Create a new pattern config filter."""
+    try:
+        data = request.get_json() or {}
+        
+        project_id = data.get('project_id')
+        name = data.get('name', '').strip()
+        section = data.get('section')
+        minute = data.get('minute')
+        field_name = data.get('field_name')
+        field_column = data.get('field_column')
+        from_value = data.get('from_value')
+        to_value = data.get('to_value')
+        include_null = data.get('include_null', 0)
+        exclude_mode = data.get('exclude_mode', 0)
+        is_active = data.get('is_active', 1)
+        
+        if not project_id:
+            return jsonify({'success': False, 'error': 'project_id is required'}), 400
+        if not field_name:
+            return jsonify({'success': False, 'error': 'field_name is required'}), 400
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO pattern_config_filters 
+                    (project_id, name, section, minute, field_name, field_column, 
+                     from_value, to_value, include_null, exclude_mode, is_active)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, [project_id, name or field_name, section, minute, field_name, 
+                      field_column, from_value, to_value, include_null, exclude_mode, is_active])
+                result = cursor.fetchone()
+                new_id = result['id'] if result else None
+                
+                # Update project's updated_at timestamp
+                cursor.execute("""
+                    UPDATE pattern_config_projects 
+                    SET updated_at = NOW()
+                    WHERE id = %s
+                """, [project_id])
+            conn.commit()
+        
+        return jsonify({'success': True, 'id': new_id})
+    except Exception as e:
+        logger.error(f"Create pattern filter failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['PUT'])
+def update_pattern_filter(filter_id):
+    """Update a pattern config filter."""
+    try:
+        data = request.get_json() or {}
+        
+        # Build dynamic UPDATE query
+        update_fields = []
+        params = []
+        
+        allowed_fields = ['name', 'section', 'minute', 'field_name', 'field_column',
+                          'from_value', 'to_value', 'include_null', 'exclude_mode', 'is_active']
+        
+        for field in allowed_fields:
+            if field in data:
+                update_fields.append(f"{field} = %s")
+                params.append(data[field])
+        
+        if not update_fields:
+            return jsonify({'success': False, 'error': 'No fields to update'}), 400
+        
+        params.append(filter_id)
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                query = f"""
+                    UPDATE pattern_config_filters
+                    SET {', '.join(update_fields)}
+                    WHERE id = %s
+                """
+                cursor.execute(query, params)
+                rows_affected = cursor.rowcount
+                
+                if rows_affected > 0:
+                    # Update parent project's updated_at
+                    cursor.execute("""
+                        UPDATE pattern_config_projects 
+                        SET updated_at = NOW()
+                        WHERE id = (SELECT project_id FROM pattern_config_filters WHERE id = %s)
+                    """, [filter_id])
+            conn.commit()
+        
+        if rows_affected > 0:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Filter not found'}), 404
+    except Exception as e:
+        logger.error(f"Update pattern filter failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/patterns/filters/<int:filter_id>', methods=['DELETE'])
+def delete_pattern_filter(filter_id):
+    """Delete a pattern config filter."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get project_id before deleting
+                cursor.execute("""
+                    SELECT project_id FROM pattern_config_filters WHERE id = %s
+                """, [filter_id])
+                filter_row = cursor.fetchone()
+                project_id = filter_row['project_id'] if filter_row else None
+                
+                # Delete filter
+                cursor.execute("""
+                    DELETE FROM pattern_config_filters WHERE id = %s
+                """, [filter_id])
+                rows_deleted = cursor.rowcount
+                
+                # Update project's updated_at
+                if project_id:
+                    cursor.execute("""
+                        UPDATE pattern_config_projects SET updated_at = NOW() WHERE id = %s
+                    """, [project_id])
+            conn.commit()
+        
+        if rows_deleted > 0:
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'Filter not found'}), 404
+    except Exception as e:
+        logger.error(f"Delete pattern filter failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
 # SCHEDULER STATUS (READ FROM FILE)
 # =============================================================================
 
@@ -1137,6 +1415,722 @@ def get_trail_for_buyin(buyin_id):
     except Exception as e:
         logger.error(f"Get trail for buyin failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
+
+
+# Trail section field definitions
+TRAIL_SECTIONS = {
+    'price_movements': {
+        'prefix': 'pm_',
+        'fields': [
+            'price_change_1m', 'momentum_volatility_ratio', 'momentum_acceleration_1m',
+            'price_change_5m', 'price_change_10m', 'volatility_pct', 'body_range_ratio',
+            'volatility_surge_ratio', 'price_stddev_pct', 'trend_consistency_3m',
+            'cumulative_return_5m', 'candle_body_pct', 'upper_wick_pct', 'lower_wick_pct',
+            'wick_balance_ratio', 'price_vs_ma5_pct', 'breakout_strength_10m',
+            'open_price', 'high_price', 'low_price', 'close_price', 'avg_price'
+        ]
+    },
+    'order_book_signals': {
+        'prefix': 'ob_',
+        'fields': [
+            'mid_price', 'price_change_1m', 'price_change_5m', 'price_change_10m',
+            'volume_imbalance', 'imbalance_shift_1m', 'imbalance_trend_3m',
+            'depth_imbalance_ratio', 'bid_liquidity_share_pct', 'ask_liquidity_share_pct',
+            'depth_imbalance_pct', 'total_liquidity', 'liquidity_change_3m',
+            'microprice_deviation', 'microprice_acceleration_2m', 'spread_bps',
+            'aggression_ratio', 'vwap_spread_bps', 'net_flow_5m', 'net_flow_to_liquidity_ratio',
+            'sample_count', 'coverage_seconds'
+        ]
+    },
+    'transactions': {
+        'prefix': 'tx_',
+        'fields': [
+            'buy_sell_pressure', 'buy_volume_pct', 'sell_volume_pct', 'pressure_shift_1m',
+            'pressure_trend_3m', 'long_short_ratio', 'long_volume_pct', 'short_volume_pct',
+            'perp_position_skew_pct', 'long_ratio_shift_1m', 'perp_dominance_pct',
+            'total_volume_usd', 'volume_acceleration_ratio', 'volume_surge_ratio',
+            'whale_volume_pct', 'avg_trade_size', 'trades_per_second', 'buy_trade_pct',
+            'price_change_1m', 'price_volatility_pct', 'cumulative_buy_flow_5m',
+            'trade_count', 'large_trade_count', 'vwap'
+        ]
+    },
+    'whale_activity': {
+        'prefix': 'wh_',
+        'fields': [
+            'net_flow_ratio', 'flow_shift_1m', 'flow_trend_3m', 'accumulation_ratio',
+            'strong_accumulation', 'cumulative_flow_5m', 'total_sol_moved',
+            'inflow_share_pct', 'outflow_share_pct', 'net_flow_strength_pct',
+            'strong_accumulation_pct', 'strong_distribution_pct', 'activity_surge_ratio',
+            'movement_count', 'massive_move_pct', 'avg_wallet_pct_moved',
+            'largest_move_dominance', 'distribution_pressure_pct', 'outflow_surge_pct',
+            'movement_imbalance_pct', 'inflow_sol', 'outflow_sol', 'net_flow_sol',
+            'inflow_count', 'outflow_count', 'massive_move_count', 'max_move_size',
+            'strong_distribution'
+        ]
+    },
+    'patterns': {
+        'prefix': 'pat_',
+        'fields': [
+            'breakout_score', 'detected_count', 'detected_list',
+            'asc_tri_detected', 'asc_tri_confidence', 'asc_tri_resistance_level',
+            'asc_tri_support_level', 'asc_tri_compression_ratio',
+            'bull_flag_detected', 'bull_flag_confidence', 'bull_flag_pole_height_pct',
+            'bull_flag_retracement_pct'
+        ]
+    }
+}
+
+# Field types (boolean fields)
+BOOLEAN_FIELDS = {
+    'pat_asc_tri_detected', 'pat_bull_flag_detected', 'pat_cup_handle_detected',
+    'pat_inv_head_shoulders_detected', 'pat_double_bottom_detected'
+}
+
+
+@app.route('/trail/sections', methods=['GET'])
+def get_trail_sections():
+    """Get available trail data sections and their fields."""
+    try:
+        section = request.args.get('section')
+        
+        if section and section in TRAIL_SECTIONS:
+            # Return fields for specific section
+            section_data = TRAIL_SECTIONS[section]
+            prefix = section_data['prefix']
+            fields = section_data['fields']
+            
+            # Determine field types
+            field_types = {}
+            for field in fields:
+                full_col = prefix + field
+                if full_col in BOOLEAN_FIELDS:
+                    field_types[field] = 'BOOLEAN'
+                else:
+                    field_types[field] = 'NUMERIC'
+            
+            return jsonify({
+                'success': True,
+                'section': section,
+                'prefix': prefix,
+                'fields': fields,
+                'field_types': field_types
+            })
+        else:
+            # Return all sections
+            sections_list = []
+            for sec_name, sec_data in TRAIL_SECTIONS.items():
+                sections_list.append({
+                    'name': sec_name,
+                    'prefix': sec_data['prefix'],
+                    'field_count': len(sec_data['fields'])
+                })
+            
+            return jsonify({
+                'success': True,
+                'sections': sections_list
+            })
+    except Exception as e:
+        logger.error(f"Get trail sections failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/trail/field_stats', methods=['POST'])
+def get_trail_field_stats():
+    """Get field statistics for a section/minute, broken down by gain ranges."""
+    try:
+        data = request.get_json() or {}
+        project_id = data.get('project_id')
+        section = data.get('section', 'price_movements')
+        minute = int(data.get('minute', 0))
+        status = data.get('status', 'all')
+        hours = int(data.get('hours', 24))
+        analyse_mode = data.get('analyse_mode', 'all')  # 'all' or 'passed'
+        
+        if section not in TRAIL_SECTIONS:
+            return jsonify({'success': False, 'error': 'Invalid section'}), 400
+        
+        section_data = TRAIL_SECTIONS[section]
+        prefix = section_data['prefix']
+        fields = section_data['fields']
+        
+        # Define gain ranges
+        gain_ranges = [
+            {'id': 'negative', 'label': '< 0%', 'min': None, 'max': 0},
+            {'id': '0_to_0.1', 'label': '0-0.1%', 'min': 0, 'max': 0.1},
+            {'id': '0.1_to_0.2', 'label': '0.1-0.2%', 'min': 0.1, 'max': 0.2},
+            {'id': '0.2_to_0.3', 'label': '0.2-0.3%', 'min': 0.2, 'max': 0.3},
+            {'id': '0.3_to_0.5', 'label': '0.3-0.5%', 'min': 0.3, 'max': 0.5},
+            {'id': '0.5_to_1', 'label': '0.5-1%', 'min': 0.5, 'max': 1},
+            {'id': '1_to_2', 'label': '1-2%', 'min': 1, 'max': 2},
+            {'id': '2_plus', 'label': '2%+', 'min': 2, 'max': None},
+        ]
+        
+        # Build WHERE clause
+        where_conditions = ["t.minute = %s"]
+        params = [minute]
+        
+        # Status filter
+        if status and status != 'all':
+            where_conditions.append("b.our_status = %s")
+            params.append(status)
+        
+        # Time filter
+        if hours:
+            where_conditions.append("b.followed_at >= NOW() - INTERVAL '%s hours'")
+            params.append(hours)
+        
+        # Get active filters if analyse_mode is 'passed'
+        filter_conditions = []
+        if project_id and analyse_mode == 'passed':
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT field_column, from_value, to_value, include_null, exclude_mode
+                        FROM pattern_config_filters
+                        WHERE project_id = %s AND is_active = 1
+                    """, [project_id])
+                    filters = cursor.fetchall()
+                    
+                    for f in filters:
+                        col = f['field_column']
+                        from_val = f['from_value']
+                        to_val = f['to_value']
+                        include_null = f['include_null']
+                        exclude_mode = f['exclude_mode']
+                        
+                        if exclude_mode:
+                            # Exclude mode: rows NOT in range
+                            if from_val is not None and to_val is not None:
+                                filter_conditions.append(f"(t.{col} < %s OR t.{col} > %s)")
+                                params.extend([from_val, to_val])
+                        else:
+                            # Include mode: rows in range
+                            cond_parts = []
+                            if from_val is not None:
+                                cond_parts.append(f"t.{col} >= %s")
+                                params.append(from_val)
+                            if to_val is not None:
+                                cond_parts.append(f"t.{col} <= %s")
+                                params.append(to_val)
+                            
+                            if include_null:
+                                full_cond = f"({' AND '.join(cond_parts)} OR t.{col} IS NULL)"
+                            else:
+                                full_cond = f"({' AND '.join(cond_parts)})"
+                            
+                            if cond_parts:
+                                filter_conditions.append(full_cond)
+        
+        where_clause = ' AND '.join(where_conditions + filter_conditions)
+        
+        # Build field statistics query
+        field_stats = {}
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                for field in fields:
+                    col_name = prefix + field
+                    full_col = f"t.{col_name}"
+                    is_boolean = col_name in BOOLEAN_FIELDS
+                    
+                    # For boolean fields, calculate % TRUE
+                    if is_boolean:
+                        agg_expr = f"AVG(CASE WHEN {full_col} = true THEN 100.0 ELSE 0.0 END)"
+                    else:
+                        agg_expr = f"AVG({full_col})"
+                    
+                    field_stats[field] = {'type': 'BOOLEAN' if is_boolean else 'NUMERIC', 'ranges': {}}
+                    
+                    for gain_range in gain_ranges:
+                        range_id = gain_range['id']
+                        range_min = gain_range['min']
+                        range_max = gain_range['max']
+                        
+                        # Build gain range condition
+                        gain_cond = []
+                        gain_params = list(params)
+                        
+                        if range_min is not None:
+                            gain_cond.append("b.potential_gains >= %s")
+                            gain_params.append(range_min)
+                        if range_max is not None:
+                            gain_cond.append("b.potential_gains < %s")
+                            gain_params.append(range_max)
+                        
+                        gain_where = f" AND {' AND '.join(gain_cond)}" if gain_cond else ""
+                        
+                        query = f"""
+                            SELECT {agg_expr} as avg_val, COUNT(*) as cnt
+                            FROM buyin_trail_minutes t
+                            JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                            WHERE {where_clause} {gain_where}
+                        """
+                        
+                        cursor.execute(query, gain_params)
+                        result = cursor.fetchone()
+                        
+                        field_stats[field]['ranges'][range_id] = {
+                            'avg': float(result['avg_val']) if result and result['avg_val'] is not None else None,
+                            'count': int(result['cnt']) if result else 0
+                        }
+                
+                # Get total trades count
+                cursor.execute(f"""
+                    SELECT COUNT(DISTINCT t.buyin_id) as total
+                    FROM buyin_trail_minutes t
+                    JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                    WHERE {where_clause}
+                """, params)
+                total_result = cursor.fetchone()
+                total_trades = total_result['total'] if total_result else 0
+        
+        return jsonify({
+            'success': True,
+            'field_stats': field_stats,
+            'gain_ranges': gain_ranges,
+            'total_trades': total_trades
+        })
+    except Exception as e:
+        logger.error(f"Get trail field stats failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/trail/gain_distribution', methods=['POST'])
+def get_trail_gain_distribution():
+    """Get trade count distribution across gain ranges, with and without filters applied."""
+    try:
+        data = request.get_json() or {}
+        project_id = data.get('project_id')
+        minute = int(data.get('minute', 0))
+        status = data.get('status', 'all')
+        hours = int(data.get('hours', 24))
+        apply_filters = data.get('apply_filters', False)
+        
+        # Define gain ranges
+        gain_ranges = [
+            {'id': 'negative', 'label': '< 0%', 'min': None, 'max': 0},
+            {'id': '0_to_0.1', 'label': '0-0.1%', 'min': 0, 'max': 0.1},
+            {'id': '0.1_to_0.2', 'label': '0.1-0.2%', 'min': 0.1, 'max': 0.2},
+            {'id': '0.2_to_0.3', 'label': '0.2-0.3%', 'min': 0.2, 'max': 0.3},
+            {'id': '0.3_to_0.5', 'label': '0.3-0.5%', 'min': 0.3, 'max': 0.5},
+            {'id': '0.5_to_1', 'label': '0.5-1%', 'min': 0.5, 'max': 1},
+            {'id': '1_to_2', 'label': '1-2%', 'min': 1, 'max': 2},
+            {'id': '2_plus', 'label': '2%+', 'min': 2, 'max': None},
+        ]
+        
+        # Build base WHERE clause
+        base_conditions = ["t.minute = %s"]
+        base_params = [minute]
+        
+        if status and status != 'all':
+            base_conditions.append("b.our_status = %s")
+            base_params.append(status)
+        
+        if hours:
+            base_conditions.append("b.followed_at >= NOW() - INTERVAL '%s hours'")
+            base_params.append(hours)
+        
+        base_where = ' AND '.join(base_conditions)
+        
+        # Get active filters
+        filter_conditions = []
+        filter_params = []
+        
+        if project_id and apply_filters:
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT field_column, from_value, to_value, include_null, exclude_mode
+                        FROM pattern_config_filters
+                        WHERE project_id = %s AND is_active = 1
+                    """, [project_id])
+                    filters = cursor.fetchall()
+                    
+                    for f in filters:
+                        col = f['field_column']
+                        from_val = f['from_value']
+                        to_val = f['to_value']
+                        include_null = f['include_null']
+                        exclude_mode = f['exclude_mode']
+                        
+                        if exclude_mode:
+                            if from_val is not None and to_val is not None:
+                                filter_conditions.append(f"(t.{col} < %s OR t.{col} > %s)")
+                                filter_params.extend([from_val, to_val])
+                        else:
+                            cond_parts = []
+                            if from_val is not None:
+                                cond_parts.append(f"t.{col} >= %s")
+                                filter_params.append(from_val)
+                            if to_val is not None:
+                                cond_parts.append(f"t.{col} <= %s")
+                                filter_params.append(to_val)
+                            
+                            if cond_parts:
+                                if include_null:
+                                    filter_conditions.append(f"({' AND '.join(cond_parts)} OR t.{col} IS NULL)")
+                                else:
+                                    filter_conditions.append(f"({' AND '.join(cond_parts)})")
+        
+        distribution = []
+        total_base = 0
+        total_filtered = 0
+        total_avg_gain_base = 0
+        total_avg_gain_filtered = 0
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                for gain_range in gain_ranges:
+                    range_id = gain_range['id']
+                    range_min = gain_range['min']
+                    range_max = gain_range['max']
+                    
+                    # Build gain range condition
+                    gain_cond = []
+                    if range_min is not None:
+                        gain_cond.append("b.potential_gains >= %s")
+                    if range_max is not None:
+                        gain_cond.append("b.potential_gains < %s")
+                    
+                    gain_where = f" AND {' AND '.join(gain_cond)}" if gain_cond else ""
+                    
+                    # Base count (without filters)
+                    base_query_params = list(base_params)
+                    if range_min is not None:
+                        base_query_params.append(range_min)
+                    if range_max is not None:
+                        base_query_params.append(range_max)
+                    
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT t.buyin_id) as cnt
+                        FROM buyin_trail_minutes t
+                        JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                        WHERE {base_where} {gain_where}
+                    """, base_query_params)
+                    base_result = cursor.fetchone()
+                    base_count = int(base_result['cnt']) if base_result else 0
+                    
+                    # Filtered count (with filters)
+                    if filter_conditions:
+                        filter_where = ' AND '.join(filter_conditions)
+                        filtered_query_params = base_query_params + filter_params
+                        
+                        cursor.execute(f"""
+                            SELECT COUNT(DISTINCT t.buyin_id) as cnt
+                            FROM buyin_trail_minutes t
+                            JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                            WHERE {base_where} AND {filter_where} {gain_where}
+                        """, filtered_query_params)
+                        filtered_result = cursor.fetchone()
+                        filtered_count = int(filtered_result['cnt']) if filtered_result else 0
+                    else:
+                        filtered_count = base_count
+                    
+                    distribution.append({
+                        'id': range_id,
+                        'label': gain_range['label'],
+                        'base_count': base_count,
+                        'filtered_count': filtered_count,
+                        'removed': base_count - filtered_count
+                    })
+                    
+                    total_base += base_count
+                    total_filtered += filtered_count
+                
+                # Get average gains
+                cursor.execute(f"""
+                    SELECT AVG(b.potential_gains) as avg_gain
+                    FROM buyin_trail_minutes t
+                    JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                    WHERE {base_where}
+                """, base_params)
+                base_avg = cursor.fetchone()
+                total_avg_gain_base = float(base_avg['avg_gain']) if base_avg and base_avg['avg_gain'] else 0
+                
+                if filter_conditions:
+                    filter_where = ' AND '.join(filter_conditions)
+                    cursor.execute(f"""
+                        SELECT AVG(b.potential_gains) as avg_gain
+                        FROM buyin_trail_minutes t
+                        JOIN follow_the_goat_buyins b ON t.buyin_id = b.id
+                        WHERE {base_where} AND {filter_where}
+                    """, base_params + filter_params)
+                    filtered_avg = cursor.fetchone()
+                    total_avg_gain_filtered = float(filtered_avg['avg_gain']) if filtered_avg and filtered_avg['avg_gain'] else 0
+                else:
+                    total_avg_gain_filtered = total_avg_gain_base
+        
+        return jsonify({
+            'success': True,
+            'distribution': distribution,
+            'totals': {
+                'base': total_base,
+                'filtered': total_filtered,
+                'removed': total_base - total_filtered
+            },
+            'gains': {
+                'base_avg': total_avg_gain_base,
+                'filtered_avg': total_avg_gain_filtered
+            }
+        })
+    except Exception as e:
+        logger.error(f"Get trail gain distribution failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
+# FILTER ANALYSIS ENDPOINTS
+# =============================================================================
+
+@app.route('/filter-analysis/dashboard', methods=['GET'])
+def get_filter_analysis_dashboard():
+    """Get complete filter analysis dashboard data."""
+    try:
+        result = {
+            'success': True,
+            'summary': {},
+            'suggestions': [],
+            'combinations': [],
+            'minute_distribution': [],
+            'scheduler_runs': [],
+            'filter_consistency': [],
+            'trend_chart_data': [],
+            'scheduler_stats': {'runs_today': 0, 'last_run': None, 'avg_filters': 0},
+            'settings': [],
+            'rolling_avgs': {},
+            'play_updates': []
+        }
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Summary statistics
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as total_filters, 
+                        CAST(AVG(good_trades_kept_pct) AS NUMERIC(10,1)) as avg_good_kept,
+                        CAST(AVG(bad_trades_removed_pct) AS NUMERIC(10,1)) as avg_bad_removed, 
+                        CAST(MAX(bad_trades_removed_pct) AS NUMERIC(10,1)) as best_bad_removed,
+                        MAX(good_trades_before) as total_good_trades, 
+                        MAX(bad_trades_before) as total_bad_trades,
+                        MAX(created_at) as last_updated, 
+                        MAX(analysis_hours) as analysis_hours
+                    FROM filter_reference_suggestions
+                """)
+                summary_row = cursor.fetchone()
+                if summary_row:
+                    result['summary'] = {
+                        'total_filters': summary_row['total_filters'] or 0,
+                        'avg_good_kept': summary_row['avg_good_kept'] or 0,
+                        'avg_bad_removed': summary_row['avg_bad_removed'] or 0,
+                        'best_bad_removed': summary_row['best_bad_removed'] or 0,
+                        'total_good_trades': summary_row['total_good_trades'] or 0,
+                        'total_bad_trades': summary_row['total_bad_trades'] or 0,
+                        'last_updated': str(summary_row['last_updated'])[:19] if summary_row['last_updated'] else None,
+                        'analysis_hours': summary_row['analysis_hours'] or 24
+                    }
+                
+                # Minute distribution
+                cursor.execute("""
+                    SELECT 
+                        minute_analyzed, 
+                        COUNT(*) as filter_count, 
+                        CAST(AVG(bad_trades_removed_pct) AS NUMERIC(10,1)) as avg_bad_removed, 
+                        CAST(AVG(good_trades_kept_pct) AS NUMERIC(10,1)) as avg_good_kept
+                    FROM filter_reference_suggestions 
+                    GROUP BY minute_analyzed 
+                    ORDER BY avg_bad_removed DESC
+                """)
+                result['minute_distribution'] = cursor.fetchall()
+                
+                # All suggestions with field info
+                cursor.execute("""
+                    SELECT 
+                        frs.id, frs.filter_field_id, frs.column_name, frs.from_value, frs.to_value,
+                        frs.total_trades, frs.good_trades_before, frs.bad_trades_before,
+                        frs.good_trades_after, frs.bad_trades_after,
+                        frs.good_trades_kept_pct, frs.bad_trades_removed_pct,
+                        frs.bad_negative_count, frs.bad_0_to_01_count, frs.bad_01_to_02_count, frs.bad_02_to_03_count,
+                        frs.analysis_hours, frs.minute_analyzed, frs.created_at,
+                        COALESCE(frs.section, ffc.section, 'unknown') as section, 
+                        COALESCE(ffc.field_name, frs.column_name) as field_name, 
+                        'numeric' as value_type
+                    FROM filter_reference_suggestions frs 
+                    LEFT JOIN filter_fields_catalog ffc ON frs.filter_field_id = ffc.id
+                    ORDER BY frs.bad_trades_removed_pct DESC
+                """)
+                suggestions = cursor.fetchall()
+                for s in suggestions:
+                    if s.get('created_at'):
+                        s['created_at'] = str(s['created_at'])[:19]
+                result['suggestions'] = suggestions
+                
+                # Filter combinations
+                cursor.execute("""
+                    SELECT 
+                        id, combination_name, filter_count, filter_ids, filter_columns,
+                        total_trades, good_trades_before, bad_trades_before,
+                        good_trades_after, bad_trades_after,
+                        good_trades_kept_pct, bad_trades_removed_pct,
+                        best_single_bad_removed_pct, improvement_over_single,
+                        bad_negative_count, bad_0_to_01_count, bad_01_to_02_count, bad_02_to_03_count,
+                        COALESCE(minute_analyzed, 0) as minute_analyzed, analysis_hours
+                    FROM filter_combinations 
+                    ORDER BY bad_trades_removed_pct DESC
+                    LIMIT 20
+                """)
+                result['combinations'] = cursor.fetchall()
+                
+                # Scheduler runs (get recent runs from filter_scheduler_runs)
+                cursor.execute("""
+                    SELECT 
+                        run_timestamp,
+                        completed_at,
+                        status,
+                        total_filters_analyzed,
+                        filters_saved,
+                        best_bad_removed_pct,
+                        best_good_kept_pct,
+                        analysis_hours,
+                        EXTRACT(EPOCH FROM (completed_at - run_timestamp)) as duration_seconds
+                    FROM filter_scheduler_runs
+                    ORDER BY run_timestamp DESC
+                    LIMIT 20
+                """)
+                scheduler_runs = cursor.fetchall()
+                for run in scheduler_runs:
+                    run['run_timestamp'] = str(run['run_timestamp'])[:19] if run.get('run_timestamp') else None
+                    run['completed_at'] = str(run['completed_at'])[:19] if run.get('completed_at') else None
+                result['scheduler_runs'] = scheduler_runs
+                
+                # Scheduler stats
+                cursor.execute("""
+                    SELECT 
+                        COUNT(*) as runs_today,
+                        MAX(run_timestamp) as last_run
+                    FROM filter_scheduler_runs
+                    WHERE run_timestamp >= CURRENT_DATE
+                """)
+                stats_row = cursor.fetchone()
+                if stats_row:
+                    result['scheduler_stats'] = {
+                        'runs_today': stats_row['runs_today'] or 0,
+                        'last_run': str(stats_row['last_run'])[:19] if stats_row.get('last_run') else None,
+                        'avg_filters': result['summary'].get('total_filters', 0)
+                    }
+                
+                # Filter consistency (filters that appear frequently in best combinations)
+                cursor.execute("""
+                    SELECT 
+                        column_name as filter_column,
+                        COUNT(*) as total_runs,
+                        CAST(AVG(bad_trades_removed_pct) AS NUMERIC(10,1)) as avg_bad_removed,
+                        CAST(AVG(good_trades_kept_pct) AS NUMERIC(10,1)) as avg_good_kept,
+                        MAX(minute_analyzed) as latest_minute,
+                        MAX(from_value) as latest_from,
+                        MAX(to_value) as latest_to,
+                        CAST((COUNT(*) * 100.0 / NULLIF((SELECT COUNT(DISTINCT created_at::date) 
+                            FROM filter_reference_suggestions), 0)) AS NUMERIC(10,1)) as consistency_pct
+                    FROM filter_reference_suggestions
+                    WHERE bad_trades_removed_pct >= 30
+                    GROUP BY column_name
+                    HAVING COUNT(*) >= 2
+                    ORDER BY consistency_pct DESC, avg_bad_removed DESC
+                    LIMIT 50
+                """)
+                result['filter_consistency'] = cursor.fetchall()
+                
+                # AI Play Updates - shows which plays were updated by auto-filter system
+                cursor.execute("""
+                    SELECT 
+                        apu.id, apu.play_id, apu.play_name, apu.project_id, apu.project_name,
+                        apu.pattern_count, apu.filters_applied, apu.updated_at, apu.run_id, apu.status
+                    FROM ai_play_updates apu
+                    ORDER BY apu.updated_at DESC
+                    LIMIT 50
+                """)
+                play_updates = cursor.fetchall()
+                for pu in play_updates:
+                    if pu.get('updated_at'):
+                        pu['updated_at'] = str(pu['updated_at'])[:19]
+                result['play_updates'] = play_updates
+        
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Get filter analysis dashboard failed: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'summary': {},
+            'suggestions': [],
+            'combinations': [],
+            'minute_distribution': [],
+            'scheduler_runs': [],
+            'filter_consistency': [],
+            'trend_chart_data': [],
+            'scheduler_stats': {'runs_today': 0, 'last_run': None, 'avg_filters': 0},
+            'settings': [],
+            'rolling_avgs': {},
+            'play_updates': []
+        })
+
+
+@app.route('/filter-analysis/settings', methods=['GET'])
+def get_filter_settings():
+    """Get auto filter settings."""
+    # For now, return default settings
+    # These could be stored in a settings table in the future
+    return jsonify({
+        'success': True,
+        'settings': [
+            {
+                'setting_key': 'good_trade_threshold',
+                'setting_value': '0.3',
+                'description': 'Good trade threshold percentage',
+                'setting_type': 'decimal',
+                'min_value': 0.1,
+                'max_value': 5.0
+            },
+            {
+                'setting_key': 'analysis_hours',
+                'setting_value': '24',
+                'description': 'Analysis window in hours',
+                'setting_type': 'integer',
+                'min_value': 1,
+                'max_value': 168
+            },
+            {
+                'setting_key': 'min_filters_in_combo',
+                'setting_value': '1',
+                'description': 'Minimum filters in combination',
+                'setting_type': 'integer',
+                'min_value': 1,
+                'max_value': 10
+            }
+        ]
+    })
+
+
+@app.route('/filter-analysis/settings', methods=['POST'])
+def save_filter_settings():
+    """Save auto filter settings."""
+    try:
+        data = request.get_json() or {}
+        settings = data.get('settings', {})
+        
+        # For now, just return success
+        # In the future, these could be stored in a database table
+        return jsonify({
+            'success': True,
+            'message': 'Settings saved successfully',
+            'current_settings': {
+                'good_trade_threshold': settings.get('good_trade_threshold', '0.3'),
+                'analysis_hours': settings.get('analysis_hours', '24'),
+                'min_filters_in_combo': settings.get('min_filters_in_combo', '1')
+            }
+        })
+    except Exception as e:
+        logger.error(f"Save filter settings failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # =============================================================================

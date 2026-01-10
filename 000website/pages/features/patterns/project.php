@@ -10,7 +10,7 @@
 require_once __DIR__ . '/../../../includes/DatabaseClient.php';
 require_once __DIR__ . '/../../../includes/config.php';
 $db = new DatabaseClient(DATABASE_API_URL);
-$api_available = $db->isAvailable();
+$use_duckdb = $db->isAvailable();
 
 // --- Base URL for template ---
 $baseUrl = '';

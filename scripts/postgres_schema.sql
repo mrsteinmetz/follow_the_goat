@@ -578,45 +578,96 @@ CREATE INDEX IF NOT EXISTS idx_tfv_section ON trade_filter_values(section);
 
 CREATE TABLE IF NOT EXISTS filter_fields_catalog (
     id SERIAL PRIMARY KEY,
-    field_name VARCHAR(100) NOT NULL UNIQUE,
-    section VARCHAR(50) NOT NULL,
+    field_name VARCHAR(100) NOT NULL,
+    section VARCHAR(100),
     minute SMALLINT,
-    field_type VARCHAR(20) DEFAULT 'numeric',
+    field_type VARCHAR(50) DEFAULT 'numeric',
     description TEXT,
+    column_name VARCHAR(100),
+    column_prefix VARCHAR(20),
+    data_type VARCHAR(50),
+    value_type VARCHAR(50),
+    is_filterable BOOLEAN DEFAULT TRUE,
+    display_order INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX IF NOT EXISTS idx_filter_catalog_section ON filter_fields_catalog(section);
+CREATE INDEX IF NOT EXISTS idx_filter_catalog_column ON filter_fields_catalog(column_name);
 
 CREATE TABLE IF NOT EXISTS filter_reference_suggestions (
     id SERIAL PRIMARY KEY,
-    field_name VARCHAR(100) NOT NULL,
-    min_value DOUBLE PRECISION,
-    max_value DOUBLE PRECISION,
-    avg_value DOUBLE PRECISION,
-    median_value DOUBLE PRECISION,
-    sample_count INTEGER,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_filter_suggestions_field ON filter_reference_suggestions(field_name);
-
-CREATE TABLE IF NOT EXISTS filter_combinations (
-    id BIGSERIAL PRIMARY KEY,
-    project_id INTEGER,
-    filters_applied JSONB,
-    winning_trades INTEGER DEFAULT 0,
-    losing_trades INTEGER DEFAULT 0,
-    win_rate DOUBLE PRECISION,
-    avg_profit DOUBLE PRECISION,
-    total_profit DOUBLE PRECISION,
-    sample_size INTEGER,
-    confidence_score DOUBLE PRECISION,
+    filter_field_id INTEGER,
+    column_name VARCHAR(100) NOT NULL,
+    from_value DOUBLE PRECISION,
+    to_value DOUBLE PRECISION,
+    total_trades INTEGER,
+    good_trades_before INTEGER,
+    bad_trades_before INTEGER,
+    good_trades_after INTEGER,
+    bad_trades_after INTEGER,
+    good_trades_kept_pct DOUBLE PRECISION,
+    bad_trades_removed_pct DOUBLE PRECISION,
+    bad_negative_count INTEGER,
+    bad_0_to_01_count INTEGER,
+    bad_01_to_02_count INTEGER,
+    bad_02_to_03_count INTEGER,
+    analysis_hours INTEGER,
+    minute_analyzed INTEGER,
+    section VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_filter_combos_project ON filter_combinations(project_id);
-CREATE INDEX IF NOT EXISTS idx_filter_combos_win_rate ON filter_combinations(win_rate);
+CREATE INDEX IF NOT EXISTS idx_filter_suggestions_column ON filter_reference_suggestions(column_name);
+CREATE INDEX IF NOT EXISTS idx_filter_suggestions_section ON filter_reference_suggestions(section);
+CREATE INDEX IF NOT EXISTS idx_filter_suggestions_minute ON filter_reference_suggestions(minute_analyzed);
+
+CREATE TABLE IF NOT EXISTS filter_combinations (
+    id SERIAL PRIMARY KEY,
+    combination_name VARCHAR(255),
+    filter_count INTEGER,
+    filter_ids TEXT,
+    filter_columns TEXT,
+    total_trades INTEGER,
+    good_trades_before INTEGER,
+    bad_trades_before INTEGER,
+    good_trades_after INTEGER,
+    bad_trades_after INTEGER,
+    good_trades_kept_pct DOUBLE PRECISION,
+    bad_trades_removed_pct DOUBLE PRECISION,
+    best_single_bad_removed_pct DOUBLE PRECISION,
+    improvement_over_single DOUBLE PRECISION,
+    bad_negative_count INTEGER,
+    bad_0_to_01_count INTEGER,
+    bad_01_to_02_count INTEGER,
+    bad_02_to_03_count INTEGER,
+    analysis_hours INTEGER,
+    minute_analyzed INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_filter_combos_filter_count ON filter_combinations(filter_count);
+CREATE INDEX IF NOT EXISTS idx_filter_combos_minute ON filter_combinations(minute_analyzed);
+
+-- =============================================================================
+-- AI PLAY UPDATES (tracks automatic filter updates to plays)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS ai_play_updates (
+    id SERIAL PRIMARY KEY,
+    play_id INTEGER NOT NULL,
+    play_name VARCHAR(255),
+    project_id INTEGER,
+    project_name VARCHAR(255),
+    pattern_count INTEGER DEFAULT 0,
+    filters_applied INTEGER DEFAULT 0,
+    run_id VARCHAR(50),
+    status VARCHAR(50) DEFAULT 'success',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_play_updates_play_id ON ai_play_updates(play_id);
+CREATE INDEX IF NOT EXISTS idx_ai_play_updates_updated_at ON ai_play_updates(updated_at);
 
 -- =============================================================================
 -- JOB EXECUTION METRICS (for scheduler monitoring)
@@ -656,7 +707,7 @@ BEGIN
         'price_points', 'price_analysis', 'wallet_profiles', 'wallet_profiles_state',
         'pattern_config_projects', 'pattern_config_filters', 'buyin_trail_minutes',
         'trade_filter_values', 'filter_fields_catalog', 'filter_reference_suggestions',
-        'filter_combinations', 'job_execution_metrics'
+        'filter_combinations', 'ai_play_updates', 'job_execution_metrics'
     );
     
     RAISE NOTICE 'Schema migration complete! Created % tables.', table_count;

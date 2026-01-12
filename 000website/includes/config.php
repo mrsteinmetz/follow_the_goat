@@ -12,10 +12,10 @@
 define('WSL_HOST_IP', getenv('WSL_HOST_IP') ?: '172.19.254.84');
 
 // PostgreSQL API URL (Flask website_api.py server)
-// Use 127.0.0.1 for fastest local connections
+// Use server IP for external access (required for CORS)
 // Port 5051 = Website API (can restart freely)
 // Port 5052 = Trading Logic API (master2.py local API)
-define('DATABASE_API_URL', 'http://127.0.0.1:5051');
+define('DATABASE_API_URL', 'http://195.201.84.5:5051');
 
 // Legacy alias for backward compatibility
 define('DUCKDB_API_URL', DATABASE_API_URL);

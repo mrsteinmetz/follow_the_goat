@@ -43,9 +43,9 @@ if (!$start_sec || !$end_sec) {
     exit;
 }
 
-// Convert Unix timestamps to datetime strings
-$start_datetime = date('Y-m-d H:i:s', $start_sec);
-$end_datetime = date('Y-m-d H:i:s', $end_sec);
+// Convert Unix timestamps to datetime strings (MUST use gmdate for UTC)
+$start_datetime = gmdate('Y-m-d H:i:s', $start_sec);
+$end_datetime = gmdate('Y-m-d H:i:s', $end_sec);
 
 try {
     // Fetch price points from DuckDB API

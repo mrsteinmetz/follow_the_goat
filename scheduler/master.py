@@ -29,6 +29,7 @@ import os
 import signal
 import threading
 import atexit
+import fcntl  # For atomic file locking
 import subprocess
 import time
 from pathlib import Path
@@ -770,9 +771,97 @@ def create_scheduler() -> BackgroundScheduler:
     return scheduler
 
 
+# =============================================================================
+# INSTANCE LOCKING - Using fcntl for atomic locking  
+# =============================================================================
+
+_lock_file_handle = None  # Keep file handle open to maintain lock
+
+def acquire_lock():
+    """
+    Acquire an exclusive lock to prevent multiple instances.
+    Uses fcntl for atomic file locking (prevents race conditions).
+    Returns True if lock acquired, False if another instance is running.
+    """
+    global _lock_file_handle
+    
+    lock_file = PROJECT_ROOT / "scheduler" / "master.lock"
+    
+    try:
+        # Open lock file (create if doesn't exist)
+        _lock_file_handle = open(lock_file, 'w')
+        
+        # Try to acquire exclusive lock (non-blocking)
+        # LOCK_EX = exclusive lock, LOCK_NB = non-blocking
+        fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Write our PID to the lock file
+        _lock_file_handle.write(str(os.getpid()))
+        _lock_file_handle.flush()
+        
+        logger.info(f"✓ Lock acquired (PID: {os.getpid()})")
+        return True
+        
+    except BlockingIOError:
+        # Another process holds the lock
+        try:
+            # Try to read the PID of the process holding the lock
+            with open(lock_file, 'r') as f:
+                pid = f.read().strip()
+            logger.error(f"✗ Another instance of master.py is already running (PID: {pid})")
+        except:
+            logger.error(f"✗ Another instance of master.py is already running")
+            
+        logger.error("To force start, kill the existing process or delete the lock file:")
+        logger.error(f"  pkill -f 'scheduler/master.py' && rm {lock_file}")
+        
+        if _lock_file_handle:
+            _lock_file_handle.close()
+            _lock_file_handle = None
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to acquire lock: {e}")
+        if _lock_file_handle:
+            _lock_file_handle.close()
+            _lock_file_handle = None
+        return False
+
+
+def release_lock():
+    """Release the exclusive lock and remove lock file."""
+    global _lock_file_handle
+    
+    lock_file = PROJECT_ROOT / "scheduler" / "master.lock"
+    
+    try:
+        if _lock_file_handle:
+            # Release the lock
+            fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_UN)
+            _lock_file_handle.close()
+            _lock_file_handle = None
+            logger.info("Lock released")
+        
+        # Remove lock file
+        if lock_file.exists():
+            lock_file.unlink()
+            
+    except Exception as e:
+        logger.warning(f"Failed to release lock: {e}")
+
+
 def main():
     """Start the data ingestion services and scheduler."""
     global _scheduler
+    
+    # =====================================================
+    # CHECK FOR EXISTING INSTANCE
+    # =====================================================
+    if not acquire_lock():
+        sys.exit(1)
+    
+    # Register lock cleanup on exit
+    atexit.register(release_lock)
     
     # =====================================================
     # SETUP SIGNAL HANDLERS FOR CLEAN SHUTDOWN
@@ -781,6 +870,7 @@ def main():
         """Handle shutdown signals gracefully."""
         sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
         logger.info(f"\nReceived {sig_name} signal")
+        release_lock()
         shutdown_all()
         sys.exit(0)
     
@@ -929,6 +1019,9 @@ def main():
 def shutdown_all():
     """Gracefully shutdown all services in the correct order."""
     global _binance_collector, _scheduler
+    
+    # Release lock first
+    release_lock()
     
     logger.info("=" * 60)
     logger.info("SHUTTING DOWN - Please wait...")

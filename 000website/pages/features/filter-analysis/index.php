@@ -107,10 +107,14 @@ if (!$api_available) {
 $currentThreshold = '0.3';
 $currentHours = '24';
 $currentMinFilters = '1';
+$currentMinGoodKept = '50';
+$currentMinBadRemoved = '10';
 foreach ($auto_filter_settings as $s) {
     if ($s['setting_key'] === 'good_trade_threshold') $currentThreshold = $s['setting_value'];
     if ($s['setting_key'] === 'analysis_hours') $currentHours = $s['setting_value'];
     if ($s['setting_key'] === 'min_filters_in_combo') $currentMinFilters = $s['setting_value'];
+    if ($s['setting_key'] === 'min_good_trades_kept_pct') $currentMinGoodKept = $s['setting_value'];
+    if ($s['setting_key'] === 'min_bad_trades_removed_pct') $currentMinBadRemoved = $s['setting_value'];
 }
 
 // Prepare chart data for JavaScript
@@ -354,7 +358,7 @@ ob_start();
         <h6 class="mb-0"><i class="ri-settings-3-line me-1"></i>Auto Filter Settings</h6>
         <div class="d-flex align-items-center gap-2">
             <span class="badge bg-info-transparent" id="settingsStatus">
-                Good: <?php echo $currentThreshold; ?>% | Hours: <?php echo $currentHours; ?> | Min Filters: <?php echo $currentMinFilters; ?>
+                Good: <?php echo $currentThreshold; ?>% | Hours: <?php echo $currentHours; ?> | Min Filters: <?php echo $currentMinFilters; ?> | Min Good: <?php echo $currentMinGoodKept; ?>% | Min Bad: <?php echo $currentMinBadRemoved; ?>%
             </span>
             <i class="ri-arrow-down-s-line fs-18" id="settingsArrow"></i>
         </div>
@@ -390,6 +394,23 @@ ob_start();
                                value="<?php echo htmlspecialchars($currentMinFilters); ?>" 
                                min="1" max="10">
                         <small class="text-muted">Current: <?php echo $currentMinFilters; ?> (Default: 1)</small>
+                    </div>
+                </div>
+                
+                <div class="row g-3 mt-2">
+                    <div class="col-md-6">
+                        <label class="form-label fw-semibold">Min Good Trades Kept (%)</label>
+                        <input type="number" class="form-control" name="min_good_trades_kept_pct" 
+                               value="<?php echo htmlspecialchars($currentMinGoodKept); ?>" 
+                               step="1" min="0" max="100">
+                        <small class="text-muted">Filters must keep at least this % of good trades (Default: 50%)</small>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label fw-semibold">Min Bad Trades Removed (%)</label>
+                        <input type="number" class="form-control" name="min_bad_trades_removed_pct" 
+                               value="<?php echo htmlspecialchars($currentMinBadRemoved); ?>" 
+                               step="1" min="0" max="100">
+                        <small class="text-muted">Filters must remove at least this % of bad trades (Default: 10%)</small>
                     </div>
                 </div>
                 
@@ -774,11 +795,24 @@ ob_start();
                 <option value="<?php echo $key; ?>"><?php echo $name; ?></option>
                 <?php endforeach; ?>
             </select>
+            <select id="minuteFilter" class="form-select form-select-sm" style="width: auto;" onchange="filterTable()">
+                <option value="">All Minutes</option>
+                <?php for ($m = 0; $m < 15; $m++): ?>
+                    <option value="<?php echo $m; ?>">Minute <?php echo $m; ?></option>
+                <?php endfor; ?>
+            </select>
             <select id="minBadRemoved" class="form-select form-select-sm" style="width: auto;" onchange="filterTable()">
                 <option value="0">All Bad %</option>
                 <option value="30">≥ 30%</option>
                 <option value="40">≥ 40%</option>
                 <option value="50">≥ 50%</option>
+                <option value="60">≥ 60%</option>
+            </select>
+            <select id="minGoodKept" class="form-select form-select-sm" style="width: auto;" onchange="filterTable()">
+                <option value="0">All Good %</option>
+                <option value="60">≥ 60%</option>
+                <option value="70">≥ 70%</option>
+                <option value="80">≥ 80%</option>
             </select>
         </div>
     </div>
@@ -802,7 +836,10 @@ ob_start();
                         $eff_class = get_effectiveness_class($filter['bad_trades_removed_pct'], $filter['good_trades_kept_pct']);
                         $score = ($filter['bad_trades_removed_pct'] * $filter['good_trades_kept_pct']) / 100;
                     ?>
-                    <tr data-section="<?php echo $filter['section']; ?>" data-bad-removed="<?php echo $filter['bad_trades_removed_pct']; ?>">
+                    <tr data-section="<?php echo $filter['section']; ?>" 
+                        data-bad-removed="<?php echo $filter['bad_trades_removed_pct']; ?>"
+                        data-good-kept="<?php echo $filter['good_trades_kept_pct']; ?>"
+                        data-minute="<?php echo $filter['minute_analyzed'] ?? 0; ?>">
                         <td><strong class="fs-12"><?php echo htmlspecialchars($filter['column_name']); ?></strong></td>
                         <td class="fs-11"><?php echo $section_names[$filter['section']] ?? $filter['section']; ?></td>
                         <td><span class="badge bg-purple-transparent text-purple">M<?php echo $filter['minute_analyzed'] ?? 0; ?></span></td>
@@ -830,15 +867,21 @@ ob_start();
 <script>
     function filterTable() {
         const section = document.getElementById('sectionFilter').value;
+        const minute = document.getElementById('minuteFilter').value;
         const minBadRemoved = parseFloat(document.getElementById('minBadRemoved').value) || 0;
+        const minGoodKept = parseFloat(document.getElementById('minGoodKept').value) || 0;
         
         document.querySelectorAll('#filtersTable tbody tr').forEach(row => {
             const rowSection = row.dataset.section;
+            const rowMinute = row.dataset.minute;
             const badRemoved = parseFloat(row.dataset.badRemoved);
+            const goodKept = parseFloat(row.dataset.goodKept);
             
             let show = true;
             if (section && rowSection !== section) show = false;
+            if (minute && rowMinute !== minute) show = false;
             if (badRemoved < minBadRemoved) show = false;
+            if (goodKept < minGoodKept) show = false;
             
             row.style.display = show ? '' : 'none';
         });
@@ -912,7 +955,7 @@ ob_start();
         formData.forEach((value, key) => settings[key] = value);
         
         try {
-            const response = await fetch('<?php echo DUCKDB_API_URL; ?>/filter-analysis/settings', {
+            const response = await fetch('<?php echo DATABASE_API_URL; ?>/filter-analysis/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ settings })
@@ -928,7 +971,7 @@ ob_start();
                 const statusBadge = document.getElementById('settingsStatus');
                 if (statusBadge && result.current_settings) {
                     const s = result.current_settings;
-                    statusBadge.textContent = `Good: ${s.good_trade_threshold || '0.3'}% | Hours: ${s.analysis_hours || '24'} | Min Filters: ${s.min_filters_in_combo || '1'}`;
+                    statusBadge.textContent = `Good: ${s.good_trade_threshold || '0.3'}% | Hours: ${s.analysis_hours || '24'} | Min Filters: ${s.min_filters_in_combo || '1'} | Min Good: ${s.min_good_trades_kept_pct || '50'}% | Min Bad: ${s.min_bad_trades_removed_pct || '10'}%`;
                 }
                 
                 setTimeout(() => {
@@ -962,7 +1005,9 @@ ob_start();
         const defaults = {
             'good_trade_threshold': '0.3',
             'analysis_hours': '24',
-            'min_filters_in_combo': '1'
+            'min_filters_in_combo': '1',
+            'min_good_trades_kept_pct': '50',
+            'min_bad_trades_removed_pct': '10'
         };
         
         for (const [key, value] of Object.entries(defaults)) {

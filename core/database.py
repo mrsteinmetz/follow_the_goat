@@ -79,7 +79,8 @@ class PostgreSQLPool:
                 logger.info("✓ Test connection successful")
                 
                 # Create connection pool with 1-10 connections (reduced for stability)
-                self._pool = psycopg2.pool.SimpleConnectionPool(
+                # Use ThreadedConnectionPool for better thread safety in APScheduler
+                self._pool = psycopg2.pool.ThreadedConnectionPool(
                     minconn=1,
                     maxconn=10,
                     host=settings.postgres.host,
@@ -110,7 +111,8 @@ class PostgreSQLPool:
         
         try:
             conn = self._pool.getconn()
-            conn.autocommit = True  # Auto-commit for simplicity
+            # DO NOT call conn.rollback() here - it closes cursors in concurrent threads!
+            # psycopg2 connection pool handles transaction state automatically
             return conn
         except Exception as e:
             logger.error(f"Failed to get PostgreSQL connection from pool: {e}")
@@ -151,6 +153,7 @@ def get_postgres():
     Context manager for PostgreSQL connections.
     
     Gets a connection from the pool and automatically returns it when done.
+    Automatically commits on successful completion or rolls back on error.
     
     Usage:
         with get_postgres() as conn:
@@ -165,6 +168,8 @@ def get_postgres():
     try:
         conn = _pool.get_connection()
         yield conn
+        # Commit on successful completion
+        conn.commit()
     except Exception as e:
         logger.error(f"PostgreSQL connection error: {e}")
         if conn:
@@ -202,14 +207,14 @@ def close_all_postgres():
 def postgres_execute(sql: str, params: List[Any] = None) -> int:
     """
     Execute a write query (INSERT/UPDATE/DELETE) on PostgreSQL.
-    
+
     Args:
         sql: SQL query string
         params: Query parameters (optional)
-    
+
     Returns:
         Number of rows affected
-    
+
     Example:
         rows = postgres_execute(
             "INSERT INTO prices (timestamp, token, price) VALUES (%s, %s, %s)",
@@ -219,6 +224,7 @@ def postgres_execute(sql: str, params: List[Any] = None) -> int:
     with get_postgres() as conn:
         with conn.cursor() as cursor:
             cursor.execute(sql, params or [])
+            conn.commit()  # Explicitly commit the transaction
             return cursor.rowcount
 
 

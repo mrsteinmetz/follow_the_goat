@@ -88,6 +88,15 @@ if (!$api_available) {
         exit;
     }
     
+    // Fetch all pattern config projects for the dropdown
+    $pattern_projects = [];
+    $timing['before_pattern_projects_query'] = microtime(true);
+    $projects_result = $client->getPatternProjects();
+    $timing['after_pattern_projects_query'] = microtime(true);
+    if ($projects_result && isset($projects_result['projects'])) {
+        $pattern_projects = $projects_result['projects'];
+    }
+    
     // Fetch trades from API
     // For play 46 (training validator), use shorter window (24h) due to high volume
     // Other plays use 168h (7 days)
@@ -155,6 +164,9 @@ $timing['page_ready'] = microtime(true);
 $timing_report = [];
 if (isset($timing['after_play_query'], $timing['before_play_query'])) {
     $timing_report['Play Query'] = ($timing['after_play_query'] - $timing['before_play_query']) * 1000;
+}
+if (isset($timing['after_pattern_projects_query'], $timing['before_pattern_projects_query'])) {
+    $timing_report['Pattern Projects Query'] = ($timing['after_pattern_projects_query'] - $timing['before_pattern_projects_query']) * 1000;
 }
 if (isset($timing['after_trades_query'], $timing['before_trades_query'])) {
     $timing_report['Trades Query'] = ($timing['after_trades_query'] - $timing['before_trades_query']) * 1000;
@@ -564,6 +576,112 @@ ob_start();
             <div class="form-text">Control which wallet types trigger this play based on their perpetual position</div>
         </div>
 
+        <!-- Timing Conditions Section -->
+        <div class="card custom-card mb-3">
+            <div class="card-body">
+                <div class="form-check mb-3">
+                    <input type="checkbox" class="form-check-input" id="enable_timing" name="timing_enabled" value="1">
+                    <label class="form-check-label fw-semibold" for="enable_timing">Enable Timing Conditions</label>
+                </div>
+                <div id="timing_settings" style="display: none;">
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <label class="form-label">Price Direction:</label>
+                            <select class="form-select" id="timing_price_direction" name="timing_price_direction">
+                                <option value="decrease">Decrease ↓</option>
+                                <option value="increase">Increase ↑</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Time Window (seconds):</label>
+                            <input type="number" class="form-control" id="timing_time_window" name="timing_time_window" min="1" step="1" placeholder="e.g., 60">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">Price Change Threshold (decimal):</label>
+                            <input type="number" class="form-control" id="timing_price_threshold" name="timing_price_threshold" min="0" step="0.001" placeholder="e.g., 0.005">
+                            <div class="form-text">0.005 = 0.5% change</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Bundle Trades Section -->
+        <div class="card custom-card mb-3">
+            <div class="card-body">
+                <div class="form-check mb-3">
+                    <input type="checkbox" class="form-check-input" id="enable_bundle_trades" name="bundle_enabled" value="1">
+                    <label class="form-check-label fw-semibold" for="enable_bundle_trades">Enable Bundle Trades</label>
+                </div>
+                <div id="bundle_trades_settings" style="display: none;">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label">Number of Trades:</label>
+                            <input type="number" class="form-control" id="bundle_num_trades" name="bundle_num_trades" min="1" step="1" placeholder="e.g., 3">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Within Seconds:</label>
+                            <input type="number" class="form-control" id="bundle_seconds" name="bundle_seconds" min="1" step="1" placeholder="e.g., 15">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Cache Found Wallets Section -->
+        <div class="card custom-card mb-3">
+            <div class="card-body">
+                <div class="form-check mb-3">
+                    <input type="checkbox" class="form-check-input" id="enable_cashe_wallets" name="cashe_enabled" value="1">
+                    <label class="form-check-label fw-semibold" for="enable_cashe_wallets">Cache Found Wallets</label>
+                </div>
+                <div id="cashe_wallets_settings" style="display: none;">
+                    <div>
+                        <label class="form-label">Cache Duration (seconds):</label>
+                        <input type="number" class="form-control" id="cashe_seconds" name="cashe_seconds" min="1" step="1" placeholder="e.g., 300" style="max-width: 200px;">
+                        <div class="form-text" id="cashe_time_display">How long to cache wallet results</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Pattern Validator Settings Section -->
+        <div class="card custom-card mb-3">
+            <div class="card-body">
+                <h6 class="fw-semibold mb-3">Pattern Validator Settings</h6>
+                
+                <div class="mb-3">
+                    <label class="form-label" for="edit_project_ids">Pattern Config Projects</label>
+                    <select class="form-select" id="edit_project_ids" name="project_ids[]" multiple size="5" style="min-height: 120px;">
+                        <?php foreach ($pattern_projects as $project): ?>
+                        <option value="<?php echo $project['id']; ?>">
+                            <?php echo htmlspecialchars($project['name']); ?>
+                            <?php if (isset($project['filter_count'])): ?>
+                                (<?php echo $project['filter_count']; ?> filters)
+                            <?php endif; ?>
+                        </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <div class="form-text">Hold Ctrl (Cmd on Mac) to select multiple projects for trade validation. Leave empty for no project filter.</div>
+                </div>
+                
+                <div class="form-check mb-3">
+                    <input type="checkbox" class="form-check-input" id="edit_pattern_validator_enable" name="pattern_validator_enable" value="1">
+                    <label class="form-check-label fw-semibold" for="edit_pattern_validator_enable">Enable Pattern Validator</label>
+                    <div class="form-text">When enabled, trades will be validated against pattern rules before execution</div>
+                </div>
+                <div class="form-check mb-3">
+                    <input type="checkbox" class="form-check-input" id="edit_pattern_update_by_ai" name="pattern_update_by_ai" value="1">
+                    <label class="form-check-label fw-semibold" for="edit_pattern_update_by_ai">AI Auto-Update Pattern Config</label>
+                    <div class="form-text">Let AI automatically select the best performing filter projects</div>
+                </div>
+                <div id="ai_update_notice" class="alert alert-info mb-0" style="display: none;">
+                    <i class="ri-robot-line me-2"></i>
+                    <strong>AI Management Enabled:</strong> Projects will be automatically selected based on the best performing filters. The project selector above has been disabled.
+                </div>
+            </div>
+        </div>
+
         <div class="form-actions">
             <button type="submit" class="btn btn-primary" id="updatePlayBtn" <?php echo $is_restricted_play ? 'disabled' : ''; ?>>Update Play</button>
             <button type="button" class="btn btn-secondary" onclick="toggleEditForm()">Cancel</button>
@@ -924,7 +1042,7 @@ ob_start();
             return;
         }
         try {
-            const response = await fetch(API_BASE + '/plays/' + playId, {
+            const response = await fetch(API_BASE + '?endpoint=/plays/' + playId, {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ sorting: parseInt(sorting) })
@@ -969,7 +1087,7 @@ ob_start();
         const playId = <?php echo $play_id; ?>;
         
         try {
-            const response = await fetch(API_BASE + '/plays/' + playId + '/for_edit');
+            const response = await fetch(API_BASE + '?endpoint=/plays/' + playId + '/for_edit');
             
             if (!response.ok) {
                 const errorText = await response.text();
@@ -990,6 +1108,103 @@ ob_start();
                 
                 const triggerMode = data.trigger_on_perp?.mode || 'any';
                 document.getElementById('edit_trigger_on_perp').value = triggerMode;
+                
+                // Handle timing conditions
+                if (data.timing_conditions && data.timing_conditions.enabled) {
+                    document.getElementById('enable_timing').checked = true;
+                    document.getElementById('timing_settings').style.display = 'block';
+                    document.getElementById('timing_price_direction').value = data.timing_conditions.price_direction || 'decrease';
+                    document.getElementById('timing_time_window').value = data.timing_conditions.time_window_seconds || '';
+                    document.getElementById('timing_price_threshold').value = data.timing_conditions.price_change_threshold || '';
+                } else {
+                    document.getElementById('enable_timing').checked = false;
+                    document.getElementById('timing_settings').style.display = 'none';
+                }
+                
+                // Handle bundle trades
+                if (data.bundle_trades && data.bundle_trades.enabled) {
+                    document.getElementById('enable_bundle_trades').checked = true;
+                    document.getElementById('bundle_trades_settings').style.display = 'block';
+                    document.getElementById('bundle_num_trades').value = data.bundle_trades.num_trades || '';
+                    document.getElementById('bundle_seconds').value = data.bundle_trades.seconds || '';
+                } else {
+                    document.getElementById('enable_bundle_trades').checked = false;
+                    document.getElementById('bundle_trades_settings').style.display = 'none';
+                }
+                
+                // Handle cache wallets
+                if (data.cashe_wallets && data.cashe_wallets.enabled) {
+                    document.getElementById('enable_cashe_wallets').checked = true;
+                    document.getElementById('cashe_wallets_settings').style.display = 'block';
+                    document.getElementById('cashe_seconds').value = data.cashe_wallets.seconds || '';
+                    document.getElementById('cashe_seconds').dispatchEvent(new Event('input'));
+                } else {
+                    document.getElementById('enable_cashe_wallets').checked = false;
+                    document.getElementById('cashe_wallets_settings').style.display = 'none';
+                }
+                
+                // Handle multi-select for project_ids
+                const projectSelect = document.getElementById('edit_project_ids');
+                if (projectSelect) {
+                    let projectIds = data.project_ids || [];
+                    
+                    // Handle case where project_ids might be a string (e.g., "[1,2]" or "1,2")
+                    if (typeof projectIds === 'string') {
+                        try {
+                            projectIds = JSON.parse(projectIds);
+                        } catch (e) {
+                            // Fallback: try comma-separated
+                            projectIds = projectIds.split(',').map(id => parseInt(id.trim())).filter(id => !isNaN(id));
+                        }
+                    }
+                    
+                    // Ensure all IDs are integers for comparison
+                    const projectIdNumbers = Array.isArray(projectIds) 
+                        ? projectIds.map(id => parseInt(id)).filter(id => !isNaN(id))
+                        : [];
+                    
+                    // Clear all selections first, then set the correct ones
+                    Array.from(projectSelect.options).forEach(opt => {
+                        const optValue = parseInt(opt.value);
+                        const shouldSelect = projectIdNumbers.includes(optValue);
+                        opt.selected = shouldSelect;
+                    });
+                }
+                
+                // Handle pattern validator settings
+                const patternValidatorEnabled = data.pattern_validator_enable == 1;
+                const patternUpdateByAi = data.pattern_update_by_ai == 1;
+                
+                document.getElementById('edit_pattern_validator_enable').checked = patternValidatorEnabled;
+                document.getElementById('edit_pattern_update_by_ai').checked = patternUpdateByAi;
+                
+                // Apply AI update state to UI elements
+                const validatorEnableCheckbox = document.getElementById('edit_pattern_validator_enable');
+                const aiNotice = document.getElementById('ai_update_notice');
+                
+                if (patternUpdateByAi) {
+                    // Auto-enable pattern validator when AI update is enabled
+                    validatorEnableCheckbox.checked = true;
+                    validatorEnableCheckbox.disabled = true;
+                    
+                    // Disable and grey out project selector
+                    if (projectSelect) {
+                        projectSelect.disabled = true;
+                        projectSelect.style.opacity = '0.5';
+                        projectSelect.style.cursor = 'not-allowed';
+                    }
+                    aiNotice.style.display = 'block';
+                } else {
+                    validatorEnableCheckbox.disabled = false;
+                    
+                    // Re-enable project selector
+                    if (projectSelect) {
+                        projectSelect.disabled = false;
+                        projectSelect.style.opacity = '1';
+                        projectSelect.style.cursor = '';
+                    }
+                    aiNotice.style.display = 'none';
+                }
                 
                 document.getElementById('edit-decreases-container').innerHTML = '';
                 document.getElementById('edit-increases-container').innerHTML = '';
@@ -1121,6 +1336,34 @@ ob_start();
         submitBtn.innerHTML = '<i class="ri-loader-4-line me-1"></i>Updating...';
         
         try {
+            // Get project_ids from multi-select
+            const projectSelect = document.getElementById('edit_project_ids');
+            const selectedProjects = Array.from(projectSelect.selectedOptions).map(opt => parseInt(opt.value));
+            
+            // Build timing conditions
+            const timingEnabled = document.getElementById('enable_timing').checked;
+            const timingConditions = {
+                enabled: timingEnabled,
+                price_direction: timingEnabled ? document.getElementById('timing_price_direction').value : 'decrease',
+                time_window_seconds: timingEnabled ? parseInt(document.getElementById('timing_time_window').value) || 60 : 60,
+                price_change_threshold: timingEnabled ? parseFloat(document.getElementById('timing_price_threshold').value) || 0.005 : 0.005
+            };
+            
+            // Build bundle trades
+            const bundleEnabled = document.getElementById('enable_bundle_trades').checked;
+            const bundleTrades = {
+                enabled: bundleEnabled,
+                num_trades: bundleEnabled ? parseInt(document.getElementById('bundle_num_trades').value) || null : null,
+                seconds: bundleEnabled ? parseInt(document.getElementById('bundle_seconds').value) || null : null
+            };
+            
+            // Build cache wallets
+            const casheEnabled = document.getElementById('enable_cashe_wallets').checked;
+            const casheWallets = {
+                enabled: casheEnabled,
+                seconds: casheEnabled ? parseInt(document.getElementById('cashe_seconds').value) || null : null
+            };
+            
             const data = {
                 name: form.querySelector('[name="name"]').value,
                 description: form.querySelector('[name="description"]').value,
@@ -1128,10 +1371,16 @@ ob_start();
                 sell_logic: buildSellLogic(form),
                 max_buys_per_cycle: parseInt(form.querySelector('[name="max_buys_per_cycle"]').value),
                 short_play: form.querySelector('[name="short_play"]').checked ? 1 : 0,
-                trigger_on_perp: { mode: form.querySelector('[name="trigger_on_perp"]').value }
+                trigger_on_perp: { mode: form.querySelector('[name="trigger_on_perp"]').value },
+                timing_conditions: timingConditions,
+                bundle_trades: bundleTrades,
+                cashe_wallets: casheWallets,
+                pattern_validator_enable: document.getElementById('edit_pattern_validator_enable').checked ? 1 : 0,
+                pattern_update_by_ai: document.getElementById('edit_pattern_update_by_ai').checked ? 1 : 0,
+                project_ids: selectedProjects
             };
             
-            const response = await fetch(API_BASE + '/plays/' + window.playId, {
+            const response = await fetch(API_BASE + '?endpoint=/plays/' + window.playId, {
                 method: 'PUT',
                 headers: {
                     'Content-Type': 'application/json',
@@ -1169,7 +1418,7 @@ ob_start();
         }
         
         try {
-            const response = await fetch(API_BASE + '/plays/' + window.playId, { method: 'DELETE' });
+            const response = await fetch(API_BASE + '?endpoint=/plays/' + window.playId, { method: 'DELETE' });
             const data = await response.json();
             
             if (data.success) {
@@ -1191,6 +1440,70 @@ ob_start();
             input.addEventListener('input', function() {
                 updatePipConversion(this);
             });
+        });
+        
+        // Timing conditions toggle
+        document.getElementById('enable_timing').addEventListener('change', function(e) {
+            document.getElementById('timing_settings').style.display = e.target.checked ? 'block' : 'none';
+        });
+        
+        // Bundle trades toggle
+        document.getElementById('enable_bundle_trades').addEventListener('change', function(e) {
+            document.getElementById('bundle_trades_settings').style.display = e.target.checked ? 'block' : 'none';
+        });
+        
+        // Cache wallets toggle
+        document.getElementById('enable_cashe_wallets').addEventListener('change', function(e) {
+            document.getElementById('cashe_wallets_settings').style.display = e.target.checked ? 'block' : 'none';
+        });
+        
+        // Cache duration display updater
+        document.getElementById('cashe_seconds').addEventListener('input', function(e) {
+            const seconds = parseInt(e.target.value) || 0;
+            const display = document.getElementById('cashe_time_display');
+            
+            if (seconds < 60) {
+                display.textContent = `= ${seconds} second${seconds !== 1 ? 's' : ''}`;
+            } else if (seconds < 3600) {
+                const minutes = (seconds / 60).toFixed(1);
+                display.textContent = `= ${minutes} minute${minutes !== '1.0' ? 's' : ''}`;
+            } else {
+                const hours = (seconds / 3600).toFixed(2);
+                display.textContent = `= ${hours} hour${hours !== '1.00' ? 's' : ''}`;
+            }
+        });
+        
+        // Pattern Validator AI Update checkbox handler
+        document.getElementById('edit_pattern_update_by_ai').addEventListener('change', function(e) {
+            const aiEnabled = e.target.checked;
+            const validatorEnableCheckbox = document.getElementById('edit_pattern_validator_enable');
+            const projectSelect = document.getElementById('edit_project_ids');
+            const aiNotice = document.getElementById('ai_update_notice');
+            
+            if (aiEnabled) {
+                // Auto-enable pattern validator when AI update is enabled
+                validatorEnableCheckbox.checked = true;
+                validatorEnableCheckbox.disabled = true;
+                
+                // Disable and grey out project selector
+                projectSelect.disabled = true;
+                projectSelect.style.opacity = '0.5';
+                projectSelect.style.cursor = 'not-allowed';
+                
+                // Show AI notice
+                aiNotice.style.display = 'block';
+            } else {
+                // Re-enable pattern validator checkbox
+                validatorEnableCheckbox.disabled = false;
+                
+                // Re-enable project selector
+                projectSelect.disabled = false;
+                projectSelect.style.opacity = '1';
+                projectSelect.style.cursor = '';
+                
+                // Hide AI notice
+                aiNotice.style.display = 'none';
+            }
         });
     });
     

@@ -160,6 +160,8 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     
     pivot_sql = ",\n                ".join(pivot_columns)
     
+    # OPTIMIZATION: Use a subquery to limit the number of buyins analyzed
+    # This prevents timeouts when there are millions of filter values
     query = f"""
         SELECT 
             b.id as trade_id,
@@ -169,10 +171,15 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
             b.our_status,
             tfv.minute,
             {pivot_sql}
-        FROM follow_the_goat_buyins b
+        FROM (
+            SELECT id, play_id, followed_at, potential_gains, our_status
+            FROM follow_the_goat_buyins
+            WHERE potential_gains IS NOT NULL
+              AND followed_at >= NOW() - INTERVAL '{hours} hours'
+            ORDER BY followed_at DESC
+            LIMIT 5000
+        ) b
         INNER JOIN trade_filter_values tfv ON tfv.buyin_id = b.id
-        WHERE b.potential_gains IS NOT NULL
-          AND b.followed_at >= NOW() - INTERVAL '{hours} hours'
         GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute
         ORDER BY b.id, tfv.minute
     """

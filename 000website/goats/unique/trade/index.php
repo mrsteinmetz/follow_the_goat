@@ -8,9 +8,10 @@
 date_default_timezone_set('UTC');
 
 // --- Load Database Client ---
+require_once __DIR__ . '/../../../includes/config.php';
 require_once __DIR__ . '/../../../includes/DatabaseClient.php';
-// API Base URL - uses PHP proxy to reach Flask API on server
-$API_BASE = dirname($_SERVER["SCRIPT_NAME"]) . '/../../../api/proxy.php';
+// Use configured API URL (Flask website_api.py). Matches other pages.
+$client = new DatabaseClient(DATABASE_API_URL);
 
 // Get trade ID, play ID, and return URL from query parameters
 $trade_id = (int)($_GET['id'] ?? 0);
@@ -29,7 +30,6 @@ $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
 $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https://' : 'http://') . $_SERVER['HTTP_HOST'] . dirname(dirname(dirname(dirname($_SERVER['SCRIPT_NAME']))));
 
 // --- Initialize API Client ---
-$client = new DatabaseClient();
 $api_available = $client->isAvailable();
 
 $trade = null;
@@ -116,15 +116,23 @@ if ($trade && !empty($trade['pattern_validator_log'])) {
             // Collect project IDs for name lookup
             $project_ids = array_map(fn($pr) => $pr['project_id'] ?? 0, $project_results);
             
-            // Try to fetch project names from API
+            // Try to fetch project names from API (suppress errors - not critical)
             foreach ($project_ids as $pid) {
                 if ($pid > 0 && !isset($project_name_cache[$pid]) && $api_available) {
-                    $project_data = $client->getPatternProject($pid);
-                    if ($project_data && isset($project_data['project']['name'])) {
-                        $project_name_cache[$pid] = $project_data['project']['name'];
-                    } else {
+                    // Suppress error logging for missing project names - use fallback
+                    $old_error_level = error_reporting(0);
+                    try {
+                        $project_data = $client->getPatternProject($pid);
+                        if ($project_data && isset($project_data['project']['name'])) {
+                            $project_name_cache[$pid] = $project_data['project']['name'];
+                        } else {
+                            $project_name_cache[$pid] = "Project #$pid";
+                        }
+                    } catch (Exception $e) {
+                        // Fallback to generic name if API call fails
                         $project_name_cache[$pid] = "Project #$pid";
                     }
+                    error_reporting($old_error_level);
                 }
             }
             
@@ -212,29 +220,36 @@ if ($trade && array_key_exists('entry_log', $trade)) {
     $entry_log_raw = $trade['entry_log'];
 
     if ($entry_log_raw !== null && $entry_log_raw !== '') {
-        $candidates = [
-            $entry_log_raw,
-            trim($entry_log_raw, "\"'"),
-            stripcslashes(trim($entry_log_raw, "\"'"))
-        ];
+        // Handle both array (from PostgreSQL API) and string (legacy JSON)
+        if (is_array($entry_log_raw)) {
+            // Already decoded - just pretty print it
+            $entry_log_pretty = json_encode($entry_log_raw, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        } elseif (is_string($entry_log_raw)) {
+            // Try to decode JSON string
+            $candidates = [
+                $entry_log_raw,
+                trim($entry_log_raw, "\"'"),
+                stripcslashes(trim($entry_log_raw, "\"'"))
+            ];
 
-        foreach ($candidates as $candidate) {
-            if ($candidate === '' || $candidate === null) continue;
+            foreach ($candidates as $candidate) {
+                if ($candidate === '' || $candidate === null) continue;
 
-            $decoded = json_decode($candidate, true);
+                $decoded = json_decode($candidate, true);
 
-            if (json_last_error() === JSON_ERROR_NONE) {
-                if (is_string($decoded)) {
-                    $decodedAgain = json_decode($decoded, true);
-                    if (json_last_error() === JSON_ERROR_NONE) {
-                        $decoded = $decodedAgain;
+                if (json_last_error() === JSON_ERROR_NONE) {
+                    if (is_string($decoded)) {
+                        $decodedAgain = json_decode($decoded, true);
+                        if (json_last_error() === JSON_ERROR_NONE) {
+                            $decoded = $decodedAgain;
+                        }
                     }
-                }
 
-                if ($decoded !== null) {
-                    $entry_log_pretty = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+                    if ($decoded !== null) {
+                        $entry_log_pretty = json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
@@ -1103,8 +1118,11 @@ ob_start();
             }
         });
         
-        // Exit marker and range
-        if (exitTime && exitTime !== followedAtTime) {
+        // Exit marker and range - ONLY show for completed/sold trades
+        const tradeStatus = tradeData.our_status;
+        const isTradeCompleted = (tradeStatus === 'completed' || tradeStatus === 'sold');
+        
+        if (exitTime && exitTime !== followedAtTime && isTradeCompleted) {
             annotations.xaxis.push({
                 x: exitTime,
                 borderColor: '#f59e0b',
@@ -1352,12 +1370,19 @@ ob_start();
                     const sell = item.should_sell === true || item.should_sell == 1 || item.should_sell === '1';
                     const isBackfill = item.is_backfill === true || item.is_backfill == 1 || item.is_backfill === '1';
                     
-                    // Format in UTC (server time) - parse the datetime string and convert to UTC
+                    // Format in UTC (server time) - parse ISO format timestamp
                     let timeStr = '--';
                     if (item.checked_at) {
-                        // Parse the datetime string (assumes it's already in UTC from server)
-                        const dt = new Date(item.checked_at.replace(' ', 'T') + 'Z');
-                        timeStr = formatUTC.toUTCDateTime(dt.getTime());
+                        // Parse ISO format timestamp (already has 'Z' suffix from API)
+                        // Handle both ISO format (2026-01-12T17:14:06Z) and legacy format (2026-01-12 17:14:06)
+                        let timestamp = item.checked_at;
+                        if (!timestamp.includes('T')) {
+                            timestamp = timestamp.replace(' ', 'T') + 'Z';
+                        }
+                        const dt = new Date(timestamp);
+                        if (!isNaN(dt.getTime())) {
+                            timeStr = formatUTC.toUTCDateTime(dt.getTime());
+                        }
                     }
                     
                     const basisBadge = item.basis 

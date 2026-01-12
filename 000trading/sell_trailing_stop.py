@@ -1,20 +1,15 @@
 """
-Trailing Stop Seller - DuckDB Version
-======================================
+Trailing Stop Seller - PostgreSQL Version
+=========================================
 Monitors open buy-in positions and applies dynamic trailing stop logic.
 
 This module:
-- Monitors positions with our_status='pending' from DuckDB
+- Monitors positions with our_status='pending' from PostgreSQL
 - Fetches SOL prices from price_points table (coin_id=5, updated every 1s)
 - Applies tolerance rules from play sell_logic configuration
 - Tracks highest price reached for each position
 - Records price checks to follow_the_goat_buyins_price_checks
 - Marks positions as 'sold' when tolerance is exceeded
-
-Architecture (DuckDB-first):
-- DuckDB: Hot storage for ALL reads (price_points, buyins, plays)
-- MySQL: Archive via dual-write for updates
-- Price source: price_points with coin_id=5 (SOL)
 
 Trailing Stop Logic (DECIMAL-BASED):
 - Entry price is "ground zero" - determines which tolerance rules apply
@@ -26,7 +21,7 @@ Usage:
     # Standalone execution
     python 000trading/sell_trailing_stop.py
     
-    # As scheduled job (via scheduler/master.py)
+    # As scheduled job (via scheduler/master2.py)
     from sell_trailing_stop import run_single_cycle
     run_single_cycle()
     
@@ -187,39 +182,80 @@ class TrailingStopSeller:
     
     def get_current_sol_price(self) -> Optional[float]:
         """
-        Get the latest SOL price from price_points table (coin_id=5).
+        Get the latest SOL price from prices table.
         
         Returns:
             Current SOL price as float, or None if not found.
         """
         try:
-            with get_postgres() as conn:
+            # Create fresh connection with autocommit to avoid stale reads
+            import psycopg2
+            import psycopg2.extras
+            from core.config import settings
+            
+            conn = psycopg2.connect(
+                host=settings.postgres.host,
+                user=settings.postgres.user,
+                password=settings.postgres.password,
+                database=settings.postgres.database,
+                port=settings.postgres.port,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=5
+            )
+            
+            # Enable autocommit to always see the latest data
+            conn.autocommit = True
+            
+            try:
                 with conn.cursor() as cursor:
                     cursor.execute("""
-                    SELECT value as price, created_at, id
-                    FROM price_points 
-                    WHERE coin_id = 5
-                    ORDER BY id DESC 
+                    SELECT price, timestamp, id
+                    FROM prices 
+                    WHERE token = 'SOL'
+                    ORDER BY timestamp DESC 
                     LIMIT 1
                 """)
-                result = cursor.fetchone()
-                
-                if result:
-                    price = float(result[0])
-                    logger.debug(f"Current SOL price: ${price:.6f} (ID: {result[2]})")
-                    return price
-                else:
-                    logger.warning("No SOL price data found in price_points (coin_id=5)")
-                    return None
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        price = float(result.get('price'))
+                        logger.debug(f"Current SOL price: ${price:.6f} (ID: {result.get('id')})")
+                        return price
+                    else:
+                        logger.warning("No SOL price data found in prices table")
+                        return None
+            finally:
+                conn.close()
                     
         except Exception as e:
+            import traceback
             logger.error(f"Error getting current SOL price: {e}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return None
     
     def get_open_positions(self) -> List[Dict[str, Any]]:
         """Get all open positions that we're tracking (matching live_trade mode)."""
         try:
-            with get_postgres() as conn:
+            # Create fresh connection with autocommit to avoid stale reads
+            import psycopg2
+            import psycopg2.extras
+            from core.config import settings
+            
+            conn = psycopg2.connect(
+                host=settings.postgres.host,
+                user=settings.postgres.user,
+                password=settings.postgres.password,
+                database=settings.postgres.database,
+                port=settings.postgres.port,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=5
+            )
+            
+            # Enable autocommit to always see the latest data
+            conn.autocommit = True
+            
+            try:
                 with conn.cursor() as cursor:
                     # Build query depending on monitoring filter
                     base_sql = """
@@ -242,19 +278,18 @@ class TrailingStopSeller:
                     WHERE our_status = 'pending'
                 """
                 
-                if self.monitor_live is True:
-                    base_sql += " AND live_trade = 1"
-                elif self.monitor_live is False:
-                    base_sql += " AND live_trade = 0"
+                    if self.monitor_live is True:
+                        base_sql += " AND live_trade = 1"
+                    elif self.monitor_live is False:
+                        base_sql += " AND live_trade = 0"
                 
-                base_sql += " ORDER BY followed_at ASC"
+                    base_sql += " ORDER BY followed_at ASC"
                 
-                cursor.execute(base_sql)
-                result = cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
-                
-                positions = [dict(zip(columns, row)) for row in result]
-                return positions
+                    cursor.execute(base_sql)
+                    result = cursor.fetchall()
+                    return [dict(row) for row in (result or [])]
+            finally:
+                conn.close()
                 
         except Exception as e:
             logger.error(f"Error getting open positions: {e}")
@@ -275,35 +310,55 @@ class TrailingStopSeller:
         
         # Cache miss or expired - fetch from database
         try:
-            with get_postgres() as conn:
+            # Create fresh connection with autocommit to avoid stale reads
+            import psycopg2
+            import psycopg2.extras
+            from core.config import settings
+            
+            conn = psycopg2.connect(
+                host=settings.postgres.host,
+                user=settings.postgres.user,
+                password=settings.postgres.password,
+                database=settings.postgres.database,
+                port=settings.postgres.port,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=5
+            )
+            
+            # Enable autocommit to always see the latest data
+            conn.autocommit = True
+            
+            try:
                 with conn.cursor() as cursor:
                     cursor.execute("""
                     SELECT sell_logic
                     FROM follow_the_goat_plays
-                    WHERE id = ?
+                    WHERE id = %s
                     LIMIT 1
                 """, [play_id])
-                result = cursor.fetchone()
+                    result = cursor.fetchone()
                 
-                logic = None
-                if result and result[0]:
-                    raw = result[0]
-                    try:
-                        logic = json.loads(raw) if isinstance(raw, str) else raw
-                    except Exception:
-                        logic = None
+                    logic = None
+                    if result and result.get('sell_logic'):
+                        raw = result['sell_logic']
+                        try:
+                            logic = json.loads(raw) if isinstance(raw, str) else raw
+                        except Exception:
+                            logic = None
                 
-                if not logic:
-                    # Use default tolerance rules
-                    logic = self._get_default_tolerance_rules()
+                    if not logic:
+                        # Use default tolerance rules
+                        logic = self._get_default_tolerance_rules()
                 
-                # Thread-safe cache update
-                with self.cache_lock:
-                    self.sell_logic_cache[play_id] = logic
-                    self.cache_timestamps[play_id] = current_time
+                    # Thread-safe cache update
+                    with self.cache_lock:
+                        self.sell_logic_cache[play_id] = logic
+                        self.cache_timestamps[play_id] = current_time
                 
-                logger.debug(f"Cache refreshed for play {play_id}")
-                return logic
+                    logger.debug(f"Cache refreshed for play {play_id}")
+                    return logic
+            finally:
+                conn.close()
                 
         except Exception as e:
             logger.error(f"Error loading sell_logic for play {play_id}: {e}")
@@ -377,12 +432,11 @@ class TrailingStopSeller:
     
     def _update_highest_price_in_db(self, position_id: int, highest_price: float) -> bool:
         """
-        Update the higest_price_reached column in DuckDB.
-        MySQL sync happens when trade is sold.
+        Update the higest_price_reached column in PostgreSQL.
         """
         try:
-            duckdb_execute_write("central",
-                "UPDATE follow_the_goat_buyins SET higest_price_reached = ? WHERE id = ?",
+            postgres_execute(
+                "UPDATE follow_the_goat_buyins SET higest_price_reached = %s WHERE id = %s",
                 [highest_price, position_id]
             )
             logger.debug(f"Highest price updated for position #{position_id} to ${highest_price:.6f}")
@@ -407,12 +461,11 @@ class TrailingStopSeller:
     
     def _update_locked_tolerance_in_db(self, position_id: int, tolerance: float) -> bool:
         """
-        Update the locked tolerance in DuckDB.
-        MySQL sync happens when trade is sold.
+        Update the locked tolerance in PostgreSQL.
         """
         try:
-            duckdb_execute_write("central",
-                "UPDATE follow_the_goat_buyins SET tolerance = ? WHERE id = ?",
+            postgres_execute(
+                "UPDATE follow_the_goat_buyins SET tolerance = %s WHERE id = %s",
                 [tolerance, position_id]
             )
             logger.info(f"TOLERANCE LOCKED for position #{position_id}: {tolerance} ({tolerance*100:.4f}%)")
@@ -482,7 +535,8 @@ class TrailingStopSeller:
     ) -> Dict[str, Any]:
         """Create backfill movement data for a new position."""
         followed_at = position.get('followed_at')
-        timestamp = followed_at.strftime('%Y-%m-%d %H:%M:%S') if followed_at else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # CRITICAL: Use UTC time for database storage
+        timestamp = followed_at.strftime('%Y-%m-%d %H:%M:%S') if followed_at else datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         
         gain_decimal = ((current_price - entry_price) / entry_price) if entry_price > 0 else 0.0
         
@@ -586,8 +640,9 @@ class TrailingStopSeller:
         with self.position_tracking_lock:
             locked_tol = tracking.get('locked_tolerance', tolerance_decimal)
         
+        # CRITICAL: Use UTC time for database storage
         movement_data = {
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
             'current_price': round(current_price, 8),
             'entry_price': round(entry_price, 8),
             'highest_price': round(highest_price, 8),
@@ -622,16 +677,13 @@ class TrailingStopSeller:
     
     def batch_update_current_prices(self, price_updates: List[Dict[str, Any]]) -> bool:
         """
-        Batch update current_price for multiple positions in a single DuckDB query.
-        
-        PERFORMANCE: Only writes to DuckDB during live trading.
-        MySQL sync happens when trade is sold (execute_sell).
+        Batch update current_price for multiple positions in a single PostgreSQL query.
         
         Args:
             price_updates: List of dicts with 'position_id' and 'current_price'
             
         Returns:
-            True if DuckDB was updated successfully.
+            True if PostgreSQL was updated successfully.
         """
         if not price_updates:
             return True
@@ -639,29 +691,30 @@ class TrailingStopSeller:
         # Build batch UPDATE using CASE/WHEN for efficiency
         position_ids = [u['position_id'] for u in price_updates]
         
-        # DuckDB-only batch update (MySQL synced on sell)
+        # PostgreSQL batch update
         try:
-            case_clauses = " ".join([
-                f"WHEN id = {u['position_id']} THEN {u['current_price']}"
-                for u in price_updates
-            ])
-            ids_str = ", ".join(str(pid) for pid in position_ids)
+            case_clauses = " ".join(["WHEN id = %s THEN %s" for _ in price_updates])
+            params: List[Any] = []
+            for update in price_updates:
+                params.extend([update['position_id'], update['current_price']])
+            
+            ids_placeholders = ", ".join(["%s"] * len(position_ids))
+            params.extend(position_ids)
             
             postgres_execute(f"""
                 UPDATE follow_the_goat_buyins
                 SET current_price = CASE {case_clauses} END
-                WHERE id IN ({ids_str})
-            """)
-            logger.debug(f"DuckDB batch updated {len(price_updates)} positions")
+                WHERE id IN ({ids_placeholders})
+            """, params)
+            logger.debug(f"PostgreSQL batch updated {len(price_updates)} positions")
             return True
         except Exception as e:
-            logger.error(f"DuckDB batch update error: {e}")
+            logger.error(f"PostgreSQL batch update error: {e}")
             return False
     
     def save_price_movement(self, position_id: int, movement_data: Dict[str, Any], skip_price_update: bool = False) -> bool:
         """
-        Save price movement data to DuckDB only during live trading.
-        MySQL sync happens when trade is sold (execute_sell).
+        Save price movement data to PostgreSQL.
         
         Args:
             position_id: The buyin position ID
@@ -669,59 +722,81 @@ class TrailingStopSeller:
             skip_price_update: If True, skip the current_price update (handled by batch)
         """
         try:
-            current_price = movement_data.get('current_price')
-            should_sell = movement_data.get('should_sell', False)
+            # Create fresh connection with autocommit for immediate writes
+            import psycopg2
+            import psycopg2.extras
+            from core.config import settings
             
-            # Only update current_price if not being batched (DuckDB only)
-            if not skip_price_update:
-                try:
-                    duckdb_execute_write("central",
-                        "UPDATE follow_the_goat_buyins SET current_price = ? WHERE id = ?",
-                        [current_price, position_id]
-                    )
-                except Exception as e:
-                    logger.error(f"Error updating current_price for position {position_id}: {e}")
+            conn = psycopg2.connect(
+                host=settings.postgres.host,
+                user=settings.postgres.user,
+                password=settings.postgres.password,
+                database=settings.postgres.database,
+                port=settings.postgres.port,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+                connect_timeout=5
+            )
             
-            # Skip price_checks history for normal updates (only backfills matter)
-            if not movement_data.get('backfilled', False):
-                logger.debug(f"Price checked for position {position_id}: ${current_price:.6f}")
-                return True
+            # Enable autocommit for immediate writes
+            conn.autocommit = True
             
-            # For backfills only, write to DuckDB price_checks
-            checked_at = movement_data.get('timestamp')
-            entry_price = movement_data.get('entry_price')
-            highest_price = movement_data.get('highest_price')
-            reference_price = movement_data.get('reference_price')
-            gain_from_entry = movement_data.get('gain_from_entry_decimal')
-            drop_from_high = movement_data.get('drop_from_high_decimal')
-            drop_from_entry = movement_data.get('drop_from_entry_decimal')
-            drop_from_reference = movement_data.get('drop_from_reference_decimal')
-            tolerance = movement_data.get('tolerance_decimal')
-            basis = movement_data.get('basis')
-            bucket = movement_data.get('bucket')
-            applied_rule = json.dumps(movement_data.get('applied_rule')) if movement_data.get('applied_rule') else None
-            is_backfill = movement_data.get('backfilled', False)
-            
-            # DuckDB-only insert for price_checks (MySQL synced on sell)
             try:
-                postgres_execute("""
-                    INSERT INTO follow_the_goat_buyins_price_checks (
-                        buyin_id, checked_at, current_price, entry_price, highest_price,
-                        reference_price, gain_from_entry, drop_from_high, drop_from_entry,
-                        drop_from_reference, tolerance, basis, bucket, applied_rule,
-                        should_sell, is_backfill
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, [
-                    position_id, checked_at, current_price, entry_price, highest_price,
-                    reference_price, gain_from_entry, drop_from_high, drop_from_entry,
-                    drop_from_reference, tolerance, basis, bucket, applied_rule,
-                    should_sell, is_backfill
-                ])
-            except Exception as e:
-                logger.debug(f"DuckDB price_checks insert failed: {e}")
+                current_price = movement_data.get('current_price')
+                should_sell = movement_data.get('should_sell', False)
             
-            logger.debug(f"Price movement saved for position {position_id}: ${current_price:.6f}")
-            return True
+                # Only update current_price if not being batched
+                if not skip_price_update:
+                    try:
+                        with conn.cursor() as cursor:
+                            cursor.execute(
+                                "UPDATE follow_the_goat_buyins SET current_price = %s WHERE id = %s",
+                                [current_price, position_id]
+                            )
+                            # Autocommit handles the commit automatically
+                    except Exception as e:
+                        logger.error(f"Error updating current_price for position {position_id}: {e}")
+            
+                # Write price check to database for historical tracking
+                checked_at = movement_data.get('timestamp')
+                entry_price = movement_data.get('entry_price')
+                highest_price = movement_data.get('highest_price')
+                reference_price = movement_data.get('reference_price')
+                gain_from_entry = movement_data.get('gain_from_entry_decimal')
+                drop_from_high = movement_data.get('drop_from_high_decimal')
+                drop_from_entry = movement_data.get('drop_from_entry_decimal')
+                drop_from_reference = movement_data.get('drop_from_reference_decimal')
+                tolerance = movement_data.get('tolerance_decimal')
+                basis = movement_data.get('basis')
+                bucket = movement_data.get('bucket')
+                applied_rule = json.dumps(movement_data.get('applied_rule')) if movement_data.get('applied_rule') else None
+                is_backfill = movement_data.get('backfilled', False)
+            
+                # Insert price check to PostgreSQL
+                try:
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            INSERT INTO follow_the_goat_buyins_price_checks (
+                                buyin_id, checked_at, current_price, entry_price, highest_price,
+                                reference_price, gain_from_entry, drop_from_high, drop_from_entry,
+                                drop_from_reference, tolerance, basis, bucket, applied_rule,
+                                should_sell, is_backfill
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, [
+                            position_id, checked_at, current_price, entry_price, highest_price,
+                            reference_price, gain_from_entry, drop_from_high, drop_from_entry,
+                            drop_from_reference, tolerance, basis, bucket, applied_rule,
+                            should_sell, is_backfill
+                        ])
+                        # Autocommit handles the commit automatically
+                        if not is_backfill:
+                            logger.info(f"✓ Price check recorded for position {position_id}: ${current_price:.6f}")
+                except Exception as e:
+                    logger.error(f"Price_checks insert failed for position {position_id}: {e}")
+            
+                logger.debug(f"Price movement saved for position {position_id}: ${current_price:.6f}")
+                return True
+            finally:
+                conn.close()
                 
         except Exception as e:
             logger.error(f"Error saving price movement for position {position_id}: {e}")
@@ -729,10 +804,7 @@ class TrailingStopSeller:
     
     def execute_sell(self, position: Dict[str, Any], check_result: Dict[str, Any]) -> bool:
         """
-        Mark a position as sold and sync ALL data to MySQL.
-        
-        This is the only place where MySQL writes happen - all live trading
-        updates were DuckDB-only for performance.
+        Mark a position as sold and persist data to PostgreSQL.
         """
         position_id = position['id']
         logger.info(f"Executing sell for position #{position_id}")
@@ -748,7 +820,8 @@ class TrailingStopSeller:
             actual_profit_loss_amount = actual_exit_price - entry_price_value
             percent_change = ((actual_profit_loss_amount / entry_price_value) * 100) if entry_price_value else 0.0
             
-            exit_timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            # CRITICAL: Use UTC time, not local time (server is CET, database is UTC)
+            exit_timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             
             # Get tracking data for this position
             with self.position_tracking_lock:
@@ -756,23 +829,23 @@ class TrailingStopSeller:
                 highest_price = tracking.get('highest_price', check_result.get('highest_price', actual_exit_price))
                 locked_tolerance = tracking.get('locked_tolerance')
             
-            # Update DuckDB with sold status (no MySQL - all data in DuckDB)
+            # Update PostgreSQL with sold status
             try:
                 postgres_execute("""
                     UPDATE follow_the_goat_buyins 
-                    SET our_exit_price = ?,
-                        our_exit_timestamp = ?,
-                        our_profit_loss = ?,
+                    SET our_exit_price = %s,
+                        our_exit_timestamp = %s,
+                        our_profit_loss = %s,
                         our_status = 'sold',
-                        current_price = ?,
-                        higest_price_reached = ?,
-                        tolerance = ?
-                    WHERE id = ?
+                        current_price = %s,
+                        higest_price_reached = %s,
+                        tolerance = %s
+                    WHERE id = %s
                 """, [actual_exit_price, exit_timestamp, percent_change, actual_exit_price, 
-                      highest_price, locked_tolerance, position_id], sync=True)
-                logger.debug(f"DuckDB updated position {position_id} to sold")
+                      highest_price, locked_tolerance, position_id])
+                logger.debug(f"PostgreSQL updated position {position_id} to sold")
             except Exception as e:
-                logger.error(f"DuckDB sell update failed for {position_id}: {e}")
+                logger.error(f"PostgreSQL sell update failed for {position_id}: {e}")
                 return False
             
             # Update statistics
@@ -869,15 +942,15 @@ class TrailingStopSeller:
             batch_duration = time.time() - batch_start
             logger.debug(f"Batch price update for {len(price_updates)} positions took {batch_duration:.3f}s")
         
-        # Step 5: Process backfills and sell signals (these need individual records)
+        # Step 5: Save price checks for ALL positions (for tracking/display on website)
         for position, check_result in check_results:
             try:
-                # Save backfill data if present (new position) - uses individual insert
+                # Save backfill data if present (new position)
                 if check_result.get('backfill_data'):
                     self.save_price_movement(position['id'], check_result['backfill_data'], skip_price_update=True)
                 
-                # For sell signals, save the final movement data for audit
-                if check_result['should_sell'] and check_result.get('movement_data'):
+                # Save regular price check for this cycle (for website timeline display)
+                if check_result.get('movement_data'):
                     self.save_price_movement(position['id'], check_result['movement_data'], skip_price_update=True)
                     
             except Exception as e:
@@ -1005,7 +1078,7 @@ def get_seller() -> TrailingStopSeller:
             elif monitor_filter == 'test':
                 monitor_live = False
             else:
-                monitor_live = None  # Monitor all
+                monitor_live = None  # Monitor all (both live and test)
             
             _seller_instance = TrailingStopSeller(
                 live_trade=live_mode,

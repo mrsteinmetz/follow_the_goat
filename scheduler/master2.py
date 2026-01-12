@@ -26,6 +26,7 @@ import threading
 import atexit
 import time
 import json
+import fcntl  # For atomic file locking
 from pathlib import Path
 from datetime import datetime, timedelta, timezone, date
 
@@ -35,6 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED, JobExecutionEvent
 from apscheduler.executors.pool import ThreadPoolExecutor as APThreadPoolExecutor
 import logging
@@ -441,6 +443,32 @@ def run_create_profiles():
         logger.error(f"Create profiles job error: {e}", exc_info=True)
 
 
+@track_job("archive_old_data", "Archive data older than 24h to Parquet (hourly)")
+def run_archive_old_data():
+    """Archive PostgreSQL data older than 24 hours to Parquet files."""
+    try:
+        enabled = os.getenv("DATA_ARCHIVAL_ENABLED", "1") == "1"
+        if not enabled:
+            return
+        
+        archival_path = PROJECT_ROOT / "000data_feeds" / "8_keep_24_hours_of_data"
+        if str(archival_path) not in sys.path:
+            sys.path.insert(0, str(archival_path))
+        from keep_24_hours_of_data import run as run_archival
+        
+        result = run_archival()
+        if result.get('success'):
+            logger.info(
+                f"Data archival: {result['total_rows_archived']} rows archived, "
+                f"{result['total_rows_deleted']} rows deleted, "
+                f"{result['total_size_bytes'] / 1024 / 1024:.2f} MB saved"
+            )
+        else:
+            logger.warning(f"Data archival completed with errors: {result.get('errors', [])}")
+    except Exception as e:
+        logger.error(f"Archive old data job error: {e}", exc_info=True)
+
+
 @track_job("export_job_status", "Export job status to file (every 5s)")
 def export_job_status_to_file():
     """Export current job status to JSON file for website_api.py to read."""
@@ -516,7 +544,7 @@ def create_scheduler() -> BackgroundScheduler:
     
     scheduler.add_job(
         func=run_train_validator,
-        trigger=IntervalTrigger(seconds=10),
+        trigger=IntervalTrigger(seconds=20),
         id="train_validator",
         name="Train Validator",
         executor='realtime'
@@ -554,7 +582,94 @@ def create_scheduler() -> BackgroundScheduler:
         executor='realtime'
     )
     
+    scheduler.add_job(
+        func=run_archive_old_data,
+        trigger=CronTrigger(minute=0),
+        id="archive_old_data",
+        name="Archive Old Data to Parquet",
+        executor='heavy'
+    )
+    
     return scheduler
+
+
+# =============================================================================
+# INSTANCE LOCKING - Using fcntl for atomic locking
+# =============================================================================
+
+_lock_file_handle = None  # Keep file handle open to maintain lock
+
+def acquire_lock():
+    """
+    Acquire an exclusive lock to prevent multiple instances.
+    Uses fcntl for atomic file locking (prevents race conditions).
+    Returns True if lock acquired, False if another instance is running.
+    """
+    global _lock_file_handle
+    
+    lock_file = PROJECT_ROOT / "scheduler" / "master2.lock"
+    
+    try:
+        # Open lock file (create if doesn't exist)
+        _lock_file_handle = open(lock_file, 'w')
+        
+        # Try to acquire exclusive lock (non-blocking)
+        # LOCK_EX = exclusive lock, LOCK_NB = non-blocking
+        fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        
+        # Write our PID to the lock file
+        _lock_file_handle.write(str(os.getpid()))
+        _lock_file_handle.flush()
+        
+        logger.info(f"✓ Lock acquired (PID: {os.getpid()})")
+        return True
+        
+    except BlockingIOError:
+        # Another process holds the lock
+        try:
+            # Try to read the PID of the process holding the lock
+            with open(lock_file, 'r') as f:
+                pid = f.read().strip()
+            logger.error(f"✗ Another instance of master2.py is already running (PID: {pid})")
+        except:
+            logger.error(f"✗ Another instance of master2.py is already running")
+            
+        logger.error("To force start, kill the existing process or delete the lock file:")
+        logger.error(f"  pkill -f 'scheduler/master2.py' && rm {lock_file}")
+        
+        if _lock_file_handle:
+            _lock_file_handle.close()
+            _lock_file_handle = None
+        return False
+        
+    except Exception as e:
+        logger.error(f"Failed to acquire lock: {e}")
+        if _lock_file_handle:
+            _lock_file_handle.close()
+            _lock_file_handle = None
+        return False
+
+
+def release_lock():
+    """Release the exclusive lock and remove lock file."""
+    global _lock_file_handle
+    
+    lock_file = PROJECT_ROOT / "scheduler" / "master2.lock"
+    
+    try:
+        if _lock_file_handle:
+            # Release the lock
+            fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_UN)
+            _lock_file_handle.close()
+            _lock_file_handle = None
+            logger.info("Lock released")
+        
+        # Remove lock file
+        if lock_file.exists():
+            lock_file.unlink()
+            
+    except Exception as e:
+        logger.warning(f"Failed to release lock: {e}")
 
 
 # =============================================================================
@@ -564,6 +679,15 @@ def create_scheduler() -> BackgroundScheduler:
 def main():
     """Main entry point for trading logic scheduler."""
     global _scheduler
+    
+    # =====================================================
+    # CHECK FOR EXISTING INSTANCE
+    # =====================================================
+    if not acquire_lock():
+        sys.exit(1)
+    
+    # Register lock cleanup on exit
+    atexit.register(release_lock)
     
     print("=" * 60)
     print("Follow The Goat - Trading Logic Scheduler (master2.py)")
@@ -616,6 +740,9 @@ def main():
 def shutdown_all():
     """Gracefully shutdown all services."""
     global _scheduler
+    
+    # Release lock first
+    release_lock()
     
     logger.info("Shutting down...")
     

@@ -1,10 +1,10 @@
 {
   "good_trade_threshold": 0.3,
-  "analysis_hours": 24,
+  "analysis_hours": 6,
   "min_filters_in_combo": 2,
   "max_filters_in_combo": 6,
-  "min_good_trades_kept_pct": 50,
-  "min_bad_trades_removed_pct": 10,
+  "min_good_trades_kept_pct": 50.0,
+  "min_bad_trades_removed_pct": 10.0,
   "combo_min_good_kept_pct": 25,
   "combo_min_improvement": 1.0,
   "auto_project_name": "AutoFilters",
@@ -42,4 +42,3 @@
     "eth_": "eth_correlation"
   }
 }
-

@@ -28,9 +28,19 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from flask.json.provider import DefaultJSONProvider
 from core.database import get_postgres, postgres_query, verify_tables_exist
 
+class CustomJSONProvider(DefaultJSONProvider):
+    """Custom JSON provider that converts datetime objects to ISO format strings."""
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            # Always return ISO format with 'Z' suffix for UTC
+            return obj.isoformat() + ('Z' if obj.tzinfo is None else '')
+        return super().default(obj)
+
 app = Flask(__name__)
+app.json = CustomJSONProvider(app)
 CORS(app)
 
 logger = logging.getLogger("website_api")
@@ -189,10 +199,18 @@ def get_price_points():
                 results = cursor.fetchall()
                 
                 # Format for JavaScript charting
+                # IMPORTANT: Return timestamps in ISO format with 'Z' to indicate UTC
+                # JavaScript Date() will interpret plain datetime strings as local time!
                 prices = []
                 for row in results:
+                    if hasattr(row['timestamp'], 'strftime'):
+                        # Return ISO format with 'Z' suffix to explicitly indicate UTC
+                        timestamp_str = row['timestamp'].strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+                    else:
+                        timestamp_str = str(row['timestamp'])
+                    
                     prices.append({
-                        'x': row['timestamp'].strftime('%Y-%m-%d %H:%M:%S') if hasattr(row['timestamp'], 'strftime') else str(row['timestamp']),
+                        'x': timestamp_str,
                         'y': float(row['price'])
                     })
                 
@@ -742,6 +760,70 @@ def get_single_buyin(buyin_id):
             return jsonify({'error': 'Buyin not found'}), 404
     except Exception as e:
         logger.error(f"Get single buyin failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/price_checks', methods=['GET'])
+def get_price_checks():
+    """Get price checks for a buyin."""
+    try:
+        buyin_id = request.args.get('buyin_id', type=int)
+        hours = request.args.get('hours', default='24')
+        limit = min(int(request.args.get('limit', 100)), 10000)
+        
+        if not buyin_id:
+            return jsonify({'error': 'buyin_id parameter required'}), 400
+        
+        # Build WHERE clause for time filtering
+        where_conditions = ["buyin_id = %s"]
+        params = [buyin_id]
+        
+        if hours != 'all':
+            try:
+                hours_int = int(hours)
+                where_conditions.append(f"checked_at >= NOW() - INTERVAL '{hours_int} hours'")
+            except ValueError:
+                pass
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT 
+                        id,
+                        buyin_id,
+                        checked_at,
+                        current_price,
+                        entry_price,
+                        highest_price,
+                        reference_price,
+                        gain_from_entry,
+                        drop_from_high,
+                        drop_from_entry,
+                        drop_from_reference,
+                        tolerance,
+                        basis,
+                        bucket,
+                        applied_rule,
+                        should_sell,
+                        is_backfill
+                    FROM follow_the_goat_buyins_price_checks
+                    WHERE {where_clause}
+                    ORDER BY checked_at ASC
+                    LIMIT %s
+                """, params + [limit])
+                
+                results = cursor.fetchall()
+        
+        return jsonify({
+            'success': True,
+            'price_checks': [dict(row) for row in results],
+            'count': len(results),
+            'source': 'postgres'
+        })
+    except Exception as e:
+        logger.error(f"Get price checks failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -2076,56 +2158,125 @@ def get_filter_analysis_dashboard():
 
 @app.route('/filter-analysis/settings', methods=['GET'])
 def get_filter_settings():
-    """Get auto filter settings."""
-    # For now, return default settings
-    # These could be stored in a settings table in the future
-    return jsonify({
-        'success': True,
-        'settings': [
-            {
-                'setting_key': 'good_trade_threshold',
-                'setting_value': '0.3',
-                'description': 'Good trade threshold percentage',
-                'setting_type': 'decimal',
-                'min_value': 0.1,
-                'max_value': 5.0
-            },
-            {
-                'setting_key': 'analysis_hours',
-                'setting_value': '24',
-                'description': 'Analysis window in hours',
-                'setting_type': 'integer',
-                'min_value': 1,
-                'max_value': 168
-            },
-            {
-                'setting_key': 'min_filters_in_combo',
-                'setting_value': '1',
-                'description': 'Minimum filters in combination',
-                'setting_type': 'integer',
-                'min_value': 1,
-                'max_value': 10
+    """Get auto filter settings from config file."""
+    import json
+    from pathlib import Path
+    
+    try:
+        # Path to config file
+        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
+        
+        # Load config
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            # Default values
+            config = {
+                'good_trade_threshold': 0.3,
+                'analysis_hours': 24,
+                'min_filters_in_combo': 1,
+                'min_good_trades_kept_pct': 50,
+                'min_bad_trades_removed_pct': 10
             }
-        ]
-    })
+        
+        return jsonify({
+            'success': True,
+            'settings': [
+                {
+                    'setting_key': 'good_trade_threshold',
+                    'setting_value': str(config.get('good_trade_threshold', 0.3)),
+                    'description': 'Good trade threshold percentage',
+                    'setting_type': 'decimal',
+                    'min_value': 0.1,
+                    'max_value': 5.0
+                },
+                {
+                    'setting_key': 'analysis_hours',
+                    'setting_value': str(config.get('analysis_hours', 24)),
+                    'description': 'Analysis window in hours',
+                    'setting_type': 'integer',
+                    'min_value': 1,
+                    'max_value': 168
+                },
+                {
+                    'setting_key': 'min_filters_in_combo',
+                    'setting_value': str(config.get('min_filters_in_combo', 1)),
+                    'description': 'Minimum filters in combination',
+                    'setting_type': 'integer',
+                    'min_value': 1,
+                    'max_value': 10
+                },
+                {
+                    'setting_key': 'min_good_trades_kept_pct',
+                    'setting_value': str(config.get('min_good_trades_kept_pct', 50)),
+                    'description': 'Minimum good trades kept percentage',
+                    'setting_type': 'integer',
+                    'min_value': 0,
+                    'max_value': 100
+                },
+                {
+                    'setting_key': 'min_bad_trades_removed_pct',
+                    'setting_value': str(config.get('min_bad_trades_removed_pct', 10)),
+                    'description': 'Minimum bad trades removed percentage',
+                    'setting_type': 'integer',
+                    'min_value': 0,
+                    'max_value': 100
+                }
+            ]
+        })
+    except Exception as e:
+        logger.error(f"Get filter settings failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/filter-analysis/settings', methods=['POST'])
 def save_filter_settings():
-    """Save auto filter settings."""
+    """Save auto filter settings to config file."""
+    import json
+    from pathlib import Path
+    
     try:
         data = request.get_json() or {}
         settings = data.get('settings', {})
         
-        # For now, just return success
-        # In the future, these could be stored in a database table
+        # Path to config file
+        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
+        
+        # Load existing config
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            config = {}
+        
+        # Update with new settings
+        if 'good_trade_threshold' in settings:
+            config['good_trade_threshold'] = float(settings['good_trade_threshold'])
+        if 'analysis_hours' in settings:
+            config['analysis_hours'] = int(settings['analysis_hours'])
+        if 'min_filters_in_combo' in settings:
+            config['min_filters_in_combo'] = int(settings['min_filters_in_combo'])
+        if 'min_good_trades_kept_pct' in settings:
+            config['min_good_trades_kept_pct'] = float(settings['min_good_trades_kept_pct'])
+        if 'min_bad_trades_removed_pct' in settings:
+            config['min_bad_trades_removed_pct'] = float(settings['min_bad_trades_removed_pct'])
+        
+        # Save to file
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        
+        logger.info(f"Filter settings saved to {config_path}")
+        
         return jsonify({
             'success': True,
-            'message': 'Settings saved successfully',
+            'message': 'Settings saved successfully to config file',
             'current_settings': {
-                'good_trade_threshold': settings.get('good_trade_threshold', '0.3'),
-                'analysis_hours': settings.get('analysis_hours', '24'),
-                'min_filters_in_combo': settings.get('min_filters_in_combo', '1')
+                'good_trade_threshold': config.get('good_trade_threshold', 0.3),
+                'analysis_hours': config.get('analysis_hours', 24),
+                'min_filters_in_combo': config.get('min_filters_in_combo', 1),
+                'min_good_trades_kept_pct': config.get('min_good_trades_kept_pct', 50),
+                'min_bad_trades_removed_pct': config.get('min_bad_trades_removed_pct', 10)
             }
         })
     except Exception as e:

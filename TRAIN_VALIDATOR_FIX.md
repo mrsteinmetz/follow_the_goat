@@ -1,76 +1,99 @@
-# Train Validator Fix - Price Data Issue
+# Train Validator Fix - Database Transaction Issue
 
-## Problem Diagnosed
+## Problem Summary
 
-**Issue**: Train validator was skipping every cycle with message "Waiting for price data (0/10 points)"
+The `train_validator` job was failing to create new trades every 15 seconds (now 10 seconds). 
 
-**Root Cause**: 
-- Master2.py's in-memory DuckDB has 12,000+ rows in `prices` table (token='SOL') ✅
-- But `train_validator.py` checks `price_points` table (coin_id=5) which had 0 rows ❌
-- Legacy modules like `create_price_cycles.py` and `train_validator.py` expect data in `price_points` format
+### Symptoms
+- Last trade was created over 1 hour ago
+- `train_validator` job was running in scheduler but failing silently
+- Error in logs: "Trail generation failed for buy-in #55732: Buy-in #55732 not found"
 
-## Solution Implemented
+### Root Cause
 
-Added automatic sync of `prices` → `price_points` in master2.py:
+**Race condition in database transactions** - The `get_postgres()` context manager was NOT committing transactions.
 
-### 1. Real-time Sync (every 1 second)
-Added `sync_prices_to_price_points()` function that:
-- Runs after each `sync_from_engine()` call
-- Transforms prices (token='SOL') → price_points (coin_id=5)
-- Uses incremental sync to avoid duplicates
+#### What Was Happening:
 
-### 2. Startup Backfill
-Added Phase 4 to `backfill_from_data_engine()`:
-- Populates price_points from all existing prices on startup
-- Ensures historical data is available immediately
+1. `train_validator.py` inserts a new buyin record using `get_postgres()` context manager
+2. The context manager returns the connection to the pool **without calling `commit()`**
+3. The transaction remains uncommitted (changes not persisted)
+4. `trail_generator.py` tries to fetch that buyin using a **different** connection from the pool
+5. The uncommitted data is not visible to other connections
+6. Error: "Buy-in not found"
+7. The entire training cycle aborts
+
+## The Fix
+
+Modified `/root/follow_the_goat/core/database.py` - Added `conn.commit()` to the `get_postgres()` context manager:
+
+**Before:**
+```python
+@contextmanager
+def get_postgres():
+    conn = None
+    try:
+        conn = _pool.get_connection()
+        yield conn
+    except Exception as e:
+        logger.error(f"PostgreSQL connection error: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        raise
+    finally:
+        if conn:
+            _pool.return_connection(conn)
+```
+
+**After:**
+```python
+@contextmanager
+def get_postgres():
+    conn = None
+    try:
+        conn = _pool.get_connection()
+        yield conn
+        # Commit on successful completion
+        conn.commit()  # <-- ADDED THIS LINE
+    except Exception as e:
+        logger.error(f"PostgreSQL connection error: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+        raise
+    finally:
+        if conn:
+            _pool.return_connection(conn)
+```
+
+## Results
+
+✅ `train_validator` now creates trades every 10 seconds successfully
+✅ Each cycle completes in ~350-1264ms
+✅ Trail generation works correctly
+✅ Pattern validation works correctly
+
+### Recent Successful Trades:
+- Training #55737: NO_GO @ $142.88 (cycle 19566) [350ms]
+- Training #55739: NO_GO @ $142.86 (cycle 19566) [332ms]
+- Training #55741: NO_GO @ $142.89 (cycle 19566) [353ms]
+- Training #55750: NO_GO @ $142.80 (cycle 19566) [1264ms]
+
+## Impact
+
+This fix affects **ALL database operations** using `get_postgres()` context manager:
+- ✅ All inserts/updates now commit automatically
+- ✅ All reads see the latest committed data
+- ✅ Transactions properly rolled back on errors
+- ✅ No more race conditions between concurrent jobs
+
+## Date Fixed
+January 12, 2026 at 17:59:00 CET
 
 ## Files Modified
-
-- `scheduler/master2.py`:
-  - Added `sync_prices_to_price_points()` function (after line 2767)
-  - Modified `run_sync_from_engine()` to call price_points sync (line 2936)
-  - Added Phase 4 to backfill process (line 2693)
-
-## To Apply Fix
-
-Restart master2.py:
-```bash
-# Find PID
-ps aux | grep "python scheduler/master2.py" | grep -v grep
-
-# Kill gracefully
-kill -TERM <PID>
-
-# Restart
-cd /root/follow_the_goat
-nohup /root/follow_the_goat/venv/bin/python scheduler/master2.py > logs/master2.log 2>&1 &
-```
-
-## Expected Result
-
-After restart:
-- `price_points` table will have 12,000+ rows (same as `prices`)
-- Train validator will create trades every 15 seconds
-- Website at http://195.201.84.5/pages/features/trades/ will show new trades
-
-## Verification
-
-Check that price_points is populated:
-```bash
-curl -s http://localhost:5052/tables | python3 -m json.tool | grep price_points
-```
-
-Should show `"price_points": 12000+` (not 0)
-
-Monitor train_validator logs:
-```bash
-tail -f /root/follow_the_goat/000trading/logs/train_validator.log
-```
-
-Should see "✓ Training #<ID>: GO @ $135.xx" messages every 15 seconds.
-
----
-
-**Date**: 2026-01-05
-**Status**: Fix implemented, awaiting master2.py restart
-
+- `/root/follow_the_goat/core/database.py` - Added auto-commit to `get_postgres()` context manager

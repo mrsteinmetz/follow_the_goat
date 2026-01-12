@@ -117,7 +117,11 @@ class DatabaseClient {
         }
         
         if ($httpCode >= 400) {
-            error_log("Database API HTTP error: {$httpCode} - Response: {$response}");
+            // Only log server errors (500+) and connection failures
+            // 404s are expected for optional data (e.g., missing projects)
+            if ($httpCode >= 500) {
+                error_log("Database API HTTP error: {$httpCode} - Response: {$response}");
+            }
             return null;
         }
         

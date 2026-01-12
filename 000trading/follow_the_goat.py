@@ -491,11 +491,11 @@ class WalletFollower:
             }
             cache_json = json.dumps(cache_data)
             
-            # Update in DuckDB only (no MySQL writes) via write queue
+            # Update cache metadata in PostgreSQL
             postgres_execute("""
                 UPDATE follow_the_goat_plays
-                SET cashe_wallets_settings = ?
-                WHERE id = ?
+                SET cashe_wallets_settings = %s
+                WHERE id = %s
             """, [cache_json, play_id])
             
             # Update in-memory
@@ -571,22 +571,15 @@ class WalletFollower:
                     logger.error(f"Play #{play_id}: Missing 'query' in find_wallets_sql")
                     continue
                 
-                # Execute against DuckDB (source of wallet trades)
-                # Convert MySQL placeholders and table names to DuckDB format
-                query_duckdb = query.replace('%s', '?').replace('NOW()', 'CURRENT_TIMESTAMP')
-                # Map old MySQL table names to DuckDB equivalents
-                query_duckdb = query_duckdb.replace('solcatcher.sol_stablecoin_profiles', 'wallet_profiles')
-                query_duckdb = query_duckdb.replace('solcatcher.sol_stablecoin_trades', 'sol_stablecoin_trades')
-                
                 engine = get_trading_engine()
                 if engine and engine._running:
                     # Use in-memory engine for fastest reads
-                    results = engine.read(query_duckdb)
+                    results = engine.read(query)
                 else:
-                    # Fallback to PostgreSQL
+                    # PostgreSQL execution
                     with get_postgres() as conn:
                         with conn.cursor() as cursor:
-                            cursor.execute(query_duckdb)
+                            cursor.execute(query)
                             results = cursor.fetchall()
                 
                 initial_wallet_addresses = [
@@ -861,13 +854,12 @@ class WalletFollower:
     def update_last_processed_trade_id(self, wallet_address: str, trade_id: int) -> None:
         """Update the last processed trade ID (DuckDB only - no MySQL)."""
         try:
-            # DuckDB upsert via write queue
             from datetime import datetime, timezone
             now = datetime.now(timezone.utc)
             postgres_execute("""
                 INSERT INTO follow_the_goat_tracking 
                 (wallet_address, last_trade_id, last_checked_at)
-                VALUES (?, ?, ?)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (wallet_address) DO UPDATE SET
                     last_trade_id = excluded.last_trade_id,
                     last_checked_at = excluded.last_checked_at
@@ -1096,14 +1088,15 @@ class WalletFollower:
                         return False, "wallet_already_bought"
                 
                 # Check total buys in cycle
-                result = cursor.execute("""
+                cursor.execute("""
                     SELECT COUNT(*) as buy_count
                     FROM follow_the_goat_buyins
-                    WHERE play_id = ?
-                      AND price_cycle = ?
-                """, [play_id, price_cycle]).fetchone()
+                    WHERE play_id = %s
+                      AND price_cycle = %s
+                """, [play_id, price_cycle])
+                result = cursor.fetchone()
                 
-                buy_count = result[0] if result else 0
+                buy_count = result['buy_count'] if result else 0
                 can_buy = buy_count < max_buys_per_cycle
                 
                 if not can_buy:
@@ -1213,14 +1206,14 @@ class WalletFollower:
                 })
                 logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
             else:
-                # Fallback to file-based DuckDB via write queue
+                # Fallback to PostgreSQL write
                 postgres_execute("""
                     INSERT INTO follow_the_goat_buyins (
                         id, play_id, wallet_address, original_trade_id, trade_signature,
                         block_timestamp, quote_amount, base_amount, price, direction,
                         our_entry_price, live_trade, price_cycle, our_status, followed_at,
                         higest_price_reached
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, [
                     buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
                     block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),

@@ -407,8 +407,10 @@ def run_create_new_patterns():
     try:
         enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
         if not enabled:
+            logger.debug("Create new patterns disabled via CREATE_NEW_PATTERNS_ENABLED=0")
             return
         
+        logger.info("Starting create_new_patterns job...")
         patterns_path = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns"
         if str(patterns_path) not in sys.path:
             sys.path.insert(0, str(patterns_path))
@@ -416,7 +418,9 @@ def run_create_new_patterns():
         
         result = run_pattern_generator()
         if result.get('success'):
-            logger.info(f"Pattern generation: {result.get('suggestions_count', 0)} suggestions")
+            logger.info(f"Pattern generation completed: {result.get('suggestions_count', 0)} suggestions, "
+                       f"{result.get('combinations_count', 0)} combinations, "
+                       f"{result.get('plays_updated', 0)} plays updated")
         else:
             logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
     except Exception as e:
@@ -558,12 +562,15 @@ def create_scheduler() -> BackgroundScheduler:
         executor='realtime'
     )
     
+    # Create New Patterns - runs every 5 minutes, starts immediately
     scheduler.add_job(
         func=run_create_new_patterns,
         trigger=IntervalTrigger(minutes=5),
         id="create_new_patterns",
         name="Create New Patterns",
-        executor='heavy'
+        executor='heavy',
+        next_run_time=datetime.now(timezone.utc),  # Run immediately on startup
+        replace_existing=True
     )
     
     scheduler.add_job(

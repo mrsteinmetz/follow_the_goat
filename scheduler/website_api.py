@@ -21,6 +21,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 import logging
+import json
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -337,6 +338,12 @@ def update_play(play_id):
         update_fields = []
         params = []
         
+        # JSONB columns that need JSON string conversion
+        jsonb_fields = {
+            'find_wallets_sql', 'sell_logic', 'trigger_on_perp', 
+            'timing_conditions', 'bundle_trades', 'cashe_wallets', 'project_ids'
+        }
+        
         field_mappings = {
             'name': 'name',
             'description': 'description',
@@ -361,6 +368,11 @@ def update_play(play_id):
                 # Convert find_wallets_sql to JSON format if it's a string
                 if key == 'find_wallets_sql' and isinstance(value, str):
                     value = {'query': value}
+                
+                # Convert dict/list values to JSON strings for JSONB columns
+                if key in jsonb_fields and (isinstance(value, dict) or isinstance(value, list)):
+                    value = json.dumps(value)
+                
                 update_fields.append(f"{db_field} = %s")
                 params.append(value)
         
@@ -495,6 +507,15 @@ def create_play():
         
         with get_postgres() as conn:
             with conn.cursor() as cursor:
+                # Prepare JSONB values - convert dicts/lists to JSON strings
+                find_wallets_sql = {'query': data['find_wallets_sql']}
+                sell_logic = data.get('sell_logic', {'tolerance_rules': {'increases': [], 'decreases': []}})
+                trigger_on_perp = data.get('trigger_on_perp', {'mode': 'any'})
+                timing_conditions = data.get('timing_conditions', {'enabled': False})
+                bundle_trades = data.get('bundle_trades', {'enabled': False})
+                cashe_wallets = data.get('cashe_wallets', {'enabled': False})
+                project_ids = data.get('project_ids', []) if data.get('project_ids') else None
+                
                 cursor.execute("""
                     INSERT INTO follow_the_goat_plays (
                         name, description, find_wallets_sql, sell_logic, 
@@ -508,15 +529,15 @@ def create_play():
                 """, [
                     data['name'],
                     data['description'],
-                    {'query': data['find_wallets_sql']},
-                    data.get('sell_logic', {'tolerance_rules': {'increases': [], 'decreases': []}}),
+                    json.dumps(find_wallets_sql),
+                    json.dumps(sell_logic),
                     data.get('max_buys_per_cycle', 5),
                     data.get('short_play', 0),
-                    data.get('trigger_on_perp', {'mode': 'any'}),
-                    data.get('timing_conditions', {'enabled': False}),
-                    data.get('bundle_trades', {'enabled': False}),
-                    data.get('cashe_wallets', {'enabled': False}),
-                    data.get('project_ids', []) if data.get('project_ids') else None,
+                    json.dumps(trigger_on_perp),
+                    json.dumps(timing_conditions),
+                    json.dumps(bundle_trades),
+                    json.dumps(cashe_wallets) if cashe_wallets else None,
+                    json.dumps(project_ids) if project_ids else None,
                     1,  # is_active = 1
                     10,
                     0,
@@ -553,7 +574,21 @@ def duplicate_play(play_id):
                 if not original:
                     return jsonify({'success': False, 'error': 'Play not found'}), 404
                 
-                # Create duplicate
+                # Create duplicate - convert JSONB values to JSON strings
+                jsonb_fields_to_convert = [
+                    'find_wallets_sql', 'sell_logic', 'tricker_on_perp',
+                    'timing_conditions', 'bundle_trades', 'cashe_wallets',
+                    'project_ids', 'pattern_validator', 'cashe_wallets_settings'
+                ]
+                
+                def convert_jsonb_value(value):
+                    """Convert dict/list to JSON string, or return None if value is None."""
+                    if value is None:
+                        return None
+                    if isinstance(value, (dict, list)):
+                        return json.dumps(value)
+                    return value
+                
                 cursor.execute("""
                     INSERT INTO follow_the_goat_plays (
                         name, description, find_wallets_sql, sell_logic,
@@ -568,21 +603,21 @@ def duplicate_play(play_id):
                 """, [
                     new_name,
                     original.get('description'),
-                    original.get('find_wallets_sql'),
-                    original.get('sell_logic'),
+                    convert_jsonb_value(original.get('find_wallets_sql')),
+                    convert_jsonb_value(original.get('sell_logic')),
                     original.get('max_buys_per_cycle', 5),
                     original.get('short_play', 0),
-                    original.get('tricker_on_perp'),
-                    original.get('timing_conditions'),
-                    original.get('bundle_trades'),
-                    original.get('cashe_wallets'),
-                    original.get('project_ids'),
+                    convert_jsonb_value(original.get('tricker_on_perp')),
+                    convert_jsonb_value(original.get('timing_conditions')),
+                    convert_jsonb_value(original.get('bundle_trades')),
+                    convert_jsonb_value(original.get('cashe_wallets')),
+                    convert_jsonb_value(original.get('project_ids')),
                     1,  # is_active = 1
                     original.get('sorting', 10),
                     original.get('pattern_validator_enable', 0),
                     original.get('pattern_update_by_ai', 0),
-                    original.get('pattern_validator'),
-                    original.get('cashe_wallets_settings')
+                    convert_jsonb_value(original.get('pattern_validator')),
+                    convert_jsonb_value(original.get('cashe_wallets_settings'))
                 ])
                 result = cursor.fetchone()
                 new_id = result['id'] if result else None
@@ -1983,6 +2018,66 @@ def get_filter_analysis_dashboard():
             'play_updates': []
         }
         
+        # Load filter settings from config file
+        import json
+        from pathlib import Path
+        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        else:
+            config = {
+                'good_trade_threshold': 0.3,
+                'analysis_hours': 24,
+                'min_filters_in_combo': 1,
+                'min_good_trades_kept_pct': 50,
+                'min_bad_trades_removed_pct': 10
+            }
+        
+        # Format settings for frontend (matching GET /filter-analysis/settings format)
+        result['settings'] = [
+            {
+                'setting_key': 'good_trade_threshold',
+                'setting_value': str(config.get('good_trade_threshold', 0.3)),
+                'description': 'Good trade threshold percentage',
+                'setting_type': 'decimal',
+                'min_value': 0.1,
+                'max_value': 5.0
+            },
+            {
+                'setting_key': 'analysis_hours',
+                'setting_value': str(config.get('analysis_hours', 24)),
+                'description': 'Analysis window in hours',
+                'setting_type': 'integer',
+                'min_value': 1,
+                'max_value': 168
+            },
+            {
+                'setting_key': 'min_filters_in_combo',
+                'setting_value': str(config.get('min_filters_in_combo', 1)),
+                'description': 'Minimum filters in combination',
+                'setting_type': 'integer',
+                'min_value': 1,
+                'max_value': 10
+            },
+            {
+                'setting_key': 'min_good_trades_kept_pct',
+                'setting_value': str(config.get('min_good_trades_kept_pct', 50)),
+                'description': 'Minimum good trades kept percentage',
+                'setting_type': 'integer',
+                'min_value': 0,
+                'max_value': 100
+            },
+            {
+                'setting_key': 'min_bad_trades_removed_pct',
+                'setting_value': str(config.get('min_bad_trades_removed_pct', 10)),
+                'description': 'Minimum bad trades removed percentage',
+                'setting_type': 'integer',
+                'min_value': 0,
+                'max_value': 100
+            }
+        ]
+        
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 # Summary statistics
@@ -2250,7 +2345,7 @@ def save_filter_settings():
         else:
             config = {}
         
-        # Update with new settings
+        # Update with new settings (preserve all other config values)
         if 'good_trade_threshold' in settings:
             config['good_trade_threshold'] = float(settings['good_trade_threshold'])
         if 'analysis_hours' in settings:
@@ -2262,7 +2357,10 @@ def save_filter_settings():
         if 'min_bad_trades_removed_pct' in settings:
             config['min_bad_trades_removed_pct'] = float(settings['min_bad_trades_removed_pct'])
         
-        # Save to file
+        # Ensure directory exists
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Save to file (preserve all existing config values)
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
         

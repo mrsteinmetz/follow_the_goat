@@ -2106,28 +2106,44 @@ def get_filter_analysis_dashboard():
             'play_updates': []
         }
         
-        # Load filter settings from config file
+        # Load filter settings from PostgreSQL (same source as POST endpoint)
         import json
-        from pathlib import Path
-        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        else:
-            config = {
-                'good_trade_threshold': 0.3,
-                'analysis_hours': 24,
-                'min_filters_in_combo': 1,
-                'min_good_trades_kept_pct': 50,
-                'min_bad_trades_removed_pct': 10,
-                'is_ratio': False
-            }
+        
+        # Default values
+        defaults = {
+            'good_trade_threshold': '0.3',
+            'analysis_hours': '24',
+            'min_filters_in_combo': '2',
+            'max_filters_in_combo': '6',
+            'min_good_trades_kept_pct': '50',
+            'min_bad_trades_removed_pct': '10',
+            'combo_min_good_kept_pct': '25',
+            'combo_min_improvement': '1.0',
+            'auto_project_name': 'AutoFilters',
+            'percentile_low': '10',
+            'percentile_high': '90',
+            'is_ratio': 'false',
+            'skip_columns': '[]',
+            'section_prefixes': '{}'
+        }
+        
+        # Load from PostgreSQL
+        config = defaults.copy()
+        try:
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT setting_key, setting_value FROM auto_filter_settings")
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        config[row['setting_key']] = row['setting_value'] or defaults.get(row['setting_key'], '')
+        except Exception as e:
+            logger.warning(f"Could not load settings from PostgreSQL in dashboard endpoint, using defaults: {e}")
         
         # Format settings for frontend (matching GET /filter-analysis/settings format)
         result['settings'] = [
             {
                 'setting_key': 'good_trade_threshold',
-                'setting_value': str(config.get('good_trade_threshold', 0.3)),
+                'setting_value': config.get('good_trade_threshold', '0.3'),
                 'description': 'Good trade threshold percentage',
                 'setting_type': 'decimal',
                 'min_value': 0.1,
@@ -2135,7 +2151,7 @@ def get_filter_analysis_dashboard():
             },
             {
                 'setting_key': 'analysis_hours',
-                'setting_value': str(config.get('analysis_hours', 24)),
+                'setting_value': config.get('analysis_hours', '24'),
                 'description': 'Analysis window in hours',
                 'setting_type': 'integer',
                 'min_value': 1,
@@ -2143,7 +2159,7 @@ def get_filter_analysis_dashboard():
             },
             {
                 'setting_key': 'min_filters_in_combo',
-                'setting_value': str(config.get('min_filters_in_combo', 1)),
+                'setting_value': config.get('min_filters_in_combo', '2'),
                 'description': 'Minimum filters in combination',
                 'setting_type': 'integer',
                 'min_value': 1,
@@ -2151,7 +2167,7 @@ def get_filter_analysis_dashboard():
             },
             {
                 'setting_key': 'min_good_trades_kept_pct',
-                'setting_value': str(config.get('min_good_trades_kept_pct', 50)),
+                'setting_value': config.get('min_good_trades_kept_pct', '50'),
                 'description': 'Minimum good trades kept percentage',
                 'setting_type': 'integer',
                 'min_value': 0,
@@ -2159,7 +2175,7 @@ def get_filter_analysis_dashboard():
             },
             {
                 'setting_key': 'min_bad_trades_removed_pct',
-                'setting_value': str(config.get('min_bad_trades_removed_pct', 10)),
+                'setting_value': config.get('min_bad_trades_removed_pct', '10'),
                 'description': 'Minimum bad trades removed percentage',
                 'setting_type': 'integer',
                 'min_value': 0,
@@ -2167,7 +2183,7 @@ def get_filter_analysis_dashboard():
             },
             {
                 'setting_key': 'is_ratio',
-                'setting_value': str(config.get('is_ratio', False)).lower(),
+                'setting_value': config.get('is_ratio', 'false'),
                 'description': 'Use ratio-only filters',
                 'setting_type': 'boolean',
                 'min_value': None,

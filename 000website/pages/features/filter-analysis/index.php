@@ -983,6 +983,34 @@ ob_start();
                 btn.classList.remove('btn-primary');
                 btn.classList.add('btn-success');
                 
+                // Update form inputs with saved values
+                if (result.current_settings) {
+                    const s = result.current_settings;
+                    
+                    // Update each form input
+                    const thresholdInput = document.querySelector('input[name="good_trade_threshold"]');
+                    if (thresholdInput && s.good_trade_threshold) thresholdInput.value = s.good_trade_threshold;
+                    
+                    const hoursInput = document.querySelector('input[name="analysis_hours"]');
+                    if (hoursInput && s.analysis_hours) hoursInput.value = s.analysis_hours;
+                    
+                    const minFiltersInput = document.querySelector('input[name="min_filters_in_combo"]');
+                    if (minFiltersInput && s.min_filters_in_combo) minFiltersInput.value = s.min_filters_in_combo;
+                    
+                    const minGoodInput = document.querySelector('input[name="min_good_trades_kept_pct"]');
+                    if (minGoodInput && s.min_good_trades_kept_pct) minGoodInput.value = s.min_good_trades_kept_pct;
+                    
+                    const minBadInput = document.querySelector('input[name="min_bad_trades_removed_pct"]');
+                    if (minBadInput && s.min_bad_trades_removed_pct) minBadInput.value = s.min_bad_trades_removed_pct;
+                    
+                    const ratioToggle = document.getElementById('isRatioToggle');
+                    if (ratioToggle) {
+                        const isRatio = s.is_ratio === true || s.is_ratio === 'true' || s.is_ratio === '1';
+                        ratioToggle.checked = isRatio;
+                    }
+                }
+                
+                // Update status badge
                 const statusBadge = document.getElementById('settingsStatus');
                 if (statusBadge && result.current_settings) {
                     const s = result.current_settings;
@@ -990,11 +1018,9 @@ ob_start();
                     statusBadge.textContent = `Good: ${s.good_trade_threshold || '0.3'}% | Hours: ${s.analysis_hours || '24'} | Min Filters: ${s.min_filters_in_combo || '1'} | Min Good: ${s.min_good_trades_kept_pct || '50'}% | Min Bad: ${s.min_bad_trades_removed_pct || '10'}% | Ratio Only: ${ratioLabel}`;
                 }
                 
+                // Reload page after 2 seconds to ensure all data is fresh
                 setTimeout(() => {
-                    btn.innerHTML = originalHtml;
-                    btn.classList.remove('btn-success');
-                    btn.classList.add('btn-primary');
-                    btn.disabled = false;
+                    window.location.reload();
                 }, 2000);
             } else {
                 throw new Error(result.error || 'Failed to save');

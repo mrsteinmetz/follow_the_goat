@@ -478,7 +478,7 @@ def run_update_potential_gains():
         logger.error(f"Update potential gains job error: {e}", exc_info=True)
 
 
-@track_job("create_new_patterns", "Auto-generate filter patterns (every 5 min)")
+@track_job("create_new_patterns", "Auto-generate filter patterns (every 25 min)")
 def run_create_new_patterns():
     """Auto-generate filter patterns from trade data analysis."""
     try:
@@ -639,10 +639,10 @@ def create_scheduler() -> BackgroundScheduler:
         executor='realtime'
     )
     
-    # Create New Patterns - runs every 5 minutes, starts immediately
+    # Create New Patterns - runs every 25 minutes, starts immediately
     scheduler.add_job(
         func=run_create_new_patterns,
-        trigger=IntervalTrigger(minutes=5),
+        trigger=IntervalTrigger(minutes=25),
         id="create_new_patterns",
         name="Create New Patterns",
         executor='heavy',

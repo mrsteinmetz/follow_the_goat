@@ -839,6 +839,9 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
     Save/update filter fields catalog directly to PostgreSQL.
     
     Returns dict mapping column_name to id.
+    
+    Note: Multiple columns can map to the same field_name (e.g., pm_price_change_10m and tx_price_change_10m
+    both become price_change_10m). We deduplicate by field_name and use ON CONFLICT to handle this.
     """
     column_to_id = {}
     
@@ -848,34 +851,48 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
                 # Clear existing catalog
                 cursor.execute("DELETE FROM filter_fields_catalog")
                 
-                next_id = 1
+                # Build mapping of field_name -> (column_name, section) to handle duplicates
+                field_name_to_info = {}
                 for col in columns:
                     config = load_config()
                     section = get_section_from_column(col)
                     field_name = get_field_name_from_column(col)
                     
-                    # Insert only columns that exist in the actual table schema
+                    # If multiple columns map to same field_name, keep the first one encountered
+                    # (or we could merge sections, but keeping first is simpler)
+                    if field_name not in field_name_to_info:
+                        field_name_to_info[field_name] = {
+                            'column_name': col,
+                            'section': section
+                        }
+                
+                # Insert unique field_names
+                next_id = 1
+                for field_name, info in field_name_to_info.items():
                     cursor.execute("""
                         INSERT INTO filter_fields_catalog 
                         (id, section, field_name, field_type, description)
                         VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (id) DO UPDATE SET
+                        ON CONFLICT (field_name) DO UPDATE SET
                             section = EXCLUDED.section,
-                            field_name = EXCLUDED.field_name,
                             field_type = EXCLUDED.field_type,
                             description = EXCLUDED.description
                     """, [
                         next_id,
-                        section,
+                        info['section'],
                         field_name,
                         'numeric',
-                        f"Filter field: {col}"
+                        f"Filter field: {info['column_name']}"
                     ])
                     
-                    column_to_id[col] = next_id
+                    # Map all columns that share this field_name to the same ID
+                    for col in columns:
+                        if get_field_name_from_column(col) == field_name:
+                            column_to_id[col] = next_id
+                    
                     next_id += 1
             conn.commit()
-        logger.info(f"Saved {len(columns)} fields to filter_fields_catalog")
+        logger.info(f"Saved {len(field_name_to_info)} unique fields (from {len(columns)} columns) to filter_fields_catalog")
     except Exception as e:
         logger.error(f"Failed to save filter catalog to PostgreSQL: {e}", exc_info=True)
     

@@ -103,6 +103,7 @@ SECTION_PREFIX_MAP = {
     "wh_": "whale_activity",
     "sp_": "second_prices",
     "pat_": "patterns",
+    "mp_": "micro_patterns",
     "btc_": "btc_price_movements",
     "eth_": "eth_price_movements",
 }
@@ -508,7 +509,7 @@ def _get_field_name_from_column(field_column: str) -> Optional[str]:
 
 def _extract_pattern_data_flat(trail_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract pattern detection data from trail and flatten to field names."""
-    patterns = trail_data.get("patterns", {})
+    patterns = trail_data.get("patterns") or trail_data.get("traditional_patterns") or {}
     
     if not isinstance(patterns, dict):
         return {}
@@ -545,6 +546,32 @@ def _extract_pattern_data_flat(trail_data: Dict[str, Any]) -> Dict[str, Any]:
     result["swing_lower_highs"] = bool(swing.get("lower_highs"))
     
     return result
+
+
+def _extract_micro_pattern_data_flat(trail_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract micro-pattern detection data from trail and flatten to field names."""
+    micro = trail_data.get("micro_patterns", {})
+    if not isinstance(micro, dict):
+        return {}
+    
+    def _detected(key: str) -> bool:
+        return bool(micro.get(key, {}).get("detected"))
+    
+    def _confidence(key: str):
+        return micro.get(key, {}).get("confidence")
+    
+    return {
+        "volume_divergence_detected": _detected("volume_divergence"),
+        "volume_divergence_confidence": _confidence("volume_divergence"),
+        "order_book_squeeze_detected": _detected("order_book_squeeze"),
+        "order_book_squeeze_confidence": _confidence("order_book_squeeze"),
+        "whale_stealth_accumulation_detected": _detected("whale_stealth_accumulation"),
+        "whale_stealth_accumulation_confidence": _confidence("whale_stealth_accumulation"),
+        "momentum_acceleration_detected": _detected("momentum_acceleration"),
+        "momentum_acceleration_confidence": _confidence("momentum_acceleration"),
+        "microstructure_shift_detected": _detected("microstructure_shift"),
+        "microstructure_shift_confidence": _confidence("microstructure_shift"),
+    }
 
 
 def _calculate_second_prices_aggregates(trail_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -601,6 +628,9 @@ def _find_minute_data(
     
     if section == "patterns":
         return _extract_pattern_data_flat(trail_data)
+
+    if section == "micro_patterns":
+        return _extract_micro_pattern_data_flat(trail_data)
     
     section_data = trail_data.get(section, [])
     if not isinstance(section_data, list):

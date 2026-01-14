@@ -554,7 +554,7 @@ class WalletFollower:
                 
                 continue
             
-            # Execute wallet discovery query against MySQL
+            # Execute wallet discovery query against PostgreSQL
             find_wallets_json = play.get('find_wallets_sql')
             if not find_wallets_json:
                 logger.warning(f"Play #{play_id}: No find_wallets_sql configured")
@@ -571,16 +571,10 @@ class WalletFollower:
                     logger.error(f"Play #{play_id}: Missing 'query' in find_wallets_sql")
                     continue
                 
-                engine = get_trading_engine()
-                if engine and engine._running:
-                    # Use in-memory engine for fastest reads
-                    results = engine.read(query)
-                else:
-                    # PostgreSQL execution
-                    with get_postgres() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute(query)
-                            results = cursor.fetchall()
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute(query)
+                        results = cursor.fetchall()
                 
                 initial_wallet_addresses = [
                     r.get('wallet_address') for r in results if r.get('wallet_address')
@@ -623,7 +617,13 @@ class WalletFollower:
                 logger.error(f"Play #{play_id}: Error executing wallet query: {e}")
         
         total_ms = round((time.time() - run_start) * 1000, 3)
-        logger.info(f"Wallet discovery completed in {total_ms}ms: {len(all_wallets_with_plays)} wallet-play combinations")
+        discovery_count = len(all_wallets_with_plays)
+        logger.info(f"Wallet discovery completed in {total_ms}ms: {discovery_count} wallet-play combinations")
+        if discovery_count == 0:
+            logger.warning(
+                "Wallet discovery returned zero wallets across %s play(s); check find_wallets_sql queries.",
+                len(self.plays),
+            )
         
         return all_wallets_with_plays
     
@@ -637,7 +637,11 @@ class WalletFollower:
     ) -> Tuple[List[str], Optional[Dict[str, Any]]]:
         """Filter wallets to only those trading together in a time window.
         
-        Uses DuckDB for maximum speed.
+        CRITICAL: This enforces that N DIFFERENT wallets must trade within X seconds.
+        Example: If config says 5 trades within 2 seconds, we need 5 DISTINCT wallets
+        each making at least one trade, all within a 2-second window.
+        
+        A single wallet making 5 trades in 2 seconds does NOT count as a bundle.
         """
         if not wallet_addresses:
             return [], None
@@ -647,13 +651,21 @@ class WalletFollower:
         
         try:
             required_wallets = int(bundle_config.get('num_wallets', bundle_config.get('num_trades', 3)))
-            seconds_threshold = int(bundle_config.get('seconds', 5))
-            window_seconds = int(bundle_config.get('window_seconds', 600))
         except (TypeError, ValueError):
-            return wallet_addresses, None
-        
+            required_wallets = 3
         required_wallets = max(required_wallets, 1)
+        
+        try:
+            seconds_threshold = int(bundle_config.get('seconds', 5))
+        except (TypeError, ValueError):
+            seconds_threshold = 5
         seconds_threshold = max(seconds_threshold, 1)
+        
+        raw_window_seconds = bundle_config.get('window_seconds', 600)
+        try:
+            window_seconds = int(raw_window_seconds)
+        except (TypeError, ValueError):
+            window_seconds = 600
         window_seconds = max(window_seconds, seconds_threshold)
         
         # Build perp condition
@@ -663,68 +675,122 @@ class WalletFollower:
         elif perp_mode == 'short_only':
             perp_condition = " AND perp_direction = 'short'"
         
-        # Build wallet list for DuckDB
-        wallet_list = ", ".join([f"'{w}'" for w in wallet_addresses])
-        
-        # DuckDB query - simplified for speed
-        # Find wallets that traded together within the time window
         try:
             with get_postgres() as conn:
                 with conn.cursor() as cursor:
                     # Get recent buy trades from target wallets
-                    cursor.execute(f"""
+                    perp_clause = ""
+                    params: List[Any] = [f"{window_seconds} seconds", wallet_addresses]
+                    if perp_condition:
+                        perp_clause = " AND perp_direction = %s"
+                        params.append('long' if perp_mode == 'long_only' else 'short')
+                    
+                    cursor.execute(
+                        f"""
                         SELECT wallet_address, trade_timestamp, 
                                EXTRACT(EPOCH FROM trade_timestamp) AS ts_unix
                         FROM sol_stablecoin_trades
-                    WHERE trade_timestamp >= NOW() - INTERVAL '{window_seconds} seconds'
-                      AND direction = 'buy'
-                      AND wallet_address IN ({wallet_list})
-                      {perp_condition}
-                    ORDER BY trade_timestamp DESC
-                """)
+                        WHERE trade_timestamp >= NOW() - INTERVAL %s
+                          AND direction = 'buy'
+                          AND wallet_address = ANY(%s)
+                          {perp_clause}
+                        ORDER BY trade_timestamp DESC
+                        """,
+                        params,
+                    )
                     trades = cursor.fetchall()
             
             if not trades:
-                logger.info(f"Play #{play_id}: Bundle filter found no qualifying clusters")
+                logger.info(
+                    f"Play #{play_id} ({play_name}): Bundle filter found no qualifying wallet clusters (required {required_wallets})"
+                )
                 return [], None
             
-            # Find clustering: wallets trading within seconds_threshold of each other
-            # Group trades by time windows
+            # Find clustering: DISTINCT wallets trading within seconds_threshold of each other
+            # CRITICAL: Each wallet should only be counted once (earliest trade in window)
             from collections import defaultdict
             
-            # Find the best window with most wallets
+            # Build a dictionary of earliest trade per wallet
+            wallet_earliest_trade = {}
+            for wallet, ts, ts_unix in trades:
+                if wallet not in wallet_earliest_trade:
+                    wallet_earliest_trade[wallet] = (ts, ts_unix)
+                else:
+                    # Keep earliest trade
+                    if ts_unix < wallet_earliest_trade[wallet][1]:
+                        wallet_earliest_trade[wallet] = (ts, ts_unix)
+            
+            # Find the best window with most DISTINCT wallets
             best_wallets = set()
             best_timestamp = None
             
-            for i, (wallet, ts, ts_unix) in enumerate(trades):
-                # Find all wallets that traded within seconds_threshold of this trade
+            # Convert to list for iteration
+            wallet_list = list(wallet_earliest_trade.items())
+            
+            for i, (wallet, (ts, ts_unix)) in enumerate(wallet_list):
+                # Find all DISTINCT wallets that traded within seconds_threshold AFTER this wallet
+                # CRITICAL: Window is forward-only (not bidirectional) to match old SQL logic:
+                # OLD SQL: rt.ts_unix BETWEEN window_start AND window_start + seconds_threshold
                 window_wallets = {wallet}
-                for j, (w2, ts2, ts_unix2) in enumerate(trades):
-                    if i != j and abs(ts_unix - ts_unix2) <= seconds_threshold:
-                        window_wallets.add(w2)
+                for j, (w2, (ts2, ts_unix2)) in enumerate(wallet_list):
+                    if i != j:
+                        # Only count wallets that traded within the forward window
+                        time_diff = ts_unix2 - ts_unix
+                        if 0 <= time_diff <= seconds_threshold:
+                            window_wallets.add(w2)
                 
                 if len(window_wallets) >= required_wallets and len(window_wallets) > len(best_wallets):
                     best_wallets = window_wallets
                     best_timestamp = ts
             
             if len(best_wallets) < required_wallets:
-                logger.info(f"Play #{play_id}: Bundle filter found no qualifying clusters")
+                logger.info(
+                    f"Play #{play_id} ({play_name}): Bundle filter found no qualifying wallet clusters (required {required_wallets})"
+                )
                 return [], None
             
             # Preserve original order
             ordered_filtered = [w for w in wallet_addresses if w in best_wallets]
             
+            if not ordered_filtered:
+                window_end = None
+                if isinstance(best_timestamp, datetime):
+                    window_end = best_timestamp + timedelta(seconds=seconds_threshold)
+                logger.info(
+                    f"Play #{play_id} ({play_name}): Bundle filter window found but none of the original wallets matched"
+                )
+                return [], {
+                    'window_start': best_timestamp,
+                    'window_end': window_end,
+                    'window_duration_seconds': seconds_threshold,
+                    'wallet_count': len(best_wallets),
+                    'participating_wallets': list(best_wallets),
+                    'required_wallet_count': required_wallets,
+                    'source_wallet_count': len(wallet_addresses)
+                }
+            
+            window_end = None
+            if isinstance(best_timestamp, datetime):
+                window_end = best_timestamp + timedelta(seconds=seconds_threshold)
+            
             bundle_context = {
                 'window_start': best_timestamp,
-                'wallet_count': len(ordered_filtered),
+                'window_end': window_end,
+                'window_duration_seconds': seconds_threshold,
+                'wallet_count': len(best_wallets),
                 'participating_wallets': list(best_wallets),
                 'required_wallet_count': required_wallets,
+                'source_wallet_count': len(wallet_addresses)
             }
+            
+            logger.debug(
+                f"Play #{play_id} ({play_name}): Bundle filter window starting {best_timestamp} with {len(best_wallets)} wallet(s)"
+            )
             
             return ordered_filtered, bundle_context
             
         except Exception as e:
-            logger.error(f"Play #{play_id}: Bundle filter error: {e}")
+            logger.error(f"Play #{play_id} ({play_name}): Error executing bundle filter query: {e}")
             return wallet_addresses, None
     
     # =========================================================================
@@ -872,11 +938,7 @@ class WalletFollower:
     # =========================================================================
     
     def check_for_new_trades(self) -> List[Dict[str, Any]]:
-        """Check for new buy transactions from all target wallets.
-        
-        Uses TradingDataEngine (in-memory) for instant trade detection.
-        Falls back to file-based DuckDB if engine not available.
-        """
+        """Check for new buy transactions from all target wallets."""
         if not self.target_wallets:
             logger.debug("No target wallets configured - skipping trade check")
             return []
@@ -887,43 +949,19 @@ class WalletFollower:
                 self.last_trade_ids.get(wallet, 0) for wallet in self.target_wallets
             )
             
-            # Build wallet list for query
-            wallet_list = ", ".join([f"'{w}'" for w in self.target_wallets])
-            
-            # Try TradingDataEngine first (in-memory, instant)
-            all_trades = []
-            try:
-                engine = get_trading_engine()
-                if engine and engine._running:
-                    results = engine.read(f"""
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
                         SELECT id, signature, trade_timestamp, stablecoin_amount, sol_amount, 
                                price, direction, wallet_address, perp_direction
                         FROM sol_stablecoin_trades 
-                        WHERE wallet_address IN ({wallet_list})
+                        WHERE wallet_address = ANY(%s)
                           AND direction = 'buy' 
-                          AND id > ?
-                          AND trade_timestamp >= NOW() - INTERVAL 5 MINUTE
+                          AND id > %s
+                          AND trade_timestamp >= NOW() - INTERVAL '5 minutes'
                         ORDER BY wallet_address, id ASC
-                    """, [min_last_id])
-                    all_trades = list(results)
-            except Exception as e:
-                logger.debug(f"Engine read failed, falling back to file-DB: {e}")
-            
-            # Fallback to PostgreSQL if engine didn't return results
-            if not all_trades:
-                with get_postgres() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute(f"""
-                            SELECT id, signature, trade_timestamp, stablecoin_amount, sol_amount, 
-                                   price, direction, wallet_address, perp_direction
-                            FROM sol_stablecoin_trades 
-                            WHERE wallet_address IN ({wallet_list})
-                              AND direction = 'buy' 
-                              AND id > %s
-                              AND trade_timestamp >= NOW() - INTERVAL '5 minutes'
-                            ORDER BY wallet_address, id ASC
-                        """, [min_last_id])
-                        all_trades = cursor.fetchall()
+                    """, [self.target_wallets, min_last_id])
+                    all_trades = cursor.fetchall()
             
             # Filter by per-wallet last_id
             filtered_trades = []
@@ -1014,33 +1052,30 @@ class WalletFollower:
                         LIMIT 1
                     """, [timestamp_str, timestamp_str])
                     result = cursor.fetchone()
-                    
-                    if result:
-                        cycle_id = result['id']
-                    cycle_start = result[1] if len(result) > 1 else None
-                    
-                    # Log cycle age if it's suspiciously old (>1 hour)
-                    if cycle_start:
-                        try:
-                            if hasattr(cycle_start, 'timestamp'):
-                                start_ts = cycle_start.timestamp()
-                            elif isinstance(cycle_start, str):
-                                start_ts = datetime.fromisoformat(cycle_start.replace('Z', '+00:00')).timestamp()
-                            else:
-                                start_ts = datetime.fromisoformat(str(cycle_start).replace('Z', '+00:00')).timestamp()
-                            age_minutes = (at_timestamp.timestamp() - start_ts) / 60
-                            if age_minutes > 60:
-                                logger.warning(f"Price cycle {cycle_id} is {age_minutes:.0f} minutes old (started: {cycle_start})")
-                        except Exception:
-                            pass
-                    
-                    return cycle_id
-                
-                # No active cycle found - try to get count for diagnostics
-                count_result = cursor.execute("SELECT COUNT(*) FROM cycle_tracker WHERE threshold = 0.3").fetchone()
-                total_cycles = count_result[0] if count_result else 0
-                logger.warning(f"No active price cycle found for timestamp {timestamp_str} (total 0.3% cycles: {total_cycles})")
+            
+            if not result:
+                logger.warning(f"No active price cycle found for timestamp {timestamp_str}")
                 return None
+            
+            cycle_id = result.get('id')
+            cycle_start = result.get('cycle_start_time')
+            
+            # Log cycle age if it's suspiciously old (>1 hour)
+            if cycle_start:
+                try:
+                    if hasattr(cycle_start, 'timestamp'):
+                        start_ts = cycle_start.timestamp()
+                    elif isinstance(cycle_start, str):
+                        start_ts = datetime.fromisoformat(cycle_start.replace('Z', '+00:00')).timestamp()
+                    else:
+                        start_ts = datetime.fromisoformat(str(cycle_start).replace('Z', '+00:00')).timestamp()
+                    age_minutes = (at_timestamp.timestamp() - start_ts) / 60
+                    if age_minutes > 60:
+                        logger.warning(f"Price cycle {cycle_id} is {age_minutes:.0f} minutes old (started: {cycle_start})")
+                except Exception:
+                    pass
+            
+            return cycle_id
             
         except Exception as e:
             logger.error(f"Error getting price cycle: {e}")
@@ -1087,23 +1122,23 @@ class WalletFollower:
                         logger.debug(f"Play #{play_id}: Wallet {wallet_address[:8]}... already bought in cycle {price_cycle}")
                         return False, "wallet_already_bought"
                 
-                # Check total buys in cycle
-                cursor.execute("""
-                    SELECT COUNT(*) as buy_count
-                    FROM follow_the_goat_buyins
-                    WHERE play_id = %s
-                      AND price_cycle = %s
-                """, [play_id, price_cycle])
-                result = cursor.fetchone()
-                
-                buy_count = result['buy_count'] if result else 0
-                can_buy = buy_count < max_buys_per_cycle
-                
-                if not can_buy:
-                    logger.debug(f"Play #{play_id}: Max buys reached ({buy_count}/{max_buys_per_cycle}) for cycle {price_cycle}")
-                    return False, f"max_buys_reached:{buy_count}/{max_buys_per_cycle}"
-                
-                return True, "ok"
+                    # Check total buys in cycle
+                    cursor.execute("""
+                        SELECT COUNT(*) as buy_count
+                        FROM follow_the_goat_buyins
+                        WHERE play_id = %s
+                          AND price_cycle = %s
+                    """, [play_id, price_cycle])
+                    result = cursor.fetchone()
+                    
+                    buy_count = result['buy_count'] if result else 0
+                    can_buy = buy_count < max_buys_per_cycle
+                    
+                    if not can_buy:
+                        logger.debug(f"Play #{play_id}: Max buys reached ({buy_count}/{max_buys_per_cycle}) for cycle {price_cycle}")
+                        return False, f"max_buys_reached:{buy_count}/{max_buys_per_cycle}"
+                    
+                    return True, "ok"
                 
         except Exception as e:
             logger.error(f"Error checking max_buys_per_cycle: {e}")
@@ -1181,47 +1216,23 @@ class WalletFollower:
         import random
         buyin_id = int(insert_timestamp.strftime('%Y%m%d%H%M%S')) * 1000 + random.randint(0, 999)
         
-        # Insert directly into DuckDB (in-memory via TradingDataEngine)
+        # Insert directly into PostgreSQL
         try:
-            engine = get_trading_engine()
-            if engine and engine._running:
-                # Use in-memory engine for instant write
-                engine.write('follow_the_goat_buyins', {
-                    'id': buyin_id,
-                    'play_id': play_id,
-                    'wallet_address': trade['wallet_address'],
-                    'original_trade_id': trade['id'],
-                    'trade_signature': trade.get('signature'),
-                    'block_timestamp': block_ts,
-                    'quote_amount': trade.get('stablecoin_amount'),
-                    'base_amount': trade.get('sol_amount'),
-                    'price': trade.get('price'),
-                    'direction': trade.get('direction', 'buy'),
-                    'our_entry_price': our_entry_price,
-                    'live_trade': 1 if self.live_trade else 0,
-                    'price_cycle': current_price_cycle,
-                    'our_status': initial_status,
-                    'followed_at': block_timestamp_str,
-                    'higest_price_reached': our_entry_price  # Initialize with entry price
-                })
-                logger.debug(f"Engine insert successful, buyin_id={buyin_id}")
-            else:
-                # Fallback to PostgreSQL write
-                postgres_execute("""
-                    INSERT INTO follow_the_goat_buyins (
-                        id, play_id, wallet_address, original_trade_id, trade_signature,
-                        block_timestamp, quote_amount, base_amount, price, direction,
-                        our_entry_price, live_trade, price_cycle, our_status, followed_at,
-                        higest_price_reached
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, [
-                    buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
-                    block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),
-                    trade.get('price'), trade.get('direction', 'buy'), our_entry_price,
-                    1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str,
-                    our_entry_price  # Initialize higest_price_reached with entry price
-                ])
-                logger.debug(f"DuckDB insert successful, buyin_id={buyin_id}")
+            postgres_execute("""
+                INSERT INTO follow_the_goat_buyins (
+                    id, play_id, wallet_address, original_trade_id, trade_signature,
+                    block_timestamp, quote_amount, base_amount, price, direction,
+                    our_entry_price, live_trade, price_cycle, our_status, followed_at,
+                    higest_price_reached
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, [
+                buyin_id, play_id, trade['wallet_address'], trade['id'], trade.get('signature'),
+                block_ts, trade.get('stablecoin_amount'), trade.get('sol_amount'),
+                trade.get('price'), trade.get('direction', 'buy'), our_entry_price,
+                1 if self.live_trade else 0, current_price_cycle, initial_status, block_timestamp_str,
+                our_entry_price  # Initialize higest_price_reached with entry price
+            ])
+            logger.debug(f"PostgreSQL insert successful, buyin_id={buyin_id}")
         except Exception as e:
             logger.error(f"Buyin insert failed: {e}")
             step_logger.fail(overall_token, str(e))

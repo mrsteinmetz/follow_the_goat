@@ -75,6 +75,13 @@ $chart_field_configs = [
     'patterns' => [
         'pat_breakout_score' => ['label' => 'Breakout Score', 'format' => 'decimal', 'color' => 'rgb(59, 130, 246)'],
     ],
+    'micro_patterns' => [
+        'mp_volume_divergence_confidence' => ['label' => 'Volume Divergence Conf', 'format' => 'decimal', 'color' => 'rgb(16, 185, 129)'],
+        'mp_order_book_squeeze_confidence' => ['label' => 'Order Book Squeeze Conf', 'format' => 'decimal', 'color' => 'rgb(59, 130, 246)'],
+        'mp_whale_stealth_accumulation_confidence' => ['label' => 'Whale Stealth Accum Conf', 'format' => 'decimal', 'color' => 'rgb(139, 92, 246)'],
+        'mp_momentum_acceleration_confidence' => ['label' => 'Momentum Accel Conf', 'format' => 'decimal', 'color' => 'rgb(245, 158, 11)'],
+        'mp_microstructure_shift_confidence' => ['label' => 'Microstructure Shift Conf', 'format' => 'decimal', 'color' => 'rgb(236, 72, 153)'],
+    ],
     'second_prices' => [
         'sp_price_range_pct' => ['label' => 'Price Range %', 'format' => 'percent', 'color' => 'rgb(59, 130, 246)'],
         'sp_total_change_pct' => ['label' => 'Total Change %', 'format' => 'percent', 'color' => 'rgb(16, 185, 129)'],
@@ -150,6 +157,18 @@ $field_groups = [
         'pat_fall_wedge_confidence' => ['label' => 'Falling Wedge Conf', 'format' => 'decimal'],
         'pat_cup_handle_confidence' => ['label' => 'Cup & Handle Conf', 'format' => 'decimal'],
         'pat_inv_hs_confidence' => ['label' => 'Inv H&S Conf', 'format' => 'decimal'],
+    ],
+    'Micro Patterns' => [
+        'mp_volume_divergence_detected' => ['label' => 'Volume Divergence', 'format' => 'bool'],
+        'mp_volume_divergence_confidence' => ['label' => 'Volume Divergence Conf', 'format' => 'decimal'],
+        'mp_order_book_squeeze_detected' => ['label' => 'Order Book Squeeze', 'format' => 'bool'],
+        'mp_order_book_squeeze_confidence' => ['label' => 'Order Book Squeeze Conf', 'format' => 'decimal'],
+        'mp_whale_stealth_accumulation_detected' => ['label' => 'Whale Stealth Accum', 'format' => 'bool'],
+        'mp_whale_stealth_accumulation_confidence' => ['label' => 'Whale Stealth Accum Conf', 'format' => 'decimal'],
+        'mp_momentum_acceleration_detected' => ['label' => 'Momentum Acceleration', 'format' => 'bool'],
+        'mp_momentum_acceleration_confidence' => ['label' => 'Momentum Accel Conf', 'format' => 'decimal'],
+        'mp_microstructure_shift_detected' => ['label' => 'Microstructure Shift', 'format' => 'bool'],
+        'mp_microstructure_shift_confidence' => ['label' => 'Microstructure Shift Conf', 'format' => 'decimal'],
     ],
     'Second Prices' => [
         'sp_min_price' => ['label' => 'Min Price', 'format' => 'price'],
@@ -291,6 +310,10 @@ function formatValue($value, $format) {
         case 'decimal':
             $class = $numValue > 0 ? 'text-success' : ($numValue < 0 ? 'text-danger' : '');
             return "<span class='{$class}'>" . number_format($numValue, 4) . "</span>";
+        
+        case 'bool':
+            $isTrue = in_array(strtolower((string)$value), ['1', 'true', 'yes', 'on'], true) || $value === 1;
+            return $isTrue ? '<span class="text-success">✓</span>' : '<span class="text-muted">-</span>';
         
         default:
             return htmlspecialchars($value);
@@ -837,6 +860,7 @@ $category_colors = [
     'Transactions' => '#f59e0b',      // Amber
     'Whale Activity' => '#8b5cf6',    // Purple
     'Patterns' => '#ec4899',          // Pink
+    'Micro Patterns' => '#14b8a6',    // Teal
     'Second Prices' => '#06b6d4',     // Cyan
     'BTC Prices' => '#f97316',        // Orange
     'ETH Prices' => '#6366f1',        // Indigo
@@ -980,6 +1004,7 @@ $category_colors = [
         'Transactions' => 'transactions',
         'Whale Activity' => 'whale_activity',
         'Patterns' => 'patterns',
+        'Micro Patterns' => 'micro_patterns',
         'Second Prices' => 'second_prices',
         'BTC Prices' => 'btc_prices',
         'ETH Prices' => 'eth_prices',
@@ -1056,6 +1081,13 @@ $category_colors = [
             ],
             'patterns': [
                 { key: 'pat_breakout_score', label: 'Breakout Score', color: 'rgb(59, 130, 246)' },
+            ],
+            'micro_patterns': [
+                { key: 'mp_volume_divergence_confidence', label: 'Volume Divergence Conf', color: 'rgb(16, 185, 129)' },
+                { key: 'mp_order_book_squeeze_confidence', label: 'Order Book Squeeze Conf', color: 'rgb(59, 130, 246)' },
+                { key: 'mp_whale_stealth_accumulation_confidence', label: 'Whale Stealth Accum Conf', color: 'rgb(139, 92, 246)' },
+                { key: 'mp_momentum_acceleration_confidence', label: 'Momentum Accel Conf', color: 'rgb(245, 158, 11)' },
+                { key: 'mp_microstructure_shift_confidence', label: 'Microstructure Shift Conf', color: 'rgb(236, 72, 153)' },
             ],
             'second_prices': [
                 { key: 'sp_price_range_pct', label: 'Price Range %', color: 'rgb(59, 130, 246)' },

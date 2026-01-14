@@ -49,8 +49,9 @@ if (!$api_available) {
     }
     
     if (!$trade) {
-        header('Location: ../../?error=' . urlencode('Trade not found'));
-        exit;
+        // Trade not found - show error page instead of redirecting
+        $error_message = 'Trade not found in database';
+        // Don't exit - show error page with more details
     }
     
     // Update play_id if not provided
@@ -542,7 +543,31 @@ ob_start();
 <!-- Error Message -->
 <?php if ($error_message): ?>
 <div class="alert alert-danger" role="alert">
-    <?php echo $error_message; ?>
+    <div class="d-flex align-items-start">
+        <i class="ri-error-warning-line fs-3 me-3"></i>
+        <div class="flex-grow-1">
+            <h5 class="alert-heading mb-2"><?php echo $error_message; ?></h5>
+            <?php if (!$trade): ?>
+                <p class="mb-2">The trade with ID <strong><?php echo $trade_id; ?></strong> could not be found in the database.</p>
+                <p class="mb-2">Possible reasons:</p>
+                <ul class="mb-3">
+                    <li>The trade may have been automatically cleaned up (no_go trades older than 24 hours are removed)</li>
+                    <li>The trade ID may be incorrect or from a different system</li>
+                    <li>The database may have been recently migrated or restored</li>
+                </ul>
+                <div class="d-flex gap-2">
+                    <a href="../?id=<?php echo $play_id; ?>" class="btn btn-primary">
+                        <i class="ri-arrow-left-line me-1"></i>Return to Play
+                    </a>
+                    <a href="../../" class="btn btn-secondary">
+                        <i class="ri-home-line me-1"></i>All Plays
+                    </a>
+                </div>
+            <?php else: ?>
+                <p><?php echo $error_message; ?></p>
+            <?php endif; ?>
+        </div>
+    </div>
 </div>
 <?php endif; ?>
 

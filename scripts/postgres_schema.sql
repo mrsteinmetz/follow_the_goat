@@ -514,6 +514,18 @@ CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
     pat_swing_trend VARCHAR(20),
     pat_swing_higher_lows BOOLEAN,
     pat_swing_lower_highs BOOLEAN,
+
+    -- Micro Patterns (mp_) - 10 columns
+    mp_volume_divergence_detected BOOLEAN,
+    mp_volume_divergence_confidence DOUBLE PRECISION,
+    mp_order_book_squeeze_detected BOOLEAN,
+    mp_order_book_squeeze_confidence DOUBLE PRECISION,
+    mp_whale_stealth_accumulation_detected BOOLEAN,
+    mp_whale_stealth_accumulation_confidence DOUBLE PRECISION,
+    mp_momentum_acceleration_detected BOOLEAN,
+    mp_momentum_acceleration_confidence DOUBLE PRECISION,
+    mp_microstructure_shift_detected BOOLEAN,
+    mp_microstructure_shift_confidence DOUBLE PRECISION,
     
     -- Second Prices Summary (sp_) - 9 columns
     sp_price_count INTEGER,
@@ -562,6 +574,7 @@ CREATE TABLE IF NOT EXISTS trade_filter_values (
     minute INTEGER NOT NULL,
     filter_name VARCHAR(100) NOT NULL,
     filter_value DOUBLE PRECISION,
+    is_ratio SMALLINT DEFAULT 0,
     section VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -571,6 +584,7 @@ CREATE INDEX IF NOT EXISTS idx_tfv_buyin_id ON trade_filter_values(buyin_id);
 CREATE INDEX IF NOT EXISTS idx_tfv_filter_name ON trade_filter_values(filter_name);
 CREATE INDEX IF NOT EXISTS idx_tfv_minute ON trade_filter_values(minute);
 CREATE INDEX IF NOT EXISTS idx_tfv_section ON trade_filter_values(section);
+CREATE INDEX IF NOT EXISTS idx_tfv_is_ratio ON trade_filter_values(is_ratio);
 
 -- =============================================================================
 -- FILTER ANALYSIS TABLES (for auto filter management)
@@ -648,6 +662,19 @@ CREATE TABLE IF NOT EXISTS filter_combinations (
 
 CREATE INDEX IF NOT EXISTS idx_filter_combos_filter_count ON filter_combinations(filter_count);
 CREATE INDEX IF NOT EXISTS idx_filter_combos_minute ON filter_combinations(minute_analyzed);
+
+-- =============================================================================
+-- AUTO FILTER SETTINGS (configuration for pattern generator)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS auto_filter_settings (
+    id SERIAL PRIMARY KEY,
+    setting_key VARCHAR(100) UNIQUE NOT NULL,
+    setting_value TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_auto_filter_settings_key ON auto_filter_settings(setting_key);
 
 -- =============================================================================
 -- AI PLAY UPDATES (tracks automatic filter updates to plays)

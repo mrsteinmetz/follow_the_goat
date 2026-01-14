@@ -811,34 +811,36 @@ def save_filter_results_to_db(
         
         if rows_to_insert:
             with get_postgres() as conn:
-                # Ensure table exists
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS trade_filter_results (
-                        id INTEGER PRIMARY KEY,
-                        buyin_id INTEGER,
-                        play_id INTEGER,
-                        project_id INTEGER,
-                        filter_id INTEGER,
-                        filter_name VARCHAR,
-                        field_column VARCHAR,
-                        section VARCHAR,
-                        minute INTEGER,
-                        from_value DOUBLE,
-                        to_value DOUBLE,
-                        actual_value DOUBLE,
-                        passed INTEGER,
-                        error VARCHAR,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                
-                conn.executemany("""
-                    INSERT INTO trade_filter_results (
-                        buyin_id, play_id, project_id, filter_id, filter_name,
-                        field_column, section, minute, from_value, to_value,
-                        actual_value, passed, error
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, rows_to_insert)
+                with conn.cursor() as cursor:
+                    # Ensure table exists
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS trade_filter_results (
+                            id BIGSERIAL PRIMARY KEY,
+                            buyin_id BIGINT,
+                            play_id INTEGER,
+                            project_id INTEGER,
+                            filter_id INTEGER,
+                            filter_name VARCHAR(255),
+                            field_column VARCHAR(100),
+                            section VARCHAR(100),
+                            minute SMALLINT,
+                            from_value DOUBLE PRECISION,
+                            to_value DOUBLE PRECISION,
+                            actual_value DOUBLE PRECISION,
+                            passed SMALLINT,
+                            error TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    cursor.executemany("""
+                        INSERT INTO trade_filter_results (
+                            buyin_id, play_id, project_id, filter_id, filter_name,
+                            field_column, section, minute, from_value, to_value,
+                            actual_value, passed, error
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, rows_to_insert)
+                conn.commit()
                 
             logger.info("Saved %d filter results for buyin_id=%s", len(rows_to_insert), buyin_id)
         

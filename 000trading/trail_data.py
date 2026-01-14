@@ -403,7 +403,7 @@ def _get_section_data_for_minute(
 
 def _extract_pattern_data(trail_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract pattern detection data from trail payload."""
-    patterns = trail_data.get("patterns", {})
+    patterns = trail_data.get("patterns") or trail_data.get("traditional_patterns") or {}
     
     if not isinstance(patterns, dict):
         return {}
@@ -460,6 +460,32 @@ def _extract_pattern_data(trail_data: Dict[str, Any]) -> Dict[str, Any]:
     result["pat_swing_lower_highs"] = bool(swing.get("lower_highs"))
     
     return result
+
+
+def _extract_micro_pattern_data(trail_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract micro-pattern detection data from trail payload."""
+    micro = trail_data.get("micro_patterns", {})
+    if not isinstance(micro, dict):
+        return {}
+    
+    def _flag(key: str) -> bool:
+        return bool(micro.get(key, {}).get("detected"))
+    
+    def _conf(key: str):
+        return micro.get(key, {}).get("confidence")
+    
+    return {
+        "mp_volume_divergence_detected": _flag("volume_divergence"),
+        "mp_volume_divergence_confidence": _conf("volume_divergence"),
+        "mp_order_book_squeeze_detected": _flag("order_book_squeeze"),
+        "mp_order_book_squeeze_confidence": _conf("order_book_squeeze"),
+        "mp_whale_stealth_accumulation_detected": _flag("whale_stealth_accumulation"),
+        "mp_whale_stealth_accumulation_confidence": _conf("whale_stealth_accumulation"),
+        "mp_momentum_acceleration_detected": _flag("momentum_acceleration"),
+        "mp_momentum_acceleration_confidence": _conf("momentum_acceleration"),
+        "mp_microstructure_shift_detected": _flag("microstructure_shift"),
+        "mp_microstructure_shift_confidence": _conf("microstructure_shift"),
+    }
 
 
 def _extract_second_prices_stats(trail_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -561,6 +587,7 @@ def _build_row_for_minute(
     trail_data: Dict[str, Any],
     minute: int,
     pattern_data: Dict[str, Any],
+    micro_pattern_data: Dict[str, Any],
     second_prices_stats: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Build a flattened row for a specific minute."""
@@ -608,6 +635,10 @@ def _build_row_for_minute(
     # Add pattern data (same for all minutes of a trade)
     for key, value in pattern_data.items():
         row[key] = _convert_value(value)
+
+    # Add micro-pattern data (same for all minutes of a trade)
+    for key, value in micro_pattern_data.items():
+        row[key] = _convert_value(value)
     
     # Add second_prices summary statistics (same for all minutes)
     for key, value in second_prices_stats.items():
@@ -636,6 +667,7 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
     
     # Extract pattern data once (same for all minutes)
     pattern_data = _extract_pattern_data(trail_payload)
+    micro_pattern_data = _extract_micro_pattern_data(trail_payload)
     
     # Extract second_prices summary statistics once (same for all minutes)
     second_prices_stats = _extract_second_prices_stats(trail_payload)
@@ -647,6 +679,7 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
             trail_data=trail_payload,
             minute=minute,
             pattern_data=pattern_data,
+            micro_pattern_data=micro_pattern_data,
             second_prices_stats=second_prices_stats
         )
         rows.append(row)
@@ -684,6 +717,16 @@ def _get_all_columns() -> List[str]:
         "pat_swing_trend", "pat_swing_higher_lows", "pat_swing_lower_highs",
     ]
     columns.extend(pattern_cols)
+
+    # Add micro-pattern columns
+    micro_pattern_cols = [
+        "mp_volume_divergence_detected", "mp_volume_divergence_confidence",
+        "mp_order_book_squeeze_detected", "mp_order_book_squeeze_confidence",
+        "mp_whale_stealth_accumulation_detected", "mp_whale_stealth_accumulation_confidence",
+        "mp_momentum_acceleration_detected", "mp_momentum_acceleration_confidence",
+        "mp_microstructure_shift_detected", "mp_microstructure_shift_confidence",
+    ]
+    columns.extend(micro_pattern_cols)
     
     # Add second_prices summary columns
     sp_cols = [
@@ -814,7 +857,7 @@ def insert_trail_data(buyin_id: int, trail_payload: Dict[str, Any]) -> bool:
         logger.error(f"✗ Failed to insert trail rows for buyin_id={buyin_id}")
     
     # Also insert normalized filter values for filter analysis
-    filter_success = insert_filter_values(buyin_id, rows)
+    filter_success = insert_filter_values(buyin_id, rows, trail_payload)
     if filter_success:
         logger.debug(f"✓ Inserted filter values for buyin_id={buyin_id}")
     
@@ -834,6 +877,7 @@ COLUMN_SECTION_MAP = {
     "btc_": "btc_correlation",
     "eth_": "eth_correlation",
     "pat_": "patterns",
+    "mp_": "micro_patterns",
     "sp_": "second_prices",
 }
 
@@ -869,6 +913,16 @@ def _get_filterable_columns() -> List[str]:
         "pat_inv_hs_confidence", "pat_inv_hs_neckline",
     ]
     columns.extend(pattern_cols)
+
+    # Add micro-pattern columns (confidence + detected flags)
+    micro_pattern_cols = [
+        "mp_volume_divergence_detected", "mp_volume_divergence_confidence",
+        "mp_order_book_squeeze_detected", "mp_order_book_squeeze_confidence",
+        "mp_whale_stealth_accumulation_detected", "mp_whale_stealth_accumulation_confidence",
+        "mp_momentum_acceleration_detected", "mp_momentum_acceleration_confidence",
+        "mp_microstructure_shift_detected", "mp_microstructure_shift_confidence",
+    ]
+    columns.extend(micro_pattern_cols)
     
     # Add second prices columns
     sp_cols = [
@@ -881,7 +935,48 @@ def _get_filterable_columns() -> List[str]:
     return columns
 
 
-def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool:
+def _is_ratio_by_name(column_name: str) -> int:
+    """Heuristic to classify ratio-style fields."""
+    name = column_name.lower()
+    return 1 if any(token in name for token in ["pct", "ratio", "bps", "share", "acceleration"]) else 0
+
+
+def _build_is_ratio_map(trail_payload: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    """Build a column -> is_ratio map using trail payload field_types metadata."""
+    if not trail_payload:
+        return {}
+    
+    section_maps = {
+        "price_movements": PRICE_MOVEMENTS_FIELDS,
+        "order_book_signals": ORDER_BOOK_FIELDS,
+        "transactions": TRANSACTIONS_FIELDS,
+        "whale_activity": WHALE_ACTIVITY_FIELDS,
+        "btc_price_movements": BTC_PRICE_FIELDS,
+        "eth_price_movements": ETH_PRICE_FIELDS,
+    }
+    
+    is_ratio_map: Dict[str, int] = {}
+    for section_key, field_map in section_maps.items():
+        rows = trail_payload.get(section_key) or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            field_types = row.get("field_types")
+            if not isinstance(field_types, dict):
+                continue
+            for json_field, is_ratio in field_types.items():
+                column_name = field_map.get(json_field)
+                if column_name:
+                    is_ratio_map[column_name] = 1 if is_ratio else 0
+    
+    return is_ratio_map
+
+
+def insert_filter_values(
+    buyin_id: int,
+    wide_rows: List[Dict[str, Any]],
+    trail_payload: Optional[Dict[str, Any]] = None
+) -> bool:
     """Insert normalized filter values into trade_filter_values table.
     
     Converts wide format rows (one row per minute with many columns)
@@ -898,6 +993,7 @@ def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool
         return False
     
     filterable_columns = _get_filterable_columns()
+    is_ratio_map = _build_is_ratio_map(trail_payload)
     
     try:
         # Check if data already exists
@@ -941,11 +1037,21 @@ def insert_filter_values(buyin_id: int, wide_rows: List[Dict[str, Any]]) -> bool
                         section = _get_section_for_column(col_name)
                         
                         # Insert the normalized row
+                        is_ratio = is_ratio_map.get(col_name, _is_ratio_by_name(col_name))
+                        
                         cursor.execute("""
                             INSERT INTO trade_filter_values 
-                            (id, buyin_id, minute, filter_name, filter_value, section)
-                            VALUES (%s, %s, %s, %s, %s, %s)
-                        """, [base_id + id_counter, buyin_id, minute, col_name, float(value), section])
+                            (id, buyin_id, minute, filter_name, filter_value, is_ratio, section)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """, [
+                            base_id + id_counter,
+                            buyin_id,
+                            minute,
+                            col_name,
+                            float(value),
+                            is_ratio,
+                            section,
+                        ])
                         id_counter += 1
                         inserted_count += 1
                 

@@ -394,6 +394,18 @@ CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
     pat_swing_trend VARCHAR(20),
     pat_swing_higher_lows BOOLEAN,
     pat_swing_lower_highs BOOLEAN,
+
+    -- Micro Patterns (mp_)
+    mp_volume_divergence_detected BOOLEAN,
+    mp_volume_divergence_confidence DOUBLE,
+    mp_order_book_squeeze_detected BOOLEAN,
+    mp_order_book_squeeze_confidence DOUBLE,
+    mp_whale_stealth_accumulation_detected BOOLEAN,
+    mp_whale_stealth_accumulation_confidence DOUBLE,
+    mp_momentum_acceleration_detected BOOLEAN,
+    mp_momentum_acceleration_confidence DOUBLE,
+    mp_microstructure_shift_detected BOOLEAN,
+    mp_microstructure_shift_confidence DOUBLE,
     
     -- Second Prices Summary (sp_) - 9 columns
     sp_price_count INTEGER,
@@ -444,6 +456,7 @@ CREATE TABLE IF NOT EXISTS trade_filter_values (
     minute INTEGER NOT NULL,
     filter_name VARCHAR(100) NOT NULL,
     filter_value DOUBLE,
+    is_ratio SMALLINT DEFAULT 0,
     section VARCHAR(50),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -453,6 +466,7 @@ CREATE INDEX IF NOT EXISTS idx_tfv_buyin_id ON trade_filter_values(buyin_id);
 CREATE INDEX IF NOT EXISTS idx_tfv_filter_name ON trade_filter_values(filter_name);
 CREATE INDEX IF NOT EXISTS idx_tfv_minute ON trade_filter_values(minute);
 CREATE INDEX IF NOT EXISTS idx_tfv_section ON trade_filter_values(section);
+CREATE INDEX IF NOT EXISTS idx_tfv_is_ratio ON trade_filter_values(is_ratio);
 """
 
 # =============================================================================

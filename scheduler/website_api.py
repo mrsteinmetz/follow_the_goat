@@ -864,26 +864,26 @@ def get_price_checks():
 
 @app.route('/buyins/cleanup_no_gos', methods=['DELETE'])
 def cleanup_no_gos():
-    """Delete all no_go trades older than 24 hours from PostgreSQL."""
+    """Delete all no_go and error trades older than 24 hours from PostgreSQL."""
     try:
         deleted_count = 0
         
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Count before delete
+                # Count before delete (both no_go and error status)
                 cursor.execute("""
                     SELECT COUNT(*) as count FROM follow_the_goat_buyins 
-                    WHERE our_status = 'no_go' 
+                    WHERE our_status IN ('no_go', 'error')
                     AND followed_at < NOW() - INTERVAL '24 hours'
                 """)
                 result = cursor.fetchone()
                 deleted_count = result['count'] if result else 0
                 
                 if deleted_count > 0:
-                    # Delete from PostgreSQL
+                    # Delete from PostgreSQL (both no_go and error status)
                     cursor.execute("""
                         DELETE FROM follow_the_goat_buyins 
-                        WHERE our_status = 'no_go' 
+                        WHERE our_status IN ('no_go', 'error')
                         AND followed_at < NOW() - INTERVAL '24 hours'
                     """)
             conn.commit()
@@ -891,7 +891,7 @@ def cleanup_no_gos():
         return jsonify({
             'success': True,
             'deleted': deleted_count,
-            'message': f'Deleted {deleted_count} no_go trades older than 24 hours'
+            'message': f'Deleted {deleted_count} no_go/error trades older than 24 hours'
         })
     except Exception as e:
         logger.error(f"Cleanup no-gos failed: {e}", exc_info=True)
@@ -1364,6 +1364,94 @@ def get_scheduler_status():
             })
     except Exception as e:
         logger.error(f"Get scheduler status failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/job_metrics', methods=['GET'])
+def get_job_metrics():
+    """
+    Get job execution metrics with execution time analysis.
+    
+    Query parameters:
+    - hours: Number of hours of history to analyze (default: 1, max: 24)
+    
+    Returns per-job statistics including:
+    - avg_duration_ms, max_duration_ms, min_duration_ms
+    - execution_count, error_count
+    - recent_executions (last 20)
+    - is_slow flag (avg > 80% of expected interval)
+    """
+    try:
+        hours = float(request.args.get('hours', 1.0))
+        hours = max(0.01, min(24.0, hours))  # Clamp to 0.01-24 hours
+        
+        from scheduler.status import get_job_metrics as fetch_metrics
+        metrics = fetch_metrics(hours=hours)
+        return jsonify(metrics)
+        
+    except Exception as e:
+        logger.error(f"Get job metrics failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'status': 'error',
+            'error': str(e),
+            'message': 'Failed to fetch job metrics'
+        }), 500
+
+
+@app.route('/job_metrics_debug', methods=['GET'])
+def get_job_metrics_debug():
+    """Debug endpoint to check metrics table status."""
+    try:
+        from scheduler.status import _metrics_table_initialized, _metrics_writer_running
+        
+        result = {
+            'metrics_table_initialized': _metrics_table_initialized,
+            'metrics_writer_running': _metrics_writer_running,
+        }
+        
+        try:
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    # Check if table exists
+                    cursor.execute("""
+                        SELECT COUNT(*) as count FROM information_schema.tables 
+                        WHERE table_name = 'job_execution_metrics'
+                    """)
+                    count_result = cursor.fetchone()
+                    result['table_exists'] = (count_result['count'] if count_result else 0) > 0
+                    
+                    if result['table_exists']:
+                        cursor.execute("SELECT COUNT(*) as count FROM job_execution_metrics")
+                        row_count_result = cursor.fetchone()
+                        result['row_count'] = row_count_result['count'] if row_count_result else 0
+                        
+                        # Get sample rows
+                        cursor.execute("""
+                            SELECT job_id, status, duration_ms, started_at 
+                            FROM job_execution_metrics 
+                            ORDER BY started_at DESC LIMIT 5
+                        """)
+                        rows = cursor.fetchall()
+                        result['sample_rows'] = [
+                            {
+                                'job_id': r['job_id'], 
+                                'status': r['status'], 
+                                'duration_ms': r['duration_ms'], 
+                                'started_at': r['started_at'].isoformat() if r['started_at'] else None
+                            }
+                            for r in rows
+                        ]
+        except Exception as db_error:
+            result['db_error'] = str(db_error)
+            import traceback
+            result['traceback'] = traceback.format_exc()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Get job metrics debug failed: {e}")
         return jsonify({'error': str(e)}), 500
 
 
@@ -2031,7 +2119,8 @@ def get_filter_analysis_dashboard():
                 'analysis_hours': 24,
                 'min_filters_in_combo': 1,
                 'min_good_trades_kept_pct': 50,
-                'min_bad_trades_removed_pct': 10
+                'min_bad_trades_removed_pct': 10,
+                'is_ratio': False
             }
         
         # Format settings for frontend (matching GET /filter-analysis/settings format)
@@ -2075,6 +2164,14 @@ def get_filter_analysis_dashboard():
                 'setting_type': 'integer',
                 'min_value': 0,
                 'max_value': 100
+            },
+            {
+                'setting_key': 'is_ratio',
+                'setting_value': str(config.get('is_ratio', False)).lower(),
+                'description': 'Use ratio-only filters',
+                'setting_type': 'boolean',
+                'min_value': None,
+                'max_value': None
             }
         ]
         
@@ -2253,34 +2350,57 @@ def get_filter_analysis_dashboard():
 
 @app.route('/filter-analysis/settings', methods=['GET'])
 def get_filter_settings():
-    """Get auto filter settings from config file."""
+    """Get auto filter settings from PostgreSQL table."""
     import json
-    from pathlib import Path
     
     try:
-        # Path to config file
-        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
+        # Default values
+        defaults = {
+            'good_trade_threshold': '0.3',
+            'analysis_hours': '24',
+            'min_filters_in_combo': '2',
+            'max_filters_in_combo': '6',
+            'min_good_trades_kept_pct': '50',
+            'min_bad_trades_removed_pct': '10',
+            'combo_min_good_kept_pct': '25',
+            'combo_min_improvement': '1.0',
+            'auto_project_name': 'AutoFilters',
+            'percentile_low': '10',
+            'percentile_high': '90',
+            'is_ratio': 'false',
+            'skip_columns': '[]',
+            'section_prefixes': '{}'
+        }
         
-        # Load config
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        else:
-            # Default values
-            config = {
-                'good_trade_threshold': 0.3,
-                'analysis_hours': 24,
-                'min_filters_in_combo': 1,
-                'min_good_trades_kept_pct': 50,
-                'min_bad_trades_removed_pct': 10
-            }
+        # Load from PostgreSQL
+        config = defaults.copy()
+        try:
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT setting_key, setting_value FROM auto_filter_settings")
+                    rows = cursor.fetchall()
+                    for row in rows:
+                        config[row['setting_key']] = row['setting_value'] or defaults.get(row['setting_key'], '')
+        except Exception as e:
+            logger.warning(f"Could not load settings from PostgreSQL, using defaults: {e}")
+        
+        # Parse JSON fields
+        try:
+            skip_columns = json.loads(config.get('skip_columns', '[]'))
+        except:
+            skip_columns = []
+        
+        try:
+            section_prefixes = json.loads(config.get('section_prefixes', '{}'))
+        except:
+            section_prefixes = {}
         
         return jsonify({
             'success': True,
             'settings': [
                 {
                     'setting_key': 'good_trade_threshold',
-                    'setting_value': str(config.get('good_trade_threshold', 0.3)),
+                    'setting_value': config.get('good_trade_threshold', '0.3'),
                     'description': 'Good trade threshold percentage',
                     'setting_type': 'decimal',
                     'min_value': 0.1,
@@ -2288,7 +2408,7 @@ def get_filter_settings():
                 },
                 {
                     'setting_key': 'analysis_hours',
-                    'setting_value': str(config.get('analysis_hours', 24)),
+                    'setting_value': config.get('analysis_hours', '24'),
                     'description': 'Analysis window in hours',
                     'setting_type': 'integer',
                     'min_value': 1,
@@ -2296,15 +2416,23 @@ def get_filter_settings():
                 },
                 {
                     'setting_key': 'min_filters_in_combo',
-                    'setting_value': str(config.get('min_filters_in_combo', 1)),
+                    'setting_value': config.get('min_filters_in_combo', '2'),
                     'description': 'Minimum filters in combination',
                     'setting_type': 'integer',
                     'min_value': 1,
                     'max_value': 10
                 },
                 {
+                    'setting_key': 'max_filters_in_combo',
+                    'setting_value': config.get('max_filters_in_combo', '6'),
+                    'description': 'Maximum filters in combination',
+                    'setting_type': 'integer',
+                    'min_value': 1,
+                    'max_value': 20
+                },
+                {
                     'setting_key': 'min_good_trades_kept_pct',
-                    'setting_value': str(config.get('min_good_trades_kept_pct', 50)),
+                    'setting_value': config.get('min_good_trades_kept_pct', '50'),
                     'description': 'Minimum good trades kept percentage',
                     'setting_type': 'integer',
                     'min_value': 0,
@@ -2312,11 +2440,59 @@ def get_filter_settings():
                 },
                 {
                     'setting_key': 'min_bad_trades_removed_pct',
-                    'setting_value': str(config.get('min_bad_trades_removed_pct', 10)),
+                    'setting_value': config.get('min_bad_trades_removed_pct', '10'),
                     'description': 'Minimum bad trades removed percentage',
                     'setting_type': 'integer',
                     'min_value': 0,
                     'max_value': 100
+                },
+                {
+                    'setting_key': 'combo_min_good_kept_pct',
+                    'setting_value': config.get('combo_min_good_kept_pct', '25'),
+                    'description': 'Minimum good trades kept for combinations',
+                    'setting_type': 'integer',
+                    'min_value': 0,
+                    'max_value': 100
+                },
+                {
+                    'setting_key': 'combo_min_improvement',
+                    'setting_value': config.get('combo_min_improvement', '1.0'),
+                    'description': 'Minimum improvement over single filter',
+                    'setting_type': 'decimal',
+                    'min_value': 0.1,
+                    'max_value': 50.0
+                },
+                {
+                    'setting_key': 'auto_project_name',
+                    'setting_value': config.get('auto_project_name', 'AutoFilters'),
+                    'description': 'Name of auto-generated project',
+                    'setting_type': 'string',
+                    'min_value': None,
+                    'max_value': None
+                },
+                {
+                    'setting_key': 'percentile_low',
+                    'setting_value': config.get('percentile_low', '10'),
+                    'description': 'Low percentile for threshold calculation',
+                    'setting_type': 'integer',
+                    'min_value': 1,
+                    'max_value': 50
+                },
+                {
+                    'setting_key': 'percentile_high',
+                    'setting_value': config.get('percentile_high', '90'),
+                    'description': 'High percentile for threshold calculation',
+                    'setting_type': 'integer',
+                    'min_value': 50,
+                    'max_value': 99
+                },
+                {
+                    'setting_key': 'is_ratio',
+                    'setting_value': config.get('is_ratio', 'false'),
+                    'description': 'Use ratio-only filters',
+                    'setting_type': 'boolean',
+                    'min_value': None,
+                    'max_value': None
                 }
             ]
         })
@@ -2327,55 +2503,80 @@ def get_filter_settings():
 
 @app.route('/filter-analysis/settings', methods=['POST'])
 def save_filter_settings():
-    """Save auto filter settings to config file."""
+    """Save auto filter settings to PostgreSQL table."""
     import json
-    from pathlib import Path
     
     try:
         data = request.get_json() or {}
         settings = data.get('settings', {})
         
-        # Path to config file
-        config_path = Path(__file__).parent.parent / "000data_feeds" / "7_create_new_patterns" / "config.json"
+        # Ensure table exists
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS auto_filter_settings (
+                        id SERIAL PRIMARY KEY,
+                        setting_key VARCHAR(100) UNIQUE NOT NULL,
+                        setting_value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_auto_filter_settings_key 
+                    ON auto_filter_settings(setting_key)
+                """)
+                conn.commit()
         
-        # Load existing config
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        else:
-            config = {}
+        # Save each setting to PostgreSQL
+        saved_settings = {}
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Map of setting keys to their values
+                setting_map = {
+                    'good_trade_threshold': settings.get('good_trade_threshold'),
+                    'analysis_hours': settings.get('analysis_hours'),
+                    'min_filters_in_combo': settings.get('min_filters_in_combo'),
+                    'max_filters_in_combo': settings.get('max_filters_in_combo'),
+                    'min_good_trades_kept_pct': settings.get('min_good_trades_kept_pct'),
+                    'min_bad_trades_removed_pct': settings.get('min_bad_trades_removed_pct'),
+                    'combo_min_good_kept_pct': settings.get('combo_min_good_kept_pct'),
+                    'combo_min_improvement': settings.get('combo_min_improvement'),
+                    'auto_project_name': settings.get('auto_project_name'),
+                    'percentile_low': settings.get('percentile_low'),
+                    'percentile_high': settings.get('percentile_high'),
+                    'is_ratio': settings.get('is_ratio'),
+                    'skip_columns': settings.get('skip_columns'),
+                    'section_prefixes': settings.get('section_prefixes'),
+                }
+                
+                for key, value in setting_map.items():
+                    if value is not None:
+                        # Convert complex types to JSON strings
+                        if isinstance(value, (dict, list)):
+                            value_str = json.dumps(value)
+                        else:
+                            value_str = str(value)
+                        
+                        # Upsert setting
+                        cursor.execute("""
+                            INSERT INTO auto_filter_settings (setting_key, setting_value, updated_at)
+                            VALUES (%s, %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (setting_key) 
+                            DO UPDATE SET 
+                                setting_value = EXCLUDED.setting_value,
+                                updated_at = CURRENT_TIMESTAMP
+                        """, [key, value_str])
+                        
+                        saved_settings[key] = value
+                
+                conn.commit()
         
-        # Update with new settings (preserve all other config values)
-        if 'good_trade_threshold' in settings:
-            config['good_trade_threshold'] = float(settings['good_trade_threshold'])
-        if 'analysis_hours' in settings:
-            config['analysis_hours'] = int(settings['analysis_hours'])
-        if 'min_filters_in_combo' in settings:
-            config['min_filters_in_combo'] = int(settings['min_filters_in_combo'])
-        if 'min_good_trades_kept_pct' in settings:
-            config['min_good_trades_kept_pct'] = float(settings['min_good_trades_kept_pct'])
-        if 'min_bad_trades_removed_pct' in settings:
-            config['min_bad_trades_removed_pct'] = float(settings['min_bad_trades_removed_pct'])
-        
-        # Ensure directory exists
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save to file (preserve all existing config values)
-        with open(config_path, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        logger.info(f"Filter settings saved to {config_path}")
+        logger.info(f"Filter settings saved to PostgreSQL: {list(saved_settings.keys())}")
         
         return jsonify({
             'success': True,
-            'message': 'Settings saved successfully to config file',
-            'current_settings': {
-                'good_trade_threshold': config.get('good_trade_threshold', 0.3),
-                'analysis_hours': config.get('analysis_hours', 24),
-                'min_filters_in_combo': config.get('min_filters_in_combo', 1),
-                'min_good_trades_kept_pct': config.get('min_good_trades_kept_pct', 50),
-                'min_bad_trades_removed_pct': config.get('min_bad_trades_removed_pct', 10)
-            }
+            'message': 'Settings saved successfully to PostgreSQL',
+            'current_settings': saved_settings
         })
     except Exception as e:
         logger.error(f"Save filter settings failed: {e}", exc_info=True)

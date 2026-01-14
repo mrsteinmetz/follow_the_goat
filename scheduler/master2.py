@@ -272,6 +272,83 @@ def create_local_api() -> FastAPI:
             logger.error(f"Query SQL failed: {e}")
             raise HTTPException(status_code=500, detail=str(e))
     
+    @app.get("/job_metrics")
+    async def get_job_metrics_endpoint(hours: float = Query(default=1.0, ge=0.01, le=24.0)):
+        """
+        Get job execution metrics with execution time analysis.
+        
+        Returns per-job statistics including:
+        - Average, min, max execution duration
+        - Execution count and error count
+        - Recent execution history
+        - Slow job detection
+        
+        Args:
+            hours: Number of hours of history to analyze (default: 1, max: 24)
+        """
+        try:
+            from scheduler.status import get_job_metrics
+            metrics = get_job_metrics(hours=hours)
+            return metrics
+        except Exception as e:
+            logger.error(f"Get job metrics failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/job_metrics_debug")
+    async def get_job_metrics_debug_endpoint():
+        """Debug endpoint to check metrics table status."""
+        try:
+            from scheduler.status import _metrics_table_initialized, _metrics_writer_running
+            
+            result = {
+                'metrics_table_initialized': _metrics_table_initialized,
+                'metrics_writer_running': _metrics_writer_running,
+            }
+            
+            try:
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        # Check if table exists
+                        cursor.execute("""
+                            SELECT COUNT(*) as count FROM information_schema.tables 
+                            WHERE table_name = 'job_execution_metrics'
+                        """)
+                        count_result = cursor.fetchone()
+                        result['table_exists'] = (count_result['count'] if count_result else 0) > 0
+                        
+                        if result['table_exists']:
+                            cursor.execute("SELECT COUNT(*) as count FROM job_execution_metrics")
+                            row_count_result = cursor.fetchone()
+                            result['row_count'] = row_count_result['count'] if row_count_result else 0
+                            
+                            # Get sample rows
+                            cursor.execute("""
+                                SELECT job_id, status, duration_ms, started_at 
+                                FROM job_execution_metrics 
+                                ORDER BY started_at DESC LIMIT 5
+                            """)
+                            rows = cursor.fetchall()
+                            result['sample_rows'] = [
+                                {
+                                    'job_id': r['job_id'], 
+                                    'status': r['status'], 
+                                    'duration_ms': r['duration_ms'], 
+                                    'started_at': r['started_at'].isoformat() if r['started_at'] else None
+                                }
+                                for r in rows
+                            ]
+            except Exception as db_error:
+                result['db_error'] = str(db_error)
+                import traceback
+                result['traceback'] = traceback.format_exc()
+            
+            return result
+        except Exception as e:
+            logger.error(f"Get job metrics debug failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+    
     return app
 
 

@@ -104,20 +104,20 @@ if ($api_available) {
     // DEBUG: Log the API call
     error_log("PRICE DEBUG: Requesting from $start_datetime to $end_datetime");
     
-    // Try the 2-hour fallback FIRST (since we know data only goes back ~2 hours)
-    $price_response = $db->getPricePoints($token, $fallback_start_datetime, $end_datetime);
-    error_log("PRICE DEBUG: Fallback response - count=" . ($price_response['count'] ?? 'N/A') . ", total=" . ($price_response['total_available'] ?? 'N/A'));
+    // Try 24 hours FIRST to match the cycle data range
+    $price_response = $db->getPricePoints($token, $start_datetime, $end_datetime);
+    error_log("PRICE DEBUG: 24h response - count=" . ($price_response['count'] ?? 'N/A') . ", total=" . ($price_response['total_available'] ?? 'N/A'));
     
     if ($price_response && isset($price_response['prices']) && count($price_response['prices']) > 0) {
         $chart_data['prices'] = $price_response['prices'];
-        $start_datetime = $fallback_start_datetime; // Update for display
-        error_log("PRICE DEBUG: Using fallback data with " . count($chart_data['prices']) . " prices");
+        error_log("PRICE DEBUG: Using 24h data with " . count($chart_data['prices']) . " prices");
     } else {
-        // If fallback failed, try 24h (shouldn't happen, but for completeness)
-        error_log("PRICE DEBUG: Fallback empty, trying 24h range");
-        $price_response = $db->getPricePoints($token, $start_datetime, $end_datetime);
+        // If 24h failed, try 2-hour fallback (for new deployments with limited data)
+        error_log("PRICE DEBUG: 24h empty, trying 2h fallback");
+        $price_response = $db->getPricePoints($token, $fallback_start_datetime, $end_datetime);
         if ($price_response && isset($price_response['prices'])) {
             $chart_data['prices'] = $price_response['prices'];
+            $start_datetime = $fallback_start_datetime; // Update for display
         }
     }
 } else {
@@ -881,17 +881,34 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                 const selectedCycle = window.selectedCycle;
 
                 if (!chartData.candles || chartData.candles.length === 0) {
+                    console.warn('No candle data available for chart');
                     return;
                 }
 
                 // Build annotations for cycle start times (all cycles, not just filtered ones)
-                // Only show these if no cycle is selected (initial display)
-                // Timestamps from database are UTC strings like "2025-01-04 06:49:49"
+                // Show these on initial display AND when no cycle is selected
+                // Timestamps from database are UTC strings (may be "2025-01-04 06:49:49" or "2025-01-04T06:49:49Z")
                 const xAxisAnnotations = [];
-                if (!selectedCycle && allCyclesForDisplay.length > 0) {
+                
+                // Always show all cycle lines if cycles exist
+                if (allCyclesForDisplay.length > 0) {
                     allCyclesForDisplay.forEach(function(cycle, index) {
-                        // Parse UTC timestamp - database returns UTC strings without timezone indicator
-                        const timeValue = new Date(cycle.cycle_start_time.replace(' ', 'T') + 'Z').getTime();
+                        // Parse UTC timestamp - handle both formats
+                        let timestampStr = cycle.cycle_start_time;
+                        if (!timestampStr.includes('T')) {
+                            timestampStr = timestampStr.replace(' ', 'T');
+                        }
+                        if (!timestampStr.endsWith('Z')) {
+                            timestampStr += 'Z';
+                        }
+                        const timeValue = new Date(timestampStr).getTime();
+                        
+                        // If this is the selected cycle, we'll add a highlighted version later
+                        // So skip adding the basic annotation for it
+                        if (selectedCycle && cycle.id == selectedCycle.price_cycle) {
+                            return; // Skip this one, we'll add special styling later
+                        }
+                        
                         xAxisAnnotations.push({
                             x: timeValue,
                             borderColor: '#50cd89',
@@ -919,13 +936,31 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
                 }
 
                 // Add highlighted region and vertical lines for selected cycle
-                // Timestamps from database are UTC strings like "2025-01-04 06:49:49"
+                // Timestamps from database are UTC strings (may be "2025-01-04 06:49:49" or "2025-01-04T06:49:49Z")
                 if (selectedCycle && selectedCycle.cycle_start_time) {
-                    // Parse UTC timestamps - database returns UTC strings without timezone indicator
-                    const cycleStart = new Date(selectedCycle.cycle_start_time.replace(' ', 'T') + 'Z').getTime();
-                    const cycleEnd = selectedCycle.cycle_end_time 
-                        ? new Date(selectedCycle.cycle_end_time.replace(' ', 'T') + 'Z').getTime()
-                        : Date.now(); // Current time in UTC milliseconds
+                    // Parse UTC timestamps - handle both formats
+                    let startStr = selectedCycle.cycle_start_time;
+                    if (!startStr.includes('T')) {
+                        startStr = startStr.replace(' ', 'T');
+                    }
+                    if (!startStr.endsWith('Z')) {
+                        startStr += 'Z';
+                    }
+                    const cycleStart = new Date(startStr).getTime();
+                    
+                    let cycleEnd;
+                    if (selectedCycle.cycle_end_time) {
+                        let endStr = selectedCycle.cycle_end_time;
+                        if (!endStr.includes('T')) {
+                            endStr = endStr.replace(' ', 'T');
+                        }
+                        if (!endStr.endsWith('Z')) {
+                            endStr += 'Z';
+                        }
+                        cycleEnd = new Date(endStr).getTime();
+                    } else {
+                        cycleEnd = Date.now(); // Current time in UTC milliseconds
+                    }
                     
                     // Add the highlighted region annotation (background fill)
                     xAxisAnnotations.push({

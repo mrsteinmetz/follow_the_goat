@@ -560,7 +560,7 @@ def get_job_metrics():
 def get_job_metrics_debug():
     """Debug endpoint to check metrics table directly."""
     try:
-        from core.database import get_duckdb
+        from core.database import get_postgres
         from scheduler.status import _metrics_table_initialized, _metrics_writer_running
         
         result = {
@@ -569,30 +569,36 @@ def get_job_metrics_debug():
         }
         
         try:
-            with get_duckdb("central") as conn:
-                # Check if table exists
-                tables = conn.execute("""
-                    SELECT table_name FROM information_schema.tables 
-                    WHERE table_name = 'job_execution_metrics'
-                """).fetchall()
-                result['table_exists'] = len(tables) > 0
-                
-                if result['table_exists']:
-                    count = conn.execute("SELECT COUNT(*) FROM job_execution_metrics").fetchone()
-                    result['row_count'] = count[0]
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    # Check if table exists
+                    cursor.execute("""
+                        SELECT table_name FROM information_schema.tables 
+                        WHERE table_name = 'job_execution_metrics'
+                    """)
+                    tables = cursor.fetchall()
+                    result['table_exists'] = len(tables) > 0
                     
-                    # Get sample rows
-                    rows = conn.execute("""
-                        SELECT job_id, status, duration_ms, started_at 
-                        FROM job_execution_metrics 
-                        ORDER BY started_at DESC LIMIT 5
-                    """).fetchall()
-                    result['sample_rows'] = [
-                        {'job_id': r[0], 'status': r[1], 'duration_ms': r[2], 'started_at': str(r[3])}
-                        for r in rows
-                    ]
+                    if result['table_exists']:
+                        cursor.execute("SELECT COUNT(*) FROM job_execution_metrics")
+                        count = cursor.fetchone()
+                        result['row_count'] = count[0] if count else 0
+                        
+                        # Get sample rows
+                        cursor.execute("""
+                            SELECT job_id, status, duration_ms, started_at 
+                            FROM job_execution_metrics 
+                            ORDER BY started_at DESC LIMIT 5
+                        """)
+                        rows = cursor.fetchall()
+                        result['sample_rows'] = [
+                            {'job_id': r[0], 'status': r[1], 'duration_ms': r[2], 'started_at': str(r[3])}
+                            for r in rows
+                        ]
         except Exception as db_error:
             result['db_error'] = str(db_error)
+            import traceback
+            result['traceback'] = traceback.format_exc()
         
         return jsonify(result)
     except Exception as e:
@@ -1248,23 +1254,40 @@ def update_buyin(buyin_id):
 
 @app.route('/buyins/<int:buyin_id>', methods=['GET'])
 def get_single_buyin(buyin_id):
-    """Get a single buyin/trade by ID from DuckDB."""
+    """Get a single buyin/trade by ID - checks DuckDB first, then falls back to PostgreSQL."""
     try:
+        # Try DuckDB first (fast, recent data)
         with get_duckdb("central") as conn:
             result = conn.execute("SELECT * FROM follow_the_goat_buyins WHERE id = ?", [buyin_id]).fetchone()
             
-            if not result:
-                return jsonify({'success': False, 'error': 'Trade not found'}), 404
-            
-            columns = [desc[0] for desc in conn.description]
-            buyin = dict(zip(columns, result))
+            if result:
+                columns = [desc[0] for desc in conn.description]
+                buyin = dict(zip(columns, result))
+                
+                # Convert datetime fields
+                for key in ['block_timestamp', 'followed_at', 'our_exit_timestamp', 'created_at']:
+                    if buyin.get(key) and hasattr(buyin[key], 'strftime'):
+                        buyin[key] = buyin[key].strftime('%Y-%m-%d %H:%M:%S')
+                
+                return jsonify({'success': True, 'buyin': buyin, 'source': 'duckdb'})
         
-        # Convert datetime fields
-        for key in ['block_timestamp', 'followed_at', 'our_exit_timestamp', 'created_at']:
-            if buyin.get(key) and hasattr(buyin[key], 'strftime'):
-                buyin[key] = buyin[key].strftime('%Y-%m-%d %H:%M:%S')
-        
-        return jsonify({'success': True, 'buyin': buyin, 'source': 'duckdb'})
+        # If not found in DuckDB, fall back to PostgreSQL (for older trades)
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM follow_the_goat_buyins WHERE id = %s", [buyin_id])
+                result = cursor.fetchone()
+                
+                if not result:
+                    return jsonify({'success': False, 'error': 'Trade not found'}), 404
+                
+                buyin = dict(result)
+                
+                # Convert datetime fields to strings
+                for key in ['block_timestamp', 'followed_at', 'our_exit_timestamp', 'created_at']:
+                    if buyin.get(key) and hasattr(buyin[key], 'strftime'):
+                        buyin[key] = buyin[key].strftime('%Y-%m-%d %H:%M:%S')
+                
+                return jsonify({'success': True, 'buyin': buyin, 'source': 'postgresql'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 

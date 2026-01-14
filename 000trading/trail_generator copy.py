@@ -1,17 +1,10 @@
 """
-15-Minute Trail Generator - Enhanced for Micro-Movement Detection
-==================================================================
-Generate analytics trail data for buy-in signals using PostgreSQL.
+15-Minute Trail Generator
+=========================
+Generate analytics trail data for buy-in signals using DuckDB.
 
 This module fetches order book, transactions, whale activity, and price data
-and computes derived metrics optimized for detecting 0.5% price climbs.
-
-Enhanced Features:
-- Micro-pattern detection for sub-1% moves
-- Field type tracking (is_ratio metadata)
-- Multi-signal confirmation scoring
-- Time-series derivatives and acceleration metrics
-- Cross-market correlation analysis
+from DuckDB tables and computes derived metrics for pattern validation.
 
 Trail data is stored in the `buyin_trail_minutes` table (one row per minute,
 15 rows per buyin) for efficient querying and pattern validation.
@@ -35,7 +28,7 @@ import os
 from datetime import datetime, timedelta, date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -112,164 +105,12 @@ def _execute_query(query: str, params: list = None, as_dict: bool = True, gracef
         if graceful:
             return []
         raise
-
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "SOLUSDT")
 DEFAULT_LOOKBACK_MINUTES = int(os.getenv("TRAIL_LOOKBACK_MINUTES", "15"))
 TRAIL_COLUMN_NAME = "fifteen_min_trail"  # DuckDB uses this name (no numeric prefix)
-
-
-# =============================================================================
-# FIELD TYPE SCHEMA - RATIO VS VALUE TRACKING
-# =============================================================================
-
-FIELD_TYPE_SCHEMA = {
-    "order_book_signals": {
-        # Ratios (1)
-        "volume_imbalance": 1,
-        "relative_spread_bps": 1,
-        "microprice_dev_bps": 1,
-        "bid_depth_bps_10": 1,
-        "ask_depth_bps_10": 1,
-        "depth_imbalance_ratio": 1,
-        "bid_liquidity_share_pct": 1,
-        "ask_liquidity_share_pct": 1,
-        "depth_imbalance_pct": 1,
-        "liquidity_change_3m": 1,
-        "microprice_acceleration_2m": 1,
-        "aggression_ratio": 1,
-        "vwap_spread_bps": 1,
-        "net_flow_to_liquidity_ratio": 1,
-        "price_change_1m": 1,
-        "price_change_5m": 1,
-        "price_change_10m": 1,
-        "imbalance_shift_1m": 1,
-        # Values (0)
-        "mid_price": 0,
-        "microprice": 0,
-        "bid_depth_10": 0,
-        "ask_depth_10": 0,
-        "total_depth_10": 0,
-        "total_liquidity": 0,
-        "bid_slope": 0,
-        "ask_slope": 0,
-        "bid_vwap_10": 0,
-        "ask_vwap_10": 0,
-        "net_liquidity_change_sum": 0,
-        "net_flow_5m": 0,
-        "sample_count": 0,
-        "coverage_seconds": 0,
-    },
-    "transactions": {
-        # Ratios (1)
-        "buy_sell_pressure": 1,
-        "buy_volume_pct": 1,
-        "sell_volume_pct": 1,
-        "pressure_shift_1m": 1,
-        "long_short_ratio": 1,
-        "long_volume_pct": 1,
-        "short_volume_pct": 1,
-        "perp_position_skew_pct": 1,
-        "perp_dominance_pct": 1,
-        "volume_acceleration_ratio": 1,
-        "whale_volume_pct": 1,
-        "trades_per_second": 1,
-        "buy_trade_pct": 1,
-        "price_change_1m": 1,
-        "price_volatility_pct": 1,
-        # Values (0)
-        "total_volume_usd": 0,
-        "avg_trade_size": 0,
-        "trade_count": 0,
-        "large_trade_count": 0,
-        "vwap": 0,
-    },
-    "whale_activity": {
-        # Ratios (1)
-        "net_flow_ratio": 1,
-        "flow_shift_1m": 1,
-        "accumulation_ratio": 1,
-        "inflow_share_pct": 1,
-        "outflow_share_pct": 1,
-        "net_flow_strength_pct": 1,
-        "strong_accumulation_pct": 1,
-        "strong_distribution_pct": 1,
-        "massive_move_pct": 1,
-        "avg_wallet_pct_moved": 1,
-        "distribution_pressure_pct": 1,
-        "outflow_surge_pct": 1,
-        "movement_imbalance_pct": 1,
-        # Values (0)
-        "strong_accumulation": 0,
-        "total_sol_moved": 0,
-        "inflow_sol": 0,
-        "outflow_sol": 0,
-        "net_flow_sol": 0,
-        "inflow_count": 0,
-        "outflow_count": 0,
-        "movement_count": 0,
-        "massive_move_count": 0,
-        "max_move_size": 0,
-        "strong_distribution": 0,
-    },
-    "price_movements": {
-        # Ratios (1)
-        "price_change_1m": 1,
-        "momentum_volatility_ratio": 1,
-        "momentum_acceleration_1m": 1,
-        "price_change_5m": 1,
-        "price_change_10m": 1,
-        "volatility_pct": 1,
-        "body_range_ratio": 1,
-        "price_stddev_pct": 1,
-        "candle_body_pct": 1,
-        "upper_wick_pct": 1,
-        "lower_wick_pct": 1,
-        # Values (0)
-        "open_price": 0,
-        "high_price": 0,
-        "low_price": 0,
-        "close_price": 0,
-        "avg_price": 0,
-        "price_updates": 0,
-    },
-}
-
-
-def annotate_field_types(data: List[Dict[str, Any]], data_type: str) -> List[Dict[str, Any]]:
-    """Add is_ratio metadata to each field in the data.
-    
-    Args:
-        data: List of records (order_book, transactions, whale, or price data)
-        data_type: Type of data ("order_book_signals", "transactions", "whale_activity", "price_movements")
-    
-    Returns:
-        Enhanced list with field_types metadata added to each record
-    """
-    if not data or data_type not in FIELD_TYPE_SCHEMA:
-        return data
-    
-    schema = FIELD_TYPE_SCHEMA[data_type]
-    
-    for record in data:
-        field_types = {}
-        for field_name, value in record.items():
-            if field_name in schema:
-                field_types[field_name] = schema[field_name]
-            elif field_name in ["minute_timestamp", "minute_number", "minute_span_from", "minute_span_to"]:
-                field_types[field_name] = 0  # Metadata fields are values
-            else:
-                # Unknown field - guess based on name
-                if any(x in field_name.lower() for x in ["pct", "ratio", "bps", "share", "acceleration"]):
-                    field_types[field_name] = 1
-                else:
-                    field_types[field_name] = 0
-        
-        record["field_types"] = field_types
-    
-    return data
 
 
 # =============================================================================
@@ -354,6 +195,8 @@ def fetch_order_book_signals(
 ) -> List[Dict[str, Any]]:
     """Fetch order book signals from PostgreSQL with computed metrics."""
     # PostgreSQL query for order book data with minute aggregation
+    # Note: order_book_features doesn't have a symbol column, it's SOL/USDT only
+    # Available columns: mid_price, spread_bps, bid/ask_liquidity, volume_imbalance, etc.
     query = """
         WITH minute_aggregates AS (
             SELECT 
@@ -448,6 +291,7 @@ def fetch_transactions(
     Note: All timestamps are in UTC (server time).
     """
     # Query sol_stablecoin_trades from local DuckDB
+    # All timestamps are UTC now (after timezone fix)
     query = """
         SELECT 
             trade_timestamp,
@@ -587,6 +431,7 @@ def fetch_whale_activity(
     Note: All timestamps are in UTC (server time).
     """
     # Query whale_movements from local DuckDB
+    # All timestamps are UTC now (after timezone fix)
     query = """
         SELECT 
             timestamp,
@@ -879,6 +724,7 @@ def fetch_price_movements(
         return results
     
     # Fallback: PostgreSQL price_points table (legacy)
+    # PostgreSQL uses TO_CHAR() for date formatting
     query_duckdb = """
         WITH minute_aggregates AS (
             SELECT 
@@ -957,6 +803,7 @@ def fetch_price_movements(
             with conn.cursor() as cursor:
                 cursor.execute(query_duckdb, [start_time, end_time, coin_id])
                 rows = cursor.fetchall()
+                # RealDictCursor returns dicts directly
                 return rows if rows else []
     except Exception as e:
         logger.error("PostgreSQL price_movements query failed for %s (coin_id=%s): %s", token, coin_id, e)
@@ -1000,6 +847,7 @@ def fetch_second_prices(
                     ORDER BY created_at ASC
                 """, [start_time, end_time])
                 fallback_results = cursor.fetchall()
+                # RealDictCursor returns dicts directly
     except Exception as e:
         logger.error("PostgreSQL second_prices query failed: %s", e)
         fallback_results = []
@@ -1015,803 +863,7 @@ def fetch_second_prices(
 
 
 # =============================================================================
-# MICRO-PATTERN DETECTION FUNCTIONS (Optimized for 0.5% Moves)
-# =============================================================================
-
-def detect_volume_divergence(
-    transaction_rows: List[Dict[str, Any]],
-    price_rows: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """
-    Detect when volume increases while price consolidates (accumulation signal).
-    
-    Key signal: Rising volume + flat/slight down price = smart money accumulating
-    This is a strong precursor to 0.5% climbs.
-    
-    Args:
-        transaction_rows: Latest 15 minutes of transaction data
-        price_rows: Latest 15 minutes of price movement data
-    
-    Returns:
-        Detection result with confidence score
-    """
-    result = {"detected": False, "confidence": 0.0, "signal_type": "volume_divergence"}
-    
-    if not transaction_rows or not price_rows or len(transaction_rows) < 5 or len(price_rows) < 5:
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Sort by minute number (ascending for analysis)
-    tx_sorted = sorted(transaction_rows, key=lambda x: x.get('minute_number', 0))
-    price_sorted = sorted(price_rows, key=lambda x: x.get('minute_number', 0))
-    
-    # Split into early and late periods
-    mid_point = len(tx_sorted) // 2
-    early_tx = tx_sorted[:mid_point]
-    late_tx = tx_sorted[mid_point:]
-    early_price = price_sorted[:mid_point]
-    late_price = price_sorted[mid_point:]
-    
-    # Calculate average volume for each period
-    early_vol = np.mean([x.get('total_volume_usd', 0) for x in early_tx])
-    late_vol = np.mean([x.get('total_volume_usd', 0) for x in late_tx])
-    
-    if early_vol <= 0:
-        result["error"] = "no_early_volume"
-        return result
-    
-    volume_increase_pct = ((late_vol - early_vol) / early_vol) * 100
-    
-    # Calculate price movement for each period
-    early_price_change = np.mean([x.get('price_change_1m', 0) for x in early_price])
-    late_price_change = np.mean([x.get('price_change_1m', 0) for x in late_price])
-    
-    # Calculate price volatility
-    early_volatility = np.mean([x.get('volatility_pct', 0) for x in early_price])
-    late_volatility = np.mean([x.get('volatility_pct', 0) for x in late_price])
-    
-    # Divergence occurs when:
-    # 1. Volume is increasing (>15% increase)
-    # 2. Price is flat or slightly declining (-0.3% to +0.2%)
-    # 3. Volatility is decreasing (consolidation)
-    
-    volume_increasing = volume_increase_pct > 15
-    price_consolidating = -0.3 <= late_price_change <= 0.2
-    volatility_decreasing = late_volatility < early_volatility
-    
-    if not volume_increasing:
-        result["error"] = "volume_not_increasing"
-        return result
-    
-    # Calculate buy pressure trend
-    buy_pressure_early = np.mean([x.get('buy_sell_pressure', 0) for x in early_tx])
-    buy_pressure_late = np.mean([x.get('buy_sell_pressure', 0) for x in late_tx])
-    buy_pressure_improving = buy_pressure_late > buy_pressure_early
-    
-    # Scoring
-    volume_score = min(1.0, volume_increase_pct / 50)  # Scale: 50% increase = 1.0
-    consolidation_score = 1.0 if price_consolidating else max(0, 1.0 - abs(late_price_change) / 0.5)
-    volatility_score = 0.5 if volatility_decreasing else 0.0
-    pressure_score = 0.3 if buy_pressure_improving else 0.0
-    
-    confidence = (volume_score * 0.4 + consolidation_score * 0.35 + volatility_score * 0.15 + pressure_score * 0.1)
-    confidence = min(1.0, max(0.0, confidence))
-    
-    if confidence >= 0.5:
-        result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["volume_increase_pct"] = round(volume_increase_pct, 2)
-        result["late_price_change"] = round(late_price_change, 4)
-        result["buy_pressure_trend"] = "improving" if buy_pressure_improving else "declining"
-        result["interpretation"] = "Smart money accumulation - volume rising while price stable"
-    
-    return result
-
-
-def detect_order_book_squeeze(order_book_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Detect when bid depth increases faster than ask depth (pressure building).
-    
-    Key signal: Bid/ask ratio increasing + spread tightening = breakout imminent
-    This indicates buyers are stepping up while sellers back off.
-    
-    Args:
-        order_book_rows: Latest 15 minutes of order book data
-    
-    Returns:
-        Detection result with confidence score
-    """
-    result = {"detected": False, "confidence": 0.0, "signal_type": "order_book_squeeze"}
-    
-    if not order_book_rows or len(order_book_rows) < 5:
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Sort by minute number (ascending)
-    sorted_rows = sorted(order_book_rows, key=lambda x: x.get('minute_number', 0))
-    
-    # Split into early and late periods
-    mid_point = len(sorted_rows) // 2
-    early = sorted_rows[:mid_point]
-    late = sorted_rows[mid_point:]
-    
-    def _to_float(value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-    
-    # Calculate average depth imbalance ratio (bid/ask)
-    early_ratio = np.mean([_to_float(x.get('depth_imbalance_ratio', 1.0), 1.0) for x in early])
-    late_ratio = np.mean([_to_float(x.get('depth_imbalance_ratio', 1.0), 1.0) for x in late])
-    
-    # Calculate spread tightening
-    early_spread = np.mean([_to_float(x.get('spread_bps', 10), 10.0) for x in early])
-    late_spread = np.mean([_to_float(x.get('spread_bps', 10), 10.0) for x in late])
-    
-    # Calculate liquidity changes
-    liquidity_changes = [_to_float(x.get('liquidity_change_3m', 0), 0.0) for x in late]
-    avg_liquidity_change = np.mean(liquidity_changes) if liquidity_changes else 0
-    
-    # Squeeze occurs when:
-    # 1. Bid/ask ratio is increasing (bids building up)
-    # 2. Spread is tightening (market getting more efficient)
-    # 3. Total liquidity is stable or increasing
-    
-    if early_ratio == 0:
-        result["error"] = "invalid_ratio_baseline"
-        return result
-    
-    ratio_improving = late_ratio > early_ratio * 1.05  # 5% improvement
-    spread_tightening = late_spread < early_spread * 0.95 if early_spread else False  # 5% tighter
-    liquidity_stable = avg_liquidity_change > -5  # Not dropping significantly
-    
-    if not ratio_improving:
-        result["error"] = "ratio_not_improving"
-        return result
-    
-    # Calculate volume imbalance trend
-    early_vol_imbalance = np.mean([_to_float(x.get('volume_imbalance', 0), 0.0) for x in early])
-    late_vol_imbalance = np.mean([_to_float(x.get('volume_imbalance', 0), 0.0) for x in late])
-    vol_imbalance_improving = late_vol_imbalance > early_vol_imbalance
-    
-    # Scoring
-    ratio_change_pct = ((late_ratio - early_ratio) / early_ratio) * 100
-    ratio_score = min(1.0, ratio_change_pct / 20)  # 20% improvement = 1.0
-    
-    if early_spread:
-        spread_change_pct = ((early_spread - late_spread) / early_spread) * 100
-        spread_score = min(1.0, spread_change_pct / 10) if spread_tightening else 0
-    else:
-        spread_change_pct = 0
-        spread_score = 0
-    
-    liquidity_score = min(1.0, (avg_liquidity_change + 10) / 20) if liquidity_stable else 0
-    imbalance_score = 0.2 if vol_imbalance_improving else 0
-    
-    confidence = (ratio_score * 0.45 + spread_score * 0.30 + liquidity_score * 0.15 + imbalance_score * 0.10)
-    confidence = min(1.0, max(0.0, confidence))
-    
-    if confidence >= 0.5:
-        result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["ratio_change_pct"] = round(ratio_change_pct, 2)
-        result["spread_tightening_pct"] = round(spread_change_pct, 2) if spread_tightening else 0
-        result["interpretation"] = "Order book squeeze - buyers stepping up, sellers backing off"
-    
-    return result
-
-
-def detect_whale_stealth_accumulation(
-    whale_rows: List[Dict[str, Any]],
-    price_rows: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """
-    Detect whale buying without price impact (smart money signal).
-    
-    Key signal: Whale inflow increasing + price stable/down = accumulation before pump
-    Whales often accumulate quietly before significant moves.
-    
-    Args:
-        whale_rows: Latest 15 minutes of whale activity data
-        price_rows: Latest 15 minutes of price movement data
-    
-    Returns:
-        Detection result with confidence score
-    """
-    result = {"detected": False, "confidence": 0.0, "signal_type": "whale_stealth_accumulation"}
-    
-    if not whale_rows or not price_rows or len(whale_rows) < 3 or len(price_rows) < 3:
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Sort by minute number (ascending)
-    whale_sorted = sorted(whale_rows, key=lambda x: x.get('minute_number', 0))
-    price_sorted = sorted(price_rows, key=lambda x: x.get('minute_number', 0))
-    
-    # Get recent whale activity (last 5-7 minutes)
-    recent_whale = whale_sorted[-7:] if len(whale_sorted) >= 7 else whale_sorted[-5:]
-    recent_price = price_sorted[-7:] if len(price_sorted) >= 7 else price_sorted[-5:]
-    
-    # Calculate net flow ratio trend
-    net_flow_ratios = [x.get('net_flow_ratio', 0) for x in recent_whale]
-    net_flow_trend = np.mean(net_flow_ratios)
-    
-    # Calculate strong accumulation percentage
-    strong_acc_pcts = [x.get('strong_accumulation_pct', 0) for x in recent_whale]
-    avg_strong_acc = np.mean(strong_acc_pcts)
-    
-    # Calculate price stability
-    price_changes = [x.get('price_change_1m', 0) for x in recent_price]
-    avg_price_change = np.mean(price_changes)
-    price_volatility = np.std(price_changes)
-    
-    # Stealth accumulation occurs when:
-    # 1. Net flow ratio is increasingly positive (>0.3)
-    # 2. Strong accumulation is significant (>10%)
-    # 3. Price is stable or declining (-0.3% to +0.2%)
-    # 4. Price volatility is low
-    
-    net_flow_positive = net_flow_trend > 0.3
-    accumulation_significant = avg_strong_acc > 10
-    price_stable = -0.3 <= avg_price_change <= 0.2
-    low_volatility = price_volatility < 0.3
-    
-    if not net_flow_positive:
-        result["error"] = "net_flow_not_positive"
-        return result
-    
-    # Calculate accumulation ratio trend
-    acc_ratios = [x.get('accumulation_ratio', 1.0) for x in recent_whale]
-    avg_acc_ratio = np.mean(acc_ratios)
-    acc_ratio_improving = avg_acc_ratio > 2.0  # More than 2x inflow vs outflow
-    
-    # Scoring
-    net_flow_score = min(1.0, net_flow_trend / 0.7)  # 0.7 net flow = 1.0
-    accumulation_score = min(1.0, avg_strong_acc / 30)  # 30% strong acc = 1.0
-    stability_score = 1.0 if price_stable else max(0, 1.0 - abs(avg_price_change) / 0.5)
-    volatility_score = max(0, 1.0 - price_volatility / 0.5) if low_volatility else 0
-    ratio_score = 0.2 if acc_ratio_improving else 0
-    
-    confidence = (
-        net_flow_score * 0.35 +
-        accumulation_score * 0.30 +
-        stability_score * 0.20 +
-        volatility_score * 0.10 +
-        ratio_score * 0.05
-    )
-    confidence = min(1.0, max(0.0, confidence))
-    
-    if confidence >= 0.5:
-        result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["net_flow_ratio"] = round(net_flow_trend, 3)
-        result["strong_accumulation_pct"] = round(avg_strong_acc, 2)
-        result["price_change"] = round(avg_price_change, 4)
-        result["accumulation_ratio"] = round(avg_acc_ratio, 2)
-        result["interpretation"] = "Whale stealth accumulation - smart money buying without price impact"
-    
-    return result
-
-
-def detect_momentum_acceleration(price_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Detect when rate of change is accelerating (second derivative).
-    
-    Key signal: momentum_acceleration_1m increasing = trend strengthening
-    This helps identify when small moves are gaining steam.
-    
-    Args:
-        price_rows: Latest 15 minutes of price movement data
-    
-    Returns:
-        Detection result with confidence score
-    """
-    result = {"detected": False, "confidence": 0.0, "signal_type": "momentum_acceleration"}
-    
-    if not price_rows or len(price_rows) < 5:
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Sort by minute number (ascending)
-    sorted_rows = sorted(price_rows, key=lambda x: x.get('minute_number', 0))
-    
-    def _to_float(value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-    
-    # Get momentum acceleration values
-    momentum_accel = [_to_float(x.get('momentum_acceleration_1m', 0), 0.0) for x in sorted_rows]
-    
-    # Split into early and late periods
-    mid_point = len(momentum_accel) // 2
-    early_accel = momentum_accel[:mid_point]
-    late_accel = momentum_accel[mid_point:]
-    
-    avg_early_accel = np.mean(early_accel)
-    avg_late_accel = np.mean(late_accel)
-    
-    # Get price changes for context
-    price_changes_1m = [_to_float(x.get('price_change_1m', 0), 0.0) for x in sorted_rows[-5:]]
-    price_changes_5m = [_to_float(x.get('price_change_5m', 0), 0.0) for x in sorted_rows[-5:]]
-    
-    avg_price_change_1m = np.mean(price_changes_1m)
-    avg_price_change_5m = np.mean(price_changes_5m)
-    
-    # Get volatility trend
-    volatilities = [_to_float(x.get('volatility_pct', 0), 0.0) for x in sorted_rows]
-    early_vol = np.mean(volatilities[:mid_point])
-    late_vol = np.mean(volatilities[mid_point:])
-    
-    # Momentum acceleration detected when:
-    # 1. Late period acceleration > early period (improving)
-    # 2. Recent price change is positive
-    # 3. 5m price change > 1m price change (sustained trend)
-    # 4. Volatility is decreasing (more directional)
-    
-    acceleration_improving = avg_late_accel > avg_early_accel
-    price_positive = avg_price_change_1m > 0
-    trend_sustained = avg_price_change_5m > avg_price_change_1m
-    volatility_decreasing = late_vol < early_vol
-    
-    if not acceleration_improving:
-        result["error"] = "acceleration_not_improving"
-        return result
-    
-    # Calculate momentum volatility ratio trend
-    mvr_values = [_to_float(x.get('momentum_volatility_ratio', 0), 0.0) for x in sorted_rows[-5:]]
-    avg_mvr = np.mean(mvr_values)
-    mvr_positive = avg_mvr > 0
-    
-    # Scoring
-    accel_change = avg_late_accel - avg_early_accel
-    accel_score = min(1.0, abs(accel_change) / 0.3)  # 0.3% acceleration = 1.0
-    
-    price_score = min(1.0, avg_price_change_1m / 0.3) if price_positive else 0
-    trend_score = 0.3 if trend_sustained else 0
-    vol_score = 0.2 if volatility_decreasing else 0
-    mvr_score = 0.15 if mvr_positive else 0
-    
-    confidence = (
-        accel_score * 0.40 +
-        price_score * 0.25 +
-        trend_score * 0.15 +
-        vol_score * 0.10 +
-        mvr_score * 0.10
-    )
-    confidence = min(1.0, max(0.0, confidence))
-    
-    if confidence >= 0.5:
-        result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["momentum_acceleration"] = round(avg_late_accel, 4)
-        result["price_change_1m"] = round(avg_price_change_1m, 4)
-        result["price_change_5m"] = round(avg_price_change_5m, 4)
-        result["interpretation"] = "Momentum accelerating - trend gaining strength"
-    
-    return result
-
-
-def detect_microstructure_shift(
-    order_book_rows: List[Dict[str, Any]],
-    transaction_rows: List[Dict[str, Any]],
-    whale_rows: List[Dict[str, Any]]
-) -> Dict[str, Any]:
-    """
-    Detect order flow shifting bullish across multiple indicators.
-    
-    Composite signal: order book + transactions + whale data all aligned bullishly.
-    This is the most reliable signal for imminent 0.5% moves.
-    
-    Args:
-        order_book_rows: Latest 15 minutes of order book data
-        transaction_rows: Latest 15 minutes of transaction data
-        whale_rows: Latest 15 minutes of whale activity data
-    
-    Returns:
-        Detection result with confidence score and component scores
-    """
-    result = {
-        "detected": False,
-        "confidence": 0.0,
-        "signal_type": "microstructure_shift",
-        "components": {}
-    }
-    
-    if not all([order_book_rows, transaction_rows, whale_rows]):
-        result["error"] = "missing_data_sources"
-        return result
-    
-    if len(order_book_rows) < 5 or len(transaction_rows) < 5 or len(whale_rows) < 3:
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Sort all data sources
-    ob_sorted = sorted(order_book_rows, key=lambda x: x.get('minute_number', 0))
-    tx_sorted = sorted(transaction_rows, key=lambda x: x.get('minute_number', 0))
-    whale_sorted = sorted(whale_rows, key=lambda x: x.get('minute_number', 0))
-    
-    # Get recent data (last 5 minutes)
-    recent_ob = ob_sorted[-5:]
-    recent_tx = tx_sorted[-5:]
-    recent_whale = whale_sorted[-3:] if len(whale_sorted) >= 3 else whale_sorted
-    
-    # === ORDER BOOK COMPONENT ===
-    volume_imbalances = [x.get('volume_imbalance', 0) for x in recent_ob]
-    avg_vol_imbalance = np.mean(volume_imbalances)
-    vol_imbalance_positive = avg_vol_imbalance > 0.1
-    
-    depth_ratios = [x.get('depth_imbalance_ratio', 1.0) for x in recent_ob]
-    avg_depth_ratio = np.mean(depth_ratios)
-    depth_ratio_bullish = avg_depth_ratio > 1.05  # Bids > asks by 5%
-    
-    microprice_devs = [x.get('microprice_deviation', 0) for x in recent_ob]
-    avg_microprice_dev = np.mean(microprice_devs)
-    microprice_bullish = avg_microprice_dev > 0
-    
-    aggression_ratios = [x.get('aggression_ratio', 1.0) for x in recent_ob]
-    avg_aggression = np.mean(aggression_ratios)
-    aggression_bullish = avg_aggression > 1.0  # Bids more aggressive
-    
-    ob_score = sum([
-        0.30 if vol_imbalance_positive else 0,
-        0.30 if depth_ratio_bullish else 0,
-        0.25 if microprice_bullish else 0,
-        0.15 if aggression_bullish else 0
-    ])
-    
-    result["components"]["order_book"] = {
-        "score": round(ob_score, 3),
-        "volume_imbalance": round(avg_vol_imbalance, 3),
-        "depth_ratio": round(avg_depth_ratio, 3),
-        "microprice_dev": round(avg_microprice_dev, 3)
-    }
-    
-    # === TRANSACTION COMPONENT ===
-    buy_pressures = [x.get('buy_sell_pressure', 0) for x in recent_tx]
-    avg_buy_pressure = np.mean(buy_pressures)
-    buy_pressure_positive = avg_buy_pressure > 0.15
-    
-    volume_accel = [x.get('volume_acceleration_ratio', 1.0) for x in recent_tx]
-    avg_vol_accel = np.mean(volume_accel)
-    volume_accelerating = avg_vol_accel > 1.1  # 10% increase
-    
-    whale_vol_pcts = [x.get('whale_volume_pct', 0) for x in recent_tx]
-    avg_whale_vol = np.mean(whale_vol_pcts)
-    whale_participation = avg_whale_vol > 20  # Whales active
-    
-    buy_trade_pcts = [x.get('buy_trade_pct', 50) for x in recent_tx]
-    avg_buy_trade_pct = np.mean(buy_trade_pcts)
-    buy_trades_dominant = avg_buy_trade_pct > 55
-    
-    tx_score = sum([
-        0.35 if buy_pressure_positive else 0,
-        0.30 if volume_accelerating else 0,
-        0.20 if whale_participation else 0,
-        0.15 if buy_trades_dominant else 0
-    ])
-    
-    result["components"]["transactions"] = {
-        "score": round(tx_score, 3),
-        "buy_pressure": round(avg_buy_pressure, 3),
-        "volume_accel": round(avg_vol_accel, 3),
-        "whale_volume_pct": round(avg_whale_vol, 2)
-    }
-    
-    # === WHALE COMPONENT ===
-    net_flow_ratios = [x.get('net_flow_ratio', 0) for x in recent_whale]
-    avg_net_flow = np.mean(net_flow_ratios)
-    net_flow_bullish = avg_net_flow > 0.2
-    
-    acc_ratios = [x.get('accumulation_ratio', 1.0) for x in recent_whale]
-    avg_acc_ratio = np.mean(acc_ratios)
-    accumulation_strong = avg_acc_ratio > 1.5
-    
-    strong_acc_pcts = [x.get('strong_accumulation_pct', 0) for x in recent_whale]
-    avg_strong_acc = np.mean(strong_acc_pcts)
-    strong_acc_present = avg_strong_acc > 5
-    
-    whale_score = sum([
-        0.40 if net_flow_bullish else 0,
-        0.35 if accumulation_strong else 0,
-        0.25 if strong_acc_present else 0
-    ])
-    
-    result["components"]["whale_activity"] = {
-        "score": round(whale_score, 3),
-        "net_flow_ratio": round(avg_net_flow, 3),
-        "accumulation_ratio": round(avg_acc_ratio, 3),
-        "strong_accumulation_pct": round(avg_strong_acc, 2)
-    }
-    
-    # === AGGREGATE SCORE ===
-    # Weight: order book 35%, transactions 40%, whale 25%
-    aggregate_score = (ob_score * 0.35 + tx_score * 0.40 + whale_score * 0.25)
-    
-    # Additional bonus for all three aligned
-    all_aligned = (ob_score > 0.6 and tx_score > 0.6 and whale_score > 0.6)
-    if all_aligned:
-        aggregate_score = min(1.0, aggregate_score * 1.15)  # 15% bonus
-    
-    confidence = min(1.0, max(0.0, aggregate_score))
-    
-    if confidence >= 0.5:
-        result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["all_aligned"] = all_aligned
-        result["interpretation"] = (
-            "Strong microstructure shift - all signals aligned bullishly" if all_aligned
-            else "Microstructure shift detected - majority of signals bullish"
-        )
-    
-    return result
-
-
-# =============================================================================
-# ENHANCED SCORING SYSTEM FOR 0.5% CLIMBS
-# =============================================================================
-
-def calculate_breakout_probability(
-    patterns: Dict[str, Any],
-    order_book_rows: List[Dict[str, Any]],
-    transaction_rows: List[Dict[str, Any]],
-    whale_rows: List[Dict[str, Any]],
-    price_rows: List[Dict[str, Any]],
-    micro_patterns: Dict[str, Any]
-) -> Dict[str, Any]:
-    """
-    Multi-factor scoring optimized for 0.5% climb probability.
-    
-    This scoring system weighs micro-patterns more heavily than traditional
-    chart patterns, as they are more predictive for small moves.
-    
-    Args:
-        patterns: Traditional pattern detection results
-        order_book_rows: Order book data
-        transaction_rows: Transaction data
-        whale_rows: Whale activity data
-        price_rows: Price movement data
-        micro_patterns: Results from micro-pattern detectors
-    
-    Returns:
-        Dictionary with overall score and component breakdown
-    """
-    result = {
-        "overall_score": 0.0,
-        "component_scores": {},
-        "risk_factors": [],
-        "confidence_level": "low"
-    }
-    
-    if not all([order_book_rows, transaction_rows, price_rows]):
-        result["error"] = "insufficient_data"
-        return result
-    
-    # Get latest data points
-    latest_ob = order_book_rows[0] if order_book_rows else {}
-    latest_tx = transaction_rows[0] if transaction_rows else {}
-    latest_whale = whale_rows[0] if whale_rows else {}
-    latest_price = price_rows[0] if price_rows else {}
-
-    def _to_float(value: Any, default: float = 0.0) -> float:
-        """Convert numeric/Decimal values to float for scoring math."""
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
-    
-    # === COMPONENT 1: MICRO-PATTERNS (35% weight) ===
-    # These are the most predictive for 0.5% moves
-    micro_score = 0.0
-    
-    # Volume divergence (10%)
-    vol_div = micro_patterns.get("volume_divergence", {})
-    if vol_div.get("detected"):
-        micro_score += vol_div.get("confidence", 0) * 0.10
-    
-    # Order book squeeze (10%)
-    ob_squeeze = micro_patterns.get("order_book_squeeze", {})
-    if ob_squeeze.get("detected"):
-        micro_score += ob_squeeze.get("confidence", 0) * 0.10
-    
-    # Whale stealth accumulation (8%)
-    whale_stealth = micro_patterns.get("whale_stealth_accumulation", {})
-    if whale_stealth.get("detected"):
-        micro_score += whale_stealth.get("confidence", 0) * 0.08
-    
-    # Momentum acceleration (5%)
-    momentum_accel = micro_patterns.get("momentum_acceleration", {})
-    if momentum_accel.get("detected"):
-        micro_score += momentum_accel.get("confidence", 0) * 0.05
-    
-    # Microstructure shift (2% bonus - already factored into other components)
-    micro_shift = micro_patterns.get("microstructure_shift", {})
-    if micro_shift.get("detected") and micro_shift.get("all_aligned"):
-        micro_score += micro_shift.get("confidence", 0) * 0.02
-    
-    micro_score = min(0.35, micro_score)  # Cap at 35%
-    result["component_scores"]["micro_patterns"] = round(micro_score, 4)
-    
-    # === COMPONENT 2: ORDER BOOK PRESSURE (25% weight) ===
-    ob_score = 0.0
-    
-    # Depth imbalance (8%)
-    depth_ratio = _to_float(latest_ob.get("depth_imbalance_ratio", 1.0), 1.0)
-    if depth_ratio > 1.0:
-        depth_score = min(1.0, (depth_ratio - 1.0) / 0.15) * 0.08  # 1.15 ratio = max
-        ob_score += depth_score
-    
-    # Spread tightness (6%)
-    spread_bps = _to_float(latest_ob.get("spread_bps", 10), 10.0)
-    spread_score = max(0, (1.0 - min(1.0, spread_bps / 10))) * 0.06
-    ob_score += spread_score
-    
-    # Volume imbalance (6%)
-    vol_imbalance = _to_float(latest_ob.get("volume_imbalance", 0), 0.0)
-    if vol_imbalance > 0:
-        vol_imb_score = min(1.0, vol_imbalance / 0.3) * 0.06
-        ob_score += vol_imb_score
-    
-    # Microprice deviation (3%)
-    microprice_dev = _to_float(latest_ob.get("microprice_deviation", 0), 0.0)
-    if microprice_dev > 0:
-        micro_dev_score = min(1.0, microprice_dev / 5.0) * 0.03
-        ob_score += micro_dev_score
-    
-    # Aggression ratio (2%)
-    aggression = _to_float(latest_ob.get("aggression_ratio", 1.0), 1.0)
-    if aggression > 1.0:
-        agg_score = min(1.0, (aggression - 1.0) / 0.3) * 0.02
-        ob_score += agg_score
-    
-    ob_score = min(0.25, ob_score)
-    result["component_scores"]["order_book"] = round(ob_score, 4)
-    
-    # === COMPONENT 3: TRANSACTION FLOW (25% weight) ===
-    tx_score = 0.0
-    
-    # Buy/sell pressure (10%)
-    buy_pressure = _to_float(latest_tx.get("buy_sell_pressure", 0), 0.0)
-    if buy_pressure > 0:
-        pressure_score = min(1.0, buy_pressure / 0.3) * 0.10
-        tx_score += pressure_score
-    
-    # Volume acceleration (7%)
-    vol_accel = _to_float(latest_tx.get("volume_acceleration_ratio", 1.0), 1.0)
-    if vol_accel > 1.0:
-        accel_score = min(1.0, (vol_accel - 1.0) / 0.5) * 0.07  # 1.5x = max
-        tx_score += accel_score
-    
-    # Whale participation (5%)
-    whale_vol_pct = _to_float(latest_tx.get("whale_volume_pct", 0), 0.0)
-    whale_part_score = min(1.0, whale_vol_pct / 40) * 0.05  # 40% = max
-    tx_score += whale_part_score
-    
-    # Pressure shift (3%)
-    pressure_shift = _to_float(latest_tx.get("pressure_shift_1m", 0), 0.0)
-    if pressure_shift > 0:
-        shift_score = min(1.0, pressure_shift / 0.2) * 0.03
-        tx_score += shift_score
-    
-    tx_score = min(0.25, tx_score)
-    result["component_scores"]["transactions"] = round(tx_score, 4)
-    
-    # === COMPONENT 4: WHALE ALIGNMENT (10% weight) ===
-    whale_score = 0.0
-    
-    if whale_rows:
-        # Net flow ratio (5%)
-        net_flow = _to_float(latest_whale.get("net_flow_ratio", 0), 0.0)
-        if net_flow > 0:
-            flow_score = min(1.0, net_flow / 0.5) * 0.05
-            whale_score += flow_score
-        
-        # Strong accumulation (3%)
-        strong_acc_pct = _to_float(latest_whale.get("strong_accumulation_pct", 0), 0.0)
-        acc_score = min(1.0, strong_acc_pct / 25) * 0.03  # 25% = max
-        whale_score += acc_score
-        
-        # Accumulation ratio (2%)
-        acc_ratio = _to_float(latest_whale.get("accumulation_ratio", 1.0), 1.0)
-        if acc_ratio > 1.0:
-            ratio_score = min(1.0, (acc_ratio - 1.0) / 2.0) * 0.02  # 3.0 ratio = max
-            whale_score += ratio_score
-    
-    whale_score = min(0.10, whale_score)
-    result["component_scores"]["whale"] = round(whale_score, 4)
-    
-    # === COMPONENT 5: MOMENTUM (5% weight) ===
-    momentum_score = 0.0
-    
-    # Price momentum (3%)
-    price_change_1m = _to_float(latest_price.get("price_change_1m", 0), 0.0)
-    if price_change_1m > 0:
-        price_mom_score = min(1.0, price_change_1m / 0.3) * 0.03  # 0.3% = max
-        momentum_score += price_mom_score
-    
-    # Momentum acceleration (2%)
-    mom_accel = _to_float(latest_price.get("momentum_acceleration_1m", 0), 0.0)
-    if mom_accel > 0:
-        accel_score = min(1.0, mom_accel / 0.2) * 0.02
-        momentum_score += accel_score
-    
-    momentum_score = min(0.05, momentum_score)
-    result["component_scores"]["momentum"] = round(momentum_score, 4)
-    
-    # === TRADITIONAL PATTERNS (Reduced to 5% for micro-moves) ===
-    pattern_score = patterns.get("breakout_score", 0.0) * 0.05
-    result["component_scores"]["traditional_patterns"] = round(pattern_score, 4)
-    
-    # === CALCULATE OVERALL SCORE ===
-    overall = micro_score + ob_score + tx_score + whale_score + momentum_score + pattern_score
-    overall = min(1.0, max(0.0, overall))
-    
-    # === RISK FACTORS (reduce score) ===
-    risk_deductions = 0.0
-    
-    # High volatility (indicates noise, not signal)
-    volatility = _to_float(latest_price.get("volatility_pct", 0), 0.0)
-    if volatility > 1.0:
-        risk_deductions += 0.05
-        result["risk_factors"].append(f"high_volatility_{volatility:.2f}%")
-    
-    # Spread widening (liquidity issues)
-    spread = _to_float(latest_ob.get("spread_bps", 0), 0.0)
-    if spread > 15:
-        risk_deductions += 0.03
-        result["risk_factors"].append(f"wide_spread_{spread:.2f}_bps")
-    
-    # Low volume (signal unreliable)
-    volume = _to_float(latest_tx.get("total_volume_usd", 0), 0.0)
-    if volume < 50000:  # Less than $50k/min
-        risk_deductions += 0.04
-        result["risk_factors"].append(f"low_volume_${volume:.0f}")
-    
-    # Whale distribution (selling pressure)
-    if whale_rows:
-        dist_pct = _to_float(latest_whale.get("distribution_pressure_pct", 0), 0.0)
-        if dist_pct > 15:
-            risk_deductions += 0.06
-            result["risk_factors"].append(f"whale_distribution_{dist_pct:.2f}%")
-    
-    # Apply risk deductions
-    overall = max(0.0, overall - risk_deductions)
-    result["overall_score"] = round(overall, 4)
-    result["risk_deduction"] = round(risk_deductions, 4)
-    
-    # === CONFIDENCE LEVEL ===
-    if overall >= 0.75:
-        result["confidence_level"] = "very_high"
-    elif overall >= 0.60:
-        result["confidence_level"] = "high"
-    elif overall >= 0.45:
-        result["confidence_level"] = "medium"
-    elif overall >= 0.30:
-        result["confidence_level"] = "low"
-    else:
-        result["confidence_level"] = "very_low"
-    
-    # === INTERPRETATION ===
-    if overall >= 0.60:
-        result["interpretation"] = "Strong probability of 0.5%+ climb in next 1-3 minutes"
-        result["action_recommendation"] = "consider_entry"
-    elif overall >= 0.45:
-        result["interpretation"] = "Moderate probability of 0.5%+ climb - monitor closely"
-        result["action_recommendation"] = "watch"
-    elif overall >= 0.30:
-        result["interpretation"] = "Low probability - mixed signals"
-        result["action_recommendation"] = "wait"
-    else:
-        result["interpretation"] = "Very low probability - avoid entry"
-        result["action_recommendation"] = "avoid"
-    
-    return result
-
-
-# =============================================================================
-# TRADITIONAL PATTERN DETECTION (Legacy - Reduced Weight for Micro-Moves)
+# PATTERN DETECTION FUNCTIONS
 # =============================================================================
 
 def find_swings(df: pd.DataFrame, lookback: int = 10, lookforward: int = 10) -> pd.DataFrame:
@@ -2364,7 +1416,7 @@ def generate_trail_payload(
     lookback_minutes: Optional[int] = None,
     persist: bool = True,
 ) -> Dict[str, Any]:
-    """Generate the 15-minute trail payload for a buy-in with enhanced micro-pattern detection.
+    """Generate the 15-minute trail payload for a buy-in.
 
     Args:
         buyin_id: Target identifier in follow_the_goat_buyins.
@@ -2373,7 +1425,7 @@ def generate_trail_payload(
         persist: If True (default), store data in buyin_trail_minutes table.
 
     Returns:
-        JSON-serializable dictionary containing all analytics and pattern detection.
+        JSON-serializable dictionary containing order book and transaction data.
     """
     symbol_to_use = symbol or DEFAULT_SYMBOL
     minutes = lookback_minutes or DEFAULT_LOOKBACK_MINUTES
@@ -2392,9 +1444,7 @@ def generate_trail_payload(
         window_end = followed_at
         window_start = window_end - timedelta(minutes=minutes)
 
-        logger.info(f"Generating trail for buyin_id={buyin_id}, window: {window_start} to {window_end}")
-
-        # === FETCH ALL DATA SOURCES ===
+        # Fetch data from all sources
         order_book_rows = fetch_order_book_signals(symbol_to_use, window_start, window_end)
         transaction_rows = fetch_transactions(window_start, window_end)
         whale_rows = fetch_whale_activity(window_start, window_end)
@@ -2408,73 +1458,16 @@ def generate_trail_payload(
         
         second_prices = fetch_second_prices(window_start, window_end)
 
-        # === ADD FIELD TYPE METADATA ===
-        order_book_rows = annotate_field_types(order_book_rows, "order_book_signals")
-        transaction_rows = annotate_field_types(transaction_rows, "transactions")
-        whale_rows = annotate_field_types(whale_rows, "whale_activity")
-        price_rows = annotate_field_types(price_rows, "price_movements")
-        btc_price_rows = annotate_field_types(btc_price_rows, "price_movements")
-        eth_price_rows = annotate_field_types(eth_price_rows, "price_movements")
-
-        # === RUN PATTERN DETECTION ===
-        # Traditional patterns (legacy - reduced weight)
+        # Run pattern detection
         if not second_prices.empty:
-            traditional_patterns = detect_all_patterns(second_prices)
+            patterns = detect_all_patterns(second_prices)
         else:
-            traditional_patterns = {
+            patterns = {
                 "detected": [],
                 "breakout_score": 0.0,
                 "swing_structure": {},
                 "error": "no_second_price_data"
             }
-
-        # === RUN MICRO-PATTERN DETECTION (Optimized for 0.5% moves) ===
-        micro_patterns = {}
-        
-        # Volume divergence
-        vol_div = detect_volume_divergence(transaction_rows, price_rows)
-        micro_patterns["volume_divergence"] = vol_div
-        if vol_div.get("detected"):
-            logger.info(f"✓ Volume divergence detected (confidence: {vol_div.get('confidence'):.2f})")
-        
-        # Order book squeeze
-        ob_squeeze = detect_order_book_squeeze(order_book_rows)
-        micro_patterns["order_book_squeeze"] = ob_squeeze
-        if ob_squeeze.get("detected"):
-            logger.info(f"✓ Order book squeeze detected (confidence: {ob_squeeze.get('confidence'):.2f})")
-        
-        # Whale stealth accumulation
-        whale_stealth = detect_whale_stealth_accumulation(whale_rows, price_rows)
-        micro_patterns["whale_stealth_accumulation"] = whale_stealth
-        if whale_stealth.get("detected"):
-            logger.info(f"✓ Whale stealth accumulation detected (confidence: {whale_stealth.get('confidence'):.2f})")
-        
-        # Momentum acceleration
-        momentum_accel = detect_momentum_acceleration(price_rows)
-        micro_patterns["momentum_acceleration"] = momentum_accel
-        if momentum_accel.get("detected"):
-            logger.info(f"✓ Momentum acceleration detected (confidence: {momentum_accel.get('confidence'):.2f})")
-        
-        # Microstructure shift (composite signal)
-        micro_shift = detect_microstructure_shift(order_book_rows, transaction_rows, whale_rows)
-        micro_patterns["microstructure_shift"] = micro_shift
-        if micro_shift.get("detected"):
-            logger.info(f"✓ Microstructure shift detected (confidence: {micro_shift.get('confidence'):.2f})")
-
-        # === CALCULATE OVERALL BREAKOUT PROBABILITY ===
-        breakout_analysis = calculate_breakout_probability(
-            traditional_patterns,
-            order_book_rows,
-            transaction_rows,
-            whale_rows,
-            price_rows,
-            micro_patterns
-        )
-        
-        logger.info(
-            f"Overall breakout probability: {breakout_analysis.get('overall_score'):.2f} "
-            f"({breakout_analysis.get('confidence_level')})"
-        )
 
         # Annotate rows with minute spans
         annotate_minute_spans(order_book_rows, window_end)
@@ -2484,7 +1477,6 @@ def generate_trail_payload(
         annotate_minute_spans(btc_price_rows, window_end)
         annotate_minute_spans(eth_price_rows, window_end)
 
-        # === BUILD PAYLOAD ===
         payload: Dict[str, Any] = {
             "buyin_id": buyin["id"],
             "symbol": symbol_to_use,
@@ -2500,9 +1492,7 @@ def generate_trail_payload(
             "price_movements": price_rows,
             "btc_price_movements": btc_price_rows,
             "eth_price_movements": eth_price_rows,
-            "traditional_patterns": traditional_patterns,
-            "micro_patterns": micro_patterns,
-            "breakout_analysis": breakout_analysis,
+            "patterns": patterns,
             "second_prices": (
                 second_prices.reset_index().to_dict('records')
                 if not second_prices.empty
@@ -2536,11 +1526,11 @@ def generate_trail_payload(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Generate a 15-minute trail payload with micro-pattern detection")
+    parser = argparse.ArgumentParser(description="Generate a 15-minute trail payload")
     parser.add_argument("buyin_id", type=int, help="follow_the_goat_buyins ID")
     parser.add_argument("--symbol", help="Override symbol (default: SOLUSDT)")
     parser.add_argument("--minutes", type=int, help="Lookback window in minutes (default: 15)")
-    parser.add_argument("--persist", action="store_true", help="Persist the generated data")
+    parser.add_argument("--persist", action="store_true", help="Persist the generated JSON")
 
     args = parser.parse_args()
 
@@ -2556,3 +1546,4 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     print(json.dumps(payload, indent=2))
+

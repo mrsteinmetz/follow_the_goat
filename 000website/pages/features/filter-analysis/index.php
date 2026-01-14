@@ -109,13 +109,17 @@ $currentHours = '24';
 $currentMinFilters = '1';
 $currentMinGoodKept = '50';
 $currentMinBadRemoved = '10';
+$currentIsRatio = 'false';
 foreach ($auto_filter_settings as $s) {
     if ($s['setting_key'] === 'good_trade_threshold') $currentThreshold = $s['setting_value'];
     if ($s['setting_key'] === 'analysis_hours') $currentHours = $s['setting_value'];
     if ($s['setting_key'] === 'min_filters_in_combo') $currentMinFilters = $s['setting_value'];
     if ($s['setting_key'] === 'min_good_trades_kept_pct') $currentMinGoodKept = $s['setting_value'];
     if ($s['setting_key'] === 'min_bad_trades_removed_pct') $currentMinBadRemoved = $s['setting_value'];
+    if ($s['setting_key'] === 'is_ratio') $currentIsRatio = $s['setting_value'];
 }
+$isRatioOn = in_array(strtolower((string)$currentIsRatio), ['1', 'true', 'yes', 'on'], true);
+$isRatioLabel = $isRatioOn ? 'On' : 'Off';
 
 // Prepare chart data for JavaScript
 $chart_labels = array_column($trend_chart_data, 'time_bucket');
@@ -358,7 +362,7 @@ ob_start();
         <h6 class="mb-0"><i class="ri-settings-3-line me-1"></i>Auto Filter Settings</h6>
         <div class="d-flex align-items-center gap-2">
             <span class="badge bg-info-transparent" id="settingsStatus">
-                Good: <?php echo $currentThreshold; ?>% | Hours: <?php echo $currentHours; ?> | Min Filters: <?php echo $currentMinFilters; ?> | Min Good: <?php echo $currentMinGoodKept; ?>% | Min Bad: <?php echo $currentMinBadRemoved; ?>%
+                Good: <?php echo $currentThreshold; ?>% | Hours: <?php echo $currentHours; ?> | Min Filters: <?php echo $currentMinFilters; ?> | Min Good: <?php echo $currentMinGoodKept; ?>% | Min Bad: <?php echo $currentMinBadRemoved; ?>% | Ratio Only: <?php echo $isRatioLabel; ?>
             </span>
             <i class="ri-arrow-down-s-line fs-18" id="settingsArrow"></i>
         </div>
@@ -398,19 +402,28 @@ ob_start();
                 </div>
                 
                 <div class="row g-3 mt-2">
-                    <div class="col-md-6">
+                    <div class="col-md-4">
                         <label class="form-label fw-semibold">Min Good Trades Kept (%)</label>
                         <input type="number" class="form-control" name="min_good_trades_kept_pct" 
                                value="<?php echo htmlspecialchars($currentMinGoodKept); ?>" 
                                step="1" min="0" max="100">
                         <small class="text-muted">Filters must keep at least this % of good trades (Default: 50%)</small>
                     </div>
-                    <div class="col-md-6">
+                    <div class="col-md-4">
                         <label class="form-label fw-semibold">Min Bad Trades Removed (%)</label>
                         <input type="number" class="form-control" name="min_bad_trades_removed_pct" 
                                value="<?php echo htmlspecialchars($currentMinBadRemoved); ?>" 
                                step="1" min="0" max="100">
                         <small class="text-muted">Filters must remove at least this % of bad trades (Default: 10%)</small>
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label fw-semibold">Ratio Only</label>
+                        <div class="form-check form-switch mt-2">
+                            <input class="form-check-input" type="checkbox" role="switch" id="isRatioToggle" name="is_ratio" value="true"
+                                   <?php echo $isRatioOn ? 'checked' : ''; ?>>
+                            <label class="form-check-label" for="isRatioToggle">Only use ratio-based filters</label>
+                        </div>
+                        <small class="text-muted">On: only ratio fields. Off: all filters.</small>
                     </div>
                 </div>
                 
@@ -953,6 +966,8 @@ ob_start();
         const formData = new FormData(this);
         const settings = {};
         formData.forEach((value, key) => settings[key] = value);
+        const isRatioToggle = document.getElementById('isRatioToggle');
+        settings['is_ratio'] = isRatioToggle && isRatioToggle.checked ? 'true' : 'false';
         
         try {
             const response = await fetch('<?php echo DATABASE_API_URL; ?>/filter-analysis/settings', {
@@ -971,7 +986,8 @@ ob_start();
                 const statusBadge = document.getElementById('settingsStatus');
                 if (statusBadge && result.current_settings) {
                     const s = result.current_settings;
-                    statusBadge.textContent = `Good: ${s.good_trade_threshold || '0.3'}% | Hours: ${s.analysis_hours || '24'} | Min Filters: ${s.min_filters_in_combo || '1'} | Min Good: ${s.min_good_trades_kept_pct || '50'}% | Min Bad: ${s.min_bad_trades_removed_pct || '10'}%`;
+                    const ratioLabel = (s.is_ratio === true || s.is_ratio === 'true' || s.is_ratio === '1') ? 'On' : 'Off';
+                    statusBadge.textContent = `Good: ${s.good_trade_threshold || '0.3'}% | Hours: ${s.analysis_hours || '24'} | Min Filters: ${s.min_filters_in_combo || '1'} | Min Good: ${s.min_good_trades_kept_pct || '50'}% | Min Bad: ${s.min_bad_trades_removed_pct || '10'}% | Ratio Only: ${ratioLabel}`;
                 }
                 
                 setTimeout(() => {
@@ -1007,13 +1023,17 @@ ob_start();
             'analysis_hours': '24',
             'min_filters_in_combo': '1',
             'min_good_trades_kept_pct': '50',
-            'min_bad_trades_removed_pct': '10'
+            'min_bad_trades_removed_pct': '10',
+            'is_ratio': 'false'
         };
         
         for (const [key, value] of Object.entries(defaults)) {
             const input = document.querySelector(`input[name="${key}"]`);
-            if (input) input.value = value;
+            if (input && input.type !== 'checkbox') input.value = value;
         }
+        
+        const ratioToggle = document.getElementById('isRatioToggle');
+        if (ratioToggle) ratioToggle.checked = false;
         
         document.getElementById('saveSettingsBtn').click();
     });

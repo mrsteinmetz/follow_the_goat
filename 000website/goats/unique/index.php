@@ -102,14 +102,15 @@ if (!$api_available) {
     // Other plays use 168h (7 days)
     $hours_window = ($play_id === 46) ? '24' : '168';
     $timing['before_trades_query'] = microtime(true);
-    $buyins_result = $client->getBuyins($play_id, null, $hours_window, 100);
+    $buyins_result = $client->getBuyins($play_id, null, $hours_window, 200); // Increased limit for load more feature
     $timing['after_trades_query'] = microtime(true);
     
     if ($buyins_result && isset($buyins_result['buyins'])) {
-        // Split into live trades (non-no_go) and no_go trades
+        // Split into live trades (non-no_go, non-error) and no_go trades
         $all_buyins = $buyins_result['buyins'];
         $trades = array_filter($all_buyins, function($t) {
-            return ($t['our_status'] ?? '') !== 'no_go';
+            $status = $t['our_status'] ?? '';
+            return $status !== 'no_go' && $status !== 'error';
         });
         $trades = array_values($trades); // Re-index
         
@@ -795,7 +796,7 @@ ob_start();
     <div class="card-header">
         <div class="card-title">Live Trades (<?php echo ($play_id === 46) ? '24-Hour' : '7-Day'; ?> DuckDB Data)</div>
         <div class="ms-auto d-flex gap-2 align-items-center">
-            <span class="badge bg-info-transparent">Showing <?php echo count($trades); ?></span>
+            <span class="badge bg-info-transparent" id="live-trades-count">Showing <span id="visible-trades-count">0</span> of <span id="total-trades-count"><?php echo count($trades); ?></span></span>
         </div>
     </div>
     <div class="card-body">
@@ -836,7 +837,7 @@ ob_start();
                             ];
                         }
                     ?>
-                    <tr onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer;">
+                    <tr class="trade-row" onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer; display: none;">
                         <td>
                             <a href="https://solscan.io/token/<?php echo urlencode($trade['wallet_address'] ?? ''); ?>" target="_blank" rel="noopener" class="text-primary" title="<?php echo htmlspecialchars($trade['wallet_address'] ?? ''); ?>" onclick="event.stopPropagation();">
                                 <code><?php echo substr(htmlspecialchars($trade['wallet_address'] ?? ''), 0, 12); ?>...</code>
@@ -916,6 +917,11 @@ ob_start();
                     <?php endforeach; ?>
                 </tbody>
             </table>
+        </div>
+        <div class="text-center mt-3" id="load-more-container" style="display: none;">
+            <button class="btn btn-primary" id="load-more-btn" onclick="loadMoreTrades()">
+                <i class="ri-arrow-down-line me-1"></i>Load More Trades
+            </button>
         </div>
         <?php endif; ?>
     </div>
@@ -1028,12 +1034,43 @@ ob_start();
     window.isRestrictedPlay = <?php echo $is_restricted_play ? 'true' : 'false'; ?>;
     window.playId = <?php echo $play_id; ?>;
 
+    // Trade pagination configuration
+    let visibleTradesCount = 0;
+    const INITIAL_LOAD = 50;
+    const LOAD_MORE_INCREMENT = 50;
+
     // Performance Timing Report
     (function() {
         const timingData = <?php echo $json_timing_report; ?>;
         console.log('%c⏱️ PAGE PERFORMANCE TIMING REPORT', 'color: rgb(var(--primary-rgb)); font-size: 14px; font-weight: bold;');
         console.table(timingData);
     })();
+    
+    // Load more trades function
+    function loadMoreTrades() {
+        const tradeRows = document.querySelectorAll('.trade-row');
+        const totalTrades = tradeRows.length;
+        const endIndex = Math.min(visibleTradesCount + LOAD_MORE_INCREMENT, totalTrades);
+        
+        // Show the next batch of trades
+        for (let i = visibleTradesCount; i < endIndex; i++) {
+            tradeRows[i].style.display = '';
+        }
+        
+        visibleTradesCount = endIndex;
+        updateTradeCounter();
+        
+        // Hide button if all trades are visible
+        if (visibleTradesCount >= totalTrades) {
+            document.getElementById('load-more-container').style.display = 'none';
+        }
+    }
+    
+    function updateTradeCounter() {
+        const totalTrades = document.querySelectorAll('.trade-row').length;
+        document.getElementById('visible-trades-count').textContent = visibleTradesCount;
+        document.getElementById('total-trades-count').textContent = totalTrades;
+    }
     
     // Update play sorting via API
     async function updatePlaySorting(playId, sorting) {
@@ -1435,6 +1472,26 @@ ob_start();
 
     // Initialize form handlers
     document.addEventListener('DOMContentLoaded', function() {
+        // Initialize trade pagination display
+        const tradeRows = document.querySelectorAll('.trade-row');
+        const totalTrades = tradeRows.length;
+        
+        if (totalTrades > 0) {
+            // Show initial batch
+            const initialLoad = Math.min(INITIAL_LOAD, totalTrades);
+            for (let i = 0; i < initialLoad; i++) {
+                tradeRows[i].style.display = '';
+            }
+            visibleTradesCount = initialLoad;
+            updateTradeCounter();
+            
+            // Show load more button if there are more trades
+            if (totalTrades > INITIAL_LOAD) {
+                document.getElementById('load-more-container').style.display = 'block';
+            }
+        }
+        
+        // PIP input conversion handlers
         document.querySelectorAll('.pip-input').forEach(input => {
             updatePipConversion(input);
             input.addEventListener('input', function() {

@@ -6,7 +6,7 @@ Separate from master.py to avoid circular imports with API.
 
 Includes:
 - In-memory job status tracking (for real-time dashboard)
-- DuckDB persistence of execution metrics (for historical analysis)
+- PostgreSQL persistence of execution metrics (for historical analysis)
 """
 
 import time
@@ -53,10 +53,9 @@ def _get_next_metric_id() -> int:
 
 
 def _init_metrics_table():
-    """Initialize the job_execution_metrics table in DuckDB.
+    """Initialize the job_execution_metrics table in PostgreSQL.
     
-    Only initializes if TradingDataEngine is running (uses in-memory DuckDB).
-    Skips if engine not running to avoid file-based DuckDB lock issues.
+    Verifies that the table exists and is accessible.
     """
     global _metrics_table_initialized
     
@@ -64,35 +63,39 @@ def _init_metrics_table():
         return True
     
     try:
-        # Check if TradingDataEngine is running first
-        try:
-            from core.trading_engine import _engine_instance
-            if _engine_instance is None or not _engine_instance._running:
-                logger.info("[METRICS] TradingDataEngine not running yet - skipping metrics init")
-                return False
-        except Exception:
-            logger.info("[METRICS] TradingDataEngine not available - skipping metrics init")
-            return False
+        from core.database import get_postgres
         
-        from core.database import get_duckdb
-        from features.price_api.schema import SCHEMA_JOB_EXECUTION_METRICS
+        logger.info("[METRICS] Verifying job_execution_metrics table in PostgreSQL...")
         
-        logger.info("[METRICS] Initializing job_execution_metrics table...")
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Verify table exists
+                cursor.execute("""
+                    SELECT COUNT(*) as cnt FROM information_schema.tables 
+                    WHERE table_name = 'job_execution_metrics'
+                """)
+                result = cursor.fetchone()
+                
+                if result and result.get('cnt', 0) > 0:
+                    # Get current row count
+                    cursor.execute("SELECT COUNT(*) as cnt FROM job_execution_metrics")
+                    count_result = cursor.fetchone()
+                    row_count = count_result.get('cnt', 0) if count_result else 0
+                    logger.info(f"[METRICS] Table ready, current row count: {row_count}")
+                    _metrics_table_initialized = True
+                    return True
+                else:
+                    logger.warning("[METRICS] job_execution_metrics table not found in PostgreSQL")
+                    return False
         
-        with get_duckdb("central") as conn:
-            # Create table if not exists
-            conn.execute(SCHEMA_JOB_EXECUTION_METRICS)
-            
-            # Verify table was created
-            result = conn.execute("SELECT COUNT(*) FROM job_execution_metrics").fetchone()
-            logger.info(f"[METRICS] Table ready, current row count: {result[0]}")
-        
-        _metrics_table_initialized = True
-        logger.info("[METRICS] job_execution_metrics table initialized successfully")
-        return True
+    except KeyError as e:
+        logger.error(f"[METRICS] KeyError accessing result: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
     except Exception as e:
         import traceback
-        logger.error(f"[METRICS] Failed to initialize job_execution_metrics table: {e}\n{traceback.format_exc()}")
+        logger.error(f"[METRICS] Failed to verify job_execution_metrics table: {e}\n{traceback.format_exc()}")
         return False
 
 
@@ -120,11 +123,11 @@ def _start_metrics_writer():
         return
     
     def _writer_loop():
-        """Background thread that writes metrics to DuckDB."""
+        """Background thread that writes metrics to PostgreSQL."""
         global _metrics_writer_running
         _metrics_writer_running = True
         
-        from core.database import get_duckdb
+        from core.database import get_postgres
         
         while _metrics_writer_running:
             batch = []
@@ -136,16 +139,18 @@ def _start_metrics_writer():
                         _metrics_queue.clear()
                 
                 if batch:
-                    # Write batch to DuckDB using the connection pool (handles locking)
+                    # Write batch to PostgreSQL using the connection pool
                     try:
-                        with get_duckdb("central") as conn:
-                            for metric in batch:
-                                conn.execute("""
-                                    INSERT INTO job_execution_metrics 
-                                    (id, job_id, started_at, ended_at, duration_ms, status, error_message, created_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                                """, metric)
-                        logger.debug(f"[METRICS] Wrote {len(batch)} metrics to DuckDB")
+                        with get_postgres() as conn:
+                            with conn.cursor() as cursor:
+                                for metric in batch:
+                                    cursor.execute("""
+                                        INSERT INTO job_execution_metrics 
+                                        (id, job_id, started_at, ended_at, duration_ms, status, error_message, created_at)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                                    """, metric)
+                            conn.commit()
+                        logger.debug(f"[METRICS] Wrote {len(batch)} metrics to PostgreSQL")
                     except Exception as e:
                         logger.warning(f"[METRICS] Batch write failed: {e}")
                 
@@ -168,7 +173,7 @@ def _record_execution(job_id: str, started_at: float, ended_at: float,
     Record a job execution to the metrics queue (non-blocking).
     
     Queues metrics for async writing to avoid blocking job execution.
-    A background thread handles the actual DuckDB writes.
+    A background thread handles the actual PostgreSQL writes.
     """
     global _metrics_table_initialized, _metrics_writer_running
     
@@ -192,11 +197,12 @@ def _record_execution(job_id: str, started_at: float, ended_at: float,
             err_msg = err_msg[:497] + "..."
         
         # Queue the metric for async writing (non-blocking)
+        # PostgreSQL uses tuple/list for parameterized queries
         metric_tuple = [
             metric_id,
             job_id,
-            started_dt.strftime('%Y-%m-%d %H:%M:%S.%f'),
-            ended_dt.strftime('%Y-%m-%d %H:%M:%S.%f'),
+            started_dt,  # PostgreSQL handles datetime objects directly
+            ended_dt,    # PostgreSQL handles datetime objects directly
             duration_ms,
             status,
             err_msg
@@ -217,7 +223,7 @@ def track_job(job_id: str, description: str = None):
     
     Records:
     - In-memory status (start time, end time, status, error message, run count)
-    - DuckDB metrics (execution duration for historical analysis)
+    - PostgreSQL metrics (execution duration for historical analysis)
     """
     def decorator(func):
         @wraps(func)
@@ -323,7 +329,7 @@ def get_job_status() -> dict:
 
 def get_job_metrics(hours: float = 1) -> dict:
     """
-    Get job execution metrics from DuckDB.
+    Get job execution metrics from PostgreSQL.
     
     Returns per-job statistics:
     - avg_duration_ms
@@ -341,87 +347,87 @@ def get_job_metrics(hours: float = 1) -> dict:
         Dictionary with 'jobs' containing metrics per job
     """
     try:
-        from core.database import get_duckdb
+        from core.database import get_postgres
         from features.price_api.schema import JOB_EXPECTED_INTERVALS_MS
         
         metrics = {}
         
-        # Convert hours to minutes for more precise filtering
-        minutes = int(hours * 60)
-        
-        with get_duckdb("central") as conn:
-            # Single optimized query that gets both aggregate stats AND recent executions
-            # Using a CTE to filter data once and reuse it
-            result = conn.execute(f"""
-                WITH filtered_metrics AS (
-                    SELECT job_id, started_at, duration_ms, status
-                    FROM job_execution_metrics
-                    WHERE started_at >= NOW() - INTERVAL {minutes} MINUTE
-                ),
-                agg_stats AS (
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Single optimized query that gets both aggregate stats AND recent executions
+                # Using a CTE to filter data once and reuse it
+                cursor.execute(f"""
+                    WITH filtered_metrics AS (
+                        SELECT job_id, started_at, duration_ms, status
+                        FROM job_execution_metrics
+                        WHERE started_at >= NOW() - INTERVAL '{hours} hours'
+                    ),
+                    agg_stats AS (
+                        SELECT 
+                            job_id,
+                            COUNT(*) as execution_count,
+                            AVG(duration_ms) as avg_duration_ms,
+                            MAX(duration_ms) as max_duration_ms,
+                            MIN(duration_ms) as min_duration_ms,
+                            SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
+                            MAX(started_at) as last_execution
+                        FROM filtered_metrics
+                        GROUP BY job_id
+                    ),
+                    recent AS (
+                        SELECT job_id, started_at, duration_ms, status,
+                               ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC) as rn
+                        FROM filtered_metrics
+                    )
                     SELECT 
-                        job_id,
-                        COUNT(*) as execution_count,
-                        AVG(duration_ms) as avg_duration_ms,
-                        MAX(duration_ms) as max_duration_ms,
-                        MIN(duration_ms) as min_duration_ms,
-                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
-                        MAX(started_at) as last_execution
-                    FROM filtered_metrics
-                    GROUP BY job_id
-                ),
-                recent AS (
-                    SELECT job_id, started_at, duration_ms, status,
-                           ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC) as rn
-                    FROM filtered_metrics
-                )
-                SELECT 
-                    a.job_id,
-                    a.execution_count,
-                    a.avg_duration_ms,
-                    a.max_duration_ms,
-                    a.min_duration_ms,
-                    a.error_count,
-                    a.last_execution,
-                    r.started_at as recent_started_at,
-                    r.duration_ms as recent_duration_ms,
-                    r.status as recent_status,
-                    r.rn
-                FROM agg_stats a
-                LEFT JOIN recent r ON a.job_id = r.job_id AND r.rn <= 20
-                ORDER BY a.job_id, r.rn
-            """).fetchall()
+                        a.job_id,
+                        a.execution_count,
+                        a.avg_duration_ms,
+                        a.max_duration_ms,
+                        a.min_duration_ms,
+                        a.error_count,
+                        a.last_execution,
+                        r.started_at as recent_started_at,
+                        r.duration_ms as recent_duration_ms,
+                        r.status as recent_status,
+                        r.rn
+                    FROM agg_stats a
+                    LEFT JOIN recent r ON a.job_id = r.job_id AND r.rn <= 20
+                    ORDER BY a.job_id, r.rn
+                """)
+                
+                result = cursor.fetchall()
             
             # Process results - aggregate and recent are combined in one query
             current_job_id = None
             for row in result:
-                job_id = row[0]
+                job_id = row['job_id']
                 
                 # First time seeing this job - add aggregate data
                 if job_id != current_job_id:
                     current_job_id = job_id
                     expected_interval = JOB_EXPECTED_INTERVALS_MS.get(job_id, 60000)
-                    avg_ms = row[2] if row[2] else 0
+                    avg_ms = row['avg_duration_ms'] if row['avg_duration_ms'] else 0
                     
                     metrics[job_id] = {
                         'job_id': job_id,
-                        'execution_count': row[1],
+                        'execution_count': row['execution_count'],
                         'avg_duration_ms': round(avg_ms, 2),
-                        'max_duration_ms': round(row[3], 2) if row[3] else 0,
-                        'min_duration_ms': round(row[4], 2) if row[4] else 0,
-                        'error_count': row[5],
+                        'max_duration_ms': round(row['max_duration_ms'], 2) if row['max_duration_ms'] else 0,
+                        'min_duration_ms': round(row['min_duration_ms'], 2) if row['min_duration_ms'] else 0,
+                        'error_count': row['error_count'],
                         'expected_interval_ms': expected_interval,
                         'is_slow': avg_ms > expected_interval * 0.8,
-                        'last_execution': row[6].isoformat() if (row[6] and hasattr(row[6], 'isoformat')) else (str(row[6]) if row[6] else None),
+                        'last_execution': row['last_execution'].isoformat() if (row['last_execution'] and hasattr(row['last_execution'], 'isoformat')) else (str(row['last_execution']) if row['last_execution'] else None),
                         'recent_executions': []
                     }
                 
                 # Add recent execution if present
-                if row[7] is not None:  # recent_started_at
+                if row['recent_started_at'] is not None:
                     metrics[job_id]['recent_executions'].append({
-                        'started_at': row[7].isoformat() if (row[7] and hasattr(row[7], 'isoformat')) else (str(row[7]) if row[7] else None),
-                        'duration_ms': round(row[8], 2) if row[8] else 0,
-                        'status': row[9]
+                        'started_at': row['recent_started_at'].isoformat() if (row['recent_started_at'] and hasattr(row['recent_started_at'], 'isoformat')) else (str(row['recent_started_at']) if row['recent_started_at'] else None),
+                        'duration_ms': round(row['recent_duration_ms'], 2) if row['recent_duration_ms'] else 0,
+                        'status': row['recent_status']
                     })
         
         return {
@@ -433,6 +439,8 @@ def get_job_metrics(hours: float = 1) -> dict:
         
     except Exception as e:
         logger.error(f"Failed to get job metrics: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {
             'status': 'error',
             'error': str(e),

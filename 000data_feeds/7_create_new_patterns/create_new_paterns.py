@@ -59,35 +59,58 @@ def _read_from_postgres(query: str, params: list = None) -> list:
         return []
 
 
-def _get_filter_columns(hours: int) -> List[str]:
+def _get_filter_columns(hours: int, ratio_only: bool = False) -> List[str]:
     """Get distinct filter names from trade_filter_values for recent trades."""
-    query = """
+    ratio_clause = "AND tfv.is_ratio = 1" if ratio_only else ""
+    query = f"""
         SELECT DISTINCT tfv.filter_name
         FROM trade_filter_values tfv
         INNER JOIN follow_the_goat_buyins b ON b.id = tfv.buyin_id
         WHERE b.potential_gains IS NOT NULL
           AND b.followed_at >= NOW() - INTERVAL '%s hours'
+          {ratio_clause}
         ORDER BY tfv.filter_name
     """
     results = _read_from_postgres(query, [hours])
     return [r['filter_name'] for r in results] if results else []
 
-# Config file path
-CONFIG_FILE = Path(__file__).parent / "config.json"
-
-
 # =============================================================================
 # Configuration
 # =============================================================================
 
+def ensure_settings_table():
+    """Ensure auto_filter_settings table exists in PostgreSQL."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS auto_filter_settings (
+                        id SERIAL PRIMARY KEY,
+                        setting_key VARCHAR(100) UNIQUE NOT NULL,
+                        setting_value TEXT,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_auto_filter_settings_key 
+                    ON auto_filter_settings(setting_key)
+                """)
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Could not ensure settings table exists: {e}")
+
+
 def load_config() -> Dict[str, Any]:
-    """Load configuration from JSON file."""
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+    """
+    Load configuration from PostgreSQL table.
     
-    # Default config if file doesn't exist
-    return {
+    NEVER CACHED - Always reads fresh from database.
+    Falls back to defaults if table doesn't exist or setting not found.
+    """
+    ensure_settings_table()
+    
+    # Default config values
+    defaults = {
         "good_trade_threshold": 0.3,
         "analysis_hours": 24,
         "min_filters_in_combo": 2,
@@ -100,21 +123,67 @@ def load_config() -> Dict[str, Any]:
         "percentile_low": 10,
         "percentile_high": 90,
         "skip_columns": [],
+        "is_ratio": False,
         "section_prefixes": {
             "pm_": "price_movements",
             "tx_": "transactions",
             "ob_": "order_book",
             "wh_": "whale_activity",
+            "mp_": "micro_patterns",
             "sp_": "second_prices",
             "pat_": "patterns",
             "btc_": "btc_correlation",
             "eth_": "eth_correlation"
         }
     }
-
-
-# Global config (loaded once)
-CONFIG = load_config()
+    
+    config = defaults.copy()
+    
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT setting_key, setting_value FROM auto_filter_settings")
+                rows = cursor.fetchall()
+                
+                for row in rows:
+                    key = row['setting_key']
+                    value = row['setting_value']
+                    
+                    # Parse JSON fields
+                    if key in ['skip_columns', 'section_prefixes']:
+                        try:
+                            config[key] = json.loads(value) if value else defaults[key]
+                        except (json.JSONDecodeError, TypeError):
+                            config[key] = defaults[key]
+                    # Parse numeric fields
+                    elif key in ['good_trade_threshold', 'min_good_trades_kept_pct', 
+                                'min_bad_trades_removed_pct', 'combo_min_good_kept_pct',
+                                'combo_min_improvement', 'percentile_low', 'percentile_high']:
+                        try:
+                            config[key] = float(value) if value else defaults[key]
+                        except (ValueError, TypeError):
+                            config[key] = defaults[key]
+                    # Parse boolean fields
+                    elif key in ['is_ratio']:
+                        if isinstance(value, bool):
+                            config[key] = value
+                        else:
+                            config[key] = str(value).strip().lower() in ['1', 'true', 'yes', 'on']
+                    # Parse integer fields
+                    elif key in ['analysis_hours', 'min_filters_in_combo', 'max_filters_in_combo']:
+                        try:
+                            config[key] = int(value) if value else defaults[key]
+                        except (ValueError, TypeError):
+                            config[key] = defaults[key]
+                    # String fields
+                    else:
+                        config[key] = value if value else defaults.get(key, '')
+                        
+    except Exception as e:
+        logger.warning(f"Could not load config from database, using defaults: {e}")
+        return defaults
+    
+    return config
 
 
 # =============================================================================
@@ -138,9 +207,12 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     import time
     start_time = time.time()
     
+    config = load_config()
+    ratio_only = bool(config.get('is_ratio', False))
+    
     # Step 1: Get distinct filter columns (fast query)
     logger.info("  Getting distinct filter columns...")
-    filter_columns = _get_filter_columns(hours)
+    filter_columns = _get_filter_columns(hours, ratio_only=ratio_only)
     
     if not filter_columns:
         logger.warning("No filter columns found")
@@ -160,8 +232,7 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     
     pivot_sql = ",\n                ".join(pivot_columns)
     
-    # OPTIMIZATION: Use a subquery to limit the number of buyins analyzed
-    # This prevents timeouts when there are millions of filter values
+    # Build query with all buyins in the time window (no artificial limit)
     query = f"""
         SELECT 
             b.id as trade_id,
@@ -171,15 +242,10 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
             b.our_status,
             tfv.minute,
             {pivot_sql}
-        FROM (
-            SELECT id, play_id, followed_at, potential_gains, our_status
-            FROM follow_the_goat_buyins
-            WHERE potential_gains IS NOT NULL
-              AND followed_at >= NOW() - INTERVAL '{hours} hours'
-            ORDER BY followed_at DESC
-            LIMIT 5000
-        ) b
+        FROM follow_the_goat_buyins b
         INNER JOIN trade_filter_values tfv ON tfv.buyin_id = b.id
+        WHERE b.potential_gains IS NOT NULL
+          AND b.followed_at >= NOW() - INTERVAL '{hours} hours'
         GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute
         ORDER BY b.id, tfv.minute
     """
@@ -220,7 +286,8 @@ def get_filterable_columns(df: pd.DataFrame) -> List[str]:
     - String columns
     - Columns in skip_columns config
     """
-    skip_columns = set(CONFIG.get('skip_columns', []))
+    config = load_config()
+    skip_columns = set(config.get('skip_columns', []))
     skip_columns.update(['trade_id', 'play_id', 'wallet_address', 'followed_at', 
                          'our_status', 'minute', 'potential_gains', 'pat_detected_list',
                          'pat_swing_trend'])
@@ -242,7 +309,8 @@ def get_filterable_columns(df: pd.DataFrame) -> List[str]:
 
 def get_section_from_column(column_name: str) -> str:
     """Determine section from column prefix."""
-    section_prefixes = CONFIG.get('section_prefixes', {})
+    config = load_config()
+    section_prefixes = config.get('section_prefixes', {})
     for prefix, section in section_prefixes.items():
         if column_name.startswith(prefix):
             return section
@@ -251,7 +319,8 @@ def get_section_from_column(column_name: str) -> str:
 
 def get_field_name_from_column(column_name: str) -> str:
     """Extract field name by removing prefix."""
-    section_prefixes = CONFIG.get('section_prefixes', {})
+    config = load_config()
+    section_prefixes = config.get('section_prefixes', {})
     for prefix in section_prefixes.keys():
         if column_name.startswith(prefix):
             return column_name[len(prefix):]
@@ -367,8 +436,9 @@ def find_optimal_threshold(
     if len(good_values) < 10 or len(values) < 20:
         return None
     
-    min_good_kept = CONFIG.get('min_good_trades_kept_pct', 50)
-    min_bad_removed = CONFIG.get('min_bad_trades_removed_pct', 10)
+    config = load_config()
+    min_good_kept = config.get('min_good_trades_kept_pct', 50)
+    min_bad_removed = config.get('min_bad_trades_removed_pct', 10)
     
     best_score = -1
     best_result = None
@@ -441,7 +511,8 @@ def analyze_field(
     else:
         df_filtered = df
     
-    threshold = CONFIG.get('good_trade_threshold', 0.3)
+    config = load_config()
+    threshold = config.get('good_trade_threshold', 0.3)
     result = find_optimal_threshold(df_filtered, column_name, threshold)
     
     if result is None:
@@ -532,7 +603,8 @@ def apply_filter_combination(df: pd.DataFrame, filters: List[Dict]) -> pd.Series
 
 def calculate_combination_metrics(df: pd.DataFrame, passes: pd.Series) -> Dict[str, Any]:
     """Calculate effectiveness metrics for a filter combination."""
-    threshold = CONFIG.get('good_trade_threshold', 0.3)
+    config = load_config()
+    threshold = config.get('good_trade_threshold', 0.3)
     potential_gains = df['potential_gains']
     
     is_good = potential_gains >= threshold
@@ -583,9 +655,10 @@ def find_best_combinations(
     Returns:
         List of combination dicts
     """
-    max_filters = CONFIG.get('max_filters_in_combo', 6)
-    min_good_kept = CONFIG.get('combo_min_good_kept_pct', 25)
-    min_improvement = CONFIG.get('combo_min_improvement', 1.0)
+    config = load_config()
+    max_filters = config.get('max_filters_in_combo', 6)
+    min_good_kept = config.get('combo_min_good_kept_pct', 25)
+    min_improvement = config.get('combo_min_improvement', 1.0)
     
     results = []
     
@@ -691,7 +764,8 @@ def find_best_combinations_all_minutes(
     
     Returns combinations from the minute that produces the best results.
     """
-    min_filters = CONFIG.get('min_filters_in_combo', 2)
+    config = load_config()
+    min_filters = config.get('min_filters_in_combo', 2)
     
     if 'minute' not in df.columns:
         logger.warning("No 'minute' column found, falling back to minute 0")
@@ -762,114 +836,163 @@ def find_best_combinations_all_minutes(
 
 def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
     """
-    Save/update filter fields catalog.
+    Save/update filter fields catalog directly to PostgreSQL.
     
     Returns dict mapping column_name to id.
     """
-    # Clear existing catalog
-    engine.execute("DELETE FROM filter_fields_catalog")
-    
     column_to_id = {}
-    next_id = 1
     
-    for col in columns:
-        section = get_section_from_column(col)
-        field_name = get_field_name_from_column(col)
-        prefix = col.split('_')[0] + '_' if '_' in col else ''
-        
-        engine.write('filter_fields_catalog', {
-            'id': next_id,
-            'section': section,
-            'field_name': field_name,
-            'column_name': col,
-            'column_prefix': prefix,
-            'data_type': 'DOUBLE',
-            'value_type': 'numeric',
-            'is_filterable': True,
-            'display_order': next_id
-        })
-        
-        column_to_id[col] = next_id
-        next_id += 1
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Clear existing catalog
+                cursor.execute("DELETE FROM filter_fields_catalog")
+                
+                next_id = 1
+                for col in columns:
+                    config = load_config()
+                    section = get_section_from_column(col)
+                    field_name = get_field_name_from_column(col)
+                    
+                    # Insert only columns that exist in the actual table schema
+                    cursor.execute("""
+                        INSERT INTO filter_fields_catalog 
+                        (id, section, field_name, field_type, description)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            section = EXCLUDED.section,
+                            field_name = EXCLUDED.field_name,
+                            field_type = EXCLUDED.field_type,
+                            description = EXCLUDED.description
+                    """, [
+                        next_id,
+                        section,
+                        field_name,
+                        'numeric',
+                        f"Filter field: {col}"
+                    ])
+                    
+                    column_to_id[col] = next_id
+                    next_id += 1
+            conn.commit()
+        logger.info(f"Saved {len(columns)} fields to filter_fields_catalog")
+    except Exception as e:
+        logger.error(f"Failed to save filter catalog to PostgreSQL: {e}", exc_info=True)
     
-    logger.info(f"Saved {len(columns)} fields to filter_fields_catalog")
     return column_to_id
 
 
 def save_suggestions(engine, suggestions: List[Dict[str, Any]], column_to_id: Dict[str, int], hours: int):
-    """Save filter suggestions to in-memory storage."""
-    # Clear existing suggestions
-    engine.execute("DELETE FROM filter_reference_suggestions")
-    
-    for i, s in enumerate(suggestions, 1):
-        engine.write('filter_reference_suggestions', {
-            'id': i,
-            'filter_field_id': column_to_id.get(s['column_name'], 0),
-            'column_name': s['column_name'],
-            'from_value': s['from_value'],
-            'to_value': s['to_value'],
-            'total_trades': s.get('total_trades', 0),
-            'good_trades_before': s.get('good_trades_before', 0),
-            'bad_trades_before': s.get('bad_trades_before', 0),
-            'good_trades_after': s.get('good_trades_after', 0),
-            'bad_trades_after': s.get('bad_trades_after', 0),
-            'good_trades_kept_pct': s.get('good_trades_kept_pct', 0),
-            'bad_trades_removed_pct': s.get('bad_trades_removed_pct', 0),
-            'bad_negative_count': s.get('bad_negative_count', 0),
-            'bad_0_to_01_count': s.get('bad_0_to_01_count', 0),
-            'bad_01_to_02_count': s.get('bad_01_to_02_count', 0),
-            'bad_02_to_03_count': s.get('bad_02_to_03_count', 0),
-            'analysis_hours': hours,
-            'minute_analyzed': s.get('minute_analyzed', 0),
-        })
-    
-    logger.info(f"Saved {len(suggestions)} filter suggestions")
+    """Save filter suggestions directly to PostgreSQL."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Clear existing suggestions
+                cursor.execute("DELETE FROM filter_reference_suggestions")
+                
+                for i, s in enumerate(suggestions, 1):
+                    cursor.execute("""
+                        INSERT INTO filter_reference_suggestions 
+                        (id, filter_field_id, column_name, from_value, to_value,
+                         total_trades, good_trades_before, bad_trades_before,
+                         good_trades_after, bad_trades_after,
+                         good_trades_kept_pct, bad_trades_removed_pct,
+                         bad_negative_count, bad_0_to_01_count, bad_01_to_02_count, bad_02_to_03_count,
+                         analysis_hours, minute_analyzed, section)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, [
+                        i,
+                        column_to_id.get(s['column_name'], 0),
+                        s['column_name'],
+                        s['from_value'],
+                        s['to_value'],
+                        s.get('total_trades', 0),
+                        s.get('good_trades_before', 0),
+                        s.get('bad_trades_before', 0),
+                        s.get('good_trades_after', 0),
+                        s.get('bad_trades_after', 0),
+                        s.get('good_trades_kept_pct', 0),
+                        s.get('bad_trades_removed_pct', 0),
+                        s.get('bad_negative_count', 0),
+                        s.get('bad_0_to_01_count', 0),
+                        s.get('bad_01_to_02_count', 0),
+                        s.get('bad_02_to_03_count', 0),
+                        hours,
+                        s.get('minute_analyzed', 0),
+                        s.get('section', get_section_from_column(s['column_name'])),
+                    ])
+            conn.commit()
+        logger.info(f"Saved {len(suggestions)} filter suggestions to PostgreSQL")
+    except Exception as e:
+        logger.error(f"Failed to save suggestions to PostgreSQL: {e}", exc_info=True)
 
 
 def save_combinations(engine, combinations: List[Dict[str, Any]], hours: int):
-    """Save filter combinations to in-memory storage."""
+    """Save filter combinations directly to PostgreSQL."""
     # Clear existing combinations
-    engine.execute("DELETE FROM filter_combinations")
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM filter_combinations")
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Could not clear existing combinations: {e}")
     
     if not combinations:
+        logger.info("No combinations to save")
         return
     
     best_single_removed = combinations[0]['bad_trades_removed_pct'] if combinations else 0
     
-    for i, combo in enumerate(combinations, 1):
-        minute = combo.get('minute_analyzed', 0)
-        name = f"[M{minute}] {len(combo['filter_columns'])}-filter combo: " + " + ".join(
-            col.replace('_', ' ').title()[:20] for col in combo['filter_columns'][:3]
-        )
-        if len(combo['filter_columns']) > 3:
-            name += f" (+{len(combo['filter_columns']) - 3} more)"
-        
-        improvement = combo['bad_trades_removed_pct'] - best_single_removed
-        
-        engine.write('filter_combinations', {
-            'id': i,
-            'combination_name': name,
-            'filter_count': len(combo['filter_columns']),
-            'filter_ids': json.dumps(list(range(1, len(combo['filter_columns']) + 1))),
-            'filter_columns': json.dumps(combo['filter_columns']),
-            'total_trades': combo.get('total_trades', 0),
-            'good_trades_before': combo.get('good_trades_before', 0),
-            'bad_trades_before': combo.get('bad_trades_before', 0),
-            'good_trades_after': combo.get('good_trades_after', 0),
-            'bad_trades_after': combo.get('bad_trades_after', 0),
-            'good_trades_kept_pct': combo.get('good_trades_kept_pct', 0),
-            'bad_trades_removed_pct': combo.get('bad_trades_removed_pct', 0),
-            'best_single_bad_removed_pct': best_single_removed,
-            'improvement_over_single': round(improvement, 2),
-            'bad_negative_count': combo.get('bad_negative_count', 0),
-            'bad_0_to_01_count': combo.get('bad_0_to_01_count', 0),
-            'bad_01_to_02_count': combo.get('bad_01_to_02_count', 0),
-            'bad_02_to_03_count': combo.get('bad_02_to_03_count', 0),
-            'minute_analyzed': combo.get('minute_analyzed', 0),
-            'analysis_hours': hours,
-        })
-    
-    logger.info(f"Saved {len(combinations)} filter combinations")
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                for i, combo in enumerate(combinations, 1):
+                    minute = combo.get('minute_analyzed', 0)
+                    name = f"[M{minute}] {len(combo['filter_columns'])}-filter combo: " + " + ".join(
+                        col.replace('_', ' ').title()[:20] for col in combo['filter_columns'][:3]
+                    )
+                    if len(combo['filter_columns']) > 3:
+                        name += f" (+{len(combo['filter_columns']) - 3} more)"
+                    
+                    improvement = combo['bad_trades_removed_pct'] - best_single_removed
+                    
+                    cursor.execute("""
+                        INSERT INTO filter_combinations 
+                        (id, combination_name, filter_count, filter_ids, filter_columns,
+                         total_trades, good_trades_before, bad_trades_before,
+                         good_trades_after, bad_trades_after,
+                         good_trades_kept_pct, bad_trades_removed_pct,
+                         best_single_bad_removed_pct, improvement_over_single,
+                         bad_negative_count, bad_0_to_01_count, bad_01_to_02_count, bad_02_to_03_count,
+                         minute_analyzed, analysis_hours)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, [
+                        i,
+                        name,
+                        len(combo['filter_columns']),
+                        json.dumps(list(range(1, len(combo['filter_columns']) + 1))),
+                        json.dumps(combo['filter_columns']),
+                        combo.get('total_trades', 0),
+                        combo.get('good_trades_before', 0),
+                        combo.get('bad_trades_before', 0),
+                        combo.get('good_trades_after', 0),
+                        combo.get('bad_trades_after', 0),
+                        combo.get('good_trades_kept_pct', 0),
+                        combo.get('bad_trades_removed_pct', 0),
+                        best_single_removed,
+                        round(improvement, 2),
+                        combo.get('bad_negative_count', 0),
+                        combo.get('bad_0_to_01_count', 0),
+                        combo.get('bad_01_to_02_count', 0),
+                        combo.get('bad_02_to_03_count', 0),
+                        combo.get('minute_analyzed', 0),
+                        hours,
+                    ])
+            conn.commit()
+        logger.info(f"Saved {len(combinations)} filter combinations to PostgreSQL")
+    except Exception as e:
+        logger.error(f"Failed to save combinations to PostgreSQL: {e}", exc_info=True)
 
 
 # =============================================================================
@@ -878,7 +1001,8 @@ def save_combinations(engine, combinations: List[Dict[str, Any]], hours: int):
 
 def get_or_create_auto_project(engine) -> int:
     """Get or create the AutoFilters project."""
-    project_name = CONFIG.get('auto_project_name', 'AutoFilters')
+    config = load_config()
+    project_name = config.get('auto_project_name', 'AutoFilters')
     
     # Check pattern_config_projects table
     try:
@@ -922,7 +1046,8 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
         return {"success": False, "error": "No combinations found"}
     
     # Get the best combination (last one has most filters)
-    min_filters = CONFIG.get('min_filters_in_combo', 2)
+    config = load_config()
+    min_filters = config.get('min_filters_in_combo', 2)
     valid_combos = [c for c in combinations if len(c['filter_columns']) >= min_filters]
     
     if not valid_combos:
@@ -998,7 +1123,8 @@ def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0
             return 0
         
         project_ids_json = json.dumps([project_id])
-        project_name = CONFIG.get('auto_project_name', 'AutoFilters')
+        config = load_config()
+        project_name = config.get('auto_project_name', 'AutoFilters')
         
         updated_count = 0
         for play in plays:
@@ -1062,11 +1188,10 @@ def run() -> Dict[str, Any]:
     logger.info(f"AUTO FILTER PATTERN GENERATOR - Run ID: {run_id}")
     logger.info("=" * 60)
     
-    # Reload config in case it changed
-    global CONFIG
-    CONFIG = load_config()
+    # Load config fresh from database (never cached)
+    config = load_config()
     
-    hours = CONFIG.get('analysis_hours', 24)
+    hours = config.get('analysis_hours', 24)
     logger.info(f"Analysis window: {hours} hours")
     
     result = {
@@ -1097,7 +1222,8 @@ def run() -> Dict[str, Any]:
             return result
         
         # Show data summary
-        threshold = CONFIG.get('good_trade_threshold', 0.3)
+        config = load_config()
+        threshold = config.get('good_trade_threshold', 0.3)
         good_count = (df['potential_gains'] >= threshold).sum()
         bad_count = (df['potential_gains'] < threshold).sum()
         logger.info(f"  Total rows: {len(df):,}")

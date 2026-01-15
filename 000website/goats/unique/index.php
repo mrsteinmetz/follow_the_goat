@@ -509,6 +509,82 @@ ob_start();
     </div>
 </div>
 
+<!-- Current Filters Display (Read-only) -->
+<?php if (!empty($play['filters_info'])): ?>
+<div class="card custom-card mb-3">
+    <div class="card-body">
+        <h6 class="fw-semibold mb-3">
+            <i class="ri-filter-3-line me-2"></i>Current Active Filters
+        </h6>
+        <?php foreach ($play['filters_info'] as $filter_info): ?>
+            <div class="mb-3 p-3 border rounded">
+                <div class="d-flex justify-content-between align-items-start mb-2">
+                    <div>
+                        <strong><?php echo htmlspecialchars($filter_info['project_name']); ?></strong>
+                        <span class="badge bg-primary ms-2">ID: <?php echo $filter_info['project_id']; ?></span>
+                        <span class="badge bg-info-transparent ms-2"><?php echo $filter_info['filter_count']; ?> filters</span>
+                    </div>
+                    <div class="text-muted small">
+                        <?php if ($filter_info['latest_filter_update']): ?>
+                            <i class="ri-time-line me-1"></i>
+                            Version: <?php echo date('M d, Y H:i', strtotime($filter_info['latest_filter_update'])); ?> UTC
+                        <?php elseif ($filter_info['project_updated_at']): ?>
+                            <i class="ri-time-line me-1"></i>
+                            Project Version: <?php echo date('M d, Y H:i', strtotime($filter_info['project_updated_at'])); ?> UTC
+                        <?php endif; ?>
+                    </div>
+                </div>
+                
+                <?php if (!empty($filter_info['filters'])): ?>
+                <div class="table-responsive mt-2">
+                    <table class="table table-sm table-bordered mb-0">
+                        <thead>
+                            <tr>
+                                <th style="width: 60px;">ID</th>
+                                <th style="width: 80px;">Minute</th>
+                                <th>Filter Name</th>
+                                <th>Field Column</th>
+                                <th style="width: 150px;">From Value</th>
+                                <th style="width: 150px;">To Value</th>
+                                <th style="width: 80px;">Section</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($filter_info['filters'] as $filter): ?>
+                            <tr>
+                                <td><code><?php echo $filter['id']; ?></code></td>
+                                <td><span class="badge bg-secondary-transparent">M<?php echo $filter['minute']; ?></span></td>
+                                <td><strong><?php echo htmlspecialchars($filter['name']); ?></strong></td>
+                                <td><code class="small"><?php echo htmlspecialchars($filter['field_column']); ?></code></td>
+                                <td>
+                                    <?php if ($filter['from_value'] !== null): ?>
+                                        <code><?php echo number_format($filter['from_value'], 6); ?></code>
+                                    <?php else: ?>
+                                        <span class="text-muted">-</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ($filter['to_value'] !== null): ?>
+                                        <code><?php echo number_format($filter['to_value'], 6); ?></code>
+                                    <?php else: ?>
+                                        <span class="text-muted">-</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><small class="text-muted"><?php echo htmlspecialchars($filter['section'] ?? 'N/A'); ?></small></td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+                <?php else: ?>
+                <div class="text-muted small">No active filters found</div>
+                <?php endif; ?>
+            </div>
+        <?php endforeach; ?>
+    </div>
+</div>
+<?php endif; ?>
+
 <!-- Edit Play Form -->
 <div class="form-container hidden" id="editPlayForm">
     <h3>Edit Play</h3>
@@ -837,7 +913,7 @@ ob_start();
                             ];
                         }
                     ?>
-                    <tr class="trade-row" onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer; display: none;">
+                    <tr class="trade-row" data-trade-id="<?php echo htmlspecialchars($trade['id']); ?>" data-play-id="<?php echo htmlspecialchars($play_id); ?>" style="cursor: pointer; display: none;">
                         <td>
                             <a href="https://solscan.io/token/<?php echo urlencode($trade['wallet_address'] ?? ''); ?>" target="_blank" rel="noopener" class="text-primary" title="<?php echo htmlspecialchars($trade['wallet_address'] ?? ''); ?>" onclick="event.stopPropagation();">
                                 <code><?php echo substr(htmlspecialchars($trade['wallet_address'] ?? ''), 0, 12); ?>...</code>
@@ -972,7 +1048,7 @@ ob_start();
                             }
                         }
                     ?>
-                    <tr onclick="viewTradeDetail(<?php echo $trade['id']; ?>, <?php echo $play_id; ?>)" style="cursor: pointer; opacity: 0.8;">
+                    <tr class="no-go-trade-row" data-trade-id="<?php echo htmlspecialchars($trade['id']); ?>" data-play-id="<?php echo htmlspecialchars($play_id); ?>" style="cursor: pointer; opacity: 0.8;">
                         <td>
                             <a href="https://solscan.io/token/<?php echo urlencode($trade['wallet_address'] ?? ''); ?>" target="_blank" rel="noopener" class="text-muted" title="<?php echo htmlspecialchars($trade['wallet_address'] ?? ''); ?>" onclick="event.stopPropagation();">
                                 <code><?php echo substr(htmlspecialchars($trade['wallet_address'] ?? ''), 0, 12); ?>...</code>
@@ -1572,6 +1648,41 @@ ob_start();
         });
         window.location.href = `trade/?${params.toString()}`;
     }
+    
+    // Event delegation for trade row clicks - ensures consistent navigation regardless of column clicked
+    document.addEventListener('DOMContentLoaded', function() {
+        // Handle clicks on live trades table
+        const liveTradesBody = document.getElementById('live-trades-body');
+        if (liveTradesBody) {
+            liveTradesBody.addEventListener('click', function(e) {
+                // Find the closest row with trade data
+                const row = e.target.closest('.trade-row');
+                if (row && row.dataset.tradeId && row.dataset.playId) {
+                    // Don't navigate if clicking on a link or button (they handle their own navigation)
+                    if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON' || e.target.closest('a') || e.target.closest('button')) {
+                        return;
+                    }
+                    viewTradeDetail(row.dataset.tradeId, row.dataset.playId, 'live');
+                }
+            });
+        }
+        
+        // Handle clicks on no-go trades table
+        const noGoTradesBody = document.getElementById('noGoTradesBody');
+        if (noGoTradesBody) {
+            noGoTradesBody.addEventListener('click', function(e) {
+                // Find the closest row with trade data
+                const row = e.target.closest('.no-go-trade-row');
+                if (row && row.dataset.tradeId && row.dataset.playId) {
+                    // Don't navigate if clicking on a link or button (they handle their own navigation)
+                    if (e.target.tagName === 'A' || e.target.tagName === 'BUTTON' || e.target.closest('a') || e.target.closest('button')) {
+                        return;
+                    }
+                    viewTradeDetail(row.dataset.tradeId, row.dataset.playId, 'live');
+                }
+            });
+        }
+    });
     
     function toggleNoGoTrades() {
         const body = document.getElementById('noGoTradesBody');

@@ -266,7 +266,7 @@ def get_plays():
 
 @app.route('/plays/<int:play_id>', methods=['GET'])
 def get_single_play(play_id):
-    """Get a single play by ID."""
+    """Get a single play by ID with filter information."""
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
@@ -278,11 +278,85 @@ def get_single_play(play_id):
                 result = cursor.fetchone()
         
         if result:
-            return jsonify({'play': result})
+            # Get filter information for projects used by this play
+            play = dict(result)
+            project_ids = []
+            if play.get('project_ids'):
+                try:
+                    if isinstance(play['project_ids'], str):
+                        project_ids = json.loads(play['project_ids'])
+                    elif isinstance(play['project_ids'], list):
+                        project_ids = play['project_ids']
+                except:
+                    project_ids = []
+            
+            # Get filters for each project with detailed filter information
+            filters_info = []
+            if project_ids:
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        for project_id in project_ids:
+                            # Get project info
+                            cursor.execute("""
+                                SELECT 
+                                    p.id as project_id,
+                                    p.name as project_name,
+                                    p.updated_at as project_updated_at
+                                FROM pattern_config_projects p
+                                WHERE p.id = %s
+                            """, [project_id])
+                            project_info = cursor.fetchone()
+                            
+                            if project_info:
+                                # Get all active filters for this project
+                                cursor.execute("""
+                                    SELECT 
+                                        f.id,
+                                        f.name,
+                                        f.section,
+                                        f.minute,
+                                        f.field_name,
+                                        f.field_column,
+                                        f.from_value,
+                                        f.to_value,
+                                        f.include_null,
+                                        f.is_active,
+                                        f.updated_at
+                                    FROM pattern_config_filters f
+                                    WHERE f.project_id = %s AND f.is_active = 1
+                                    ORDER BY f.minute, f.id
+                                """, [project_id])
+                                filters = cursor.fetchall()
+                                
+                                filters_info.append({
+                                    'project_id': project_info['project_id'],
+                                    'project_name': project_info['project_name'],
+                                    'project_updated_at': project_info['project_updated_at'].isoformat() if project_info['project_updated_at'] else None,
+                                    'filter_count': len(filters),
+                                    'latest_filter_update': max([f['updated_at'].isoformat() for f in filters if f.get('updated_at')], default=None),
+                                    'filters': [
+                                        {
+                                            'id': f['id'],
+                                            'name': f['name'],
+                                            'section': f['section'],
+                                            'minute': f['minute'],
+                                            'field_name': f['field_name'],
+                                            'field_column': f['field_column'],
+                                            'from_value': float(f['from_value']) if f.get('from_value') is not None else None,
+                                            'to_value': float(f['to_value']) if f.get('to_value') is not None else None,
+                                            'include_null': bool(f.get('include_null', 0)),
+                                            'updated_at': f['updated_at'].isoformat() if f.get('updated_at') else None
+                                        }
+                                        for f in filters
+                                    ]
+                                })
+            
+            play['filters_info'] = filters_info
+            return jsonify({'play': play})
         else:
             return jsonify({'error': 'Play not found'}), 404
     except Exception as e:
-        logger.error(f"Get single play failed: {e}")
+        logger.error(f"Get single play failed: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 
@@ -2333,8 +2407,15 @@ def get_filter_analysis_dashboard():
                 cursor.execute("""
                     SELECT 
                         apu.id, apu.play_id, apu.play_name, apu.project_id, apu.project_name,
-                        apu.pattern_count, apu.filters_applied, apu.updated_at, apu.run_id, apu.status
+                        apu.pattern_count, apu.filters_applied, apu.updated_at, apu.run_id, apu.status,
+                        p.updated_at as project_updated_at,
+                        MAX(f.updated_at) as filter_version
                     FROM ai_play_updates apu
+                    LEFT JOIN pattern_config_projects p ON p.id = apu.project_id
+                    LEFT JOIN pattern_config_filters f ON f.project_id = p.id AND f.is_active = 1
+                    GROUP BY apu.id, apu.play_id, apu.play_name, apu.project_id, apu.project_name,
+                             apu.pattern_count, apu.filters_applied, apu.updated_at, apu.run_id, apu.status,
+                             p.updated_at
                     ORDER BY apu.updated_at DESC
                     LIMIT 50
                 """)
@@ -2342,6 +2423,10 @@ def get_filter_analysis_dashboard():
                 for pu in play_updates:
                     if pu.get('updated_at'):
                         pu['updated_at'] = str(pu['updated_at'])[:19]
+                    if pu.get('project_updated_at'):
+                        pu['project_updated_at'] = str(pu['project_updated_at'])[:19]
+                    if pu.get('filter_version'):
+                        pu['filter_version'] = str(pu['filter_version'])[:19]
                 result['play_updates'] = play_updates
         
         return jsonify(result)

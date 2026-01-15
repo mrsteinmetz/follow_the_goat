@@ -52,8 +52,8 @@ def get_quick_analysis():
                 # Get trades from today
                 cursor.execute("""
                     SELECT COUNT(*) as total,
-                           SUM(CASE WHEN potential_gains >= 0.3 THEN 1 ELSE 0 END) as good_trades,
-                           SUM(CASE WHEN potential_gains < 0.3 THEN 1 ELSE 0 END) as bad_trades
+                           SUM(CASE WHEN potential_gains >= 0.6 THEN 1 ELSE 0 END) as good_trades,
+                           SUM(CASE WHEN potential_gains < 0.6 THEN 1 ELSE 0 END) as bad_trades
                     FROM follow_the_goat_buyins
                     WHERE followed_at >= CURRENT_DATE
                       AND potential_gains IS NOT NULL
@@ -61,8 +61,8 @@ def get_quick_analysis():
                 summary = cursor.fetchone()
                 
                 logger.info(f"Total trades: {summary['total']}")
-                logger.info(f"Good trades (>= 0.3%): {summary['good_trades']} ({summary['good_trades']/summary['total']*100:.1f}%)")
-                logger.info(f"Bad trades (< 0.3%): {summary['bad_trades']} ({summary['bad_trades']/summary['total']*100:.1f}%)")
+                logger.info(f"Good trades (>= 0.6%): {summary['good_trades']} ({summary['good_trades']/summary['total']*100:.1f}%)")
+                logger.info(f"Bad trades (< 0.6%): {summary['bad_trades']} ({summary['bad_trades']/summary['total']*100:.1f}%)")
                 
                 # Test each filter at different minutes
                 for col in filter_columns:
@@ -80,7 +80,7 @@ def get_quick_analysis():
                             FROM trade_filter_values tfv
                             JOIN follow_the_goat_buyins b ON b.id = tfv.buyin_id
                             WHERE b.followed_at >= CURRENT_DATE
-                              AND b.potential_gains >= 0.3
+                              AND b.potential_gains >= 0.6
                               AND tfv.filter_name = %s
                               AND tfv.minute = %s
                               AND tfv.filter_value IS NOT NULL
@@ -103,7 +103,7 @@ def get_quick_analysis():
                                     b.id,
                                     b.potential_gains,
                                     tfv.filter_value,
-                                    CASE WHEN b.potential_gains >= 0.3 THEN 1 ELSE 0 END as is_good,
+                                    CASE WHEN b.potential_gains >= 0.6 THEN 1 ELSE 0 END as is_good,
                                     CASE WHEN tfv.filter_value >= %s AND tfv.filter_value <= %s THEN 1 ELSE 0 END as passes
                                 FROM trade_filter_values tfv
                                 JOIN follow_the_goat_buyins b ON b.id = tfv.buyin_id

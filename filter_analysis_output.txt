@@ -1,0 +1,204 @@
+2026-01-15 16:05:54 [INFO] ================================================================================
+2026-01-15 16:05:54 [INFO] FILTER OPTIMIZATION ANALYSIS
+2026-01-15 16:05:54 [INFO] ================================================================================
+2026-01-15 16:05:54 [INFO] Analyzing trades from: 2026-01-15
+2026-01-15 16:05:54 [INFO] Loading today's trade data...
+2026-01-15 16:05:54 [INFO] Attempting PostgreSQL connection: ftg_user@127.0.0.1:5432/solcatcher
+2026-01-15 16:05:54 [INFO] ✓ Test connection successful
+2026-01-15 16:05:54 [INFO] PostgreSQL connection pool initialized: 127.0.0.1:5432/solcatcher
+2026-01-15 16:05:54 [INFO] Loaded 2734 trades from today
+2026-01-15 16:05:54 [INFO] Loading filter values for 2734 trades...
+2026-01-15 16:06:11 [INFO] Loaded 40935 filter value rows
+2026-01-15 16:06:11 [INFO] Loading current filter settings...
+2026-01-15 16:06:11 [INFO] Loaded 17 active filters from 5 projects
+2026-01-15 16:06:11 [INFO] 
+================================================================================
+2026-01-15 16:06:11 [INFO] ANALYZING MISSED OPPORTUNITIES
+2026-01-15 16:06:11 [INFO] ================================================================================
+2026-01-15 16:06:11 [INFO] 
+Total trades today: 2734
+2026-01-15 16:06:11 [INFO] Good trades (>= 0.6%): 301 (11.0%)
+2026-01-15 16:06:11 [INFO] Bad trades (< 0.6%): 2433 (89.0%)
+2026-01-15 16:06:11 [INFO] 
+--- Project: Anders test (ID: 1) ---
+2026-01-15 16:06:11 [INFO] Active filters: 3
+2026-01-15 16:06:19 [INFO]   Minute  0: Good kept: 0/299 (0.0%), Bad removed: 2430/2430 (100.0%), Score: 0.00
+2026-01-15 16:06:19 [INFO] 
+  BEST MINUTE: 0
+2026-01-15 16:06:19 [INFO]   Good trades caught: 0/299 (0.0%)
+2026-01-15 16:06:19 [INFO]   Bad trades filtered: 2430/2430 (100.0%)
+2026-01-15 16:06:19 [INFO] 
+--- Project: Jack testing (ID: 2) ---
+2026-01-15 16:06:19 [INFO] Active filters: 3
+2026-01-15 16:06:19 [INFO] 
+--- Project: Jack testing 2 (ID: 3) ---
+2026-01-15 16:06:19 [INFO] Active filters: 4
+2026-01-15 16:06:19 [INFO] 
+--- Project: Jack testing 3 (ID: 4) ---
+2026-01-15 16:06:19 [INFO] Active filters: 4
+2026-01-15 16:06:19 [INFO] 
+--- Project: AutoFilters (ID: 5) ---
+2026-01-15 16:06:19 [INFO] Active filters: 3
+2026-01-15 16:06:27 [INFO]   Minute  6: Good kept: 50/299 (16.7%), Bad removed: 1798/2430 (74.0%), Score: 12.37
+2026-01-15 16:06:27 [INFO] 
+  BEST MINUTE: 6
+2026-01-15 16:06:27 [INFO]   Good trades caught: 50/299 (16.7%)
+2026-01-15 16:06:27 [INFO]   Bad trades filtered: 1798/2430 (74.0%)
+2026-01-15 16:06:27 [INFO] 
+================================================================================
+2026-01-15 16:06:27 [INFO] TESTING ALTERNATIVE FILTER STRATEGIES
+2026-01-15 16:06:27 [INFO] ================================================================================
+2026-01-15 16:06:27 [INFO] 
+Testing 124 filter columns
+2026-01-15 16:06:27 [INFO] 
+--- Strategy 1: Looser Percentiles (5-95) ---
+2026-01-15 16:06:29 [INFO] 
+Top 10 filters:
+2026-01-15 16:06:29 [INFO]   1. pat_asc_tri_resistance_level (M0): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   2. pat_asc_tri_resistance_level (M1): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   3. pat_asc_tri_resistance_level (M2): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   4. pat_asc_tri_resistance_level (M3): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   5. pat_asc_tri_resistance_level (M4): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   6. pat_asc_tri_resistance_level (M5): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   7. pat_asc_tri_resistance_level (M6): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   8. pat_asc_tri_resistance_level (M7): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   9. pat_asc_tri_resistance_level (M8): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO]   10. pat_asc_tri_resistance_level (M9): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:29 [INFO] 
+--- Strategy 2: Very Loose Percentiles (1-99) ---
+2026-01-15 16:06:31 [INFO] 
+Top 10 filters:
+2026-01-15 16:06:31 [INFO]   1. pat_asc_tri_resistance_level (M0): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   2. pat_asc_tri_resistance_level (M1): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   3. pat_asc_tri_resistance_level (M2): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   4. pat_asc_tri_resistance_level (M3): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   5. pat_asc_tri_resistance_level (M4): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   6. pat_asc_tri_resistance_level (M5): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   7. pat_asc_tri_resistance_level (M6): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   8. pat_asc_tri_resistance_level (M7): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   9. pat_asc_tri_resistance_level (M8): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO]   10. pat_asc_tri_resistance_level (M9): Good 140/299 (46.8%), Bad removed 66.9%, Score: 31.31
+2026-01-15 16:06:31 [INFO] 
+--- Strategy 3: Top Performers Only (>= 0.6%) ---
+2026-01-15 16:06:33 [INFO] 
+Top 10 filters:
+2026-01-15 16:06:33 [INFO]   1. pat_asc_tri_resistance_level (M0): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   2. pat_asc_tri_resistance_level (M1): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   3. pat_asc_tri_resistance_level (M2): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   4. pat_asc_tri_resistance_level (M3): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   5. pat_asc_tri_resistance_level (M4): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   6. pat_asc_tri_resistance_level (M5): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   7. pat_asc_tri_resistance_level (M6): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   8. pat_asc_tri_resistance_level (M7): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   9. pat_asc_tri_resistance_level (M8): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO]   10. pat_asc_tri_resistance_level (M9): Good 128/299 (42.8%), Bad removed 73.1%, Score: 31.29
+2026-01-15 16:06:33 [INFO] 
+--- Strategy 4: Multi-Minute Approach (Pass if ANY minute matches) ---
+2026-01-15 16:13:12 [INFO] 
+Top 10 multi-minute filters:
+2026-01-15 16:13:12 [INFO]   1. sp_min_price: Good 272/301 (90.4%), Bad removed 52.3%, Score: 47.24
+2026-01-15 16:13:12 [INFO]   2. sp_max_price: Good 268/301 (89.0%), Bad removed 46.1%, Score: 41.02
+2026-01-15 16:13:12 [INFO]   3. sp_avg_price: Good 241/301 (80.1%), Bad removed 43.6%, Score: 34.88
+2026-01-15 16:13:12 [INFO]   4. sp_start_price: Good 241/301 (80.1%), Bad removed 41.7%, Score: 33.40
+2026-01-15 16:13:12 [INFO]   5. sp_end_price: Good 241/301 (80.1%), Bad removed 39.7%, Score: 31.76
+2026-01-15 16:13:12 [INFO]   6. pat_asc_tri_resistance_level: Good 114/301 (37.9%), Bad removed 78.9%, Score: 29.89
+2026-01-15 16:13:12 [INFO]   7. pat_asc_tri_support_level: Good 114/301 (37.9%), Bad removed 75.4%, Score: 28.56
+2026-01-15 16:13:12 [INFO]   8. pm_avg_price: Good 281/301 (93.4%), Bad removed 29.5%, Score: 27.55
+2026-01-15 16:13:12 [INFO]   9. pm_low_price: Good 281/301 (93.4%), Bad removed 28.9%, Score: 27.01
+2026-01-15 16:13:12 [INFO]   10. pm_close_price: Good 281/301 (93.4%), Bad removed 28.7%, Score: 26.82
+2026-01-15 16:13:12 [INFO] 
+================================================================================
+2026-01-15 16:13:12 [INFO] TESTING FILTER COMBINATIONS (Conservative Strategy)
+2026-01-15 16:13:12 [INFO] ================================================================================
+2026-01-15 16:13:12 [INFO] Strategy: Better to say NO than YES - prioritize avoiding bad trades
+2026-01-15 16:13:12 [INFO] 
+Testing combinations of up to 3 filters from 124 columns
+2026-01-15 16:13:12 [INFO] 
+--- Step 1: Finding top individual filters ---
+2026-01-15 16:13:14 [INFO] 
+Top 20 individual filters (conservative scoring):
+2026-01-15 16:13:14 [INFO]   1. pat_bull_flag_retracement_pct (M0): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   2. pat_bull_flag_retracement_pct (M1): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   3. pat_bull_flag_retracement_pct (M2): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   4. pat_bull_flag_retracement_pct (M3): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   5. pat_bull_flag_retracement_pct (M4): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   6. pat_bull_flag_retracement_pct (M5): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   7. pat_bull_flag_retracement_pct (M6): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   8. pat_bull_flag_retracement_pct (M7): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   9. pat_bull_flag_retracement_pct (M8): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   10. pat_bull_flag_retracement_pct (M9): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   11. pat_bull_flag_retracement_pct (M10): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   12. pat_bull_flag_retracement_pct (M11): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   13. pat_bull_flag_retracement_pct (M12): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   14. pat_bull_flag_retracement_pct (M13): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   15. pat_bull_flag_retracement_pct (M14): Good 12/299 (4.0%), Bad removed 99.5%, Precision 50.0%, Score: 65.56
+2026-01-15 16:13:14 [INFO]   16. pat_bull_flag_pole_height_pct (M0): Good 12/299 (4.0%), Bad removed 99.3%, Precision 42.9%, Score: 63.33
+2026-01-15 16:13:14 [INFO]   17. pat_bull_flag_pole_height_pct (M1): Good 12/299 (4.0%), Bad removed 99.3%, Precision 42.9%, Score: 63.33
+2026-01-15 16:13:14 [INFO]   18. pat_bull_flag_pole_height_pct (M2): Good 12/299 (4.0%), Bad removed 99.3%, Precision 42.9%, Score: 63.33
+2026-01-15 16:13:14 [INFO]   19. pat_bull_flag_pole_height_pct (M3): Good 12/299 (4.0%), Bad removed 99.3%, Precision 42.9%, Score: 63.33
+2026-01-15 16:13:14 [INFO]   20. pat_bull_flag_pole_height_pct (M4): Good 12/299 (4.0%), Bad removed 99.3%, Precision 42.9%, Score: 63.33
+2026-01-15 16:13:14 [INFO] 
+--- Step 2: Testing combinations of 3 filters (AND logic) ---
+2026-01-15 16:13:14 [INFO] Testing 2-filter combinations from 2 diverse filters...
+2026-01-15 16:13:14 [INFO] Testing top 3-filter combinations...
+2026-01-15 16:13:14 [INFO] 
+Top 10 filter combinations:
+2026-01-15 16:13:14 [INFO] 
+  1. Combination of 2 filters:
+2026-01-15 16:13:14 [INFO]      Filters: pat_bull_flag_retracement_pct (M0), pat_bull_flag_pole_height_pct (M0)
+2026-01-15 16:13:14 [INFO]      Good trades caught: 11/301 (3.7%)
+2026-01-15 16:13:14 [INFO]      Bad trades filtered: 100.0% (1 bad trades still pass)
+2026-01-15 16:13:14 [INFO]      Precision: 91.7%
+2026-01-15 16:13:14 [INFO]      Conservative Score: 78.21
+2026-01-15 16:13:14 [INFO] 
+================================================================================
+2026-01-15 16:13:14 [INFO] SUMMARY & RECOMMENDATIONS
+2026-01-15 16:13:14 [INFO] ================================================================================
+2026-01-15 16:13:14 [INFO] 
+Strategy Comparison:
+2026-01-15 16:13:14 [INFO] 
+Looser Percentiles:
+2026-01-15 16:13:14 [INFO]   Best filter: pat_asc_tri_resistance_level
+2026-01-15 16:13:14 [INFO]   Minute: 0
+2026-01-15 16:13:14 [INFO]   Good trades caught: 128/299 (42.8%)
+2026-01-15 16:13:14 [INFO]   Bad trades removed: 73.1%
+2026-01-15 16:13:14 [INFO]   Score: 31.29
+2026-01-15 16:13:14 [INFO] 
+Very Loose Percentiles:
+2026-01-15 16:13:14 [INFO]   Best filter: pat_asc_tri_resistance_level
+2026-01-15 16:13:14 [INFO]   Minute: 0
+2026-01-15 16:13:14 [INFO]   Good trades caught: 140/299 (46.8%)
+2026-01-15 16:13:14 [INFO]   Bad trades removed: 66.9%
+2026-01-15 16:13:14 [INFO]   Score: 31.31
+2026-01-15 16:13:14 [INFO] 
+Top Performers Only:
+2026-01-15 16:13:14 [INFO]   Best filter: pat_asc_tri_resistance_level
+2026-01-15 16:13:14 [INFO]   Minute: 0
+2026-01-15 16:13:14 [INFO]   Good trades caught: 128/299 (42.8%)
+2026-01-15 16:13:14 [INFO]   Bad trades removed: 73.1%
+2026-01-15 16:13:14 [INFO]   Score: 31.29
+2026-01-15 16:13:14 [INFO] 
+Multi Minute:
+2026-01-15 16:13:14 [INFO]   Best filter: sp_min_price
+2026-01-15 16:13:14 [INFO]   Good trades caught: 272/301 (90.4%)
+2026-01-15 16:13:14 [INFO]   Bad trades removed: 52.3%
+2026-01-15 16:13:14 [INFO]   Score: 47.24
+2026-01-15 16:13:14 [INFO] 
+================================================================================
+2026-01-15 16:13:14 [INFO] BEST FILTER COMBINATIONS (Conservative - Prioritize Avoiding Bad Trades)
+2026-01-15 16:13:14 [INFO] ================================================================================
+2026-01-15 16:13:14 [INFO] 
+🏆 Top Combination (2 filters):
+2026-01-15 16:13:14 [INFO]    Filters: pat_bull_flag_retracement_pct (M0), pat_bull_flag_pole_height_pct (M0)
+2026-01-15 16:13:14 [INFO]    Good trades caught: 11/301 (3.7%)
+2026-01-15 16:13:14 [INFO]    Bad trades filtered: 100.0% (1 bad trades still pass)
+2026-01-15 16:13:14 [INFO]    Precision: 91.7%
+2026-01-15 16:13:14 [INFO]    Conservative Score: 78.21
+2026-01-15 16:13:14 [INFO] 
+📊 Top 5 Combinations:
+2026-01-15 16:13:14 [INFO]    1. pat_bull_flag_retracement_pct (M0), pat_bull_flag_pole_height_pct (M0)
+2026-01-15 16:13:14 [INFO]       Good: 11/301 (3.7%), Bad removed: 100.0%, Precision: 91.7%
+2026-01-15 16:13:14 [INFO] 
+================================================================================
+2026-01-15 16:13:14 [INFO] Analysis complete!
+2026-01-15 16:13:14 [INFO] ================================================================================

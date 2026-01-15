@@ -457,6 +457,7 @@ ob_start();
                         <th>Project</th>
                         <th>Patterns</th>
                         <th>Filters</th>
+                        <th>Filter Version</th>
                         <th>Updated</th>
                         <th>Status</th>
                     </tr>
@@ -474,6 +475,31 @@ ob_start();
                         </td>
                         <td><span class="badge bg-success-transparent"><?php echo $update['pattern_count'] ?? 0; ?> patterns</span></td>
                         <td><span class="badge bg-warning-transparent"><?php echo $update['filters_applied'] ?? 0; ?> filters</span></td>
+                        <td>
+                            <?php 
+                            $filter_version = null;
+                            if (isset($update['filter_version'])) {
+                                $filter_version = $update['filter_version'];
+                            } elseif (isset($update['project_updated_at'])) {
+                                $filter_version = $update['project_updated_at'];
+                            }
+                            if ($filter_version):
+                                $version_date = is_string($filter_version) ? strtotime($filter_version) : $filter_version;
+                                if ($version_date):
+                            ?>
+                                <small class="text-muted">
+                                    <i class="ri-time-line me-1"></i>
+                                    <?php echo date('M d, H:i', $version_date); ?>
+                                </small>
+                            <?php 
+                                else:
+                                    echo '<small class="text-muted">-</small>';
+                                endif;
+                            else:
+                                echo '<small class="text-muted">-</small>';
+                            endif;
+                            ?>
+                        </td>
                         <td><small class="text-muted"><?php echo $update['updated_at']; ?></small></td>
                         <td>
                             <?php 

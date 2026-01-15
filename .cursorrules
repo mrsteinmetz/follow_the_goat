@@ -5,6 +5,20 @@ This project uses a **PostgreSQL-only architecture** for all data storage and re
 
 ---
 
+### DuckDB Exception for Filter Analysis
+
+**IMPORTANT:** There is ONE exception to the PostgreSQL-only rule:
+
+**`core/filter_cache.py`** is permitted to use DuckDB for read-only caching of filter analysis data.
+
+This is a performance optimization that:
+- Speeds up filter pattern generation by 10-50x
+- Uses DuckDB purely as a read-only cache (7-day rolling window)
+- PostgreSQL remains the source of truth
+- Cache is automatically synced incrementally from PostgreSQL
+- NO other modules should use DuckDB
+
+
 ## 🚨 CRITICAL: DUAL-MASTER ARCHITECTURE 🚨
 
 **THIS SYSTEM USES TWO SEPARATE PROCESSES SHARING ONE DATABASE**

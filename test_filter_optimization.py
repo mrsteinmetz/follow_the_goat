@@ -20,7 +20,7 @@ import logging
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 import pandas as pd
 import numpy as np
 
@@ -151,7 +151,9 @@ def get_trade_filter_values(trade_ids: List[int]) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    logger.info(f"Loaded {len(df)} filter value rows")
+    logger.info(f"Loaded {len(df)} filter value rows (pivoted: one row per buyin-minute)")
+    logger.info(f"  Note: Raw database has ~{len(trade_ids) * 15 * len(filter_columns)} filter value rows")
+    logger.info(f"  Pivoted format groups by buyin_id + minute, creating one row with all filters as columns")
     return df
 
 
@@ -236,7 +238,7 @@ def check_if_trade_passes_filters(filter_values: pd.DataFrame, filters: List[Dic
 # =============================================================================
 
 def analyze_missed_opportunities(trades_df: pd.DataFrame, filter_values_df: pd.DataFrame, 
-                                 current_filters: List[Dict], good_threshold: float = 0.3) -> Dict[str, Any]:
+                                 current_filters: List[Dict], good_threshold: float = 0.6) -> Dict[str, Any]:
     """Analyze which good trades were missed by current filters."""
     
     logger.info("\n" + "="*80)
@@ -351,7 +353,7 @@ def analyze_missed_opportunities(trades_df: pd.DataFrame, filter_values_df: pd.D
 
 
 def test_alternative_strategies(trades_df: pd.DataFrame, filter_values_df: pd.DataFrame, 
-                                good_threshold: float = 0.3) -> Dict[str, Any]:
+                                good_threshold: float = 0.6) -> Dict[str, Any]:
     """Test alternative filter strategies to find better approaches."""
     
     logger.info("\n" + "="*80)
@@ -386,12 +388,12 @@ def test_alternative_strategies(trades_df: pd.DataFrame, filter_values_df: pd.Da
     strategies['very_loose_percentiles'] = strategy2_results
     
     # Strategy 3: Focus on top performers only
-    logger.info("\n--- Strategy 3: Top Performers Only (>= 0.5%) ---")
-    top_performers = trades_df[trades_df['potential_gains'] >= 0.5].copy()
+    logger.info("\n--- Strategy 3: Top Performers Only (>= 0.6%) ---")
+    top_performers = trades_df[trades_df['potential_gains'] >= 0.6].copy()
     if len(top_performers) > 5:
         strategy3_results = test_percentile_strategy(
             top_performers, bad_trades, filter_values_df, filter_columns,
-            percentile_low=5, percentile_high=95, good_threshold=0.5
+            percentile_low=5, percentile_high=95, good_threshold=0.6
         )
         strategies['top_performers_only'] = strategy3_results
     
@@ -408,7 +410,7 @@ def test_alternative_strategies(trades_df: pd.DataFrame, filter_values_df: pd.Da
 def test_percentile_strategy(good_trades: pd.DataFrame, bad_trades: pd.DataFrame,
                              filter_values_df: pd.DataFrame, filter_columns: List[str],
                              percentile_low: float, percentile_high: float,
-                             good_threshold: float = 0.3) -> Dict[str, Any]:
+                             good_threshold: float = 0.6) -> Dict[str, Any]:
     """Test a filter strategy using specific percentiles."""
     
     best_filters = []
@@ -505,7 +507,7 @@ def test_percentile_strategy(good_trades: pd.DataFrame, bad_trades: pd.DataFrame
 
 def test_multi_minute_strategy(good_trades: pd.DataFrame, bad_trades: pd.DataFrame,
                                filter_values_df: pd.DataFrame, filter_columns: List[str],
-                               good_threshold: float = 0.3) -> Dict[str, Any]:
+                               good_threshold: float = 0.6) -> Dict[str, Any]:
     """Test if allowing trades to pass if ANY minute matches improves results."""
     
     results = []
@@ -574,6 +576,289 @@ def test_multi_minute_strategy(good_trades: pd.DataFrame, bad_trades: pd.DataFra
     }
 
 
+def test_filter_combinations(trades_df: pd.DataFrame, filter_values_df: pd.DataFrame,
+                              good_threshold: float = 0.6, max_combinations: int = 3,
+                              target_good_trades: Tuple[int, int] = (2, 5)) -> Dict[str, Any]:
+    """Test combinations of filters with AND logic - prioritize avoiding bad trades.
+    
+    Args:
+        target_good_trades: Tuple of (min, max) good trades to catch per day
+    """
+    
+    logger.info("\n" + "="*80)
+    logger.info("TESTING FILTER COMBINATIONS (Conservative Strategy)")
+    logger.info("="*80)
+    logger.info(f"Strategy: Better to say NO than YES - prioritize avoiding bad trades")
+    logger.info(f"Target: Catch {target_good_trades[0]}-{target_good_trades[1]} good trades per day")
+    
+    good_trades = trades_df[trades_df['potential_gains'] >= good_threshold].copy()
+    bad_trades = trades_df[trades_df['potential_gains'] < good_threshold].copy()
+    
+    # Get all numeric filter columns
+    filter_columns = [col for col in filter_values_df.columns 
+                     if col not in ['buyin_id', 'minute'] and filter_values_df[col].dtype in ['float64', 'int64']]
+    
+    logger.info(f"\nTesting combinations of up to {max_combinations} filters from {len(filter_columns)} columns")
+    
+    # Step 1: Find top individual filters (using conservative scoring)
+    logger.info("\n--- Step 1: Finding top individual filters ---")
+    individual_filters = []
+    
+    for minute in range(15):
+        minute_data = filter_values_df[filter_values_df['minute'] == minute].copy()
+        
+        if len(minute_data) < 20:
+            continue
+        
+        minute_data = minute_data.merge(
+            trades_df[['id', 'potential_gains']], 
+            left_on='buyin_id', 
+            right_on='id',
+            how='left'
+        )
+        
+        if len(minute_data) < 20:
+            continue
+        
+        for col in filter_columns:
+            if col not in minute_data.columns:
+                continue
+            
+            good_values = minute_data[minute_data['potential_gains'] >= good_threshold][col].dropna()
+            
+            if len(good_values) < 5:
+                continue
+            
+            try:
+                # Use tighter percentiles for conservative approach (10-90)
+                from_val = float(np.percentile(good_values, 10))
+                to_val = float(np.percentile(good_values, 90))
+                
+                if from_val >= to_val:
+                    continue
+                
+                passes_filter = (minute_data[col] >= from_val) & (minute_data[col] <= to_val)
+                is_good = minute_data['potential_gains'] >= good_threshold
+                is_bad = minute_data['potential_gains'] < good_threshold
+                
+                good_before = is_good.sum()
+                bad_before = is_bad.sum()
+                
+                good_after = (is_good & passes_filter).sum()
+                bad_after = (is_bad & passes_filter).sum()
+                
+                if good_before == 0 or bad_before == 0:
+                    continue
+                
+                good_kept_pct = (good_after / good_before * 100)
+                bad_removed_pct = ((bad_before - bad_after) / bad_before * 100)
+                
+                # Conservative score: heavily weight bad trade removal
+                # Penalize bad trades getting through more than missing good trades
+                precision = (good_after / (good_after + bad_after)) * 100 if (good_after + bad_after) > 0 else 0
+                
+                # Score prioritizes: 1) Bad trade removal, 2) Precision, 3) Good trade capture
+                score = (bad_removed_pct * 0.5) + (precision * 0.3) + (good_kept_pct * 0.2)
+                
+                individual_filters.append({
+                    'column': col,
+                    'minute': minute,
+                    'from_val': from_val,
+                    'to_val': to_val,
+                    'good_kept_pct': good_kept_pct,
+                    'bad_removed_pct': bad_removed_pct,
+                    'precision': precision,
+                    'score': score,
+                    'good_passed': int(good_after),
+                    'good_total': int(good_before),
+                    'bad_passed': int(bad_after),
+                    'bad_total': int(bad_before)
+                })
+                
+            except Exception:
+                continue
+    
+    # Sort by conservative score
+    individual_filters.sort(key=lambda x: x['score'], reverse=True)
+    
+    logger.info(f"\nTop 20 individual filters (conservative scoring):")
+    for i, f in enumerate(individual_filters[:20], 1):
+        logger.info(f"  {i}. {f['column']} (M{f['minute']}): "
+                   f"Good {f['good_passed']}/{f['good_total']} ({f['good_kept_pct']:.1f}%), "
+                   f"Bad removed {f['bad_removed_pct']:.1f}%, "
+                   f"Precision {f['precision']:.1f}%, Score: {f['score']:.2f}")
+    
+    # Step 2: Test combinations (AND logic - all filters must pass)
+    logger.info(f"\n--- Step 2: Testing combinations of {max_combinations} filters (AND logic) ---")
+    
+    # Use top 50 filters to get more diversity
+    top_filters = individual_filters[:50]
+    
+    # Group by column to avoid redundant combinations
+    filters_by_column = {}
+    for f in top_filters:
+        col = f['column']
+        if col not in filters_by_column:
+            filters_by_column[col] = []
+        filters_by_column[col].append(f)
+    
+    # Select diverse filters - get top 2-3 filters per column for more variety
+    diverse_filters = []
+    for col, col_filters in list(filters_by_column.items())[:25]:  # More columns
+        # Get top 2 filters for this column (different minutes)
+        sorted_col_filters = sorted(col_filters, key=lambda x: x['score'], reverse=True)
+        diverse_filters.extend(sorted_col_filters[:2])  # Top 2 per column
+    
+    logger.info(f"Selected {len(diverse_filters)} diverse filters from {len(filters_by_column)} columns")
+    
+    combinations = []
+    min_good, max_good = target_good_trades
+    
+    # Test 2-filter combinations - test more combinations
+    logger.info(f"Testing 2-filter combinations from {len(diverse_filters)} diverse filters...")
+    tested = 0
+    for i, filter1 in enumerate(diverse_filters[:20]):  # Test more filters
+        for filter2 in diverse_filters[i+1:20]:
+            if tested >= 150:  # Increased limit
+                break
+            combo_result = test_filter_combo(
+                trades_df, filter_values_df, [filter1, filter2], good_threshold,
+                min_bad_removed=60,  # Lower threshold to find more combinations
+                target_good_range=(min_good, max_good)
+            )
+            if combo_result:
+                combinations.append(combo_result)
+            tested += 1
+    
+    # Test 3-filter combinations (if requested)
+    if max_combinations >= 3:
+        logger.info("Testing 3-filter combinations...")
+        # Use top individual filters + best 2-filter combos
+        top_2_combos = sorted(combinations, key=lambda x: x['score'], reverse=True)[:10]
+        
+        for combo in top_2_combos[:5]:  # Top 5 two-filter combos
+            for filter3 in diverse_filters[:25]:
+                if filter3['column'] not in [f['column'] for f in combo['filters']]:
+                    combo_result = test_filter_combo(
+                        trades_df, filter_values_df, combo['filters'] + [filter3], good_threshold,
+                        min_bad_removed=60,
+                        target_good_range=(min_good, max_good)
+                    )
+                    if combo_result:
+                        combinations.append(combo_result)
+                    if len(combinations) >= 50:  # More combinations
+                        break
+                if len(combinations) >= 50:
+                    break
+            if len(combinations) >= 50:
+                break
+    
+    # Sort combinations by score
+    combinations.sort(key=lambda x: x['score'], reverse=True)
+    
+    logger.info(f"\nTop 10 filter combinations:")
+    for i, combo in enumerate(combinations[:10], 1):
+        filter_names = [f"{f['column']} (M{f['minute']})" for f in combo['filters']]
+        logger.info(f"\n  {i}. Combination of {len(combo['filters'])} filters:")
+        logger.info(f"     Filters: {', '.join(filter_names)}")
+        logger.info(f"     Good trades caught: {combo['good_passed']}/{combo['good_total']} ({combo['good_kept_pct']:.1f}%)")
+        logger.info(f"     Bad trades filtered: {combo['bad_removed_pct']:.1f}% ({combo['bad_passed']} bad trades still pass)")
+        logger.info(f"     Precision: {combo['precision']:.1f}%")
+        logger.info(f"     Conservative Score: {combo['score']:.2f}")
+    
+    return {
+        'individual_filters': individual_filters[:20],
+        'combinations': combinations[:10]
+    }
+
+
+def test_filter_combo(trades_df: pd.DataFrame, filter_values_df: pd.DataFrame,
+                      filters: List[Dict], good_threshold: float) -> Dict[str, Any]:
+    """Test a combination of filters with AND logic - queries database directly for accuracy."""
+    
+    from core.database import get_postgres
+    
+    # Get all trade IDs
+    all_trade_ids = trades_df['id'].tolist()
+    good_ids_set = set(trades_df[trades_df['potential_gains'] >= good_threshold]['id'].tolist())
+    bad_ids_set = set(trades_df[trades_df['potential_gains'] < good_threshold]['id'].tolist())
+    
+    good_total = len(good_ids_set)
+    bad_total = len(bad_ids_set)
+    
+    if good_total == 0 or bad_total == 0:
+        return None
+    
+    # Query database directly to get accurate filter values
+    # For each filter, find which trades pass it
+    passing_trades_by_filter = []
+    
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                for f in filters:
+                    col = f['column']
+                    minute = f['minute']
+                    from_val = f['from_val']
+                    to_val = f['to_val']
+                    
+                    # Query database directly for trades that pass this filter
+                    cursor.execute("""
+                        SELECT DISTINCT buyin_id
+                        FROM trade_filter_values
+                        WHERE buyin_id = ANY(%s)
+                          AND minute = %s
+                          AND filter_name = %s
+                          AND filter_value IS NOT NULL
+                          AND filter_value >= %s
+                          AND filter_value <= %s
+                    """, [all_trade_ids, minute, col, from_val, to_val])
+                    
+                    results = cursor.fetchall()
+                    if not results:
+                        return None  # No trades pass this filter
+                    
+                    # Get unique buyin_ids that pass this filter
+                    passing_buyins = set(r['buyin_id'] for r in results)
+                    passing_trades_by_filter.append(passing_buyins)
+    except Exception as e:
+        logger.error(f"Error querying filter combination: {e}")
+        return None
+    
+    # Find trades that pass ALL filters (intersection)
+    passing_trades = set.intersection(*passing_trades_by_filter) if passing_trades_by_filter else set()
+    
+    if len(passing_trades) == 0:
+        return None
+    
+    # Count good vs bad trades that pass
+    good_passed = len(passing_trades & good_ids_set)
+    bad_passed = len(passing_trades & bad_ids_set)
+    
+    good_kept_pct = (good_passed / good_total * 100)
+    bad_removed_pct = ((bad_total - bad_passed) / bad_total * 100)
+    precision = (good_passed / (good_passed + bad_passed)) * 100 if (good_passed + bad_passed) > 0 else 0
+    
+    # Conservative score: prioritize avoiding bad trades
+    score = (bad_removed_pct * 0.5) + (precision * 0.3) + (good_kept_pct * 0.2)
+    
+    # Only return if it filters out at least 70% of bad trades
+    if bad_removed_pct < 70:
+        return None
+    
+    return {
+        'filters': filters,
+        'good_passed': good_passed,
+        'good_total': good_total,
+        'bad_passed': bad_passed,
+        'bad_total': bad_total,
+        'good_kept_pct': good_kept_pct,
+        'bad_removed_pct': bad_removed_pct,
+        'precision': precision,
+        'score': score
+    }
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -607,6 +892,13 @@ def main():
     # Test alternative strategies
     alternative_strategies = test_alternative_strategies(trades_df, filter_values_df)
     
+    # Test filter combinations (conservative approach - target 2-5 good trades per day)
+    combination_results = test_filter_combinations(
+        trades_df, filter_values_df, 
+        max_combinations=3,
+        target_good_trades=(2, 5)
+    )
+    
     # Summary report
     logger.info("\n" + "="*80)
     logger.info("SUMMARY & RECOMMENDATIONS")
@@ -625,6 +917,57 @@ def main():
             logger.info(f"  Good trades caught: {best['good_passed']}/{best['good_total']} ({best['good_kept_pct']:.1f}%)")
             logger.info(f"  Bad trades removed: {best['bad_removed_pct']:.1f}%")
             logger.info(f"  Score: {best['score']:.2f}")
+    
+    # Show best filter combinations (conservative approach)
+    if combination_results and combination_results.get('combinations'):
+        logger.info("\n" + "="*80)
+        logger.info("BEST FILTER COMBINATIONS (Target: 2-5 Good Trades Per Day)")
+        logger.info("="*80)
+        
+        # Sort by score, then by precision, then by bad removal
+        sorted_combos = sorted(
+            combination_results['combinations'],
+            key=lambda x: (x['score'], x['precision'], x['bad_removed_pct']),
+            reverse=True
+        )
+        
+        best_combo = sorted_combos[0]
+        filter_names = [f"{f['column']} (M{f['minute']})" for f in best_combo['filters']]
+        
+        logger.info(f"\n🏆 Top Combination ({len(best_combo['filters'])} filters):")
+        logger.info(f"   Filters: {', '.join(filter_names)}")
+        logger.info(f"   ✅ Good trades caught: {best_combo['good_passed']}/{best_combo['good_total']} ({best_combo['good_kept_pct']:.1f}%)")
+        logger.info(f"   ❌ Bad trades filtered: {best_combo['bad_removed_pct']:.1f}% ({best_combo['bad_passed']} bad trades still pass)")
+        logger.info(f"   🎯 Precision: {best_combo['precision']:.1f}% (of trades that pass, {best_combo['precision']:.1f}% are good)")
+        logger.info(f"   📊 Conservative Score: {best_combo['score']:.2f}")
+        
+        logger.info(f"\n📊 Top 10 Combinations (Target: 2-5 good trades per day):")
+        for i, combo in enumerate(sorted_combos[:10], 1):
+            filter_names = [f"{f['column']} (M{f['minute']})" for f in combo['filters']]
+            logger.info(f"\n   {i}. {len(combo['filters'])} filters: {', '.join(filter_names[:3])}{'...' if len(filter_names) > 3 else ''}")
+            logger.info(f"      ✅ Good: {combo['good_passed']} trades ({combo['good_kept_pct']:.1f}%) | "
+                       f"❌ Bad removed: {combo['bad_removed_pct']:.1f}% | "
+                       f"🎯 Precision: {combo['precision']:.1f}% | "
+                       f"Score: {combo['score']:.2f}")
+        
+        # Show SQL for top 3 combinations
+        logger.info(f"\n" + "="*80)
+        logger.info("SQL TO IMPLEMENT TOP COMBINATIONS:")
+        logger.info("="*80)
+        for i, combo in enumerate(sorted_combos[:3], 1):
+            logger.info(f"\n-- Combination {i}: {combo['good_passed']} good trades, {combo['bad_removed_pct']:.1f}% bad removed, {combo['precision']:.1f}% precision")
+            logger.info("DELETE FROM pattern_config_filters WHERE project_id = 5;")
+            for j, f in enumerate(combo['filters'], 1):
+                sql = f"""
+INSERT INTO pattern_config_filters 
+(project_id, name, section, minute, field_name, field_column, from_value, to_value, include_null, is_active)
+VALUES 
+(5, 'Auto: {f['column']}', 'auto', {f['minute']}, '{f['column']}', '{f['column']}', {f['from_val']:.6f}, {f['to_val']:.6f}, 0, 1);
+"""
+                logger.info(sql.strip())
+    else:
+        logger.warning("\n⚠️  No filter combinations found that meet criteria (2-5 good trades, 60%+ bad removed)")
+        logger.info("   Try lowering the bad trade removal threshold or adjusting target range")
     
     logger.info("\n" + "="*80)
     logger.info("Analysis complete!")

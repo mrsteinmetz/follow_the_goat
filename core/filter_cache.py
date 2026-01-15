@@ -274,6 +274,8 @@ def sync_filter_values_incremental():
     
     This creates a wide table with one column per filter field.
     Uses PostgreSQL's FILTER clause for efficient pivoting.
+    
+    Note: Only syncs filters where is_ratio=1 to avoid duplicates and follow ratio_only settings.
     """
     conn = get_duckdb_connection()
     
@@ -317,28 +319,31 @@ def sync_filter_values_incremental():
             logger.info(f"Loading filter values for all {len(trade_ids)} cached trades...")
             trades_to_sync = trade_ids
         
-        # Get distinct filter names
+        # Get distinct filter names (ONLY ratio filters to avoid duplicates)
         with get_postgres() as pg_conn:
             with pg_conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT DISTINCT filter_name
                     FROM trade_filter_values
                     WHERE buyin_id = ANY(%s)
+                      AND is_ratio = 1
                     ORDER BY filter_name
                 """, [trades_to_sync])
                 
                 filter_columns = [row['filter_name'] for row in cursor.fetchall()]
         
         if not filter_columns:
-            logger.warning("No filter columns found")
+            logger.warning("No ratio filter columns found")
             return 0
         
-        # Build pivoted query using PostgreSQL's FILTER clause
+        logger.info(f"Found {len(filter_columns)} ratio-based filter columns")
+        
+        # Build pivoted query using PostgreSQL's FILTER clause (only is_ratio=1)
         pivot_cols = []
         for col in filter_columns:
             safe_col = col.replace("'", "''")
             pivot_cols.append(
-                f"MAX(filter_value) FILTER (WHERE filter_name = '{safe_col}') AS \"{col}\""
+                f"MAX(filter_value) FILTER (WHERE filter_name = '{safe_col}' AND is_ratio = 1) AS \"{col}\""
             )
         
         pivot_sql = ",\n            ".join(pivot_cols)
@@ -350,6 +355,7 @@ def sync_filter_values_incremental():
                 {pivot_sql}
             FROM trade_filter_values
             WHERE buyin_id = ANY(%s)
+              AND is_ratio = 1
             GROUP BY buyin_id, minute
             ORDER BY buyin_id, minute
         """
@@ -381,7 +387,7 @@ def sync_filter_values_incremental():
                 )
             """
             conn.execute(create_sql)
-            logger.info("Created cached_filter_values table")
+            logger.info("Created cached_filter_values table (ratio filters only)")
         
         # Insert data
         conn.execute("""
@@ -389,7 +395,7 @@ def sync_filter_values_incremental():
             SELECT * FROM df
         """)
         
-        logger.info(f"Synced filter values for {len(df)} buyin-minute combinations")
+        logger.info(f"Synced filter values for {len(df)} buyin-minute combinations (ratio filters only)")
         return len(df)
         
     finally:
@@ -477,6 +483,29 @@ def get_cached_trades(hours: int = 24, ratio_only: bool = False) -> pd.DataFrame
         if len(df) == 0:
             logger.warning(f"No cached data found for last {hours} hours")
             return pd.DataFrame()
+        
+        # Filter columns if ratio_only is enabled
+        if ratio_only:
+            # Get list of ratio-only columns from PostgreSQL
+            from core.database import get_postgres
+            
+            with get_postgres() as pg_conn:
+                with pg_conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT DISTINCT filter_name
+                        FROM trade_filter_values
+                        WHERE is_ratio = 1
+                    """)
+                    ratio_columns = [row['filter_name'] for row in cursor.fetchall()]
+            
+            # Keep only metadata columns + ratio columns
+            metadata_cols = ['trade_id', 'play_id', 'followed_at', 'potential_gains', 'our_status', 'minute']
+            columns_to_keep = metadata_cols + [col for col in df.columns if col in ratio_columns]
+            
+            # Filter dataframe
+            df = df[columns_to_keep]
+            
+            logger.info(f"Ratio-only mode: filtered to {len(columns_to_keep) - len(metadata_cols)} ratio columns")
         
         logger.info(f"Loaded {len(df)} rows from cache ({df['trade_id'].nunique()} unique trades)")
         

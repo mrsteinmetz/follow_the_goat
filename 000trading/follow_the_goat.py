@@ -712,7 +712,11 @@ class WalletFollower:
             
             # Build a dictionary of earliest trade per wallet
             wallet_earliest_trade = {}
-            for wallet, ts, ts_unix in trades:
+            for trade in trades:
+                wallet = trade['wallet_address']
+                ts = trade['trade_timestamp']
+                ts_unix = float(trade['ts_unix'])  # Convert Decimal to float
+                
                 if wallet not in wallet_earliest_trade:
                     wallet_earliest_trade[wallet] = (ts, ts_unix)
                 else:

@@ -23,3 +23,9 @@ define('DUCKDB_API_URL', DATABASE_API_URL);
 // .NET Webhook API URL (running on Windows IIS)
 define('WEBHOOK_API_URL', 'http://195.201.84.5');
 
+// Include authentication system
+require_once __DIR__ . '/auth.php';
+
+// Auto-require authentication for all pages (auth.php handles login page exclusion)
+requireAuth();
+

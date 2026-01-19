@@ -29,7 +29,8 @@ if ($play_id <= 0) {
     exit;
 }
 
-$is_restricted_play = ($play_id === 46);
+// Play ID 46: Allow editing but disable deletion
+$is_deletion_restricted = ($play_id === 46);
 
 // --- Base URL for v2 template ---
 $rootFolder = basename($_SERVER['DOCUMENT_ROOT']);
@@ -407,7 +408,7 @@ ob_start();
         </span>
         <div class="d-flex align-items-center gap-2">
             <label for="playSorting" class="text-muted fs-12">Priority:</label>
-            <select id="playSorting" class="form-select form-select-sm" style="width: auto;" onchange="updatePlaySorting(<?php echo $play_id; ?>, this.value)" <?php echo $is_restricted_play ? 'disabled title="Editing disabled for this play"' : ''; ?>>
+            <select id="playSorting" class="form-select form-select-sm" style="width: auto;" onchange="updatePlaySorting(<?php echo $play_id; ?>, this.value)">
                 <?php for ($i = 1; $i <= 10; $i++): ?>
                     <option value="<?php echo $i; ?>" <?php echo (($play['sorting'] ?? 10) == $i) ? 'selected' : ''; ?>>
                         <?php echo $i; ?>
@@ -415,7 +416,7 @@ ob_start();
                 <?php endfor; ?>
             </select>
         </div>
-        <button id="editPlayBtn" class="btn btn-primary" onclick="toggleEditForm()" <?php echo $is_restricted_play ? 'disabled title="Editing disabled for this play"' : ''; ?>>
+        <button id="editPlayBtn" class="btn btn-primary" onclick="toggleEditForm()">
             <i class="ri-edit-line me-1"></i>Edit Play
         </button>
     </div>
@@ -436,9 +437,9 @@ ob_start();
 </div>
 <?php endif; ?>
 
-<?php if ($is_restricted_play): ?>
+<?php if ($is_deletion_restricted): ?>
 <div class="alert alert-warning" role="alert">
-    <i class="ri-error-warning-line me-1"></i> Editing and deleting are disabled for this play.
+    <i class="ri-error-warning-line me-1"></i> Deletion is disabled for this play. Editing is allowed.
 </div>
 <?php endif; ?>
 
@@ -760,9 +761,9 @@ ob_start();
         </div>
 
         <div class="form-actions">
-            <button type="submit" class="btn btn-primary" id="updatePlayBtn" <?php echo $is_restricted_play ? 'disabled' : ''; ?>>Update Play</button>
+            <button type="submit" class="btn btn-primary" id="updatePlayBtn">Update Play</button>
             <button type="button" class="btn btn-secondary" onclick="toggleEditForm()">Cancel</button>
-            <button type="button" class="btn btn-danger" onclick="deletePlay()" id="deletePlayBtn" <?php echo $is_restricted_play ? 'disabled' : ''; ?>>Delete Play</button>
+            <button type="button" class="btn btn-danger" onclick="deletePlay()" id="deletePlayBtn" <?php echo $is_deletion_restricted ? 'disabled title="Deletion disabled for this play"' : ''; ?>>Delete Play</button>
         </div>
     </form>
 </div>
@@ -1107,7 +1108,7 @@ ob_start();
 <script>
     // API Configuration
     const API_BASE = '<?php echo $API_BASE; ?>';
-    window.isRestrictedPlay = <?php echo $is_restricted_play ? 'true' : 'false'; ?>;
+    window.isDeletionRestricted = <?php echo $is_deletion_restricted ? 'true' : 'false'; ?>;
     window.playId = <?php echo $play_id; ?>;
 
     // Trade pagination configuration
@@ -1150,10 +1151,6 @@ ob_start();
     
     // Update play sorting via API
     async function updatePlaySorting(playId, sorting) {
-        if (window.isRestrictedPlay) {
-            alert('Priority changes are disabled for this play.');
-            return;
-        }
         try {
             const response = await fetch(API_BASE + '?endpoint=/plays/' + playId, {
                 method: 'PUT',
@@ -1179,10 +1176,6 @@ ob_start();
     
     // Play editing functions
     function toggleEditForm() {
-        if (window.isRestrictedPlay) {
-            alert('Editing is disabled for this play.');
-            return;
-        }
         const editForm = document.getElementById('editPlayForm');
         const isHidden = editForm.classList.contains('hidden');
         
@@ -1196,7 +1189,6 @@ ob_start();
     }
 
     async function loadPlayForEdit() {
-        if (window.isRestrictedPlay) return;
         const playId = <?php echo $play_id; ?>;
         
         try {
@@ -1438,11 +1430,6 @@ ob_start();
     async function handleUpdatePlay(event) {
         event.preventDefault();
         
-        if (window.isRestrictedPlay) {
-            alert('Editing is disabled for this play.');
-            return false;
-        }
-        
         const form = event.target;
         const submitBtn = document.getElementById('updatePlayBtn');
         submitBtn.disabled = true;
@@ -1520,7 +1507,7 @@ ob_start();
     }
 
     async function deletePlay() {
-        if (window.isRestrictedPlay) {
+        if (window.isDeletionRestricted) {
             alert('Deleting is disabled for this play.');
             return;
         }

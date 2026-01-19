@@ -32,3 +32,7 @@ pyarrow>=14.0.0  # Fast DuckDB insertion via zero-copy Arrow tables
 # Environment management
 python-dotenv>=1.0.0
 
+# Solana SDK (for swap testing)
+solders>=0.18.0  # Solana Python SDK
+base58>=2.1.1  # Base58 encoding for keys
+

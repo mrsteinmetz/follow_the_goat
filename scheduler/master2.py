@@ -478,16 +478,19 @@ def run_update_potential_gains():
         logger.error(f"Update potential gains job error: {e}", exc_info=True)
 
 
-@track_job("create_new_patterns", "Auto-generate filter patterns (every 25 min)")
+@track_job("create_new_patterns", "Auto-generate filter patterns (every 10 min)")
 def run_create_new_patterns():
     """Auto-generate filter patterns from trade data analysis."""
+    # CRITICAL: Log function entry immediately
+    logger.info("[PATTERN GENERATOR] Function run_create_new_patterns() called")
     try:
         enabled = os.getenv("CREATE_NEW_PATTERNS_ENABLED", "1") == "1"
+        logger.info(f"[PATTERN GENERATOR] Environment check: CREATE_NEW_PATTERNS_ENABLED={os.getenv('CREATE_NEW_PATTERNS_ENABLED', 'NOT_SET')}, enabled={enabled}")
         if not enabled:
-            logger.debug("Create new patterns disabled via CREATE_NEW_PATTERNS_ENABLED=0")
+            logger.warning("[PATTERN GENERATOR] DISABLED via CREATE_NEW_PATTERNS_ENABLED=0")
             return
         
-        logger.info("Starting create_new_patterns job...")
+        logger.info("[PATTERN GENERATOR] Starting create_new_patterns job...")
         patterns_path = PROJECT_ROOT / "000data_feeds" / "7_create_new_patterns"
         if str(patterns_path) not in sys.path:
             sys.path.insert(0, str(patterns_path))
@@ -495,13 +498,13 @@ def run_create_new_patterns():
         
         result = run_pattern_generator()
         if result.get('success'):
-            logger.info(f"Pattern generation completed: {result.get('suggestions_count', 0)} suggestions, "
+            logger.info(f"[PATTERN GENERATOR] Completed: {result.get('suggestions_count', 0)} suggestions, "
                        f"{result.get('combinations_count', 0)} combinations, "
                        f"{result.get('plays_updated', 0)} plays updated")
         else:
-            logger.warning(f"Pattern generation failed: {result.get('error', 'Unknown error')}")
+            logger.error(f"[PATTERN GENERATOR] FAILED: {result.get('error', 'Unknown error')}")
     except Exception as e:
-        logger.error(f"Create new patterns job error: {e}", exc_info=True)
+        logger.error(f"[PATTERN GENERATOR] Exception in job wrapper: {e}", exc_info=True)
 
 
 @track_job("create_profiles", "Build wallet profiles (every 30s)")
@@ -639,10 +642,10 @@ def create_scheduler() -> BackgroundScheduler:
         executor='realtime'
     )
     
-    # Create New Patterns - runs every 25 minutes, starts immediately
+    # Create New Patterns - runs every 10 minutes, starts immediately
     scheduler.add_job(
         func=run_create_new_patterns,
-        trigger=IntervalTrigger(minutes=25),
+        trigger=IntervalTrigger(minutes=10),
         id="create_new_patterns",
         name="Create New Patterns",
         executor='heavy',

@@ -697,6 +697,29 @@ CREATE INDEX IF NOT EXISTS idx_ai_play_updates_play_id ON ai_play_updates(play_i
 CREATE INDEX IF NOT EXISTS idx_ai_play_updates_updated_at ON ai_play_updates(updated_at);
 
 -- =============================================================================
+-- FILTER SCENARIO RESULTS (tracks multi-scenario testing)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS filter_scenario_results (
+    id SERIAL PRIMARY KEY,
+    run_id VARCHAR(50),
+    scenario_name VARCHAR(200),
+    settings JSONB,
+    filter_count INTEGER,
+    bad_trades_removed_pct DOUBLE PRECISION,
+    good_trades_kept_pct DOUBLE PRECISION,
+    score DOUBLE PRECISION,
+    filters_applied JSONB,
+    rank INTEGER,
+    was_selected BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_scenario_results_run_id ON filter_scenario_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_scenario_results_score ON filter_scenario_results(score DESC);
+CREATE INDEX IF NOT EXISTS idx_scenario_results_created_at ON filter_scenario_results(created_at);
+
+-- =============================================================================
 -- JOB EXECUTION METRICS (for scheduler monitoring)
 -- =============================================================================
 

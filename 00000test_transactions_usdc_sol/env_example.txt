@@ -1,0 +1,45 @@
+# =============================================================================
+# Solana Swap Testing Configuration
+# =============================================================================
+# Copy these variables to your main .env file in the project root
+#
+# SECURITY WARNING:
+# - NEVER commit your .env file to git
+# - NEVER share your private key
+# - This key has full access to your wallet funds
+# =============================================================================
+
+# Solana RPC Endpoint
+# Default: Public Solana RPC (rate limited)
+# Recommended: Get a free RPC from QuickNode, Alchemy, or Helius for better performance
+SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
+
+# Your Wallet Private Key (base58 encoded)
+# Get this from:
+# - Phantom: Settings → Security → Export Private Key
+# - Solflare: Settings → Show Private Key  
+# - Solana CLI: Convert your keypair JSON to base58
+SOLANA_PRIVATE_KEY=your_base58_private_key_here
+
+# Jupiter API Key (OPTIONAL - but recommended for better rates)
+# Get a free key at: https://portal.jup.ag
+JUPITER_API_KEY=your_jupiter_api_key_here
+
+# =============================================================================
+# Example Wallet Setup
+# =============================================================================
+# 
+# 1. Install packages:
+#    pip install solders base58 requests python-dotenv
+#
+# 2. Get your private key from Phantom/Solflare
+#
+# 3. Fund your wallet with at least $6 USDC:
+#    - $5 for the test swap
+#    - ~$0.01-0.10 for network fees
+#
+# 4. Add your SOLANA_PRIVATE_KEY to .env above
+#
+# 5. Run: python testswap.py
+#
+# =============================================================================

@@ -103,27 +103,26 @@ if (!$api_available) {
     // Other plays use 168h (7 days)
     $hours_window = ($play_id === 46) ? '24' : '168';
     $timing['before_trades_query'] = microtime(true);
-    $buyins_result = $client->getBuyins($play_id, null, $hours_window, 200); // Increased limit for load more feature
+    
+    // Fetch live trades (exclude no_go and error) - limit 100 for display
+    $buyins_result = $client->getBuyins($play_id, null, $hours_window, 100, 'no_go,error');
     $timing['after_trades_query'] = microtime(true);
     
     if ($buyins_result && isset($buyins_result['buyins'])) {
-        // Split into live trades (non-no_go, non-error) and no_go trades
-        $all_buyins = $buyins_result['buyins'];
-        $trades = array_filter($all_buyins, function($t) {
-            $status = $t['our_status'] ?? '';
-            return $status !== 'no_go' && $status !== 'error';
-        });
-        $trades = array_values($trades); // Re-index
-        
-        // Separate no_go trades for display
-        $no_go_trades = array_filter($all_buyins, function($t) {
-            return ($t['our_status'] ?? '') === 'no_go';
-        });
-        $no_go_trades = array_values($no_go_trades); // Re-index
-        
+        $trades = $buyins_result['buyins'];
         $live_total_count = $buyins_result['total'] ?? count($trades);
     }
     $timing['trades_count'] = count($trades);
+    
+    // Fetch no_go trades separately for display - limit to recent 100
+    $timing['before_no_go_query'] = microtime(true);
+    $no_go_result = $client->getBuyins($play_id, 'no_go', $hours_window, 100);
+    $timing['after_no_go_query'] = microtime(true);
+    
+    if ($no_go_result && isset($no_go_result['buyins'])) {
+        $no_go_trades = $no_go_result['buyins'];
+    }
+    $timing['no_go_count'] = count($no_go_trades);
     
     // Get performance stats
     // For play 46 (training validator), use shorter window (24h) due to high volume
@@ -175,6 +174,12 @@ if (isset($timing['after_trades_query'], $timing['before_trades_query'])) {
 }
 if (isset($timing['trades_count'])) {
     $timing_report['Trades Count'] = $timing['trades_count'];
+}
+if (isset($timing['after_no_go_query'], $timing['before_no_go_query'])) {
+    $timing_report['No-Go Query'] = ($timing['after_no_go_query'] - $timing['before_no_go_query']) * 1000;
+}
+if (isset($timing['no_go_count'])) {
+    $timing_report['No-Go Count'] = $timing['no_go_count'];
 }
 if (isset($timing['after_stats_query'], $timing['before_stats_query'])) {
     $timing_report['Stats Query'] = ($timing['after_stats_query'] - $timing['before_stats_query']) * 1000;

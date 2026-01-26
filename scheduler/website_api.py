@@ -794,6 +794,7 @@ def get_buyins():
     try:
         limit = min(int(request.args.get('limit', 100)), 1000)
         status_filter = request.args.get('status')
+        exclude_status = request.args.get('exclude_status')  # New parameter for excluding statuses
         play_id = request.args.get('play_id')
         hours = request.args.get('hours')
         
@@ -805,6 +806,14 @@ def get_buyins():
             where_conditions.append("our_status = %s")
             params.append(status_filter)
         
+        # Support excluding multiple statuses (comma-separated)
+        if exclude_status:
+            excluded_statuses = [s.strip() for s in exclude_status.split(',') if s.strip()]
+            if excluded_statuses:
+                placeholders = ', '.join(['%s'] * len(excluded_statuses))
+                where_conditions.append(f"our_status NOT IN ({placeholders})")
+                params.extend(excluded_statuses)
+        
         if play_id:
             where_conditions.append("play_id = %s")
             params.append(int(play_id))
@@ -812,8 +821,8 @@ def get_buyins():
         if hours and hours != 'all':
             try:
                 hours_int = int(hours)
-                where_conditions.append("followed_at >= NOW() - INTERVAL '%s hours'")
-                params.append(hours_int)
+                # Use string formatting for INTERVAL, not parameterized query
+                where_conditions.append(f"followed_at >= NOW() - INTERVAL '{hours_int} hours'")
             except ValueError:
                 pass
         

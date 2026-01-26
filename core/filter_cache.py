@@ -388,6 +388,51 @@ def sync_filter_values_incremental():
             """
             conn.execute(create_sql)
             logger.info("Created cached_filter_values table (ratio filters only)")
+        else:
+            # Check for schema mismatch (new columns added)
+            existing_cols = conn.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'cached_filter_values'
+            """).fetchall()
+            existing_col_names = set(row[0] for row in existing_cols)
+            new_col_names = set(['buyin_id', 'minute'] + filter_columns)
+            
+            if new_col_names != existing_col_names:
+                # Schema changed - drop and recreate table
+                missing = new_col_names - existing_col_names
+                extra = existing_col_names - new_col_names
+                logger.warning(f"Schema mismatch detected! Missing: {len(missing)}, Extra: {len(extra)}")
+                logger.info("Recreating cached_filter_values table with new schema...")
+                
+                conn.execute("DROP TABLE cached_filter_values")
+                
+                col_defs = ["buyin_id BIGINT", "minute INTEGER"]
+                for col in filter_columns:
+                    col_defs.append(f'"{col}" DOUBLE')
+                
+                create_sql = f"""
+                    CREATE TABLE cached_filter_values (
+                        {', '.join(col_defs)},
+                        PRIMARY KEY (buyin_id, minute)
+                    )
+                """
+                conn.execute(create_sql)
+                logger.info("Recreated cached_filter_values table")
+                
+                # Reset trades_to_sync to sync ALL trades since table is empty
+                trades_to_sync = trade_ids
+                
+                # Re-fetch data for ALL trades
+                with get_postgres() as pg_conn:
+                    with pg_conn.cursor() as cursor:
+                        cursor.execute(query, [trades_to_sync])
+                        results = cursor.fetchall()
+                
+                if not results:
+                    logger.warning("No filter values found after schema rebuild")
+                    return 0
+                
+                df = pd.DataFrame(results)
         
         # Insert data
         conn.execute("""

@@ -267,11 +267,13 @@ class DatabaseClient {
      * @param string|null $status Filter by status (pending, sold, no_go, etc.)
      * @param string $hours Limit to last N hours (default: 24)
      * @param int $limit Max records (default: 100)
+     * @param string|null $excludeStatus Exclude statuses (comma-separated: 'no_go,error')
      */
-    public function getBuyins(?int $playId = null, ?string $status = null, string $hours = '24', int $limit = 100): ?array {
+    public function getBuyins(?int $playId = null, ?string $status = null, string $hours = '24', int $limit = 100, ?string $excludeStatus = null): ?array {
         $params = ['hours' => $hours, 'limit' => $limit];
         if ($playId !== null) $params['play_id'] = $playId;
         if ($status !== null) $params['status'] = $status;
+        if ($excludeStatus !== null) $params['exclude_status'] = $excludeStatus;
         
         return $this->get('/buyins', $params);
     }

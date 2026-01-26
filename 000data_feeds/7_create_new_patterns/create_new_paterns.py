@@ -486,7 +486,12 @@ def find_optimal_threshold(
     is_good = df['potential_gains'] >= threshold
     good_values = df.loc[is_good, column_name].dropna()
     
-    if len(good_values) < 10 or len(values) < 20:
+    # Need minimum good trades for reliable percentile calculations
+    # With < 100 good trades, P10-P90 range can be artificially narrow
+    MIN_GOOD_TRADES = 100
+    if len(good_values) < MIN_GOOD_TRADES or len(values) < 20:
+        if len(good_values) < MIN_GOOD_TRADES and len(good_values) >= 10:
+            logger.debug(f"Skipping {column_name}: only {len(good_values)} good trades (need {MIN_GOOD_TRADES} for reliable percentiles)")
         return None
     
     # Use override settings if provided (for scenario testing)
@@ -538,6 +543,11 @@ def find_optimal_threshold(
     if (15, 85) not in percentile_pairs:
         percentile_pairs.append((15, 85))
     
+    # Calculate the overall data range to detect suspiciously narrow filters
+    all_values = df[column_name].dropna()
+    data_range = float(all_values.max() - all_values.min()) if len(all_values) > 0 else 0
+    min_acceptable_range = data_range * 0.05  # Filter range should be at least 5% of data range
+    
     # Test each percentile combination
     for p_low, p_high in percentile_pairs:
         try:
@@ -545,6 +555,13 @@ def find_optimal_threshold(
             to_val = float(np.percentile(good_values, p_high))
             
             if from_val >= to_val:
+                continue
+            
+            # VALIDATION: Reject suspiciously narrow ranges
+            # If the filter range is < 5% of total data range, it's likely due to insufficient good trades
+            filter_range = to_val - from_val
+            if data_range > 0 and filter_range < min_acceptable_range:
+                logger.debug(f"Rejecting narrow filter for {column_name}: range {filter_range:.6f} < min {min_acceptable_range:.6f}")
                 continue
             
             metrics = test_filter_effectiveness(df, column_name, from_val, to_val, threshold)
@@ -1300,19 +1317,19 @@ def calculate_scenario_score(bad_removed_pct: float, good_kept_pct: float) -> fl
     Calculate score for a scenario, heavily prioritizing bad trade removal.
     
     Target: 95%+ bad removal (VERY AGGRESSIVE)
-    Accept: 30-40% good retention
+    Accept: 20-30% good retention (MORE AGGRESSIVE - prefer fewer but better trades)
     
     Scoring:
-    - Bad removal weighted 10x (950 points for 95% removal)
-    - Good retention weighted 1x (30-40 points for 30-40% retention)
-    - Penalty for bad removal < 85%
+    - Bad removal weighted 15x (1425 points for 95% removal) - INCREASED from 10x
+    - Good retention weighted 1x (20-30 points for 20-30% retention)
+    - Penalty for bad removal < 90% (STRICTER - was 85%)
     """
-    bad_removal_score = bad_removed_pct * 10  # 950 points for 95% removal
-    good_retention_score = good_kept_pct * 1  # 30-40 points for 30-40% retention
+    bad_removal_score = bad_removed_pct * 15  # 1425 points for 95% removal (was 10x)
+    good_retention_score = good_kept_pct * 1  # 20-30 points for 20-30% retention
     
-    # Penalty if bad removal < 85%
-    if bad_removed_pct < 85:
-        bad_removal_score *= 0.5
+    # Penalty if bad removal < 90% (STRICTER - was 85%)
+    if bad_removed_pct < 90:
+        bad_removal_score *= 0.3  # Harsher penalty (was 0.5)
     
     return bad_removal_score + good_retention_score
 
@@ -1334,40 +1351,40 @@ def generate_test_scenarios() -> List[Dict[str, Any]]:
     # For each time window, test filter count combinations
     for hours in analysis_hours_options:
         for min_filters in min_filters_options:
-            # Very aggressive: prioritize bad removal over good retention
+            # Very aggressive: prioritize bad removal over good retention (MORE AGGRESSIVE)
             scenarios.append({
                 'name': f'H{hours}_F{min_filters}_VeryAgg',
                 'settings': {
                     'analysis_hours': hours,
                     'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 20,  # Low threshold - accept losing good trades
-                    'min_bad_trades_removed_pct': 95,  # Very high - maximum filtering
+                    'min_good_trades_kept_pct': 15,  # LOWER - accept fewer good trades (was 20)
+                    'min_bad_trades_removed_pct': 97,  # HIGHER - remove more bad trades (was 95)
                     'percentile_low': 1,
                     'percentile_high': 99,
                 }
             })
             
-            # Aggressive: good balance
+            # Aggressive: good balance (MORE AGGRESSIVE)
             scenarios.append({
                 'name': f'H{hours}_F{min_filters}_Agg',
                 'settings': {
                     'analysis_hours': hours,
                     'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 30,
-                    'min_bad_trades_removed_pct': 90,
+                    'min_good_trades_kept_pct': 25,  # LOWER (was 30)
+                    'min_bad_trades_removed_pct': 95,  # HIGHER (was 90)
                     'percentile_low': 5,
                     'percentile_high': 95,
                 }
             })
             
-            # Moderate: fallback if aggressive fails
+            # Moderate: fallback if aggressive fails (MORE AGGRESSIVE)
             scenarios.append({
                 'name': f'H{hours}_F{min_filters}_Mod',
                 'settings': {
                     'analysis_hours': hours,
                     'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 40,
-                    'min_bad_trades_removed_pct': 85,
+                    'min_good_trades_kept_pct': 30,  # LOWER (was 40)
+                    'min_bad_trades_removed_pct': 90,  # HIGHER (was 85)
                     'percentile_low': 10,
                     'percentile_high': 90,
                 }
@@ -1653,7 +1670,7 @@ def run() -> Dict[str, Any]:
         
         # Step 1: Load trade data (use maximum window for multi-scenario testing)
         logger.info("\n[Step 1/6] Loading trade data...")
-        max_hours = 48  # Load max window, scenarios will filter as needed
+        max_hours = 48  # Load 48 hours - crypto is volatile, this provides enough data
         try:
             df = load_trade_data(engine, max_hours)
             logger.info(f"✓ Data loaded: {len(df)} rows")

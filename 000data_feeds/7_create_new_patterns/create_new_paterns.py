@@ -591,6 +591,94 @@ def find_optimal_threshold(
     return best_result
 
 
+def generate_cycle_bottom_filters(
+    df: pd.DataFrame,
+    minute: int = 0
+) -> List[Dict[str, Any]]:
+    """
+    Generate filter suggestions based on cycle bottom signature analysis.
+    
+    These thresholds were discovered by analyzing exact cycle bottoms - the optimal
+    buy moments in good cycles (0.8%+ gains). Cycle bottoms are characterized by:
+    - Recent price drops (capitulation)
+    - High volatility  
+    - Correlated drops in ETH/BTC
+    - Draining liquidity
+    
+    Returns:
+        List of filter suggestions with specific thresholds
+    """
+    config = load_config()
+    threshold = config.get('good_trade_threshold', 0.6)
+    
+    # Filter to specific minute
+    if 'minute' in df.columns:
+        df_filtered = df[df['minute'] == minute].copy()
+    else:
+        df_filtered = df
+    
+    if len(df_filtered) == 0:
+        return []
+    
+    suggestions = []
+    
+    # Cycle bottom signature rules based on analysis of 6 good cycles
+    # These represent the "capitulation signature" - rapid drop before reversal
+    cycle_bottom_rules = [
+        # Price momentum - looking for recent drops
+        ('pm_price_change_1m', -999, -0.04, 'Price dropped > 0.04% in last minute'),
+        ('pm_price_change_5m', -999, -0.09, 'Price dropped > 0.09% in last 5 min'),
+        ('sp_total_change_pct', -999, -0.10, 'Session price down > 0.1%'),
+        
+        # Volatility - high volatility indicates capitulation
+        ('pm_volatility_pct', 0.08, 999, 'High volatility > 0.08%'),
+        ('sp_volatility_pct', 0.08, 999, 'Session volatility > 0.08%'),
+        
+        # Correlated market - ETH/BTC also dropping
+        ('eth_price_change_5m', -999, -0.01, 'ETH dropped in last 5 min'),
+        ('btc_price_change_5m', -999, 0.02, 'BTC not rallying alone'),
+        
+        # Order book stress - liquidity draining
+        ('ob_liquidity_change_3m', -999, -5.0, 'Liquidity draining from book'),
+        ('ob_depth_imbalance_ratio', 0.5, 1.1, 'Order book not heavily bid-biased'),
+        
+        # Momentum acceleration - downward momentum
+        ('pm_momentum_acceleration_1m', -999, -0.02, 'Momentum accelerating down'),
+    ]
+    
+    for column, from_val, to_val, description in cycle_bottom_rules:
+        if column not in df_filtered.columns:
+            continue
+        
+        # Test this specific threshold
+        metrics = test_filter_effectiveness(df_filtered, column, from_val, to_val, threshold)
+        
+        if metrics is None:
+            continue
+        
+        # Only include if it has some effect
+        if metrics['bad_trades_removed_pct'] < 5:
+            continue
+        
+        suggestion = {
+            'column_name': column,
+            'section': get_section_from_column(column),
+            'field_name': get_field_name_from_column(column),
+            'from_value': round(from_val, 6),
+            'to_value': round(to_val, 6),
+            'minute_analyzed': minute,
+            'source': 'cycle_bottom_signature',
+            'description': description,
+            **metrics
+        }
+        suggestions.append(suggestion)
+        logger.debug(f"Cycle bottom filter: {column} [{from_val}, {to_val}] - "
+                    f"bad removed: {metrics['bad_trades_removed_pct']:.1f}%, "
+                    f"good kept: {metrics['good_trades_kept_pct']:.1f}%")
+    
+    return suggestions
+
+
 def analyze_field(
     df: pd.DataFrame,
     column_name: str,
@@ -1714,8 +1802,25 @@ def run() -> Dict[str, Any]:
                 suggestions_by_minute[best_minute].append(suggestion)
                 all_suggestions.append(suggestion)
         
+        # Add cycle bottom signature filters (based on analysis of optimal buy moments)
+        logger.info("  Adding cycle bottom signature filters...")
+        for minute in [0, 1, 2, 3]:  # Test at early minutes when signal is freshest
+            cycle_bottom_suggestions = generate_cycle_bottom_filters(df, minute)
+            for suggestion in cycle_bottom_suggestions:
+                col = suggestion['column_name']
+                # Check if we already have this column at this minute
+                existing_cols = [s['column_name'] for s in suggestions_by_minute.get(minute, [])]
+                if col not in existing_cols:
+                    if minute not in suggestions_by_minute:
+                        suggestions_by_minute[minute] = []
+                    suggestions_by_minute[minute].append(suggestion)
+                    all_suggestions.append(suggestion)
+        
+        cycle_bottom_count = sum(1 for s in all_suggestions if s.get('source') == 'cycle_bottom_signature')
+        logger.info(f"  Added {cycle_bottom_count} cycle bottom signature filters")
+        
         result['suggestions_count'] = len(all_suggestions)
-        logger.info(f"  Generated {len(all_suggestions)} filter suggestions")
+        logger.info(f"  Generated {len(all_suggestions)} filter suggestions total")
         
         if not all_suggestions:
             result['error'] = "No filter suggestions could be generated"

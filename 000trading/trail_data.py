@@ -35,6 +35,14 @@ sys.path.insert(0, str(MODULE_DIR))
 
 from core.database import get_postgres
 
+# Import pre-entry price movement analyzer
+try:
+    from pre_entry_price_movement import calculate_pre_entry_metrics
+    PRE_ENTRY_AVAILABLE = True
+except ImportError:
+    logger.warning("pre_entry_price_movement module not available")
+    PRE_ENTRY_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -672,6 +680,32 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
     # Extract second_prices summary statistics once (same for all minutes)
     second_prices_stats = _extract_second_prices_stats(trail_payload)
     
+    # Calculate pre-entry price movement metrics (only for minute 0)
+    pre_entry_data = {}
+    if PRE_ENTRY_AVAILABLE:
+        try:
+            # Get buyin details from database
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT followed_at, our_entry_price
+                        FROM follow_the_goat_buyins
+                        WHERE id = %s
+                    """, [buyin_id])
+                    buyin_info = cursor.fetchone()
+            
+            if buyin_info:
+                entry_time = buyin_info['followed_at']
+                entry_price = float(buyin_info['our_entry_price'])
+                
+                # Calculate pre-entry metrics
+                pre_entry_data = calculate_pre_entry_metrics(entry_time, entry_price)
+                logger.debug(f"Calculated pre-entry metrics for buyin {buyin_id}: trend={pre_entry_data.get('pre_entry_trend')}, change_10m={pre_entry_data.get('pre_entry_change_10m')}")
+            else:
+                logger.warning(f"Could not find buyin {buyin_id} for pre-entry analysis")
+        except Exception as e:
+            logger.error(f"Error calculating pre-entry metrics for buyin {buyin_id}: {e}")
+    
     rows = []
     for minute in range(15):
         row = _build_row_for_minute(
@@ -682,6 +716,11 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
             micro_pattern_data=micro_pattern_data,
             second_prices_stats=second_prices_stats
         )
+        
+        # Add pre-entry data to minute 0 only
+        if minute == 0 and pre_entry_data:
+            row.update(pre_entry_data)
+        
         rows.append(row)
     
     return rows
@@ -735,6 +774,20 @@ def _get_all_columns() -> List[str]:
         "sp_volatility_pct", "sp_avg_price",
     ]
     columns.extend(sp_cols)
+    
+    # Add pre-entry price movement columns (only for minute 0)
+    pre_entry_cols = [
+        "pre_entry_price_1m_before",
+        "pre_entry_price_2m_before",
+        "pre_entry_price_5m_before",
+        "pre_entry_price_10m_before",
+        "pre_entry_change_1m",
+        "pre_entry_change_2m",
+        "pre_entry_change_5m",
+        "pre_entry_change_10m",
+        "pre_entry_trend",
+    ]
+    columns.extend(pre_entry_cols)
     
     return columns
 

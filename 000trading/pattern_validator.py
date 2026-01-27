@@ -39,6 +39,18 @@ from trail_generator import (
     make_json_serializable,
 )
 
+# Import pre-entry price movement analyzer
+try:
+    from pre_entry_price_movement import (
+        calculate_pre_entry_metrics,
+        should_enter_based_on_price_movement,
+        log_pre_entry_analysis,
+    )
+    PRE_ENTRY_AVAILABLE = True
+except ImportError:
+    logger.warning("pre_entry_price_movement module not available - pre-entry filtering disabled")
+    PRE_ENTRY_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
@@ -1133,6 +1145,61 @@ def validate_buyin_signal(
         f" (play_id={play_id})" if play_id else "",
         f" (projects={projects_to_validate})" if projects_to_validate else ""
     )
+    
+    # =========================================================================
+    # CRITICAL PRE-ENTRY PRICE MOVEMENT CHECK
+    # This runs FIRST before any other validation
+    # Rejects trades where price was falling before entry
+    # =========================================================================
+    if PRE_ENTRY_AVAILABLE:
+        try:
+            logger.debug(f"Checking pre-entry price movement for buyin #{buyin_id}")
+            
+            # Get buyin details
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT followed_at, our_entry_price
+                        FROM follow_the_goat_buyins
+                        WHERE id = %s
+                    """, [buyin_id])
+                    buyin_info = cursor.fetchone()
+            
+            if buyin_info:
+                entry_time = buyin_info['followed_at']
+                entry_price = float(buyin_info['our_entry_price'])
+                
+                # Calculate pre-entry metrics
+                pre_entry_metrics = calculate_pre_entry_metrics(entry_time, entry_price)
+                
+                # Check if should enter based on price movement
+                should_enter, reason = should_enter_based_on_price_movement(pre_entry_metrics, min_change_10m=0.15)
+                
+                # Log analysis
+                log_pre_entry_analysis(pre_entry_metrics, logger)
+                
+                if not should_enter:
+                    logger.info(f"✗ Buyin #{buyin_id} REJECTED by pre-entry filter: {reason}")
+                    return {
+                        "buyin_id": buyin_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "decision": "NO_GO",
+                        "reason": f"Pre-entry price movement filter: {reason}",
+                        "pre_entry_metrics": pre_entry_metrics,
+                        "schema_source": "pre_entry_filter",
+                        "schema_play_id": play_id,
+                        "project_ids": projects_to_validate,
+                        "validator_version": "v4_pre_entry_filter",
+                        "filter_stage": "pre_entry",
+                    }
+                else:
+                    logger.info(f"✓ Buyin #{buyin_id} passes pre-entry filter: {reason}")
+            else:
+                logger.warning(f"Could not find buyin #{buyin_id} for pre-entry check")
+                
+        except Exception as e:
+            logger.error(f"Error in pre-entry check for buyin #{buyin_id}: {e}", exc_info=True)
+            # Allow trade to proceed if pre-entry check fails (graceful degradation)
     
     schema_source = 'default'
     validator_version = "v1_schema_based"

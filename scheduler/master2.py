@@ -553,6 +553,31 @@ def run_archive_old_data():
         logger.error(f"Archive old data job error: {e}", exc_info=True)
 
 
+@track_job("restart_quicknode_streams", "Monitor stream latency (every 15s)")
+def run_restart_quicknode_streams():
+    """Monitor QuickNode stream latency and restart if needed."""
+    try:
+        enabled = os.getenv("STREAM_MONITOR_ENABLED", "1") == "1"
+        if not enabled:
+            return
+        
+        streams_path = PROJECT_ROOT / "000data_feeds" / "9_restart_quicknode_streams"
+        if str(streams_path) not in sys.path:
+            sys.path.insert(0, str(streams_path))
+        from restart_streams import run_monitoring_cycle
+        
+        result = run_monitoring_cycle()
+        if result.get('success'):
+            if result.get('action_taken'):
+                restart_success = result.get('restart_success', False)
+                status = "successfully" if restart_success else "with errors"
+                logger.info(f"Stream restart triggered {status} (latency: {result['latency']:.2f}s)")
+        else:
+            logger.error(f"Stream monitoring failed: {result.get('error', 'Unknown error')}")
+    except Exception as e:
+        logger.error(f"Restart QuickNode streams job error: {e}", exc_info=True)
+
+
 @track_job("export_job_status", "Export job status to file (every 5s)")
 def export_job_status_to_file():
     """Export current job status to JSON file for website_api.py to read."""
@@ -675,6 +700,14 @@ def create_scheduler() -> BackgroundScheduler:
         id="archive_old_data",
         name="Archive Old Data to Parquet",
         executor='heavy'
+    )
+    
+    scheduler.add_job(
+        func=run_restart_quicknode_streams,
+        trigger=IntervalTrigger(seconds=15),
+        id="restart_quicknode_streams",
+        name="Monitor QuickNode Stream Latency",
+        executor='realtime'
     )
     
     return scheduler

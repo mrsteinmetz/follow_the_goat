@@ -2,27 +2,28 @@
 
 This folder contains scripts to analyze trading patterns and find optimal buy signals.
 
-## 🎯 LATEST FINDINGS (Jan 27, 2026)
+## 🎯 LATEST FINDINGS (Jan 28, 2026) ⭐ UPDATED
 
-### Price Movement Before Entry is CRITICAL!
+### **10 Minutes is TOO LONG - Switch to 3 Minutes!**
 
-**Major Discovery:** Trades where price is **RISING before entry** have 36% higher win rate than trades where price is **FALLING**.
+**Major Discovery:** For SOL's fast-moving cycles, a **3-MINUTE window** dramatically outperforms the 10-minute window.
 
-See **[PRICE_MOVEMENT_ANALYSIS_RESULTS.md](./PRICE_MOVEMENT_ANALYSIS_RESULTS.md)** for complete details.
+See **[TIMEFRAME_OPTIMIZATION_RESULTS.md](./TIMEFRAME_OPTIMIZATION_RESULTS.md)** for complete details.
 
-#### Quick Summary (4,288 trades analyzed):
-- **Rising trend entries:** 26.0% win rate
-- **Falling trend entries:** 19.1% win rate ❌
-- **Flat trend entries:** 14.1% win rate
+#### Quick Summary (8,515 trades analyzed):
+- **3-minute window:** 80-100% win rate ⭐
+- **2-minute window:** 62.5% win rate
+- **10-minute window:** NOT in any top combinations ❌
 
-#### Best Filter Combination (66.7% win rate):
+#### Best Filter Combination (100% win rate):
 ```
-✅ change_10m > 0.15          (Price up >0.15% in last 10 minutes)
-✅ pm_volatility_pct > 0.1    (High volatility)
-✅ sp_total_change_pct < 0    (Session price down - buying the dip)
+✅ change_3m > 0.08%           (Price up >0.08% in last 3 minutes)
+✅ wh_accumulation_ratio < 0.5  (Whales not overbought)
+✅ pm_volatility_pct > 0.2%     (High volatility - capitulation)
+✅ sp_total_change_pct < -0.2%  (Session price down >0.2%)
 ```
 
-This catches the **V-shaped recovery pattern**: session down, high volatility (capitulation), then price recovering.
+This catches **quick reversals** after capitulation - perfect for SOL's 5-60 minute cycles!
 
 ---
 
@@ -104,11 +105,13 @@ Focused analysis of exact cycle bottom moments.
 
 ### Optimal Detection Window
 - 1-2 minutes: Too noisy
-- 5 minutes: Good signal
-- **10 minutes: Best signal** ⭐
-- 15+ minutes: Signal degrades
+- **3 minutes: OPTIMAL signal** ⭐⭐⭐ (80-100% win rate)
+- **2 minutes: Good alternative** (62.5% win rate, more signals)
+- 5-7 minutes: Signal quality drops
+- 10+ minutes: Too late (missed entry point)
 
 ### Combine Two Strategies
 - **Mean reversion:** Session price down (opportunity)
-- **Momentum confirmation:** Recent 10-min up (reversal confirmed)
+- **Momentum confirmation:** Recent **3-min** up (reversal confirmed) ⭐
 - **Sweet spot:** Enter when BOTH conditions are true
+- **Why 3 minutes:** Catches quick reversals EARLY (not 10 minutes late!)

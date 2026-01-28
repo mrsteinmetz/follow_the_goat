@@ -45,7 +45,7 @@ logger = logging.getLogger("price_movement_analysis")
 # Configuration
 MIN_GAIN = 0.5   # Minimum gain % to consider a "good" trade (lowered to get more samples)
 HOURS_LOOKBACK = 24  # Hours of data to analyze
-NUM_SIMULATIONS = 100  # Number of filter combinations to test
+NUM_SIMULATIONS = 150  # Number of filter combinations to test (increased for more timeframes)
 
 
 def get_price_before_entry(entry_time: datetime, minutes_before: int) -> Optional[float]:
@@ -83,17 +83,21 @@ def analyze_price_movement_before_entry(trade: Dict) -> Dict:
     entry_time = trade['followed_at']
     entry_price = float(trade['our_entry_price'])
     
-    # Get prices at various points before entry
+    # Get prices at various points before entry - NOW INCLUDING MORE TIMEFRAMES
     price_1m_before = get_price_before_entry(entry_time, 1)
     price_2m_before = get_price_before_entry(entry_time, 2)
+    price_3m_before = get_price_before_entry(entry_time, 3)
     price_5m_before = get_price_before_entry(entry_time, 5)
+    price_7m_before = get_price_before_entry(entry_time, 7)
     price_10m_before = get_price_before_entry(entry_time, 10)
     
     result = {
         'entry_price': entry_price,
         'price_1m_before': price_1m_before,
         'price_2m_before': price_2m_before,
+        'price_3m_before': price_3m_before,
         'price_5m_before': price_5m_before,
+        'price_7m_before': price_7m_before,
         'price_10m_before': price_10m_before,
     }
     
@@ -108,17 +112,27 @@ def analyze_price_movement_before_entry(trade: Dict) -> Dict:
     else:
         result['change_2m'] = None
     
+    if price_3m_before:
+        result['change_3m'] = ((entry_price - price_3m_before) / price_3m_before) * 100
+    else:
+        result['change_3m'] = None
+    
     if price_5m_before:
         result['change_5m'] = ((entry_price - price_5m_before) / price_5m_before) * 100
     else:
         result['change_5m'] = None
+    
+    if price_7m_before:
+        result['change_7m'] = ((entry_price - price_7m_before) / price_7m_before) * 100
+    else:
+        result['change_7m'] = None
     
     if price_10m_before:
         result['change_10m'] = ((entry_price - price_10m_before) / price_10m_before) * 100
     else:
         result['change_10m'] = None
     
-    # Determine trend direction
+    # Determine trend direction (using 5m window as baseline)
     if price_1m_before and price_5m_before:
         if result['change_1m'] > 0.05 and result['change_5m'] > 0.1:
             result['trend'] = 'rising'
@@ -226,8 +240,8 @@ def analyze_price_movement_correlation(trades: List[Dict]):
     print(f"Good trades (>= {MIN_GAIN}% gain): {len(good_trades)}")
     print(f"Bad trades (< {MIN_GAIN}% gain): {len(bad_trades)}")
     
-    # Analyze price change distributions
-    for timeframe in ['change_1m', 'change_2m', 'change_5m', 'change_10m']:
+    # Analyze price change distributions - NOW INCLUDING MORE TIMEFRAMES
+    for timeframe in ['change_1m', 'change_2m', 'change_3m', 'change_5m', 'change_7m', 'change_10m']:
         good_changes = [t[timeframe] for t in good_trades if t[timeframe] is not None]
         bad_changes = [t[timeframe] for t in bad_trades if t[timeframe] is not None]
         
@@ -348,10 +362,18 @@ def run_simulations(trades: List[Dict], num_sims: int = NUM_SIMULATIONS):
     filter_candidates = []
     
     # Price movement filters (CRITICAL - must be rising)
-    for threshold in [0, 0.05, 0.1, 0.15, 0.2]:
-        filter_candidates.append(('change_1m', '>', threshold))
+    # NOW TESTING MORE TIMEFRAMES: 2m, 3m, 5m, 7m, 10m
+    # TESTING LOWER THRESHOLDS: 0.05%, 0.08%, 0.10%, 0.12%, 0.15%, 0.20%
+    for threshold in [0.05, 0.08, 0.10, 0.12, 0.15, 0.20]:
+        # 2-minute window
         filter_candidates.append(('change_2m', '>', threshold))
+        # 3-minute window
+        filter_candidates.append(('change_3m', '>', threshold))
+        # 5-minute window
         filter_candidates.append(('change_5m', '>', threshold))
+        # 7-minute window
+        filter_candidates.append(('change_7m', '>', threshold))
+        # 10-minute window (original)
         filter_candidates.append(('change_10m', '>', threshold))
     
     # Additional existing filters that help
@@ -417,22 +439,85 @@ def run_simulations(trades: List[Dict], num_sims: int = NUM_SIMULATIONS):
     return results
 
 
-def print_top_results(results: List[Dict], top_n: int = 20):
+def print_top_results(results: List[Dict], top_n: int = 25):
     """
-    Print the top N filter combinations.
+    Print the top N filter combinations, grouped by timeframe.
     """
     print("\n" + "="*80)
     print(f"TOP {top_n} FILTER COMBINATIONS")
     print("="*80)
     print("\nBest combinations (sorted by win rate, then signal count):\n")
     
+    # Track which timeframes appear in top results
+    timeframe_stats = {
+        'change_2m': {'count': 0, 'total_win_rate': 0, 'total_signals': 0},
+        'change_3m': {'count': 0, 'total_win_rate': 0, 'total_signals': 0},
+        'change_5m': {'count': 0, 'total_win_rate': 0, 'total_signals': 0},
+        'change_7m': {'count': 0, 'total_win_rate': 0, 'total_signals': 0},
+        'change_10m': {'count': 0, 'total_win_rate': 0, 'total_signals': 0},
+    }
+    
     for i, result in enumerate(results[:top_n], 1):
         print(f"#{i} - Win Rate: {result['win_rate']:.1f}% | Signals: {result['total_signals']} (Good: {result['good_signals']}, Bad: {result['bad_signals']}) | Avg Gain: {result['avg_gain']:.2f}%")
         print("   Filters:")
+        
+        # Track which timeframe is used
         for filter_name, (operator, threshold) in result['filters'].items():
             display_name = filter_name.replace('filter_', '')
             print(f"     - {display_name} {operator} {threshold}")
+            
+            # If it's a price change filter, track it
+            if filter_name in timeframe_stats:
+                timeframe_stats[filter_name]['count'] += 1
+                timeframe_stats[filter_name]['total_win_rate'] += result['win_rate']
+                timeframe_stats[filter_name]['total_signals'] += result['total_signals']
         print()
+    
+    # Print timeframe summary
+    print("\n" + "="*80)
+    print("TIMEFRAME ANALYSIS SUMMARY")
+    print("="*80)
+    print(f"\nHow often each timeframe appears in top {top_n} combinations:\n")
+    
+    # Sort by count
+    sorted_timeframes = sorted(timeframe_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+    
+    for timeframe, stats in sorted_timeframes:
+        if stats['count'] > 0:
+            avg_win_rate = stats['total_win_rate'] / stats['count']
+            avg_signals = stats['total_signals'] / stats['count']
+            print(f"  {timeframe.upper()}: appears {stats['count']}/{top_n} times")
+            print(f"    → Avg win rate: {avg_win_rate:.1f}%")
+            print(f"    → Avg signals: {avg_signals:.1f}")
+        else:
+            print(f"  {timeframe.upper()}: not in top {top_n}")
+    
+    print(f"\n{'='*80}")
+    print("🎯 OPTIMAL TIMEFRAME RECOMMENDATION")
+    print(f"{'='*80}")
+    
+    if sorted_timeframes[0][1]['count'] > 0:
+        best_timeframe = sorted_timeframes[0][0]
+        best_stats = sorted_timeframes[0][1]
+        avg_wr = best_stats['total_win_rate'] / best_stats['count']
+        
+        # Extract the minute value (e.g., "change_5m" -> "5")
+        minutes = best_timeframe.replace('change_', '').replace('m', '')
+        
+        print(f"\n✅ BEST TIMEFRAME: {best_timeframe.upper()}")
+        print(f"   → Appears in {best_stats['count']}/{top_n} top combinations")
+        print(f"   → Average win rate: {avg_wr:.1f}%")
+        print(f"   → {minutes} minutes captures the right balance for SOL's fast movements")
+        
+        if minutes == '10':
+            print(f"\n   ⚠️  10 minutes might be optimal, but consider testing shorter windows")
+            print(f"       if you want to catch faster reversals (5-7 minute cycles)")
+        elif int(minutes) < 5:
+            print(f"\n   ⚠️  {minutes} minutes might be too short/noisy for reliable signals")
+            print(f"       Consider 5-7 minute window for better signal quality")
+        else:
+            print(f"\n   ✅ {minutes} minutes appears to be the sweet spot!")
+            print(f"       Fast enough for SOL's movements, long enough to filter noise")
 
 
 def main():
@@ -470,7 +555,7 @@ def main():
         return
     
     # Step 4: Print top results
-    print_top_results(results, top_n=20)
+    print_top_results(results, top_n=25)
     
     # Step 5: Summary
     print("\n" + "="*80)

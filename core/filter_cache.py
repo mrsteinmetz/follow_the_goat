@@ -49,6 +49,40 @@ def get_duckdb_connection():
     return duckdb.connect(str(CACHE_FILE))
 
 
+def _try_acquire_cache_sync_lock():
+    """
+    Ensure only ONE process performs DuckDB cache writes at a time.
+    
+    Uses a PostgreSQL advisory lock so multiple local services can safely share
+    the same DuckDB file on disk without corruption/lock thrashing.
+    
+    Returns:
+        Dedicated psycopg2 connection holding the lock, or None if lock not acquired.
+    """
+    try:
+        from core.database import get_postgres_dedicated_connection
+        import hashlib
+        
+        lock_key_name = "filter_cache_sync"
+        digest = hashlib.blake2b(lock_key_name.encode("utf-8"), digest_size=8).digest()
+        n = int.from_bytes(digest, byteorder="big", signed=False)
+        if n >= 2**63:
+            n -= 2**64
+        
+        conn = get_postgres_dedicated_connection(application_name="ftg_filter_cache_sync")
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT pg_try_advisory_lock(%s) AS locked", [n])
+            row = cursor.fetchone()
+            locked = bool(row["locked"]) if row else False
+        if not locked:
+            conn.close()
+            return None
+        return conn
+    except Exception as e:
+        logger.warning(f"Failed to acquire filter cache sync lock: {e}")
+        return None
+
+
 def init_cache():
     """Initialize DuckDB cache tables and indexes."""
     logger.info("Initializing DuckDB cache tables...")
@@ -457,26 +491,38 @@ def sync_cache_incremental() -> float:
     import time
     start_time = time.time()
     
-    # Initialize tables if needed
-    init_cache()
-    
-    # Sync buyins
-    buyins_synced = sync_buyins_incremental()
-    
-    # Sync filter values (only for new trades)
-    if buyins_synced > 0:
-        sync_filter_values_incremental()
-    
-    # Cleanup old data
-    cleanup_old_data()
-    
-    # Update metadata
-    set_cache_metadata('last_sync_timestamp', datetime.now().isoformat())
-    
-    sync_time = time.time() - start_time
-    logger.info(f"Cache sync completed in {sync_time:.2f}s")
-    
-    return get_cache_age()
+    lock_conn = _try_acquire_cache_sync_lock()
+    if lock_conn is None:
+        # Another process is syncing; treat cache as “fresh enough” and return current age.
+        logger.info("Filter cache sync skipped (another instance holds sync lock)")
+        return get_cache_age()
+
+    try:
+        # Initialize tables if needed
+        init_cache()
+        
+        # Sync buyins
+        buyins_synced = sync_buyins_incremental()
+        
+        # Sync filter values (only for new trades)
+        if buyins_synced > 0:
+            sync_filter_values_incremental()
+        
+        # Cleanup old data
+        cleanup_old_data()
+        
+        # Update metadata
+        set_cache_metadata('last_sync_timestamp', datetime.now().isoformat())
+        
+        sync_time = time.time() - start_time
+        logger.info(f"Cache sync completed in {sync_time:.2f}s")
+
+        return get_cache_age()
+    finally:
+        try:
+            lock_conn.close()
+        except Exception:
+            pass
 
 
 def get_cached_trades(hours: int = 24, ratio_only: bool = False) -> pd.DataFrame:

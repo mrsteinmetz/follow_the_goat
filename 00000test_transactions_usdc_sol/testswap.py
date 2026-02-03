@@ -20,18 +20,17 @@ import sys
 import json
 import time
 import base58
+import base64
 import requests
-from datetime import datetime
-from typing import Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Dict, Optional, Tuple, List
 
 # Solana imports
 try:
     from solders.keypair import Keypair  # type: ignore
-    from solders.pubkey import Pubkey  # type: ignore
     from solders.transaction import VersionedTransaction  # type: ignore
-    from solders.rpc.requests import SendVersionedTransaction  # type: ignore
-    from solders.rpc.config import RpcSendTransactionConfig  # type: ignore
-    from solders.commitment_config import CommitmentLevel  # type: ignore
+    from solders.message import to_bytes_versioned  # type: ignore
+    from solders.signature import Signature  # type: ignore
 except ImportError:
     print("ERROR: Missing required packages!")
     print("Install with: pip install solders base58 requests")
@@ -52,26 +51,40 @@ except ImportError:
 # Configuration
 # ============================================================================
 
+def _get_rpc_url() -> str:
+    """Use SOLANA_RPC_URL, or build from helius_key if set."""
+    url = os.getenv("SOLANA_RPC_URL", "")
+    if url:
+        return url
+    key = os.getenv("helius_key", "")
+    if key:
+        return f"https://mainnet.helius-rpc.com/?api-key={key}"
+    return "https://api.mainnet-beta.solana.com"
+
+
 class Config:
     """Configuration for swap testing"""
     
     # Solana RPC endpoint
-    RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+    RPC_URL = _get_rpc_url()
     
-    # Your wallet private key (base58 encoded)
-    # KEEP THIS SECRET! Add to .env file as: SOLANA_PRIVATE_KEY=your_key_here
-    PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY", "")
+    # Wallet: prefer usdc_private_key (from .env), fallback to SOLANA_PRIVATE_KEY
+    PRIVATE_KEY = os.getenv("usdc_private_key", "") or os.getenv("SOLANA_PRIVATE_KEY", "")
     
-    # Jupiter API
-    JUPITER_API_URL = "https://quote-api.jup.ag/v6"
-    JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
+    # Jupiter Ultra API (recommended; lite-api.jup.ag deprecated Jan 31 2026)
+    # https://dev.jup.ag/docs/ultra/get-started
+    JUPITER_API_BASE = "https://api.jup.ag"
+    JUPITER_ORDER_URL = f"{JUPITER_API_BASE}/ultra/v1/order"
+    JUPITER_EXECUTE_URL = f"{JUPITER_API_BASE}/ultra/v1/execute"
+    # Jupiter API key (from .env; same key used by trading bot)
+    JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "") or os.getenv("jupiter_api_key", "")
     
     # Token addresses (Solana mainnet)
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # USDC
     SOL_MINT = "So11111111111111111111111111111111111111112"   # Wrapped SOL
     
-    # Test amount (in USDC, with 6 decimals)
-    TEST_AMOUNT_USDC = 5.0  # $5 USD
+    # Test amount (in USDC). Override with env TEST_AMOUNT_USDC (e.g. 5 or 10)
+    TEST_AMOUNT_USDC = float(os.getenv("TEST_AMOUNT_USDC", "5.0"))
     USDC_DECIMALS = 6
     SOL_DECIMALS = 9
     
@@ -83,6 +96,12 @@ class Config:
     # Fee target for trading bot
     TARGET_FEE_BPS = 5  # 5 basis points = 0.05% total cost target
 
+    # If set (e.g. AUTO_EXECUTE_SWAP=1), run both swaps without prompting
+    AUTO_EXECUTE_SWAP = os.getenv("AUTO_EXECUTE_SWAP", "").strip().lower() in ("1", "true", "yes")
+
+    # Keep a small SOL buffer for network fees (fixed amount, not %)
+    SOL_FEE_BUFFER = float(os.getenv("SOL_FEE_BUFFER", "0.002"))
+
 
 # ============================================================================
 # Wallet Management
@@ -91,12 +110,10 @@ class Config:
 def load_wallet() -> Optional[Keypair]:
     """Load wallet from private key"""
     if not Config.PRIVATE_KEY:
-        print("\n❌ ERROR: SOLANA_PRIVATE_KEY not set in environment!")
-        print("\nTo set up your wallet:")
-        print("1. Create a Solana wallet (or export from Phantom/Solflare)")
-        print("2. Get your private key as base58 string")
-        print("3. Add to .env file:")
-        print("   SOLANA_PRIVATE_KEY=your_base58_private_key_here")
+        print("\n❌ ERROR: No wallet private key set!")
+        print("\nAdd to .env in project root:")
+        print("   usdc_private_key=your_base58_private_key_here")
+        print("   (or SOLANA_PRIVATE_KEY=...)")
         print("\n⚠️  SECURITY: Never commit .env to git!")
         return None
     
@@ -160,6 +177,22 @@ def get_token_balance(wallet_address: str, token_mint: str) -> Optional[float]:
         return None
 
 
+def get_sol_price_usdc() -> Optional[float]:
+    """Get SOL price in USDC using Ultra order for 1 SOL."""
+    one_sol = 1 * (10 ** Config.SOL_DECIMALS)
+    quote = get_quote(
+        input_mint=Config.SOL_MINT,
+        output_mint=Config.USDC_MINT,
+        amount=one_sol,
+        slippage_bps=10,
+        taker=None,
+    )
+    if not quote:
+        return None
+    out_amount = int(quote.get("outAmount", 0))
+    return out_amount / (10 ** Config.USDC_DECIMALS)
+
+
 # ============================================================================
 # Jupiter Swap Functions
 # ============================================================================
@@ -168,9 +201,10 @@ def get_quote(
     input_mint: str,
     output_mint: str,
     amount: int,
-    slippage_bps: int = 50
+    slippage_bps: int = 50,
+    taker: Optional[str] = None,
 ) -> Optional[Dict]:
-    """Get swap quote from Jupiter"""
+    """Get swap order from Jupiter Ultra API (GET /ultra/v1/order)."""
     try:
         headers = {}
         if Config.JUPITER_API_KEY:
@@ -180,20 +214,20 @@ def get_quote(
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
-            "slippageBps": str(slippage_bps),
-            "onlyDirectRoutes": "false",
-            "asLegacyTransaction": "false"
         }
+        if taker:
+            params["taker"] = taker
+        if slippage_bps is not None:
+            params["slippageBps"] = str(slippage_bps)
         
         response = requests.get(
-            f"{Config.JUPITER_API_URL}/quote",
+            Config.JUPITER_ORDER_URL,
             params=params,
-            headers=headers
+            headers=headers,
+            timeout=15,
         )
         response.raise_for_status()
-        
         return response.json()
-        
     except Exception as e:
         print(f"❌ Failed to get quote: {e}")
         return None
@@ -204,131 +238,42 @@ def get_low_fee_quote(
     output_mint: str,
     amount: int,
     slippage_bps: int = 10,
-    max_fee_bps: float = 5.0
+    max_fee_bps: float = 5.0,
+    taker: Optional[str] = None,
 ) -> Optional[Dict]:
     """
-    Get quote optimized for LOW FEES (target < 0.05%)
-    
-    Strategies:
-    1. Try direct routes first (fewer hops = lower fees)
-    2. Prefer high-liquidity pools (lower price impact)
-    3. Filter by fee tier
+    Get order from Jupiter Ultra API, optimized for low fees (target < 0.05%).
+    Ultra API: GET /ultra/v1/order
     """
     try:
-        headers = {}
-        if Config.JUPITER_API_KEY:
-            headers["x-api-key"] = Config.JUPITER_API_KEY
-        
-        # Try direct routes first (lowest fees)
-        print("   Trying direct routes first...")
-        params = {
-            "inputMint": input_mint,
-            "outputMint": output_mint,
-            "amount": str(amount),
-            "slippageBps": str(slippage_bps),
-            "onlyDirectRoutes": "true",  # Direct only = fewer fees
-            "asLegacyTransaction": "false"
-        }
-        
-        response = requests.get(
-            f"{Config.JUPITER_API_URL}/quote",
-            params=params,
-            headers=headers
+        order = get_quote(
+            input_mint=input_mint,
+            output_mint=output_mint,
+            amount=amount,
+            slippage_bps=slippage_bps,
+            taker=taker,
         )
-        
-        if response.status_code == 200:
-            quote = response.json()
-            
-            # Check if fee is acceptable
-            in_amount = int(quote["inAmount"])
-            out_amount = int(quote["outAmount"])
-            price_impact = abs(float(quote.get("priceImpactPct", 0)))
-            
-            # Estimate total fee (price impact is main component)
-            estimated_fee_bps = price_impact * 100
-            
-            print(f"   Direct route: {price_impact:.4f}% price impact")
-            
-            if estimated_fee_bps <= max_fee_bps:
-                print(f"   ✅ Direct route meets fee target (<{max_fee_bps/100:.3f}%)")
-                return quote
-            else:
-                print(f"   ⚠️  Direct route fee too high: {estimated_fee_bps/100:.3f}%")
-        
-        # If direct routes don't work, try all routes
-        print("   Trying all routes...")
-        params["onlyDirectRoutes"] = "false"
-        
-        response = requests.get(
-            f"{Config.JUPITER_API_URL}/quote",
-            params=params,
-            headers=headers
-        )
-        response.raise_for_status()
-        
-        quote = response.json()
-        price_impact = abs(float(quote.get("priceImpactPct", 0)))
+        if not order:
+            return None
+        # Ultra response: inAmount, outAmount, priceImpactPct (string) or priceImpact (number), routePlan
+        in_amount = int(order.get("inAmount", 0))
+        out_amount = int(order.get("outAmount", 0))
+        price_impact_raw = order.get("priceImpactPct") or order.get("priceImpact") or 0
+        price_impact = abs(float(price_impact_raw))
         estimated_fee_bps = price_impact * 100
-        
-        print(f"   Best route: {price_impact:.4f}% price impact")
-        
+        print(f"   Ultra route: {price_impact:.4f}% price impact")
         if estimated_fee_bps > max_fee_bps:
             print(f"   ⚠️  Warning: Estimated fee {estimated_fee_bps/100:.3f}% exceeds target {max_fee_bps/100:.3f}%")
-            print(f"   ⚠️  Consider: smaller trade size or wait for better liquidity")
-        
-        return quote
-        
+        return order
     except Exception as e:
         print(f"❌ Failed to get low-fee quote: {e}")
         return None
 
 
-def execute_swap(
-    wallet: Keypair,
-    quote: Dict
-) -> Optional[str]:
-    """Execute swap using Jupiter"""
+def _send_tx_via_rpc(serialized_tx: bytes) -> Optional[str]:
+    """Send signed transaction via RPC sendTransaction (fallback when Jupiter execute rejects)."""
     try:
-        # Get swap transaction
-        headers = {"Content-Type": "application/json"}
-        if Config.JUPITER_API_KEY:
-            headers["x-api-key"] = Config.JUPITER_API_KEY
-        
-        swap_request = {
-            "quoteResponse": quote,
-            "userPublicKey": str(wallet.pubkey()),
-            "wrapAndUnwrapSol": True,
-            "dynamicComputeUnitLimit": True,
-            "prioritizationFeeLamports": "auto"
-        }
-        
-        response = requests.post(
-            f"{Config.JUPITER_API_URL}/swap",
-            json=swap_request,
-            headers=headers
-        )
-        response.raise_for_status()
-        swap_data = response.json()
-        
-        # Deserialize transaction
-        swap_transaction_buf = base58.b58decode(swap_data["swapTransaction"])
-        transaction = VersionedTransaction.from_bytes(swap_transaction_buf)
-        
-        # Sign transaction
-        signed_transaction = VersionedTransaction(
-            transaction.message,
-            [wallet]
-        )
-        
-        # Send transaction
-        rpc_config = RpcSendTransactionConfig(
-            skip_preflight=False,
-            preflight_commitment=CommitmentLevel.Confirmed,
-            max_retries=3
-        )
-        
-        serialized_tx = bytes(signed_transaction)
-        
+        tx_b58 = base58.b58encode(serialized_tx).decode("utf-8")
         response = requests.post(
             Config.RPC_URL,
             json={
@@ -336,27 +281,122 @@ def execute_swap(
                 "id": 1,
                 "method": "sendTransaction",
                 "params": [
-                    base58.b58encode(serialized_tx).decode('utf-8'),
-                    {
-                        "skipPreflight": False,
-                        "preflightCommitment": "confirmed",
-                        "maxRetries": 3
-                    }
-                ]
-            }
+                    tx_b58,
+                    {"skipPreflight": False, "preflightCommitment": "confirmed", "maxRetries": 3},
+                ],
+            },
+            timeout=30,
         )
-        
-        result = response.json()
-        
-        if "error" in result:
-            print(f"❌ Transaction error: {result['error']}")
+        data = response.json()
+        if data.get("error"):
+            print(f"❌ RPC sendTransaction error: {data['error']}")
             return None
-        
-        signature = result["result"]
-        print(f"✅ Transaction sent: {signature}")
-        
-        return signature
-        
+        sig = data.get("result")
+        if sig:
+            print(f"✅ Transaction sent via RPC: {sig}")
+        return sig
+    except Exception as e:
+        print(f"❌ RPC send failed: {e}")
+        return None
+
+
+def _sign_tx_bytes(transaction: VersionedTransaction, wallet: Keypair, mode: str) -> bytes:
+    """Sign a VersionedTransaction and return serialized bytes.
+
+    mode:
+      - "raw": bytes(transaction.message)
+      - "versioned": to_bytes_versioned(transaction.message)
+    """
+    if mode == "versioned":
+        msg_bytes = to_bytes_versioned(transaction.message)
+    else:
+        msg_bytes = bytes(transaction.message)
+    sig = wallet.sign_message(msg_bytes)
+
+    header = transaction.message.header
+    num_required = header.num_required_signatures
+    account_keys = transaction.message.account_keys
+    signer_index = None
+    for i in range(num_required):
+        if account_keys[i] == wallet.pubkey():
+            signer_index = i
+            break
+    if signer_index is None:
+        raise ValueError("Wallet pubkey not in required signer list")
+
+    signatures: List[Signature] = [Signature.default()] * num_required
+    signatures[signer_index] = sig
+    signed_tx = VersionedTransaction.populate(transaction.message, signatures)
+    return bytes(signed_tx)
+
+
+def execute_swap(
+    wallet: Keypair,
+    order: Dict,
+) -> Optional[str]:
+    """Execute swap using Jupiter Ultra API (POST /ultra/v1/execute).
+    Order must contain transaction (base64) and requestId from GET /ultra/v1/order.
+    Jupiter executes on their side; no RPC sendTransaction needed.
+    """
+    try:
+        transaction_raw = order.get("transaction")
+        request_id = order.get("requestId")
+        if not transaction_raw or not request_id:
+            print("❌ Order missing transaction or requestId (Ultra API)")
+            return None
+
+        # Deserialize: Ultra returns base64; fallback to base58 if decode fails
+        try:
+            tx_bytes = base64.b64decode(transaction_raw)
+        except Exception:
+            tx_bytes = base58.b58decode(transaction_raw)
+        transaction = VersionedTransaction.from_bytes(tx_bytes)
+
+        def _execute_signed_bytes(tx_bytes_out: bytes) -> Tuple[str, Optional[str], Dict]:
+            signed_b64 = base64.b64encode(tx_bytes_out).decode("utf-8")
+            payload = {
+                "signedTransaction": signed_b64,
+                "requestId": str(request_id),
+            }
+            headers = {"Content-Type": "application/json"}
+            if Config.JUPITER_API_KEY:
+                headers["x-api-key"] = Config.JUPITER_API_KEY
+            response = requests.post(
+                Config.JUPITER_EXECUTE_URL,
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+            result = response.json() if response.content else {}
+            if response.ok and not result.get("error"):
+                return "success", result.get("signature"), result
+            if response.status_code == 400 and result.get("code") == -2:
+                return "decode_error", None, result
+            return "error", None, result
+
+        # First try: versioned message bytes (matches Solana v0 signing)
+        tx_bytes_out = _sign_tx_bytes(transaction, wallet, "versioned")
+        status, signature, result = _execute_signed_bytes(tx_bytes_out)
+        if status == "success" and signature:
+            print(f"✅ Transaction submitted: {signature} (status: {result.get('status', '')})")
+            return signature
+
+        # If Jupiter can't decode, try versioned message bytes
+        if status == "decode_error":
+            print("⚠️  Jupiter execute rejected versioned-signed tx; retrying with raw message bytes...")
+            alt_bytes = _sign_tx_bytes(transaction, wallet, "raw")
+            status2, signature2, result2 = _execute_signed_bytes(alt_bytes)
+            if status2 == "success" and signature2:
+                print(f"✅ Transaction submitted: {signature2} (status: {result2.get('status', '')})")
+                return signature2
+
+        # Fallback to RPC sendTransaction (try raw, then versioned if needed)
+        print("⚠️  Jupiter execute failed; sending via RPC...")
+        sig_rpc = _send_tx_via_rpc(tx_bytes_out)
+        if sig_rpc:
+            return sig_rpc
+        alt_bytes = _sign_tx_bytes(transaction, wallet, "raw")
+        return _send_tx_via_rpc(alt_bytes)
     except Exception as e:
         print(f"❌ Failed to execute swap: {e}")
         import traceback
@@ -419,17 +459,15 @@ def analyze_swap_result(
 ) -> Dict:
     """Analyze swap results and calculate fees"""
     
-    # Extract quote info
-    in_amount = int(quote["inAmount"])
-    out_amount = int(quote["outAmount"])
+    # Ultra API: inAmount/outAmount can be str; priceImpactPct str or priceImpact number
+    in_amount = int(quote.get("inAmount", 0))
+    out_amount = int(quote.get("outAmount", 0))
+    price_impact_pct = float(quote.get("priceImpactPct") or quote.get("priceImpact") or 0)
     
-    # Get price impact
-    price_impact_pct = float(quote.get("priceImpactPct", 0))
-    
-    # Get platform fee info
-    platform_fee = quote.get("platformFee", {})
+    # Platform fee (Ultra may not have platformFee)
+    platform_fee = quote.get("platformFee") or {}
     platform_fee_amount = float(platform_fee.get("amount", 0)) if platform_fee else 0
-    
+
     # Calculate slippage
     expected_output = float(out_amount)
     actual_output = output_amount
@@ -470,6 +508,7 @@ def print_banner():
     print("="*70)
     print(f"Test Amount: ${Config.TEST_AMOUNT_USDC} USDC")
     print(f"Slippage: {Config.SLIPPAGE_BPS / 100}%")
+    print(f"Jupiter: Ultra API ({Config.JUPITER_API_BASE})")
     print(f"RPC: {Config.RPC_URL[:50]}...")
     print("="*70 + "\n")
 
@@ -506,12 +545,25 @@ def test_round_trip_swap():
         print(f"Required: {Config.TEST_AMOUNT_USDC} USDC")
         print(f"Available: {initial_usdc} USDC")
         return
+
+    # Solana tx fees are paid in SOL; need a small amount for both swaps
+    min_sol_for_fees = 0.005  # ~2 txs
+    if initial_sol is not None and initial_sol < min_sol_for_fees:
+        print(f"\n⚠️  Very low SOL balance ({initial_sol:.6f} SOL).")
+        print("   You need a small amount of SOL to pay network fees (~0.01 SOL).")
+        print("   Get free SOL from a faucet or transfer a tiny amount to this wallet.")
+        if not Config.AUTO_EXECUTE_SWAP:
+            reply = input("   Continue anyway? [y/N]: ").strip().lower()
+            if reply != "y":
+                return
+        else:
+            print("   Proceeding anyway (may fail on first transaction).")
     
     # Convert test amount to raw units (USDC has 6 decimals)
     test_amount_raw = int(Config.TEST_AMOUNT_USDC * (10 ** Config.USDC_DECIMALS))
     
     results = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "wallet": wallet_address,
         "initial_usdc": initial_usdc,
         "initial_sol": initial_sol,
@@ -531,7 +583,8 @@ def test_round_trip_swap():
         output_mint=Config.SOL_MINT,
         amount=test_amount_raw,
         slippage_bps=Config.SLIPPAGE_BPS,
-        max_fee_bps=Config.TARGET_FEE_BPS
+        max_fee_bps=Config.TARGET_FEE_BPS,
+        taker=wallet_address,
     )
     
     if not quote1:
@@ -541,7 +594,10 @@ def test_round_trip_swap():
     expected_sol = int(quote1["outAmount"]) / (10 ** Config.SOL_DECIMALS)
     print(f"Expected output: {expected_sol:.9f} SOL")
     
-    input(f"\n⚠️  Press ENTER to execute swap 1 (USDC -> SOL)...")
+    if not Config.AUTO_EXECUTE_SWAP:
+        input(f"\n⚠️  Press ENTER to execute swap 1 (USDC -> SOL)...")
+    else:
+        print("\nExecuting swap 1 (USDC -> SOL)...")
     
     sig1 = execute_swap(wallet, quote1)
     if not sig1:
@@ -552,12 +608,17 @@ def test_round_trip_swap():
         print("❌ Swap not confirmed")
         return
     
-    # Wait a bit for balance update
-    time.sleep(3)
+    # Wait for balance update (RPC/indexer can lag)
+    time.sleep(8)
     
-    # Check balances after swap 1
     mid_usdc = get_token_balance(wallet_address, Config.USDC_MINT)
     mid_sol = get_token_balance(wallet_address, Config.SOL_MINT)
+    sol_received = mid_sol - initial_sol if mid_sol is not None and initial_sol is not None else 0
+    if sol_received <= 0:
+        time.sleep(5)
+        mid_usdc = get_token_balance(wallet_address, Config.USDC_MINT)
+        mid_sol = get_token_balance(wallet_address, Config.SOL_MINT)
+        sol_received = (mid_sol - initial_sol) if mid_sol is not None and initial_sol is not None else 0
     
     print(f"\n📊 Balances after swap 1:")
     print(f"USDC: {mid_usdc:.6f} (change: {mid_usdc - initial_usdc:+.6f})")
@@ -566,7 +627,7 @@ def test_round_trip_swap():
     swap1_analysis = analyze_swap_result(
         quote1,
         Config.TEST_AMOUNT_USDC,
-        mid_sol - initial_sol,
+        sol_received,
         "USDC",
         "SOL"
     )
@@ -576,11 +637,10 @@ def test_round_trip_swap():
         **swap1_analysis
     })
     
-    # Calculate how much SOL we got
-    sol_received = mid_sol - initial_sol
-    
     if sol_received <= 0:
-        print("❌ No SOL received, aborting test")
+        print("❌ No SOL received (tx may have landed; check Solscan). Aborting test.")
+        if sig1:
+            print(f"   Tx: https://solscan.io/tx/{sig1}")
         return
     
     # ========================================================================
@@ -590,8 +650,12 @@ def test_round_trip_swap():
     print("\n\n🔄 SWAP 2: SOL -> USDC")
     print("="*70)
     
-    # Use the SOL we received (minus a small buffer for fees)
-    sol_to_swap = int(sol_received * 0.99 * (10 ** Config.SOL_DECIMALS))
+    # Use SOL received minus a small fixed buffer for network fees
+    sol_to_swap_amt = max(sol_received - Config.SOL_FEE_BUFFER, 0)
+    sol_to_swap = int(sol_to_swap_amt * (10 ** Config.SOL_DECIMALS))
+    if sol_to_swap <= 0:
+        print("❌ SOL received is too small after fee buffer; aborting swap 2")
+        return
     
     print("⏳ Getting low-fee quote...")
     quote2 = get_low_fee_quote(
@@ -599,7 +663,8 @@ def test_round_trip_swap():
         output_mint=Config.USDC_MINT,
         amount=sol_to_swap,
         slippage_bps=Config.SLIPPAGE_BPS,
-        max_fee_bps=Config.TARGET_FEE_BPS
+        max_fee_bps=Config.TARGET_FEE_BPS,
+        taker=wallet_address,
     )
     
     if not quote2:
@@ -609,7 +674,10 @@ def test_round_trip_swap():
     expected_usdc = int(quote2["outAmount"]) / (10 ** Config.USDC_DECIMALS)
     print(f"Expected output: {expected_usdc:.6f} USDC")
     
-    input(f"\n⚠️  Press ENTER to execute swap 2 (SOL -> USDC)...")
+    if not Config.AUTO_EXECUTE_SWAP:
+        input(f"\n⚠️  Press ENTER to execute swap 2 (SOL -> USDC)...")
+    else:
+        print("\nExecuting swap 2 (SOL -> USDC)...")
     
     sig2 = execute_swap(wallet, quote2)
     if not sig2:
@@ -620,21 +688,29 @@ def test_round_trip_swap():
         print("❌ Swap not confirmed")
         return
     
-    # Wait a bit for balance update
-    time.sleep(3)
+    # Wait for balance update (RPC/indexer can lag)
+    time.sleep(8)
     
-    # Check final balances
     final_usdc = get_token_balance(wallet_address, Config.USDC_MINT)
     final_sol = get_token_balance(wallet_address, Config.SOL_MINT)
+    usdc_change = (final_usdc - mid_usdc) if final_usdc is not None and mid_usdc is not None else 0
+    sol_change = (final_sol - mid_sol) if final_sol is not None and mid_sol is not None else 0
+    if abs(usdc_change) < 1e-6 and abs(sol_change) < 1e-9:
+        time.sleep(5)
+        final_usdc = get_token_balance(wallet_address, Config.USDC_MINT)
+        final_sol = get_token_balance(wallet_address, Config.SOL_MINT)
     
     print(f"\n📊 Final Balances:")
     print(f"USDC: {final_usdc:.6f} (change: {final_usdc - initial_usdc:+.6f})")
     print(f"SOL:  {final_sol:.9f} (change: {final_sol - initial_sol:+.9f})")
+    if abs(final_usdc - mid_usdc) < 1e-6 and abs(final_sol - mid_sol) < 1e-9:
+        print("⚠️  Balances unchanged after swap 2; check Solscan for tx status.")
+        print(f"   Tx: https://solscan.io/tx/{sig2}")
     
     swap2_analysis = analyze_swap_result(
         quote2,
         sol_received * 0.99,
-        final_usdc - mid_usdc,
+        (final_usdc - mid_usdc) if final_usdc is not None and mid_usdc is not None else 0,
         "SOL",
         "USDC"
     )
@@ -652,13 +728,27 @@ def test_round_trip_swap():
     print("📊 ROUND-TRIP ANALYSIS")
     print("="*70)
     
-    total_usdc_change = final_usdc - initial_usdc
-    total_cost_usd = abs(total_usdc_change)
-    total_cost_pct = (total_cost_usd / Config.TEST_AMOUNT_USDC) * 100
+    # Compute total portfolio value in USDC (includes leftover SOL)
+    sol_price = get_sol_price_usdc()
+    if sol_price:
+        start_value = initial_usdc + (initial_sol * sol_price)
+        end_value = final_usdc + (final_sol * sol_price)
+        total_cost_usd = max(0.0, start_value - end_value)
+        total_cost_pct = (total_cost_usd / Config.TEST_AMOUNT_USDC) * 100
+    else:
+        total_usdc_change = final_usdc - initial_usdc
+        total_cost_usd = abs(total_usdc_change)
+        total_cost_pct = (total_cost_usd / Config.TEST_AMOUNT_USDC) * 100
     
     print(f"\nStarting USDC: ${initial_usdc:.6f}")
     print(f"Ending USDC:   ${final_usdc:.6f}")
-    print(f"Net Change:    ${total_usdc_change:+.6f}")
+    if sol_price:
+        print(f"SOL Price:     ${sol_price:.6f}")
+        print(f"Start Value:   ${start_value:.6f}")
+        print(f"End Value:     ${end_value:.6f}")
+    else:
+        total_usdc_change = final_usdc - initial_usdc
+        print(f"Net Change:    ${total_usdc_change:+.6f}")
     print(f"\nTotal Cost:    ${total_cost_usd:.6f}")
     print(f"Cost %:        {total_cost_pct:.3f}%")
     
@@ -677,7 +767,7 @@ def test_round_trip_swap():
     results["total_cost_pct"] = total_cost_pct
     
     # Save results to file
-    output_file = f"swap_test_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+    output_file = f"swap_test_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
     

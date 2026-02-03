@@ -1,0 +1,6 @@
+# For USDC <-> SOL round-trip swap test. Use in a venv:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+solders>=0.27
+base58>=2.0
+requests>=2.28
+python-dotenv>=1.0

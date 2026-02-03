@@ -18,6 +18,9 @@ $baseUrl = '';
 $error_message = '';
 $metrics_data = [];
 $scheduler_status = null;
+$components_data = [];
+$components_error_counts = [];
+$components_last_error = [];
 
 // Parameters - support minutes for short intervals
 $minutes = isset($_GET['minutes']) ? (int)$_GET['minutes'] : 60;  // Default 60 minutes (1 hour)
@@ -30,6 +33,25 @@ $refresh = max(10, min(120, $refresh));  // Min 10s refresh to avoid overloading
 
 // Fetch data
 if ($api_available) {
+    // Handle component toggle POST (server-side, avoids browser CORS)
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_component'])) {
+        $component_id = isset($_POST['component_id']) ? trim((string)$_POST['component_id']) : '';
+        $enabled = (isset($_POST['enabled_checkbox']) && $_POST['enabled_checkbox'] === '1');
+        $note = isset($_POST['note']) ? trim((string)$_POST['note']) : null;
+        
+        if ($component_id !== '') {
+            $toggle_resp = $db->setSchedulerComponentEnabled($component_id, $enabled, $note);
+            if (!$toggle_resp || !isset($toggle_resp['success']) || $toggle_resp['success'] !== true) {
+                $error_message = "Failed to update component: " . htmlspecialchars($component_id);
+            } else {
+                // Redirect to avoid form resubmission
+                $qs = !empty($_GET) ? ('?' . http_build_query($_GET)) : '';
+                header('Location: ' . $_SERVER['PHP_SELF'] . $qs);
+                exit;
+            }
+        }
+    }
+
     // Get job execution metrics (pass hours as float for sub-hour intervals)
     $metrics_response = $db->getJobMetrics((float)$hours);
     if ($metrics_response && isset($metrics_response['jobs'])) {
@@ -38,6 +60,26 @@ if ($api_available) {
     
     // Get scheduler status for uptime info
     $scheduler_status = $db->getSchedulerStatus();
+
+    // Get canonical component list + health
+    $components_response = $db->getSchedulerComponents();
+    if ($components_response && isset($components_response['components']) && is_array($components_response['components'])) {
+        $components_data = $components_response['components'];
+    }
+
+    // Get recent errors (last 24h) and aggregate per component
+    $errors_response = $db->getSchedulerErrors(null, 24.0, 500);
+    if ($errors_response && isset($errors_response['events']) && is_array($errors_response['events'])) {
+        foreach ($errors_response['events'] as $ev) {
+            $cid = $ev['component_id'] ?? '';
+            if ($cid === '') continue;
+            if (!isset($components_error_counts[$cid])) $components_error_counts[$cid] = 0;
+            $components_error_counts[$cid]++;
+            if (!isset($components_last_error[$cid])) {
+                $components_last_error[$cid] = $ev;
+            }
+        }
+    }
 } else {
     $error_message = "Website API is not available. Please start the API: python scheduler/website_api.py";
 }
@@ -393,6 +435,29 @@ ob_start();
         font-size: 0.75rem;
         color: rgba(255,255,255,0.6);
     }
+
+    .status-dot {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: middle;
+    }
+
+    .status-dot.green { background: rgb(var(--success-rgb)); }
+    .status-dot.red { background: rgb(var(--danger-rgb)); }
+
+    .component-id {
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        font-size: 0.85rem;
+        font-weight: 600;
+    }
+
+    .component-meta {
+        font-size: 0.75rem;
+        color: var(--text-muted);
+    }
 </style>
 <?php
 $styles = ob_get_clean();
@@ -429,7 +494,6 @@ ob_start();
                 <span class="pulse"></span>
                 Live
             </span>
-            <span class="scheduler-uptime" id="schedulerUptime">Uptime: -</span>
         </div>
         
         <form method="GET" action="" class="filter-bar">
@@ -495,6 +559,103 @@ ob_start();
     <div class="countdown-bar">
         <div class="progress"></div>
     </div>
+
+    <!-- Required Components -->
+    <?php if (!empty($components_data)): ?>
+    <div class="card custom-card mt-3">
+        <div class="card-header">
+            <div class="card-title">
+                <i class="ri-cpu-line me-2"></i>Required Components
+            </div>
+            <div class="ms-auto">
+                <span class="badge bg-info-transparent"><?php echo number_format(count($components_data)); ?> components</span>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table jobs-table mb-0">
+                    <thead>
+                        <tr>
+                            <th>Component</th>
+                            <th>Health</th>
+                            <th>Enabled</th>
+                            <th>Last Heartbeat</th>
+                            <th>Last Run</th>
+                            <th>Errors (24h)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($components_data as $comp): 
+                            $cid = $comp['component_id'] ?? '';
+                            $healthy = (bool)($comp['healthy'] ?? false);
+                            $enabled = (bool)($comp['enabled'] ?? false);
+                            $hb = $comp['heartbeat'] ?? [];
+                            $last_hb = $hb['last_heartbeat_at'] ?? null;
+                            $last_run = $comp['last_run_at'] ?? null;
+                            $error_count = $components_error_counts[$cid] ?? 0;
+                            $health_reason = $comp['health_reason'] ?? '';
+                        ?>
+                        <tr>
+                            <td>
+                                <div class="component-id"><?php echo htmlspecialchars($cid); ?></div>
+                                <div class="component-meta">
+                                    <?php echo htmlspecialchars(($comp['group_name'] ?? '-') . ' / ' . ($comp['kind'] ?? '-')); ?>
+                                    <?php if (!empty($comp['description'])): ?>
+                                        · <?php echo htmlspecialchars($comp['description']); ?>
+                                    <?php endif; ?>
+                                </div>
+                            </td>
+                            <td>
+                                <span class="status-dot <?php echo $healthy ? 'green' : 'red'; ?>"></span>
+                                <span class="<?php echo $healthy ? 'text-success' : 'text-danger'; ?>">
+                                    <?php echo $healthy ? 'running' : 'not running'; ?>
+                                </span>
+                                <?php if (!$healthy && $health_reason): ?>
+                                    <div class="component-meta"><?php echo htmlspecialchars($health_reason); ?></div>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <form method="POST" action="" style="margin:0;">
+                                    <input type="hidden" name="toggle_component" value="1">
+                                    <input type="hidden" name="component_id" value="<?php echo htmlspecialchars($cid); ?>">
+                                    <label style="display:flex; align-items:center; gap:0.5rem; cursor:pointer;">
+                                        <input type="checkbox" name="enabled_checkbox" value="1" onchange="this.form.submit()" <?php echo $enabled ? 'checked' : ''; ?>>
+                                        <span><?php echo $enabled ? 'on' : 'off'; ?></span>
+                                    </label>
+                                </form>
+                            </td>
+                            <td>
+                                <?php if ($last_hb): ?>
+                                    <span class="component-meta"><?php echo htmlspecialchars($last_hb); ?></span>
+                                <?php else: ?>
+                                    <span class="text-muted">-</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ($last_run): ?>
+                                    <span class="component-meta"><?php echo htmlspecialchars($last_run); ?></span>
+                                <?php else: ?>
+                                    <span class="text-muted">-</span>
+                                <?php endif; ?>
+                            </td>
+                            <td>
+                                <?php if ($error_count > 0): ?>
+                                    <span class="badge bg-danger-transparent"><?php echo number_format($error_count); ?></span>
+                                    <?php if (isset($components_last_error[$cid]['message'])): ?>
+                                        <div class="component-meta"><?php echo htmlspecialchars((string)$components_last_error[$cid]['message']); ?></div>
+                                    <?php endif; ?>
+                                <?php else: ?>
+                                    <span class="text-muted">0</span>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
     
     <!-- Jobs Table -->
     <?php if (empty($metrics_data)): ?>
@@ -663,97 +824,6 @@ ob_start();
     setTimeout(function() {
         location.reload();
     }, REFRESH_SECONDS * 1000);
-    
-    // Update scheduler uptime
-    <?php 
-    // Validate scheduler_started is a non-empty string that looks like a date
-    $valid_scheduler_started = false;
-    $scheduler_started_value = '';
-    if ($scheduler_status && isset($scheduler_status['scheduler_started']) && !empty($scheduler_status['scheduler_started'])) {
-        $scheduler_started_value = $scheduler_status['scheduler_started'];
-        // Basic validation: must contain digits and common date separators
-        if (preg_match('/\d{4}[-\/]\d{2}[-\/]\d{2}/', $scheduler_started_value)) {
-            $valid_scheduler_started = true;
-        }
-    }
-    ?>
-    <?php if ($valid_scheduler_started): ?>
-    const schedulerStarted = '<?php echo htmlspecialchars($scheduler_started_value, ENT_QUOTES, 'UTF-8'); ?>';
-    
-    function updateUptime() {
-        const uptimeEl = document.getElementById('schedulerUptime');
-        if (!uptimeEl || !schedulerStarted) {
-            if (uptimeEl) uptimeEl.textContent = 'Uptime: -';
-            return;
-        }
-        
-        // Parse scheduler start time as UTC
-        let startedUTC;
-        try {
-            if (schedulerStarted.includes('T')) {
-                startedUTC = schedulerStarted.endsWith('Z') 
-                    ? new Date(schedulerStarted).getTime()
-                    : new Date(schedulerStarted + 'Z').getTime();
-            } else {
-                startedUTC = new Date(schedulerStarted.replace(' ', 'T') + 'Z').getTime();
-            }
-            
-            // Validate the parsed date
-            if (isNaN(startedUTC)) {
-                uptimeEl.textContent = 'Uptime: -';
-                return;
-            }
-        } catch (e) {
-            uptimeEl.textContent = 'Uptime: -';
-            return;
-        }
-        
-        // Get current UTC time
-        const now = new Date();
-        const nowUTC = Date.UTC(
-            now.getUTCFullYear(),
-            now.getUTCMonth(),
-            now.getUTCDate(),
-            now.getUTCHours(),
-            now.getUTCMinutes(),
-            now.getUTCSeconds()
-        );
-        
-        const uptimeSeconds = Math.floor((nowUTC - startedUTC) / 1000);
-        
-        // Validate uptime is reasonable (not negative or NaN)
-        if (isNaN(uptimeSeconds) || uptimeSeconds < 0) {
-            uptimeEl.textContent = 'Uptime: -';
-            return;
-        }
-        
-        let uptimeText = 'Uptime: ';
-        if (uptimeSeconds < 60) {
-            uptimeText += uptimeSeconds + 's';
-        } else if (uptimeSeconds < 3600) {
-            uptimeText += Math.floor(uptimeSeconds / 60) + 'm ' + (uptimeSeconds % 60) + 's';
-        } else if (uptimeSeconds < 86400) {
-            const hours = Math.floor(uptimeSeconds / 3600);
-            const mins = Math.floor((uptimeSeconds % 3600) / 60);
-            uptimeText += hours + 'h ' + mins + 'm';
-        } else {
-            const days = Math.floor(uptimeSeconds / 86400);
-            const hours = Math.floor((uptimeSeconds % 86400) / 3600);
-            uptimeText += days + 'd ' + hours + 'h';
-        }
-        uptimeEl.textContent = uptimeText;
-    }
-    
-    // Update immediately and every second
-    updateUptime();
-    setInterval(updateUptime, 1000);
-    <?php else: ?>
-    // Scheduler start time not available - show placeholder
-    (function() {
-        const uptimeEl = document.getElementById('schedulerUptime');
-        if (uptimeEl) uptimeEl.textContent = 'Uptime: -';
-    })();
-    <?php endif; ?>
 </script>
 
 <?php

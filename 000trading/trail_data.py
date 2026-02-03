@@ -180,6 +180,130 @@ WHALE_ACTIVITY_FIELDS = {
     "strong_distribution": "wh_strong_distribution",
 }
 
+# =============================================================================
+# NEW: VELOCITY/ACCELERATION FIELD MAPPINGS FOR MICRO-MOVEMENT DETECTION
+# =============================================================================
+
+# Price Movements Velocity Fields (pm_) - 15 fields
+PRICE_MOVEMENTS_VELOCITY_FIELDS = {
+    "price_velocity_1m": "pm_price_velocity_1m",
+    "price_velocity_30s": "pm_price_velocity_30s",
+    "velocity_acceleration": "pm_velocity_acceleration",
+    "momentum_persistence": "pm_momentum_persistence",
+    "realized_volatility_1m": "pm_realized_vol_1m",
+    "volatility_of_volatility": "pm_vol_of_vol",
+    "volatility_regime": "pm_volatility_regime",
+    "trend_strength_ema": "pm_trend_strength_ema",
+    "price_vs_vwap_pct": "pm_price_vs_vwap_pct",
+    "price_vs_twap_pct": "pm_price_vs_twap_pct",
+    "higher_highs_count_5m": "pm_higher_highs_5m",
+    "higher_lows_count_5m": "pm_higher_lows_5m",
+    "distance_to_resistance_pct": "pm_dist_resistance_pct",
+    "distance_to_support_pct": "pm_dist_support_pct",
+    "breakout_imminence_score": "pm_breakout_imminence",
+}
+
+# Order Book Velocity Fields (ob_) - 13 fields
+ORDER_BOOK_VELOCITY_FIELDS = {
+    "imbalance_velocity_1m": "ob_imbalance_velocity_1m",
+    "imbalance_velocity_30s": "ob_imbalance_velocity_30s",
+    "imbalance_acceleration": "ob_imbalance_acceleration",
+    "bid_depth_velocity": "ob_bid_depth_velocity",
+    "ask_depth_velocity": "ob_ask_depth_velocity",
+    "depth_ratio_velocity": "ob_depth_ratio_velocity",
+    "spread_velocity": "ob_spread_velocity",
+    "spread_percentile_1h": "ob_spread_percentile_1h",
+    "liquidity_score": "ob_liquidity_score",
+    "liquidity_gap_score": "ob_liquidity_gap_score",
+    "liquidity_concentration": "ob_liquidity_concentration",
+    "cumulative_imbalance_5m": "ob_cumulative_imbalance_5m",
+    "imbalance_consistency_5m": "ob_imbalance_consistency_5m",
+}
+
+# Transaction Velocity Fields (tx_) - 15 fields
+TRANSACTIONS_VELOCITY_FIELDS = {
+    "volume_velocity": "tx_volume_velocity",
+    "volume_acceleration": "tx_volume_acceleration",
+    "volume_percentile_1h": "tx_volume_percentile_1h",
+    "cumulative_delta": "tx_cumulative_delta",
+    "cumulative_delta_5m": "tx_cumulative_delta_5m",
+    "delta_divergence": "tx_delta_divergence",
+    "trade_intensity": "tx_trade_intensity",
+    "trade_intensity_velocity": "tx_intensity_velocity",
+    "large_trade_intensity": "tx_large_trade_intensity",
+    "vpin_estimate": "tx_vpin_estimate",
+    "order_flow_toxicity": "tx_order_flow_toxicity",
+    "kyle_lambda_estimate": "tx_kyle_lambda",
+    "aggressive_buy_ratio": "tx_aggressive_buy_ratio",
+    "aggressive_sell_ratio": "tx_aggressive_sell_ratio",
+    "aggression_imbalance": "tx_aggression_imbalance",
+}
+
+# Whale Velocity Fields (wh_) - 8 fields
+WHALE_VELOCITY_FIELDS = {
+    "flow_velocity": "wh_flow_velocity",
+    "flow_acceleration": "wh_flow_acceleration",
+    "cumulative_flow_10m": "wh_cumulative_flow_10m",
+    "stealth_accumulation_score": "wh_stealth_acc_score",
+    "distribution_urgency": "wh_distribution_urgency",
+    "whale_activity_regime": "wh_activity_regime",
+    "time_since_last_large_move": "wh_time_since_large",
+    "large_move_frequency_5m": "wh_large_freq_5m",
+}
+
+# Cross-Asset Correlation Fields (xa_) - 11 fields
+CROSS_ASSET_FIELDS = {
+    "btc_sol_correlation_1m": "xa_btc_sol_corr_1m",
+    "btc_sol_correlation_5m": "xa_btc_sol_corr_5m",
+    "btc_leads_sol_lag1": "xa_btc_leads_sol_1",
+    "btc_leads_sol_lag2": "xa_btc_leads_sol_2",
+    "sol_beta_to_btc": "xa_sol_beta_btc",
+    "eth_sol_correlation_1m": "xa_eth_sol_corr_1m",
+    "eth_leads_sol_lag1": "xa_eth_leads_sol_1",
+    "sol_beta_to_eth": "xa_sol_beta_eth",
+    "btc_sol_divergence": "xa_btc_sol_divergence",
+    "eth_sol_divergence": "xa_eth_sol_divergence",
+    "cross_asset_momentum_align": "xa_momentum_alignment",
+}
+
+# 30-Second Interval Fields (ts_) - 15 fields for per-interval data
+THIRTY_SECOND_FIELDS = {
+    # Basic price data per 30-second interval
+    "ts_price_change_30s": "ts_price_change_30s",
+    "ts_volume_30s": "ts_volume_30s",
+    "ts_buy_sell_pressure_30s": "ts_buy_sell_pressure_30s",
+    "ts_imbalance_30s": "ts_imbalance_30s",
+    "ts_trade_count_30s": "ts_trade_count_30s",
+    "ts_momentum_30s": "ts_momentum_30s",
+    "ts_volatility_30s": "ts_volatility_30s",
+    # OHLC per interval
+    "ts_open_price": "ts_open_price",
+    "ts_close_price": "ts_close_price",
+    "ts_high_price": "ts_high_price",
+    "ts_low_price": "ts_low_price",
+    # Per-interval velocity (key for prediction)
+    "ts_price_velocity": "ts_price_velocity",
+    "ts_price_acceleration": "ts_price_acceleration",
+    "ts_momentum_persistence": "ts_momentum_persistence",
+    "ts_volatility_regime": "ts_volatility_regime",
+}
+
+# Micro-Move Composite Scores (mm_) - 12 fields
+MICRO_MOVE_COMPOSITE_FIELDS = {
+    "micro_move_probability": "mm_probability",
+    "micro_move_direction": "mm_direction",
+    "micro_move_confidence": "mm_confidence",
+    "micro_move_timeframe": "mm_expected_timeframe",
+    "order_flow_score": "mm_order_flow_score",
+    "whale_alignment_score": "mm_whale_alignment",
+    "momentum_quality_score": "mm_momentum_quality",
+    "volatility_regime_score": "mm_volatility_regime",
+    "cross_asset_score": "mm_cross_asset_score",
+    "false_signal_risk": "mm_false_signal_risk",
+    "adverse_selection_risk": "mm_adverse_selection",
+    "slippage_estimate_bps": "mm_slippage_estimate",
+}
+
 
 # =============================================================================
 # TABLE MANAGEMENT
@@ -596,7 +720,11 @@ def _build_row_for_minute(
     minute: int,
     pattern_data: Dict[str, Any],
     micro_pattern_data: Dict[str, Any],
-    second_prices_stats: Dict[str, Any]
+    second_prices_stats: Dict[str, Any],
+    velocity_data: Optional[Dict[str, Any]] = None,
+    cross_asset_data: Optional[Dict[str, Any]] = None,
+    thirty_second_data: Optional[Dict[str, Any]] = None,
+    micro_move_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build a flattened row for a specific minute."""
     row = {
@@ -652,6 +780,35 @@ def _build_row_for_minute(
     for key, value in second_prices_stats.items():
         row[key] = _convert_value(value)
     
+    # NEW: Add velocity metrics (same for all minutes - computed from whole window)
+    if velocity_data:
+        for json_field, db_col in PRICE_MOVEMENTS_VELOCITY_FIELDS.items():
+            row[db_col] = _convert_value(velocity_data.get(json_field))
+        for json_field, db_col in ORDER_BOOK_VELOCITY_FIELDS.items():
+            row[db_col] = _convert_value(velocity_data.get(json_field))
+        for json_field, db_col in TRANSACTIONS_VELOCITY_FIELDS.items():
+            row[db_col] = _convert_value(velocity_data.get(json_field))
+        for json_field, db_col in WHALE_VELOCITY_FIELDS.items():
+            row[db_col] = _convert_value(velocity_data.get(json_field))
+    
+    # NEW: Add cross-asset correlation data (same for all minutes)
+    if cross_asset_data:
+        for json_field, db_col in CROSS_ASSET_FIELDS.items():
+            row[db_col] = _convert_value(cross_asset_data.get(json_field))
+    
+    # NEW: Add 30-second interval data (same for all minutes)
+    if thirty_second_data:
+        for json_field, db_col in THIRTY_SECOND_FIELDS.items():
+            row[db_col] = _convert_value(thirty_second_data.get(json_field))
+    
+    # NEW: Add micro-move composite scores (same for all minutes)
+    if micro_move_data:
+        for json_field, db_col in MICRO_MOVE_COMPOSITE_FIELDS.items():
+            row[db_col] = _convert_value(micro_move_data.get(json_field))
+    
+    # Default sub_minute to 0 (standard 1-minute intervals)
+    row["sub_minute"] = 0
+    
     return row
 
 
@@ -660,27 +817,35 @@ def _build_row_for_minute(
 # =============================================================================
 
 def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Convert a trail payload into 15 database rows (one per minute).
+    """Convert a trail payload into 30 database rows (one per 30-second interval).
     
     Args:
         buyin_id: The ID of the buyin record
         trail_payload: The trail data payload from generate_trail_payload()
         
     Returns:
-        List of 15 dictionaries, each representing one minute of data
+        List of 30 dictionaries, each representing one 30-second interval of data
     """
     if not trail_payload:
         logger.warning(f"Empty trail payload for buyin_id={buyin_id}")
         return []
     
-    # Extract pattern data once (same for all minutes)
+    # Extract pattern data once (same for all intervals)
     pattern_data = _extract_pattern_data(trail_payload)
     micro_pattern_data = _extract_micro_pattern_data(trail_payload)
     
-    # Extract second_prices summary statistics once (same for all minutes)
+    # Extract second_prices summary statistics once (same for all intervals)
     second_prices_stats = _extract_second_prices_stats(trail_payload)
     
-    # Calculate pre-entry price movement metrics (only for minute 0)
+    # Extract velocity/cross-asset/micro-move data (same for all intervals - window-level)
+    velocity_data = trail_payload.get("velocity_metrics", {})
+    cross_asset_data = trail_payload.get("cross_asset_metrics", {})
+    micro_move_data = trail_payload.get("micro_move_score", {})
+    
+    # Get 30-second bucketed data for per-interval calculations
+    thirty_second_rows = trail_payload.get("thirty_second_data", [])
+    
+    # Calculate pre-entry price movement metrics (only for interval 0)
     pre_entry_data = {}
     if PRE_ENTRY_AVAILABLE:
         try:
@@ -706,19 +871,50 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
         except Exception as e:
             logger.error(f"Error calculating pre-entry metrics for buyin {buyin_id}: {e}")
     
+    # Import per-interval calculation functions
+    try:
+        from trail_generator import (
+            calculate_30_second_interval_metrics,
+            calculate_30_second_velocity_at_interval
+        )
+        has_interval_funcs = True
+    except ImportError:
+        has_interval_funcs = False
+    
     rows = []
-    for minute in range(15):
+    # Generate 30 rows (one per 30-second interval)
+    for interval in range(30):
+        minute = interval // 2  # 0-14
+        sub_minute = interval % 2  # 0 or 1
+        
+        # Get per-interval 30-second metrics
+        if has_interval_funcs and thirty_second_rows:
+            interval_30s_data = calculate_30_second_interval_metrics(thirty_second_rows, interval)
+            interval_velocity = calculate_30_second_velocity_at_interval(thirty_second_rows, interval)
+            # Merge interval-specific data
+            thirty_second_data = {**interval_30s_data, **interval_velocity}
+        else:
+            # Fallback: use window-level metrics
+            thirty_second_data = trail_payload.get("thirty_second_metrics", {})
+        
         row = _build_row_for_minute(
             buyin_id=buyin_id,
             trail_data=trail_payload,
             minute=minute,
             pattern_data=pattern_data,
             micro_pattern_data=micro_pattern_data,
-            second_prices_stats=second_prices_stats
+            second_prices_stats=second_prices_stats,
+            velocity_data=velocity_data,
+            cross_asset_data=cross_asset_data,
+            thirty_second_data=thirty_second_data,
+            micro_move_data=micro_move_data,
         )
         
-        # Add pre-entry data to minute 0 only
-        if minute == 0 and pre_entry_data:
+        # Set sub_minute for 30-second granularity
+        row["sub_minute"] = sub_minute
+        
+        # Add pre-entry data to interval 0 only
+        if interval == 0 and pre_entry_data:
             row.update(pre_entry_data)
         
         rows.append(row)
@@ -788,6 +984,18 @@ def _get_all_columns() -> List[str]:
         "pre_entry_trend",
     ]
     columns.extend(pre_entry_cols)
+    
+    # NEW: Add velocity/acceleration columns for micro-movement detection
+    columns.extend(PRICE_MOVEMENTS_VELOCITY_FIELDS.values())
+    columns.extend(ORDER_BOOK_VELOCITY_FIELDS.values())
+    columns.extend(TRANSACTIONS_VELOCITY_FIELDS.values())
+    columns.extend(WHALE_VELOCITY_FIELDS.values())
+    columns.extend(CROSS_ASSET_FIELDS.values())
+    columns.extend(THIRTY_SECOND_FIELDS.values())
+    columns.extend(MICRO_MOVE_COMPOSITE_FIELDS.values())
+    
+    # Add sub_minute column for 30-second intervals
+    columns.append("sub_minute")
     
     return columns
 
@@ -932,6 +1140,10 @@ COLUMN_SECTION_MAP = {
     "pat_": "patterns",
     "mp_": "micro_patterns",
     "sp_": "second_prices",
+    # NEW: Velocity and micro-move sections
+    "xa_": "cross_asset",
+    "ts_": "thirty_second",
+    "mm_": "micro_move",
 }
 
 
@@ -985,13 +1197,44 @@ def _get_filterable_columns() -> List[str]:
     ]
     columns.extend(sp_cols)
     
+    # NEW: Add velocity/acceleration columns for micro-movement detection
+    columns.extend(PRICE_MOVEMENTS_VELOCITY_FIELDS.values())
+    columns.extend(ORDER_BOOK_VELOCITY_FIELDS.values())
+    columns.extend(TRANSACTIONS_VELOCITY_FIELDS.values())
+    columns.extend(WHALE_VELOCITY_FIELDS.values())
+    columns.extend(CROSS_ASSET_FIELDS.values())
+    columns.extend(THIRTY_SECOND_FIELDS.values())
+    columns.extend(MICRO_MOVE_COMPOSITE_FIELDS.values())
+    
     return columns
 
 
 def _is_ratio_by_name(column_name: str) -> int:
-    """Heuristic to classify ratio-style fields."""
+    """Heuristic to classify ratio-style fields.
+    
+    Ratio fields include:
+    - Percentages (pct)
+    - Ratios (ratio, beta, corr)
+    - Basis points (bps)
+    - Scores (0-1 normalized) like probability, confidence, score
+    - Velocity/acceleration (derivatives)
+    - Correlation coefficients
+    """
     name = column_name.lower()
-    return 1 if any(token in name for token in ["pct", "ratio", "bps", "share", "acceleration"]) else 0
+    ratio_tokens = [
+        # Original tokens
+        "pct", "ratio", "bps", "share", "acceleration",
+        # New tokens for micro-move/cross-asset fields
+        "probability", "confidence", "score", "risk",
+        "velocity", "persistence", "alignment", "divergence",
+        "corr", "beta",  # Correlation and beta coefficients
+        "regime",  # Volatility regime is categorical but treated as ratio
+        "momentum",  # Momentum indicators are normalized
+        "change_30s",  # 30-second price changes are percentages
+        "volatility_30s",  # Volatility is percentage
+        "imbalance",  # Order book imbalance is normalized
+    ]
+    return 1 if any(token in name for token in ratio_tokens) else 0
 
 
 def _build_is_ratio_map(trail_payload: Optional[Dict[str, Any]]) -> Dict[str, int]:
@@ -1075,6 +1318,7 @@ def insert_filter_values(
             with conn.cursor() as cursor:
                 for row in wide_rows:
                     minute = row.get("minute", 0)
+                    sub_minute = row.get("sub_minute", 0)
                     
                     for col_name in filterable_columns:
                         value = row.get(col_name)
@@ -1094,12 +1338,13 @@ def insert_filter_values(
                         
                         cursor.execute("""
                             INSERT INTO trade_filter_values 
-                            (id, buyin_id, minute, filter_name, filter_value, is_ratio, section)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            (id, buyin_id, minute, sub_minute, filter_name, filter_value, is_ratio, section)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """, [
                             base_id + id_counter,
                             buyin_id,
                             minute,
+                            sub_minute,
                             col_name,
                             float(value),
                             is_ratio,

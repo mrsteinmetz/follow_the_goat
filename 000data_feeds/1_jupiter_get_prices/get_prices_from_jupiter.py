@@ -1,17 +1,7 @@
 """
-Jupiter Price Fetcher with TradingDataEngine
-=============================================
-High-performance price fetcher using in-memory DuckDB with zero locks.
-
-Architecture:
-- TradingDataEngine: In-memory DuckDB (24hr hot storage, zero lock contention)
-- MySQL: Full historical master storage (via background sync)
-
-Data flow:
-1. Fetch prices from Jupiter API every 2 seconds
-2. Write to TradingDataEngine (non-blocking, queued)
-3. Engine auto-syncs to MySQL every 30s
-4. Engine auto-cleans data older than 24 hours
+Jupiter Price Fetcher (PostgreSQL-only)
+======================================
+Fetches token prices from Jupiter and writes directly to PostgreSQL.
 
 Jupiter API Migration (effective Jan 31, 2026):
 - Old: https://lite-api.jup.ag/price/v3 (deprecated)
@@ -84,32 +74,10 @@ TOKENS = {
 # Reverse lookup
 MINT_TO_TOKEN = {v: k for k, v in TOKENS.items()}
 
-# Legacy database path (for backward compatibility)
-LEGACY_DB_PATH = Path(__file__).parent / "prices.duckdb"
-
 # Rate limiting state
 _last_rate_limit_time = 0
 _backoff_seconds = 0
 _consecutive_errors = 0
-
-
-def init_legacy_database(con) -> None:
-    """Initialize DuckDB hot table (24hr fast storage).
-    
-    Uses the standard schema: id, ts_idx, coin_id, value, created_at
-    This matches TradingDataEngine and master2.py schemas.
-    """
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS price_points (
-            id BIGINT PRIMARY KEY,
-            ts_idx BIGINT,
-            coin_id INTEGER NOT NULL,
-            value DOUBLE NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_created_at ON price_points(created_at)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_price_points_coin_id ON price_points(coin_id)")
 
 
 def fetch_prices() -> dict | None:
@@ -266,56 +234,15 @@ def fetch_prices() -> dict | None:
         return None
 
 
-def insert_prices_via_engine(prices_data: dict) -> tuple[int, bool]:
+def insert_prices_postgres(prices_data: dict) -> tuple[int, bool]:
     """
-    Insert prices via TradingDataEngine (non-blocking).
-    
+    Insert prices into PostgreSQL (source of truth).
+
     Returns:
-        Tuple of (record_count, success)
+        Tuple of (record_count, postgres_success)
     """
     if not prices_data:
         return 0, False
-    
-    ts = datetime.utcnow()
-    
-    try:
-        engine = get_trading_engine()
-        count = 0
-        
-        for mint, data in prices_data.items():
-            if data and "price" in data:
-                token = MINT_TO_TOKEN.get(mint)
-                if token:
-                    price = float(data["price"])
-                    engine.write('prices', {
-                        'ts': ts,
-                        'token': token,
-                        'price': price
-                    })
-                    count += 1
-        
-        return count, True
-        
-    except Exception as e:
-        logger.error(f"Engine write error: {e}")
-        return 0, False
-
-
-def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
-    """
-    Insert prices - OPTIMIZED for speed.
-    
-    Hot path: Only TradingDataEngine (in-memory, non-blocking)
-    Background: Engine auto-syncs to MySQL every 30s
-    
-    File-based DuckDB writes removed from hot path - they were causing
-    5+ second latencies due to file I/O and lock contention.
-    
-    Returns:
-        Tuple of (record_count, duckdb_success, mysql_success)
-    """
-    if not prices_data:
-        return 0, False, False
     
     ts = datetime.utcnow()
     records = []
@@ -328,12 +255,9 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
                 records.append((ts, token, price))
     
     if not records:
-        return 0, False, False
+        return 0, False
     
-    # Write directly to PostgreSQL (PostgreSQL-only architecture)
-    # According to .cursorrules, we use PostgreSQL only - no DuckDB/TradingDataEngine
-    duckdb_success = False
-    mysql_success = False
+    postgres_success = False
     
     try:
         from core.database import postgres_insert_many
@@ -348,33 +272,17 @@ def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool, bool]:
         ]
         inserted = postgres_insert_many('prices', price_records)
         if inserted > 0:
-            duckdb_success = True
-            mysql_success = True
+            postgres_success = True
             logger.debug(f"Wrote {inserted} prices directly to PostgreSQL")
     except Exception as e:
         logger.error(f"PostgreSQL write error: {e}", exc_info=True)
     
-    return len(records), duckdb_success, mysql_success
+    return len(records), postgres_success
 
 
-def cleanup_old_data() -> int:
-    """Remove data older than 24 hours from DuckDB hot table."""
-    cutoff = datetime.now() - timedelta(hours=24)
-    deleted = 0
-    
-    try:
-        with get_duckdb("prices") as con:
-            result = con.execute(
-                "DELETE FROM price_points WHERE created_at < ? RETURNING *",
-                [cutoff]
-            ).fetchall()
-            deleted = len(result)
-            if deleted > 0:
-                logger.info(f"Cleaned up {deleted} old records from DuckDB")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-    
-    return deleted
+# Backward-compatible name (older callers expected dual-write semantics)
+def insert_prices_dual_write(prices_data: dict) -> tuple[int, bool]:
+    return insert_prices_postgres(prices_data)
 
 
 def display_prices(prices_data: dict) -> None:
@@ -397,71 +305,56 @@ def display_prices(prices_data: dict) -> None:
 def get_latest_prices() -> dict:
     """Get the most recent price for each token."""
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            results = engine.read("""
-                SELECT token, price, ts
-                FROM prices
-                WHERE (token, ts) IN (
-                    SELECT token, MAX(ts) FROM prices GROUP BY token
+        from core.database import get_postgres
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT ON (token) token, price, timestamp
+                    FROM prices
+                    WHERE source = 'jupiter'
+                    ORDER BY token, timestamp DESC
+                    """
                 )
-            """)
-            return {row['token']: {"price": row['price'], "ts": row['ts']} for row in results}
-    except:
-        pass
-    
-    try:
-        with get_duckdb("prices") as con:
-            result = con.execute("""
-                SELECT token, price, ts
-                FROM price_points
-                WHERE (token, ts) IN (
-                    SELECT token, MAX(ts) FROM price_points GROUP BY token
-                )
-            """).fetchall()
-            return {row[0]: {"price": row[1], "ts": row[2]} for row in result}
-    except:
+                rows = cursor.fetchall()
+        return {r["token"]: {"price": r["price"], "ts": r["timestamp"]} for r in rows or []}
+    except Exception:
         return {}
 
 
 def get_price_history(token: str, hours: float = 1.0) -> list:
     """Get price history for a token."""
     cutoff = datetime.now() - timedelta(hours=hours)
-    
+
     try:
-        engine = get_trading_engine()
-        if engine._running:
-            results = engine.read("""
-                SELECT ts, price FROM prices
-                WHERE token = ? AND ts >= ?
-                ORDER BY ts ASC
-            """, [token, cutoff])
-            return [(row['ts'], row['price']) for row in results]
-    except:
-        pass
-    
-    try:
-        with get_duckdb("prices") as con:
-            result = con.execute("""
-                SELECT ts, price FROM price_points
-                WHERE token = ? AND ts >= ?
-                ORDER BY ts ASC
-            """, [token, cutoff]).fetchall()
-            return [(row[0], row[1]) for row in result]
-    except:
+        from core.database import get_postgres
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT timestamp, price
+                    FROM prices
+                    WHERE token = %s AND timestamp >= %s AND source = 'jupiter'
+                    ORDER BY timestamp ASC
+                    """,
+                    [token, cutoff],
+                )
+                rows = cursor.fetchall()
+        return [(r["timestamp"], r["price"]) for r in rows or []]
+    except Exception:
         return []
 
 
-def fetch_and_store_once() -> tuple[int, bool, bool]:
+def fetch_and_store_once() -> tuple[int, bool]:
     """
     Fetch prices once and store them (for scheduler use).
     
     Returns:
-        Tuple of (record_count, duckdb_success, mysql_success)
+        Tuple of (record_count, postgres_success)
     """
     prices = fetch_prices()
     if prices:
-        count, duck_ok, mysql_ok = insert_prices_dual_write(prices)
+        count, pg_ok = insert_prices_postgres(prices)
         if count > 0:
             # Log success with prices
             price_str = ", ".join([
@@ -469,8 +362,8 @@ def fetch_and_store_once() -> tuple[int, bool, bool]:
                 for m, d in prices.items() if d
             ])
             logger.debug(f"Stored {count} prices: {price_str}")
-        return count, duck_ok, mysql_ok
-    return 0, False, False
+        return count, pg_ok
+    return 0, False
 
 
 def test_api_connection() -> None:
@@ -540,7 +433,7 @@ def test_api_connection() -> None:
 def main():
     """Main loop to fetch and store Jupiter prices."""
     print("=" * 60)
-    print("Jupiter Price Fetcher - Dual Write (DuckDB + MySQL)")
+    print("Jupiter Price Fetcher - PostgreSQL Only")
     print(f"Tokens: {', '.join(TOKENS.keys())}")
     print(f"Fetch interval: {FETCH_INTERVAL_SECONDS}s")
     print(f"API: {JUPITER_API_URL}")
@@ -555,13 +448,7 @@ def main():
         print("\n   Free tier provides 60 requests/minute.")
         return
     
-    # Initialize legacy database
-    with get_duckdb("prices") as con:
-        init_legacy_database(con)
-        logger.info(f"Database initialized at: {LEGACY_DB_PATH}")
-    
     iteration = 0
-    cleanup_iterations = int(CLEANUP_INTERVAL / FETCH_INTERVAL_SECONDS)
     success_count = 0
     error_count = 0
     
@@ -573,14 +460,14 @@ def main():
             prices = fetch_prices()
             if prices:
                 display_prices(prices)
-                count, duck_ok, mysql_ok = insert_prices_dual_write(prices)
+                count, pg_ok = insert_prices_postgres(prices)
                 if count > 0:
                     success_count += 1
                 else:
                     error_count += 1
                     logger.warning("No valid prices to insert")
-                if not duck_ok or not mysql_ok:
-                    logger.warning(f"Partial write - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
+                if not pg_ok:
+                    logger.warning("PostgreSQL write failed for this cycle")
             else:
                 error_count += 1
             
@@ -590,11 +477,7 @@ def main():
                 rate = (success_count / total * 100) if total > 0 else 0
                 logger.info(f"[STATS] {success_count}/{total} successful ({rate:.1f}%)")
             
-            # Periodic cleanup
             iteration += 1
-            if iteration >= cleanup_iterations:
-                cleanup_old_data()
-                iteration = 0
             
             # Precise sleep to maintain interval
             elapsed = time.perf_counter() - loop_start
@@ -616,21 +499,21 @@ if __name__ == "__main__":
         if cmd == "--test":
             test_api_connection()
             
-        elif cmd == "--cleanup":
-            print("Running manual cleanup...")
-            cleanup_old_data()
-            
         elif cmd == "--stats":
             print("Database statistics:")
             
             try:
-                with get_duckdb("prices") as con:
-                    hot = con.execute("SELECT COUNT(*) FROM price_points").fetchone()[0]
-                    print(f"  DuckDB Hot (24h): {hot:,} records")
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("SELECT COUNT(*) AS cnt FROM prices WHERE source = 'jupiter'")
+                        total = (cursor.fetchone() or {}).get("cnt", 0)
+                        cursor.execute("SELECT MAX(timestamp) AS max_ts FROM prices WHERE source = 'jupiter'")
+                        max_ts = (cursor.fetchone() or {}).get("max_ts")
+                print(f"  PostgreSQL prices (jupiter): {total:,} records")
+                if max_ts:
+                    print(f"  Latest timestamp: {max_ts}")
             except Exception as e:
-                logger.error(f"DuckDB error: {e}")
-            
-            # MySQL archive stats not shown (archive is optional)
+                logger.error(f"PostgreSQL stats error: {e}")
             
             latest = get_latest_prices()
             if latest:
@@ -640,14 +523,13 @@ if __name__ == "__main__":
             
         elif cmd == "--once":
             print("Fetching prices once...")
-            count, duck_ok, mysql_ok = fetch_and_store_once()
-            print(f"Inserted {count} records - DuckDB: {duck_ok}, MySQL: {mysql_ok}")
+            count, pg_ok = fetch_and_store_once()
+            print(f"Inserted {count} records - PostgreSQL: {pg_ok}")
             
         elif cmd == "--help":
             print("Usage: python get_prices_from_jupiter.py [OPTIONS]")
             print("\nOptions:")
             print("  --test      Test API connection and show detailed info")
-            print("  --cleanup   Run manual cleanup of old data")
             print("  --stats     Show database statistics")
             print("  --once      Fetch and store prices once (for scheduler)")
             print("  --help      Show this help message")

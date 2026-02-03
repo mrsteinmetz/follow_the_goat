@@ -1,0 +1,46 @@
+{
+  "timestamp": "2026-02-03T11:58:09.475478+00:00",
+  "wallet": "Gi9p3zkQuSctJmK1XxWWnLXCJ4uaByRbxdV3SaBwB9DE",
+  "initial_usdc": 9.963316,
+  "initial_sol": 0.108930339,
+  "swaps": [
+    {
+      "direction": "USDC->SOL",
+      "signature": "2R8FNuQLzDQWrHWMQ77HWUJUDqdkJ9prVNKGD8NaL8ioUWhTziGWxLpCoM3zTAdLhsbZK68PtgXhAUZfpmKV5DdD",
+      "input_amount": 5.0,
+      "output_amount": 0.04847371900000001,
+      "input_symbol": "USDC",
+      "output_symbol": "SOL",
+      "price_impact_pct": -0.00021474882435469793,
+      "platform_fee": 0.0,
+      "slippage_pct": 99.99999990004066,
+      "num_hops": 1,
+      "dexes_used": [
+        "BisonFi"
+      ]
+    },
+    {
+      "direction": "SOL->USDC",
+      "signature": "Bnu5b9Poz75cnLrLEf1ELRqvXjPXD7vANp8VBTXRGuUEjrJ6oEiMeGmvewZxJAytHu42JvdeFQstHzvnmNEahSc",
+      "input_amount": 0.04798898181000001,
+      "output_amount": 4.942741000000001,
+      "input_symbol": "SOL",
+      "output_symbol": "USDC",
+      "price_impact_pct": -0.0001595627086224617,
+      "platform_fee": 0.0,
+      "slippage_pct": 99.99990000451146,
+      "num_hops": 5,
+      "dexes_used": [
+        "Whirlpool",
+        "Manifest",
+        "PancakeSwap",
+        "Raydium CLMM",
+        "BisonFi"
+      ]
+    }
+  ],
+  "final_usdc": 9.906057,
+  "final_sol": 0.107410077,
+  "total_cost_usdc": 0.05725900000000017,
+  "total_cost_pct": 1.1451800000000034
+}

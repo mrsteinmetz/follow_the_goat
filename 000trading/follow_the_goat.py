@@ -299,7 +299,9 @@ class WalletFollower:
         self._last_config_refresh: float = 0.0
         self._plays_signature: Optional[str] = None
         
-        # Jupiter integration placeholder (can be enabled later)
+        # Jupiter swap integration placeholder (can be enabled later).
+        # Use Jupiter Ultra API: GET api.jup.ag/ultra/v1/order, POST api.jup.ag/ultra/v1/execute.
+        # See core.config jupiter_ultra_api_base; lite-api.jup.ag deprecated Jan 31 2026.
         self.jupiter = None
         
         logger.info("WalletFollower initialized (live_trade=%s, swaps=%s)", 

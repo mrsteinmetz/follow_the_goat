@@ -434,6 +434,108 @@ CREATE TABLE IF NOT EXISTS buyin_trail_minutes (
     eth_open_price DOUBLE,
     eth_close_price DOUBLE,
     
+    -- ==========================================================================
+    -- NEW: Velocity/Acceleration Fields for Micro-Movement Detection
+    -- ==========================================================================
+    
+    -- Price Movements Velocity (pm_) - 15 new columns
+    pm_price_velocity_1m DOUBLE,              -- (price_t - price_t-1) / time_delta
+    pm_price_velocity_30s DOUBLE,             -- 30-second velocity
+    pm_velocity_acceleration DOUBLE,          -- Change in velocity
+    pm_momentum_persistence DOUBLE,           -- How long momentum sustained
+    pm_realized_vol_1m DOUBLE,                -- Realized volatility (std of returns)
+    pm_vol_of_vol DOUBLE,                     -- Volatility of volatility
+    pm_volatility_regime SMALLINT,            -- 0=low, 1=normal, 2=high
+    pm_trend_strength_ema DOUBLE,             -- EMA crossover strength
+    pm_price_vs_vwap_pct DOUBLE,              -- Distance from VWAP
+    pm_price_vs_twap_pct DOUBLE,              -- Distance from TWAP
+    pm_higher_highs_5m SMALLINT,              -- Count of higher highs
+    pm_higher_lows_5m SMALLINT,               -- Count of higher lows
+    pm_dist_resistance_pct DOUBLE,            -- Distance to resistance
+    pm_dist_support_pct DOUBLE,               -- Distance to support
+    pm_breakout_imminence DOUBLE,             -- 0-1 breakout imminence score
+    
+    -- Order Book Velocity (ob_) - 13 new columns
+    ob_imbalance_velocity_1m DOUBLE,          -- Rate of imbalance change
+    ob_imbalance_velocity_30s DOUBLE,         -- 30-second imbalance velocity
+    ob_imbalance_acceleration DOUBLE,         -- Acceleration of imbalance
+    ob_bid_depth_velocity DOUBLE,             -- Rate of bid depth change
+    ob_ask_depth_velocity DOUBLE,             -- Rate of ask depth change
+    ob_depth_ratio_velocity DOUBLE,           -- Rate of depth ratio change
+    ob_spread_velocity DOUBLE,                -- Spread tightening/widening rate
+    ob_spread_percentile_1h DOUBLE,           -- Where current spread sits
+    ob_liquidity_score DOUBLE,                -- Composite liquidity 0-1
+    ob_liquidity_gap_score DOUBLE,            -- abs(bid-ask)/total
+    ob_liquidity_concentration DOUBLE,        -- How concentrated at top
+    ob_cumulative_imbalance_5m DOUBLE,        -- 5-minute cumulative imbalance
+    ob_imbalance_consistency_5m DOUBLE,       -- % of periods same direction
+    
+    -- Transaction Velocity (tx_) - 15 new columns
+    tx_volume_velocity DOUBLE,                -- Rate of volume change
+    tx_volume_acceleration DOUBLE,            -- Acceleration of volume
+    tx_volume_percentile_1h DOUBLE,           -- Current vs 1h distribution
+    tx_cumulative_delta DOUBLE,               -- Running sum(buy_vol - sell_vol)
+    tx_cumulative_delta_5m DOUBLE,            -- 5-minute cumulative delta
+    tx_delta_divergence DOUBLE,               -- Delta vs price divergence
+    tx_trade_intensity DOUBLE,                -- trades_per_second normalized
+    tx_intensity_velocity DOUBLE,             -- Rate of intensity change
+    tx_large_trade_intensity DOUBLE,          -- Large trades per minute
+    tx_vpin_estimate DOUBLE,                  -- Volume-sync probability of informed
+    tx_order_flow_toxicity DOUBLE,            -- Adverse selection metric
+    tx_kyle_lambda DOUBLE,                    -- Price impact coefficient
+    tx_aggressive_buy_ratio DOUBLE,           -- Buys that lifted ask
+    tx_aggressive_sell_ratio DOUBLE,          -- Sells that hit bid
+    tx_aggression_imbalance DOUBLE,           -- Net aggression
+    
+    -- Whale Velocity (wh_) - 8 new columns
+    wh_flow_velocity DOUBLE,                  -- Rate of flow change
+    wh_flow_acceleration DOUBLE,              -- Acceleration of flow
+    wh_cumulative_flow_10m DOUBLE,            -- 10-minute cumulative flow
+    wh_stealth_acc_score DOUBLE,              -- Stealth accumulation score
+    wh_distribution_urgency DOUBLE,           -- Speed of selling
+    wh_activity_regime SMALLINT,              -- 0=quiet, 1=normal, 2=active
+    wh_time_since_large DOUBLE,               -- Seconds since last large move
+    wh_large_freq_5m DOUBLE,                  -- Large move frequency per 5 min
+    
+    -- Cross-Asset Correlation (xa_) - 11 new columns
+    xa_btc_sol_corr_1m DOUBLE,                -- BTC-SOL correlation 1m
+    xa_btc_sol_corr_5m DOUBLE,                -- BTC-SOL correlation 5m
+    xa_btc_leads_sol_1 DOUBLE,                -- BTC[t-1] -> SOL[t] correlation
+    xa_btc_leads_sol_2 DOUBLE,                -- BTC[t-2] -> SOL[t] correlation
+    xa_sol_beta_btc DOUBLE,                   -- SOL sensitivity to BTC
+    xa_eth_sol_corr_1m DOUBLE,                -- ETH-SOL correlation 1m
+    xa_eth_leads_sol_1 DOUBLE,                -- ETH[t-1] -> SOL[t] correlation
+    xa_sol_beta_eth DOUBLE,                   -- SOL sensitivity to ETH
+    xa_btc_sol_divergence DOUBLE,             -- SOL outperforming/underperforming BTC
+    xa_eth_sol_divergence DOUBLE,             -- SOL outperforming/underperforming ETH
+    xa_momentum_alignment DOUBLE,             -- All 3 aligned = strong
+    
+    -- 30-Second Interval Data (ts_) - 7 new columns
+    ts_price_change_30s DOUBLE,               -- 30-second price change
+    ts_volume_30s DOUBLE,                     -- 30-second volume
+    ts_buy_sell_pressure_30s DOUBLE,          -- 30-second buy/sell pressure
+    ts_imbalance_30s DOUBLE,                  -- 30-second order book imbalance
+    ts_trade_count_30s INTEGER,               -- 30-second trade count
+    ts_momentum_30s DOUBLE,                   -- 30-second momentum
+    ts_volatility_30s DOUBLE,                 -- 30-second volatility
+    
+    -- Micro-Move Composite Scores (mm_) - 12 new columns
+    mm_probability DOUBLE,                    -- 0-1 probability of 0.5% move
+    mm_direction DOUBLE,                      -- -1 to 1 (bearish to bullish)
+    mm_confidence DOUBLE,                     -- Confidence in prediction
+    mm_expected_timeframe DOUBLE,             -- Expected minutes until move
+    mm_order_flow_score DOUBLE,               -- Order book + transactions score
+    mm_whale_alignment DOUBLE,                -- Whale behavior alignment score
+    mm_momentum_quality DOUBLE,               -- Strength of momentum score
+    mm_volatility_regime DOUBLE,              -- Favorable volatility score
+    mm_cross_asset_score DOUBLE,              -- BTC/ETH alignment score
+    mm_false_signal_risk DOUBLE,              -- Probability of false positive
+    mm_adverse_selection DOUBLE,              -- Risk of bad fill
+    mm_slippage_estimate DOUBLE,              -- Expected slippage in bps
+    
+    -- Sub-minute interval support
+    sub_minute SMALLINT DEFAULT 0,            -- 0-1 for 30-second sub-intervals
+    
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
     PRIMARY KEY (buyin_id, minute)
@@ -443,6 +545,8 @@ CREATE INDEX IF NOT EXISTS idx_trail_buyin_id ON buyin_trail_minutes(buyin_id);
 CREATE INDEX IF NOT EXISTS idx_trail_minute ON buyin_trail_minutes(minute);
 CREATE INDEX IF NOT EXISTS idx_trail_created_at ON buyin_trail_minutes(created_at);
 CREATE INDEX IF NOT EXISTS idx_trail_breakout_score ON buyin_trail_minutes(pat_breakout_score);
+CREATE INDEX IF NOT EXISTS idx_trail_mm_probability ON buyin_trail_minutes(mm_probability);
+CREATE INDEX IF NOT EXISTS idx_trail_composite ON buyin_trail_minutes(buyin_id, mm_probability, mm_direction);
 """
 
 # =============================================================================

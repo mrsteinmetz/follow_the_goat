@@ -11,10 +11,13 @@ This module:
 - Records price checks to follow_the_goat_buyins_price_checks
 - Marks positions as 'sold' when tolerance is exceeded
 
-Trailing Stop Logic (DECIMAL-BASED):
-- Entry price is "ground zero" - determines which tolerance rules apply
-- If current price > entry: Use 'increases' rules (track drop from highest)
-- If current price < entry: Use 'decreases' rules (track drop from entry)
+Trailing Stop Logic (DUAL-CHECK, DECIMAL-BASED):
+- BOTH conditions are checked EVERY cycle:
+  1. STOP-LOSS: If drop from ENTRY exceeds 'decreases' tolerance, sell immediately
+  2. TRAILING STOP: If drop from HIGHEST exceeds 'increases' tolerance, sell
+- Whichever condition triggers first wins
+- Trailing tolerance is selected based on HIGHEST GAIN ever achieved, not current gain
+- Once a tighter tolerance tier is reached, it stays LOCKED (never loosens)
 - All calculations use decimal values (0.005 = 0.5%, 0.001 = 0.1%)
 
 Usage:
@@ -131,10 +134,16 @@ def make_json_safe(value: Any) -> Any:
 
 class TrailingStopSeller:
     """
-    Monitors open buy-in positions and applies dynamic trailing stop using DECIMAL-BASED tolerance rules:
-    - Entry price is "ground zero" - determines which tolerance rules to apply
-    - If current price > entry: Use 'increases' rules (track highest, measure drop from highest)
-    - If current price < entry: Use 'decreases' rules (measure drop from entry)
+    Monitors open buy-in positions and applies DUAL-CHECK trailing stop logic:
+    
+    DUAL-CHECK SYSTEM (both checked every cycle):
+    1. STOP-LOSS: If drop from ENTRY exceeds 'decreases' tolerance -> sell
+    2. TRAILING STOP: If drop from HIGHEST exceeds 'increases' tolerance -> sell
+    
+    KEY BEHAVIORS:
+    - Trailing tolerance is selected based on HIGHEST gain ever achieved
+    - Once a tighter tolerance tier is reached, it stays LOCKED forever
+    - Both checks run simultaneously - whichever triggers first wins
     - All calculations use decimal values (e.g., 0.005 = 0.5%, 0.001 = 0.1%)
     """
     
@@ -560,6 +569,11 @@ class TrailingStopSeller:
         """
         Dynamic trailing stop logic using DECIMAL-BASED JSON rules per play.
         
+        DUAL CHECK LOGIC:
+        - Stop-loss: If drop from ENTRY exceeds 'decreases' tolerance, sell immediately
+        - Trailing stop: If drop from HIGHEST exceeds 'increases' tolerance, sell
+        - BOTH conditions are checked every cycle - whichever triggers first wins
+        
         Returns:
             Dictionary with check results including should_sell flag.
         """
@@ -575,10 +589,7 @@ class TrailingStopSeller:
         
         play_id = position.get('play_id')
         
-        # Step 1: Determine which tolerance set to use based on entry price
-        rules_bucket = 'increases' if current_price > entry_price else 'decreases'
-        
-        # Step 2: Update highest price if new high reached
+        # Step 1: Update highest price if new high reached
         if current_price > highest_price:
             with self.position_tracking_lock:
                 old_highest = tracking['highest_price']
@@ -588,57 +599,85 @@ class TrailingStopSeller:
             if self._update_highest_price_in_db(position_id, current_price):
                 logger.info(f"Position {position_id}: NEW HIGH ${current_price:.6f} (was: ${old_highest:.6f})")
         
-        # Step 3: Calculate gain/loss from entry price (DECIMAL)
+        # Step 2: Calculate all price metrics (DECIMAL)
         gain_from_entry_decimal = ((current_price - entry_price) / entry_price) if entry_price else 0.0
-        
-        # Step 4: Load rules and select applicable tolerance
-        logic = self.get_sell_logic_for_play(play_id) if play_id is not None else None
-        tolerance_rules = (logic or {}).get('tolerance_rules', {})
-        selected_rule = self._select_rule(gain_from_entry_decimal, tolerance_rules.get(rules_bucket, []))
-        rule_tolerance = float(selected_rule.get('tolerance')) if selected_rule and selected_rule.get('tolerance') is not None else 0.001
-        
-        # Step 4b: TOLERANCE LOCKING - use the tighter of rule tolerance vs locked tolerance
-        # Once a tighter tolerance is triggered, it never loosens for this position
-        with self.position_tracking_lock:
-            locked_tolerance = tracking.get('locked_tolerance', 1.0)
-            
-            # Use the minimum (tighter) of rule tolerance and locked tolerance
-            tolerance_decimal = min(rule_tolerance, locked_tolerance)
-            
-            # If rule tolerance is tighter than locked, update the lock
-            if rule_tolerance < locked_tolerance:
-                old_locked = locked_tolerance
-                tracking['locked_tolerance'] = rule_tolerance
-                tracking['current_tolerance'] = rule_tolerance
-                tolerance_decimal = rule_tolerance
-                
-                # Persist the new tighter tolerance to database
-                self._update_locked_tolerance_in_db(position_id, rule_tolerance)
-                logger.info(f"Position {position_id}: Tolerance TIGHTENED from {old_locked*100:.4f}% to {rule_tolerance*100:.4f}% (LOCKED)")
-            elif tracking['current_tolerance'] != tolerance_decimal:
-                # Just update current display tolerance (locked stays the same)
-                tracking['current_tolerance'] = tolerance_decimal
-                logger.debug(f"Position {position_id}: Using locked tolerance {tolerance_decimal*100:.4f}% (rule would be {rule_tolerance*100:.4f}%)")
-        
-        # Step 5: Calculate drops based on reference point
-        reference_price = highest_price if rules_bucket == 'increases' else entry_price
-        basis = 'highest' if rules_bucket == 'increases' else 'entry'
-        
-        drop_from_reference_decimal = ((current_price - reference_price) / reference_price) if reference_price else 0.0
+        highest_gain_decimal = ((highest_price - entry_price) / entry_price) if entry_price else 0.0
         drop_from_high_decimal = ((current_price - highest_price) / highest_price) if highest_price else 0.0
         drop_from_entry_decimal = ((current_price - entry_price) / entry_price) if entry_price else 0.0
         
-        # Step 6: Sell decision - check if drop exceeds tolerance
+        # Step 3: Load rules for BOTH buckets
+        logic = self.get_sell_logic_for_play(play_id) if play_id is not None else None
+        tolerance_rules = (logic or {}).get('tolerance_rules', {})
+        
+        # Get stop-loss tolerance (from 'decreases' rules)
+        # This applies when price drops below entry
+        decreases_rules = tolerance_rules.get('decreases', [])
+        stop_loss_rule = self._select_rule(drop_from_entry_decimal, decreases_rules) if decreases_rules else None
+        stop_loss_tolerance = float(stop_loss_rule.get('tolerance')) if stop_loss_rule and stop_loss_rule.get('tolerance') is not None else 0.003
+        
+        # Get trailing stop tolerance (from 'increases' rules)
+        # CRITICAL: Use HIGHEST GAIN achieved, not current gain, to select the right tier
+        # This ensures we use the tightest tolerance we ever qualified for
+        increases_rules = tolerance_rules.get('increases', [])
+        trailing_rule = self._select_rule(highest_gain_decimal, increases_rules) if increases_rules else None
+        trailing_tolerance = float(trailing_rule.get('tolerance')) if trailing_rule and trailing_rule.get('tolerance') is not None else 0.003
+        
+        # Step 4: TOLERANCE LOCKING - once a tighter tolerance is reached, it never loosens
+        with self.position_tracking_lock:
+            locked_tolerance = tracking.get('locked_tolerance', 1.0)
+            
+            # Use the minimum (tightest) of: current trailing tolerance vs locked tolerance
+            effective_trailing_tolerance = min(trailing_tolerance, locked_tolerance)
+            
+            # If trailing tolerance is tighter than locked, update the lock
+            if trailing_tolerance < locked_tolerance:
+                old_locked = locked_tolerance
+                tracking['locked_tolerance'] = trailing_tolerance
+                tracking['current_tolerance'] = trailing_tolerance
+                effective_trailing_tolerance = trailing_tolerance
+                
+                # Persist the new tighter tolerance to database
+                self._update_locked_tolerance_in_db(position_id, trailing_tolerance)
+                logger.info(f"Position {position_id}: Tolerance TIGHTENED from {old_locked*100:.4f}% to {trailing_tolerance*100:.4f}% (LOCKED)")
+            elif tracking['current_tolerance'] != effective_trailing_tolerance:
+                tracking['current_tolerance'] = effective_trailing_tolerance
+                logger.debug(f"Position {position_id}: Using locked tolerance {effective_trailing_tolerance*100:.4f}% (rule would be {trailing_tolerance*100:.4f}%)")
+        
+        # Step 5: DUAL SELL CHECK - check BOTH conditions
         should_sell = False
-        if drop_from_reference_decimal < -tolerance_decimal:
+        sell_reason = None
+        
+        # Check 1: Stop-loss from entry (only if price is below entry)
+        # If drop from entry exceeds the 'decreases' tolerance, trigger immediate sell
+        if drop_from_entry_decimal < -stop_loss_tolerance:
             should_sell = True
-            logger.info(f"SELL SIGNAL - Position {position_id} (basis: {basis}, tolerance {tolerance_decimal*100:.2f}%):")
+            sell_reason = 'stop_loss'
+            logger.info(f"SELL SIGNAL - Position {position_id} (STOP-LOSS from entry, tolerance {stop_loss_tolerance*100:.2f}%):")
             logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
-            logger.info(f"   Drop from {basis}: {drop_from_reference_decimal*100:.4f}% - EXCEEDED TOLERANCE")
+            logger.info(f"   Drop from entry: {drop_from_entry_decimal*100:.4f}% - EXCEEDED STOP-LOSS TOLERANCE")
+        
+        # Check 2: Trailing stop from highest (always checked if we had any gain)
+        # CRITICAL: This check runs even if current price is below entry!
+        # If we achieved a gain and then dropped too far from highest, sell
+        if not should_sell and highest_gain_decimal > 0 and drop_from_high_decimal < -effective_trailing_tolerance:
+            should_sell = True
+            sell_reason = 'trailing_stop'
+            logger.info(f"SELL SIGNAL - Position {position_id} (TRAILING STOP from highest, tolerance {effective_trailing_tolerance*100:.2f}%):")
+            logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
+            logger.info(f"   Highest gain was: {highest_gain_decimal*100:.4f}%, Drop from high: {drop_from_high_decimal*100:.4f}% - EXCEEDED TRAILING TOLERANCE")
+        
+        # Step 6: Determine which bucket we're currently in (for logging/display)
+        rules_bucket = 'increases' if current_price > entry_price else 'decreases'
+        reference_price = highest_price if rules_bucket == 'increases' else entry_price
+        basis = 'highest' if rules_bucket == 'increases' else 'entry'
+        drop_from_reference_decimal = drop_from_high_decimal if rules_bucket == 'increases' else drop_from_entry_decimal
+        
+        # For display, show the effective tolerance used for the triggered condition
+        display_tolerance = effective_trailing_tolerance if sell_reason == 'trailing_stop' else stop_loss_tolerance if sell_reason == 'stop_loss' else effective_trailing_tolerance
         
         # Step 7: Create movement data
         with self.position_tracking_lock:
-            locked_tol = tracking.get('locked_tolerance', tolerance_decimal)
+            locked_tol = tracking.get('locked_tolerance', effective_trailing_tolerance)
         
         # CRITICAL: Use UTC time for database storage
         movement_data = {
@@ -648,27 +687,36 @@ class TrailingStopSeller:
             'highest_price': round(highest_price, 8),
             'reference_price': round(reference_price, 8),
             'gain_from_entry_decimal': round(gain_from_entry_decimal, 6),
+            'highest_gain_decimal': round(highest_gain_decimal, 6),
             'drop_from_reference_decimal': round(drop_from_reference_decimal, 6),
             'drop_from_high_decimal': round(drop_from_high_decimal, 6),
             'drop_from_entry_decimal': round(drop_from_entry_decimal, 6),
-            'tolerance_decimal': tolerance_decimal,
-            'rule_tolerance_decimal': rule_tolerance,  # Original rule tolerance before locking
+            'tolerance_decimal': display_tolerance,
+            'stop_loss_tolerance': stop_loss_tolerance,
+            'trailing_tolerance': trailing_tolerance,
+            'effective_trailing_tolerance': effective_trailing_tolerance,
+            'rule_tolerance_decimal': trailing_tolerance,  # Original rule tolerance before locking
             'locked_tolerance_decimal': locked_tol,    # Locked (persisted) tolerance
             'basis': basis,
             'bucket': rules_bucket,
-            'applied_rule': selected_rule,
+            'sell_reason': sell_reason,
+            'applied_rule': trailing_rule if sell_reason == 'trailing_stop' else stop_loss_rule,
             'should_sell': should_sell
         }
         
         return {
             'should_sell': should_sell,
+            'sell_reason': sell_reason,
             'current_price': current_price,
             'entry_price': entry_price,
             'highest_price': highest_price,
             'gain_pct': gain_from_entry_decimal * 100,
+            'highest_gain_pct': highest_gain_decimal * 100,
             'drop_from_high_pct': drop_from_high_decimal * 100,
             'drop_from_entry_pct': drop_from_entry_decimal * 100,
-            'current_tolerance': tolerance_decimal * 100,
+            'current_tolerance': display_tolerance * 100,
+            'stop_loss_tolerance': stop_loss_tolerance * 100,
+            'trailing_tolerance': effective_trailing_tolerance * 100,
             'profit_loss': current_price - entry_price,
             'profit_loss_pct': gain_from_entry_decimal * 100,
             'movement_data': movement_data,
@@ -1000,10 +1048,11 @@ class TrailingStopSeller:
         logger.info("=" * 80)
         logger.info("TRAILING STOP SELLER - CONTINUOUS MODE")
         logger.info("=" * 80)
-        logger.info("DECIMAL-BASED Trailing Stop Logic:")
-        logger.info("  - Entry price is 'ground zero' - determines which rules apply")
-        logger.info("  - Price > Entry: Use 'increases' rules (track drop from highest)")
-        logger.info("  - Price < Entry: Use 'decreases' rules (track drop from entry)")
+        logger.info("DUAL-CHECK Trailing Stop Logic (both checked every cycle):")
+        logger.info("  1. STOP-LOSS: Drop from ENTRY exceeds 'decreases' tolerance -> sell")
+        logger.info("  2. TRAILING STOP: Drop from HIGHEST exceeds 'increases' tolerance -> sell")
+        logger.info("  - Trailing tolerance based on HIGHEST gain ever achieved")
+        logger.info("  - Once tighter tolerance reached, it stays LOCKED forever")
         logger.info(f"Monitoring interval: {interval_seconds}s")
         
         if self.monitor_live is None:

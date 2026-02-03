@@ -26,6 +26,12 @@ $section_names = [
     'second_prices' => 'Second Prices',
     'btc_correlation' => 'BTC Correlation',
     'eth_correlation' => 'ETH Correlation',
+    // NEW: Velocity and micro-move sections
+    'cross_asset' => 'Cross-Asset',
+    'thirty_second' => '30-Second',
+    'micro_move' => 'Micro-Move',
+    'velocity' => 'Velocity',
+    'micro_patterns' => 'Micro Patterns',
     'unknown' => 'Other',
 ];
 
@@ -611,7 +617,7 @@ ob_start();
                 <thead>
                     <tr>
                         <th>Filter Column</th>
-                        <th class="text-center">Min</th>
+                        <th class="text-center">Interval</th>
                         <th class="text-end">From Value</th>
                         <th class="text-end">To Value</th>
                         <th class="text-center">Consistency</th>
@@ -641,7 +647,11 @@ ob_start();
                             <strong class="fs-12"><?php echo htmlspecialchars($fc['filter_column']); ?></strong>
                         </td>
                         <td class="text-center">
-                            <span class="badge bg-purple-transparent text-purple">M<?php echo $fc['latest_minute'] ?? 0; ?></span>
+                            <?php 
+                            $min_val = $fc['latest_minute'] ?? 0;
+                            $interval_label = floor($min_val) . ':00';
+                            ?>
+                            <span class="badge bg-purple-transparent text-purple"><?php echo $interval_label; ?></span>
                         </td>
                         <td class="text-end font-monospace fs-11 text-primary fw-semibold"><?php echo $fc['latest_from'] !== null ? format_number($fc['latest_from'], 6) : '-'; ?></td>
                         <td class="text-end font-monospace fs-11 text-primary fw-semibold"><?php echo $fc['latest_to'] !== null ? format_number($fc['latest_to'], 6) : '-'; ?></td>
@@ -667,18 +677,22 @@ ob_start();
 </div>
 <?php endif; ?>
 
-<!-- Minute Distribution -->
+<!-- Interval Distribution (30-second intervals) -->
 <?php if (!empty($minute_distribution) && count($minute_distribution) > 1): ?>
 <div class="card custom-card mb-3">
     <div class="card-header">
-        <h6 class="mb-0"><i class="ri-time-line me-1"></i>Best Minutes (Signal Timing)</h6>
+        <h6 class="mb-0"><i class="ri-time-line me-1"></i>Best Intervals (Signal Timing)</h6>
     </div>
     <div class="card-body">
-        <p class="text-muted fs-12 mb-3">Each filter was tested across all 15 minutes before entry. The minute shown is when that filter works best.</p>
+        <p class="text-muted fs-12 mb-3">Each filter was tested across all 30 intervals (30-second granularity) before entry. The interval shown is when that filter works best.</p>
         <div class="minute-pills">
-            <?php foreach ($minute_distribution as $idx => $m): ?>
+            <?php foreach ($minute_distribution as $idx => $m): 
+                // Convert minute to 30-second interval format
+                $min_val = $m['minute_analyzed'] ?? 0;
+                $interval_label = floor($min_val) . ':00';
+            ?>
             <div class="minute-pill <?php echo $idx === 0 ? 'best' : ''; ?>">
-                <div class="fs-16 fw-bold <?php echo $idx === 0 ? 'text-success' : 'text-primary'; ?>">M<?php echo $m['minute_analyzed']; ?></div>
+                <div class="fs-16 fw-bold <?php echo $idx === 0 ? 'text-success' : 'text-primary'; ?>"><?php echo $interval_label; ?></div>
                 <div class="fs-10 text-muted"><?php echo $m['filter_count']; ?> filters</div>
                 <div class="fs-11 fw-semibold text-success"><?php echo $m['avg_bad_removed']; ?>%</div>
                 <?php if ($idx === 0): ?><div class="fs-10 text-success">Best</div><?php endif; ?>
@@ -703,8 +717,12 @@ ob_start();
             <div class="combo-card">
                 <div class="d-flex justify-content-between mb-2">
                     <div>
+                        <?php 
+                        $combo_min = $combo['minute_analyzed'] ?? 0;
+                        $combo_interval = floor($combo_min) . ':00';
+                        ?>
                         <span class="fw-semibold"><?php echo $combo['filter_count']; ?>-Filter Combo</span>
-                        <span class="badge bg-purple-transparent text-purple ms-1">M<?php echo $combo['minute_analyzed']; ?></span>
+                        <span class="badge bg-purple-transparent text-purple ms-1"><?php echo $combo_interval; ?></span>
                     </div>
                     <div class="text-success fw-bold fs-18"><?php echo number_format($combo['bad_trades_removed_pct'], 1); ?>%</div>
                 </div>
@@ -744,8 +762,12 @@ ob_start();
             ?>
             <div class="filter-card <?php echo $eff_class; ?>">
                 <div class="filter-name">
+                    <?php 
+                    $filter_min = $filter['minute_analyzed'] ?? 0;
+                    $filter_interval = floor($filter_min) . ':00';
+                    ?>
                     <?php echo htmlspecialchars($filter['column_name']); ?>
-                    <span class="badge bg-purple-transparent text-purple ms-1">M<?php echo $filter['minute_analyzed'] ?? 0; ?></span>
+                    <span class="badge bg-purple-transparent text-purple ms-1"><?php echo $filter_interval; ?></span>
                     <i class="<?php echo $trend['icon']; ?> <?php echo $trend['class']; ?> trend-indicator" title="<?php echo $trend['label']; ?>"></i>
                 </div>
                 <div class="filter-range">
@@ -835,9 +857,9 @@ ob_start();
                 <?php endforeach; ?>
             </select>
             <select id="minuteFilter" class="form-select form-select-sm" style="width: auto;" onchange="filterTable()">
-                <option value="">All Minutes</option>
+                <option value="">All Intervals</option>
                 <?php for ($m = 0; $m < 15; $m++): ?>
-                    <option value="<?php echo $m; ?>">Minute <?php echo $m; ?></option>
+                    <option value="<?php echo $m; ?>"><?php echo $m; ?>:00</option>
                 <?php endfor; ?>
             </select>
             <select id="minBadRemoved" class="form-select form-select-sm" style="width: auto;" onchange="filterTable()">
@@ -862,7 +884,7 @@ ob_start();
                     <tr>
                         <th>Column</th>
                         <th>Section</th>
-                        <th>Min</th>
+                        <th>Interval</th>
                         <th class="text-end">From</th>
                         <th class="text-end">To</th>
                         <th class="text-end">Good Kept</th>
@@ -881,7 +903,13 @@ ob_start();
                         data-minute="<?php echo $filter['minute_analyzed'] ?? 0; ?>">
                         <td><strong class="fs-12"><?php echo htmlspecialchars($filter['column_name']); ?></strong></td>
                         <td class="fs-11"><?php echo $section_names[$filter['section']] ?? $filter['section']; ?></td>
-                        <td><span class="badge bg-purple-transparent text-purple">M<?php echo $filter['minute_analyzed'] ?? 0; ?></span></td>
+                        <td>
+                            <?php 
+                            $tbl_min = $filter['minute_analyzed'] ?? 0;
+                            $tbl_interval = floor($tbl_min) . ':00';
+                            ?>
+                            <span class="badge bg-purple-transparent text-purple"><?php echo $tbl_interval; ?></span>
+                        </td>
                         <td class="text-end font-monospace fs-11"><?php echo format_number($filter['from_value'], 6); ?></td>
                         <td class="text-end font-monospace fs-11"><?php echo format_number($filter['to_value'], 6); ?></td>
                         <td class="text-end <?php echo $filter['good_trades_kept_pct'] >= 70 ? 'text-success' : ($filter['good_trades_kept_pct'] >= 50 ? 'text-warning' : 'text-danger'); ?>">

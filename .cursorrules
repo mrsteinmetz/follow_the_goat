@@ -19,51 +19,55 @@ This is a performance optimization that:
 - NO other modules should use DuckDB
 
 
-## 🚨 CRITICAL: DUAL-MASTER ARCHITECTURE 🚨
+## 🚨 COMPONENT-BASED ARCHITECTURE 🚨
 
-**THIS SYSTEM USES TWO SEPARATE PROCESSES SHARING ONE DATABASE**
+**EACH COMPONENT RUNS AS A SEPARATE PROCESS**
 
-### Master.py - DATA ENGINE (Ports 8000, 8001)
-**Purpose:** Raw data ingestion - runs continuously
+### run_component.py - Per-Component Runner
+Each scheduler component runs as an independent process via `run_component.py`:
 
-**Database:** PostgreSQL (shared with master2.py)
-- Writes: prices, trades, order book data
-- Continuous operation without restarts
+```bash
+python3 scheduler/run_component.py --component fetch_jupiter_prices
+python3 scheduler/run_component.py --component follow_the_goat
+```
 
-**Services Started by master.py:**
-- FastAPI Webhook Server (port 8001) - receives trade data
-- PHP Web Server (port 8000) - serves website
-- Binance Order Book Stream (WebSocket)
-- Jupiter Price Fetcher (every 1 second)
-- Data cleanup jobs (hourly)
+**Features:**
+- PostgreSQL advisory lock (only ONE instance per component)
+- Enable/disable toggle via dashboard
+- Heartbeat reporting for health monitoring
+- Automatic error logging
 
-**⚠️ NEVER add trading logic to master.py - it ONLY handles raw data**
+### Component Types
 
----
+**Data Ingestion (former master.py):**
+- `fetch_jupiter_prices` - Jupiter API prices (every 1s)
+- `sync_trades_from_webhook` - Trade sync (every 1s)
+- `process_price_cycles` - Price cycle detection (every 2s)
+- `webhook_server` - FastAPI webhook (port 8001)
+- `php_server` - PHP website (port 8000)
+- `binance_stream` - Order book stream
 
-### Master2.py - TRADING LOGIC (Port 5052)
-**Purpose:** All trading computation and decision making
-
-**Database:** PostgreSQL (shared with master.py)
-- Reads: prices, trades, cycles
-- Writes: buyins, positions, patterns, profiles
-- Can restart independently without data loss
+**Trading Logic (former master2.py):**
+- `follow_the_goat` - Wallet tracker (every 1s)
+- `trailing_stop_seller` - Trailing stops (every 1s)
+- `train_validator` - Trade validation (every 20s)
+- `update_potential_gains` - Gains calculation (every 15s)
+- `create_new_patterns` - Pattern generation (every 10 min)
+- `create_profiles` - Wallet profiles (every 30s)
+- `archive_old_data` - Data archival (hourly)
+- `restart_quicknode_streams` - Stream monitoring (every 15s)
+- `local_api_5052` - Local API (port 5052)
 
 **How Data Flows:**
 ```
-master.py → PostgreSQL ← master2.py
-              ↑
-         website_api.py (port 5051)
+run_component.py processes → PostgreSQL ← website_api.py (port 5051)
 ```
 
-**Jobs in master2.py:**
-- Trade validation (train_validator)
-- Trade following (follow_the_goat) 
-- Trailing stop monitoring
-- Potential gains updates
-- Pattern creation
+### Dashboard Control
+Components can be enabled/disabled via the Scheduler Metrics dashboard.
+Toggle takes effect within 5 seconds (heartbeat interval).
 
-**✅ Master2 can restart freely - all data persists in PostgreSQL**
+**✅ Each component can restart independently - all data persists in PostgreSQL**
 
 ---
 
@@ -177,18 +181,18 @@ cursor.execute("""
 - Use `BOOLEAN` for flags
 - Use `INTERVAL '24 hours'` for time arithmetic
 
-### 4. Scheduling: APScheduler Only
+### 4. Scheduling: run_component.py
 - **NEVER use .bat files** for scheduling Python scripts
-- Data ingestion jobs run in `scheduler/master.py`
-- Trading logic jobs run in `scheduler/master2.py`
-- Use APScheduler with cron or interval triggers
+- Each job runs as a separate process via `scheduler/run_component.py`
+- Jobs are defined in `scheduler/jobs.py`
+- Component registry in `scheduler/component_registry.py`
 
 ```python
-# Correct: APScheduler in master.py for data jobs
-scheduler.add_job(fetch_jupiter_prices, 'interval', seconds=1)
-
-# Correct: APScheduler in master2.py for trading jobs
-scheduler.add_job(follow_the_goat_job, 'interval', seconds=1)
+# To add a new job:
+# 1. Add the job function to scheduler/jobs.py
+# 2. Register it in scheduler/component_registry.py
+# 3. Add it to _interval_job_specs() in scheduler/run_component.py
+# 4. Start it: python3 scheduler/run_component.py --component my_new_job
 ```
 
 ---
@@ -227,22 +231,20 @@ follow_the_goat/
 
 ---
 
-## When to Use Which Master
+## Adding New Components
 
-### Add to master.py IF:
-✅ Fetching data from external API (Jupiter, Binance, etc.)
-✅ Receiving data via webhook
-✅ Data cleanup/archiving jobs
-✅ Raw data storage
+### To add a new job:
+1. Add the job function to `scheduler/jobs.py`
+2. Register it in `scheduler/component_registry.py` (ComponentDef)
+3. Add it to `_interval_job_specs()` in `scheduler/run_component.py`
+4. Start it: `python3 scheduler/run_component.py --component my_new_job`
 
-### Add to master2.py IF:
-✅ Analyzing/processing existing data
-✅ Making trading decisions
-✅ Building wallet profiles
-✅ Pattern detection
-✅ Any computation on data
+### To add a new service (long-running):
+1. Add start/stop functions to `scheduler/jobs.py`
+2. Register it in `scheduler/component_registry.py`
+3. Add it to `_service_specs()` in `scheduler/run_component.py`
 
-**Rule of Thumb:** If it creates NEW raw data, it goes in master.py. If it PROCESSES existing data, it goes in master2.py.
+**Rule of Thumb:** Jobs run periodically, Services run continuously.
 
 ---
 
@@ -420,8 +422,10 @@ postgres_execute("UPDATE ...", [params])
 |---------|----------|
 | PostgreSQL schema | `scripts/postgres_schema.sql` |
 | PostgreSQL config | See `core/config.py` for connection details |
-| Data Engine scheduler | `scheduler/master.py` |
-| Trading Logic scheduler | `scheduler/master2.py` |
+| Job functions | `scheduler/jobs.py` |
+| Component runner | `scheduler/run_component.py` |
+| Component registry | `scheduler/component_registry.py` |
+| Component control | `scheduler/control.py` |
 | Website API | `scheduler/website_api.py` |
 | Shared code | `core/` |
 | Features | `features/` |
@@ -434,53 +438,50 @@ postgres_execute("UPDATE ...", [params])
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ MASTER.PY - DATA ENGINE │
+│              COMPONENT-BASED ARCHITECTURE                       │
 ├─────────────────────────────────────────────────────────────────┤
-│ │
-│ Services: │
-│ - Jupiter Price Fetcher (every 1s) │
-│ - Binance Order Book Stream (WebSocket) │
-│ - QuickNode Webhook Server (port 8001) │
-│ - PHP Web Server (port 8000) │
-│ - Data Cleanup Jobs (hourly) │
-│ │
-│ Writes: prices, trades, order_book_features │
-│ │
-│ ↓ │
+│                                                                 │
+│  Each component runs as: python3 scheduler/run_component.py     │
+│                                                                 │
+│  Data Ingestion:              Trading Logic:                    │
+│  - fetch_jupiter_prices       - follow_the_goat                 │
+│  - process_price_cycles       - trailing_stop_seller            │
+│  - sync_trades_from_webhook   - train_validator                 │
+│  - webhook_server (8001)      - update_potential_gains          │
+│  - php_server (8000)          - create_new_patterns             │
+│  - binance_stream             - create_profiles                 │
+│                               - archive_old_data                │
+│                               - local_api_5052                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
-                             │
-                             ↓
+                               │
+                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ POSTGRESQL DATABASE (Shared) │
+│                POSTGRESQL DATABASE (Shared)                     │
 ├─────────────────────────────────────────────────────────────────┤
-│ │
-│ Tables: │
-│ - prices, sol_stablecoin_trades, order_book_features │
-│ - cycle_tracker, wallet_profiles │
-│ - follow_the_goat_plays, follow_the_goat_buyins │
-│ - pattern_config_filters, filter_combinations │
-│ - And 12 more tables... │
-│ │
+│                                                                 │
+│  Tables:                                                        │
+│  - prices, sol_stablecoin_trades, order_book_features           │
+│  - cycle_tracker, wallet_profiles                               │
+│  - follow_the_goat_plays, follow_the_goat_buyins                │
+│  - scheduler_components, scheduler_component_heartbeats         │
+│  - And more...                                                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
-           ↑                           ↑
-           │                           │
- ┌─────────┴────────┐     ┌──────────┴──────────┐
- │                  │     │                     │
-┌┴──────────────────┴┐   ┌┴─────────────────────┴┐
-│ MASTER2.PY        │   │ WEBSITE_API.PY        │
-│ (Trading Logic)   │   │ (Flask API)           │
-├───────────────────┤   ├───────────────────────┤
-│                   │   │                       │
-│ Jobs:             │   │ Endpoints:            │
-│ - follow_the_goat │   │ - /health             │
-│ - trailing_stop   │   │ - /cycles             │
-│ - train_validator │   │ - /buyins             │
-│ - update_gains    │   │ - /plays              │
-│ - create_patterns │   │ - /profiles           │
-│                   │   │ - /patterns           │
-│ Local API: 5052   │   │                       │
-│                   │   │ Port: 5051            │
-└───────────────────┘   └───────────────────────┘
+                               ↑
+                               │
+┌──────────────────────────────┴──────────────────────────────────┐
+│                      WEBSITE_API.PY                             │
+│                       (Flask API)                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Endpoints:                                                     │
+│  - /health, /cycles, /buyins, /plays, /profiles                 │
+│  - /scheduler/components (list, toggle enable/disable)          │
+│  - /scheduler/errors                                            │
+│                                                                 │
+│  Port: 5051                                                     │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---

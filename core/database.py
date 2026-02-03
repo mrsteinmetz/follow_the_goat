@@ -195,6 +195,31 @@ def get_postgres_connection():
     return _pool.get_connection()
 
 
+def get_postgres_dedicated_connection(application_name: str = "ftg_dedicated"):
+    """
+    Create a dedicated PostgreSQL connection (NOT from the pool).
+    
+    This is intended for long-lived session state like advisory locks.
+    The caller MUST close() this connection.
+    
+    Args:
+        application_name: Visible in pg_stat_activity
+        
+    Returns:
+        psycopg2 connection with RealDictCursor factory
+    """
+    return psycopg2.connect(
+        host=settings.postgres.host,
+        user=settings.postgres.user,
+        password=settings.postgres.password,
+        database=settings.postgres.database,
+        port=settings.postgres.port,
+        connect_timeout=10,
+        application_name=application_name,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
 def close_all_postgres():
     """Close all PostgreSQL connections (for shutdown)."""
     _pool.close_all()
@@ -537,7 +562,10 @@ def verify_tables_exist() -> bool:
         'follow_the_goat_buyins_price_checks', 'follow_the_goat_tracking',
         'price_points', 'price_analysis', 'wallet_profiles', 'wallet_profiles_state',
         'pattern_config_projects', 'pattern_config_filters', 'buyin_trail_minutes',
-        'trade_filter_values', 'job_execution_metrics'
+        'trade_filter_values',
+        'scheduler_components', 'scheduler_component_settings',
+        'scheduler_component_heartbeats', 'scheduler_error_events',
+        'job_execution_metrics'
     ]
     
     try:

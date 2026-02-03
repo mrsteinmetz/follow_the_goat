@@ -134,7 +134,11 @@ def load_config() -> Dict[str, Any]:
             "sp_": "second_prices",
             "pat_": "patterns",
             "btc_": "btc_correlation",
-            "eth_": "eth_correlation"
+            "eth_": "eth_correlation",
+            # NEW: Velocity and micro-move sections
+            "xa_": "cross_asset",
+            "ts_": "thirty_second",
+            "mm_": "micro_move"
         }
     }
     
@@ -291,13 +295,15 @@ def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.Da
             b.potential_gains,
             b.our_status,
             tfv.minute,
+            COALESCE(tfv.sub_minute, 0) as sub_minute,
+            (tfv.minute * 2 + COALESCE(tfv.sub_minute, 0)) as interval_idx,
             {pivot_sql}
         FROM follow_the_goat_buyins b
         INNER JOIN trade_filter_values tfv ON tfv.buyin_id = b.id
         WHERE b.potential_gains IS NOT NULL
           AND b.followed_at >= NOW() - INTERVAL '{hours} hours'
-        GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute
-        ORDER BY b.id, tfv.minute
+        GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute, tfv.sub_minute
+        ORDER BY b.id, tfv.minute, tfv.sub_minute
     """
     
     # Step 3: Execute pivoted query
@@ -339,8 +345,8 @@ def get_filterable_columns(df: pd.DataFrame) -> List[str]:
     config = load_config()
     skip_columns = set(config.get('skip_columns', []))
     skip_columns.update(['trade_id', 'play_id', 'wallet_address', 'followed_at', 
-                         'our_status', 'minute', 'potential_gains', 'pat_detected_list',
-                         'pat_swing_trend'])
+                         'our_status', 'minute', 'sub_minute', 'interval_idx', 
+                         'potential_gains', 'pat_detected_list', 'pat_swing_trend'])
     
     filterable = []
     for col in df.columns:
@@ -593,7 +599,7 @@ def find_optimal_threshold(
 
 def generate_cycle_bottom_filters(
     df: pd.DataFrame,
-    minute: int = 0
+    interval_idx: int = 0
 ) -> List[Dict[str, Any]]:
     """
     Generate filter suggestions based on cycle bottom signature analysis.
@@ -605,14 +611,22 @@ def generate_cycle_bottom_filters(
     - Correlated drops in ETH/BTC
     - Draining liquidity
     
+    Args:
+        df: Trade data DataFrame
+        interval_idx: 30-second interval index (0-29, where 0=0:00, 1=0:30, 2=1:00, etc.)
+    
     Returns:
         List of filter suggestions with specific thresholds
     """
     config = load_config()
     threshold = config.get('good_trade_threshold', 0.6)
     
-    # Filter to specific minute
-    if 'minute' in df.columns:
+    # Filter to specific interval (30-second granularity)
+    if 'interval_idx' in df.columns:
+        df_filtered = df[df['interval_idx'] == interval_idx].copy()
+    elif 'minute' in df.columns:
+        # Fallback for old data without interval_idx
+        minute = interval_idx // 2
         df_filtered = df[df['minute'] == minute].copy()
     else:
         df_filtered = df
@@ -666,7 +680,7 @@ def generate_cycle_bottom_filters(
             'field_name': get_field_name_from_column(column),
             'from_value': round(from_val, 6),
             'to_value': round(to_val, 6),
-            'minute_analyzed': minute,
+            'minute_analyzed': interval_idx,  # Now stores 30-second interval index
             'source': 'cycle_bottom_signature',
             'description': description,
             **metrics
@@ -682,24 +696,31 @@ def generate_cycle_bottom_filters(
 def analyze_field(
     df: pd.DataFrame,
     column_name: str,
-    minute: Optional[int] = None,
+    interval_idx: Optional[int] = None,
     override_settings: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Analyze a single field and generate filter suggestion.
     
     Args:
-        df: Trade data DataFrame (may include multiple minutes)
+        df: Trade data DataFrame (may include multiple intervals)
         column_name: Column name to analyze
-        minute: If provided, filter to this minute before analysis
+        interval_idx: If provided, filter to this 30-second interval (0-29) before analysis
         override_settings: Optional dict to override config settings
         
     Returns:
         Dictionary with suggestion details or None if no valid suggestion
     """
-    # Filter by minute if specified
-    if minute is not None and 'minute' in df.columns:
-        df_filtered = df[df['minute'] == minute].copy()
+    # Filter by interval if specified (30-second granularity)
+    if interval_idx is not None:
+        if 'interval_idx' in df.columns:
+            df_filtered = df[df['interval_idx'] == interval_idx].copy()
+        elif 'minute' in df.columns:
+            # Fallback for old data without interval_idx
+            minute = interval_idx // 2
+            df_filtered = df[df['minute'] == minute].copy()
+        else:
+            df_filtered = df
         if len(df_filtered) == 0:
             return None
     else:
@@ -723,36 +744,39 @@ def analyze_field(
         'field_name': get_field_name_from_column(column_name),
         'from_value': round(from_val, 6),
         'to_value': round(to_val, 6),
-        'minute_analyzed': minute if minute is not None else 0,
+        'minute_analyzed': interval_idx if interval_idx is not None else 0,
         **metrics
     }
 
 
-def find_best_minute_for_field(
+def find_best_interval_for_field(
     df: pd.DataFrame,
     column_name: str
 ) -> Optional[Tuple[int, Dict[str, Any]]]:
     """
-    Find the best minute (0-14) for a filter field by testing all 15 minutes.
+    Find the best 30-second interval (0-29) for a filter field by testing all 30 intervals.
     
-    Returns the minute that produces the best effectiveness score.
+    Returns the interval that produces the best effectiveness score.
     
     Args:
-        df: DataFrame with ALL minutes of trade data
+        df: DataFrame with ALL intervals of trade data
         column_name: Column name to analyze
         
     Returns:
-        Tuple of (best_minute, suggestion_dict) or None if no valid suggestion found
+        Tuple of (best_interval_idx, suggestion_dict) or None if no valid suggestion found
     """
-    if 'minute' not in df.columns:
+    # Check if we have interval data
+    has_intervals = 'interval_idx' in df.columns or 'minute' in df.columns
+    if not has_intervals:
         return None
     
     best_score = -1
-    best_minute = None
+    best_interval = None
     best_suggestion = None
     
-    for minute in range(15):
-        suggestion = analyze_field(df, column_name, minute=minute)
+    # Test all 30 intervals (30-second granularity)
+    for interval_idx in range(30):
+        suggestion = analyze_field(df, column_name, interval_idx=interval_idx)
         
         if suggestion is None:
             continue
@@ -764,14 +788,18 @@ def find_best_minute_for_field(
         
         if score > best_score:
             best_score = score
-            best_minute = minute
+            best_interval = interval_idx
             best_suggestion = suggestion.copy()
             best_suggestion['effectiveness_score'] = round(score, 4)
     
     if best_suggestion is None:
         return None
     
-    return (best_minute, best_suggestion)
+    return (best_interval, best_suggestion)
+
+
+# Alias for backwards compatibility
+find_best_minute_for_field = find_best_interval_for_field
 
 
 # =============================================================================
@@ -957,40 +985,57 @@ def find_best_combinations(
     return results
 
 
-def find_best_combinations_all_minutes(
+def find_best_combinations_all_intervals(
     df: pd.DataFrame,
-    suggestions_by_minute: Dict[int, List[Dict[str, Any]]]
+    suggestions_by_interval: Dict[int, List[Dict[str, Any]]]
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Find the best filter combinations by testing across all minutes.
+    Find the best filter combinations by testing across all 30-second intervals.
     
-    Returns combinations from the minute that produces the best results.
+    Returns combinations from the interval that produces the best results.
+    
+    Args:
+        df: Trade data DataFrame with interval_idx column
+        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
+    
+    Returns:
+        Tuple of (best_combinations, best_interval_idx)
     """
     config = load_config()
     min_filters = config.get('min_filters_in_combo', 2)
     
-    if 'minute' not in df.columns:
-        logger.warning("No 'minute' column found, falling back to minute 0")
-        suggestions = suggestions_by_minute.get(0, [])
+    # Check for interval data
+    has_interval_idx = 'interval_idx' in df.columns
+    has_minute = 'minute' in df.columns
+    
+    if not has_interval_idx and not has_minute:
+        logger.warning("No interval/minute column found, falling back to interval 0")
+        suggestions = suggestions_by_interval.get(0, [])
         return find_best_combinations(df, suggestions, minute=0), 0
     
     best_combinations = []
-    best_minute = 0
+    best_interval = 0
     best_score = -1
     
-    minute_results = {}
+    interval_results = {}
     
-    for minute in range(15):
-        minute_df = df[df['minute'] == minute]
+    # Test all 30 intervals (30-second granularity)
+    for interval_idx in range(30):
+        if has_interval_idx:
+            interval_df = df[df['interval_idx'] == interval_idx]
+        else:
+            # Fallback: use minute (maps 2 intervals per minute)
+            minute = interval_idx // 2
+            interval_df = df[df['minute'] == minute]
         
-        if len(minute_df) < 20:
+        if len(interval_df) < 20:
             continue
         
-        suggestions = suggestions_by_minute.get(minute, [])
+        suggestions = suggestions_by_interval.get(interval_idx, [])
         if not suggestions:
             continue
         
-        combinations = find_best_combinations(minute_df, suggestions, minute=minute)
+        combinations = find_best_combinations(interval_df, suggestions, minute=interval_idx)
         
         if not combinations:
             continue
@@ -1005,7 +1050,7 @@ def find_best_combinations_all_minutes(
         final_combo = valid_combinations[-1]
         score = final_combo['bad_trades_removed_pct'] * (final_combo['good_trades_kept_pct'] / 100)
         
-        minute_results[minute] = {
+        interval_results[interval_idx] = {
             'combinations': valid_combinations,
             'score': score,
             'bad_removed': final_combo['bad_trades_removed_pct'],
@@ -1015,21 +1060,26 @@ def find_best_combinations_all_minutes(
         
         if score > best_score:
             best_score = score
-            best_minute = minute
+            best_interval = interval_idx
             best_combinations = valid_combinations
     
-    # Log summary
-    if minute_results:
+    # Log summary (format interval as M:SS)
+    if interval_results:
         logger.info("=" * 60)
-        logger.info("MINUTE COMPARISON SUMMARY")
+        logger.info("INTERVAL COMPARISON SUMMARY (30-second granularity)")
         logger.info("=" * 60)
-        for m in sorted(minute_results.keys()):
-            r = minute_results[m]
-            marker = " <-- BEST" if m == best_minute else ""
-            logger.info(f"  Minute {m:2d}: {r['bad_removed']:.1f}% bad removed, "
+        for idx in sorted(interval_results.keys()):
+            r = interval_results[idx]
+            marker = " <-- BEST" if idx == best_interval else ""
+            interval_label = f"{idx // 2}:{(idx % 2) * 30:02d}"
+            logger.info(f"  Interval {interval_label}: {r['bad_removed']:.1f}% bad removed, "
                         f"{r['good_kept']:.1f}% good kept, {r['filter_count']} filters (score: {r['score']:.2f}){marker}")
     
-    return best_combinations, best_minute
+    return best_combinations, best_interval
+
+
+# Alias for backwards compatibility
+find_best_combinations_all_minutes = find_best_combinations_all_intervals
 
 
 # =============================================================================
@@ -1484,11 +1534,17 @@ def generate_test_scenarios() -> List[Dict[str, Any]]:
 def test_scenario(
     df: pd.DataFrame,
     scenario: Dict[str, Any],
-    suggestions_by_minute: Dict[int, List[Dict[str, Any]]],
+    suggestions_by_interval: Dict[int, List[Dict[str, Any]]],
     threshold: float
 ) -> Optional[Dict[str, Any]]:
     """
     Test a single scenario configuration.
+    
+    Args:
+        df: Trade data DataFrame with interval_idx column
+        scenario: Scenario configuration
+        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
+        threshold: Good trade threshold
     
     Returns results dict or None if no valid combinations found.
     """
@@ -1502,23 +1558,33 @@ def test_scenario(
     if len(df_filtered) < 100:  # Need minimum data
         return None
     
-    # Test across all minutes with these settings
+    # Check for interval data
+    has_interval_idx = 'interval_idx' in df_filtered.columns
+    has_minute = 'minute' in df_filtered.columns
+    
+    # Test across all 30 intervals (30-second granularity)
     best_combinations = []
-    best_minute = 0
+    best_interval = 0
     best_score = -1
     
-    for minute in range(15):
-        minute_df = df_filtered[df_filtered['minute'] == minute]
-        
-        if len(minute_df) < 20:
+    for interval_idx in range(30):
+        if has_interval_idx:
+            interval_df = df_filtered[df_filtered['interval_idx'] == interval_idx]
+        elif has_minute:
+            minute = interval_idx // 2
+            interval_df = df_filtered[df_filtered['minute'] == minute]
+        else:
             continue
         
-        suggestions = suggestions_by_minute.get(minute, [])
+        if len(interval_df) < 20:
+            continue
+        
+        suggestions = suggestions_by_interval.get(interval_idx, [])
         if not suggestions:
             continue
         
         # Find combinations with scenario settings
-        combinations = find_best_combinations(minute_df, suggestions, minute=minute, override_settings=settings)
+        combinations = find_best_combinations(interval_df, suggestions, minute=interval_idx, override_settings=settings)
         
         if not combinations:
             continue
@@ -1530,7 +1596,7 @@ def test_scenario(
         if not valid_combinations:
             continue
         
-        # Score the best combination from this minute
+        # Score the best combination from this interval
         final_combo = valid_combinations[-1]
         score = calculate_scenario_score(
             final_combo['bad_trades_removed_pct'],
@@ -1539,7 +1605,7 @@ def test_scenario(
         
         if score > best_score:
             best_score = score
-            best_minute = minute
+            best_interval = interval_idx
             best_combinations = valid_combinations
     
     if not best_combinations:
@@ -1551,7 +1617,7 @@ def test_scenario(
         'scenario': scenario,
         'combinations': best_combinations,
         'best_combo': best_combo,
-        'best_minute': best_minute,
+        'best_minute': best_interval,  # Keep as 'best_minute' for backward compatibility with DB schema
         'score': best_score,
         'bad_removed_pct': best_combo['bad_trades_removed_pct'],
         'good_kept_pct': best_combo['good_trades_kept_pct'],
@@ -1596,16 +1662,22 @@ def save_scenario_results(run_id: str, results: List[Dict[str, Any]], selected_i
 
 def run_multi_scenario_analysis(
     df: pd.DataFrame,
-    suggestions_by_minute: Dict[int, List[Dict[str, Any]]],
+    suggestions_by_interval: Dict[int, List[Dict[str, Any]]],
     threshold: float,
     run_id: str
 ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
     """
     Run multi-scenario testing to find optimal filter configuration.
     
+    Args:
+        df: Trade data DataFrame with interval_idx column
+        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
+        threshold: Good trade threshold
+        run_id: Unique run identifier
+    
     Returns:
         - List of best combinations from winning scenario
-        - Best minute
+        - Best interval index (0-29, now 30-second granularity)
         - Selected scenario details
     """
     logger.info("\n" + "=" * 80)
@@ -1620,7 +1692,7 @@ def run_multi_scenario_analysis(
     # Test each scenario
     results = []
     for idx, scenario in enumerate(scenarios, 1):
-        result = test_scenario(df, scenario, suggestions_by_minute, threshold)
+        result = test_scenario(df, scenario, suggestions_by_interval, threshold)
         if result:
             results.append(result)
             logger.debug(f"  [{idx:3d}/{len(scenarios)}] {scenario['name']:<25} "
@@ -1788,32 +1860,33 @@ def run() -> Dict[str, Any]:
         column_to_id = save_filter_catalog(engine, filterable_columns)
         logger.info(f"  Found {len(filterable_columns)} filterable columns")
         
-        # Step 3: Generate filter suggestions for each minute
-        logger.info("\n[Step 3/6] Generating filter suggestions...")
-        suggestions_by_minute = {}
+        # Step 3: Generate filter suggestions for each 30-second interval
+        logger.info("\n[Step 3/6] Generating filter suggestions (30-second granularity)...")
+        suggestions_by_interval = {}
         all_suggestions = []
         
         for column in filterable_columns:
-            result_tuple = find_best_minute_for_field(df, column)
+            result_tuple = find_best_interval_for_field(df, column)
             if result_tuple:
-                best_minute, suggestion = result_tuple
-                if best_minute not in suggestions_by_minute:
-                    suggestions_by_minute[best_minute] = []
-                suggestions_by_minute[best_minute].append(suggestion)
+                best_interval, suggestion = result_tuple
+                if best_interval not in suggestions_by_interval:
+                    suggestions_by_interval[best_interval] = []
+                suggestions_by_interval[best_interval].append(suggestion)
                 all_suggestions.append(suggestion)
         
         # Add cycle bottom signature filters (based on analysis of optimal buy moments)
         logger.info("  Adding cycle bottom signature filters...")
-        for minute in [0, 1, 2, 3]:  # Test at early minutes when signal is freshest
-            cycle_bottom_suggestions = generate_cycle_bottom_filters(df, minute)
+        # Test at early intervals (0-7 = first 4 minutes) when signal is freshest
+        for interval_idx in range(8):
+            cycle_bottom_suggestions = generate_cycle_bottom_filters(df, interval_idx)
             for suggestion in cycle_bottom_suggestions:
                 col = suggestion['column_name']
-                # Check if we already have this column at this minute
-                existing_cols = [s['column_name'] for s in suggestions_by_minute.get(minute, [])]
+                # Check if we already have this column at this interval
+                existing_cols = [s['column_name'] for s in suggestions_by_interval.get(interval_idx, [])]
                 if col not in existing_cols:
-                    if minute not in suggestions_by_minute:
-                        suggestions_by_minute[minute] = []
-                    suggestions_by_minute[minute].append(suggestion)
+                    if interval_idx not in suggestions_by_interval:
+                        suggestions_by_interval[interval_idx] = []
+                    suggestions_by_interval[interval_idx].append(suggestion)
                     all_suggestions.append(suggestion)
         
         cycle_bottom_count = sum(1 for s in all_suggestions if s.get('source') == 'cycle_bottom_signature')
@@ -1832,8 +1905,8 @@ def run() -> Dict[str, Any]:
         
         # Step 4: Run multi-scenario analysis to find optimal configuration
         logger.info("\n[Step 4/6] Running multi-scenario analysis...")
-        combinations, best_minute, selected_scenario = run_multi_scenario_analysis(
-            df, suggestions_by_minute, threshold, run_id
+        combinations, best_interval, selected_scenario = run_multi_scenario_analysis(
+            df, suggestions_by_interval, threshold, run_id
         )
         
         result['combinations_count'] = len(combinations)
@@ -1847,7 +1920,8 @@ def run() -> Dict[str, Any]:
             save_combinations(engine, [], max_hours)
         else:
             save_combinations(engine, combinations, max_hours)
-            logger.info(f"  Best minute: {best_minute}")
+            interval_label = f"{best_interval // 2}:{(best_interval % 2) * 30:02d}"
+            logger.info(f"  Best interval: {interval_label} (index {best_interval})")
             logger.info(f"  Found {len(combinations)} valid combinations")
         
         # Step 5: Sync to pattern config
@@ -1877,8 +1951,6 @@ def run() -> Dict[str, Any]:
             sync_result = sync_best_filters_to_project(engine, combinations, project_id)
             result['filters_synced'] = sync_result.get('filters_synced', 0)
             save_combinations(engine, combinations, max_hours)
-            logger.info(f"  Best minute: {best_minute}")
-            logger.info(f"  Found {len(combinations)} valid combinations")
         
         # Step 6: Update AI-enabled plays
         logger.info("\n[Step 6/6] Updating AI-enabled plays...")

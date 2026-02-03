@@ -127,7 +127,7 @@ def get_best_quote(amount_usdc: float):
     
     # Try direct route first
     response = requests.get(
-        "https://quote-api.jup.ag/v6/quote",
+        "https://api.jup.ag/ultra/v1/order",
         params={
             "inputMint": USDC_MINT,
             "outputMint": SOL_MINT,
@@ -147,7 +147,7 @@ def get_best_quote(amount_usdc: float):
     
     # Otherwise try optimized routing
     response = requests.get(
-        "https://quote-api.jup.ag/v6/quote",
+        "https://api.jup.ag/ultra/v1/order",
         params={
             "inputMint": USDC_MINT,
             "outputMint": SOL_MINT,

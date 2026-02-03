@@ -19,7 +19,7 @@ import sys
 import os
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import json
 
@@ -1426,28 +1426,330 @@ def delete_pattern_filter(filter_id):
 
 
 # =============================================================================
-# SCHEDULER STATUS (READ FROM FILE)
+# SCHEDULER STATUS (POSTGRESQL)
 # =============================================================================
 
 @app.route('/scheduler_status', methods=['GET'])
 def get_scheduler_status():
-    """Get scheduler job status (read from exported JSON file)."""
+    """
+    Backward-compatible scheduler status endpoint.
+    
+    Returns a shape similar to the historical JSON export, but the source of truth
+    is PostgreSQL heartbeats (works across multiple independent services).
+    """
     try:
-        import json
-        status_file = PROJECT_ROOT / "logs" / "master2_job_status.json"
-        
-        if status_file.exists():
-            with open(status_file, 'r') as f:
-                data = json.load(f)
-            return jsonify(data)
-        else:
-            return jsonify({
-                'status': 'unavailable',
-                'message': 'Job status file not found. Is master2.py running?'
-            })
+        from scheduler.component_registry import ensure_default_components_registered
+        ensure_default_components_registered()
+
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    WITH latest_hb AS (
+                        SELECT DISTINCT ON (component_id)
+                            component_id, instance_id, host, pid, started_at,
+                            last_heartbeat_at, status, last_error_at, last_error_message
+                        FROM scheduler_component_heartbeats
+                        ORDER BY component_id, last_heartbeat_at DESC
+                    )
+                    SELECT
+                        c.component_id,
+                        c.description,
+                        c.kind,
+                        c.group_name,
+                        c.expected_interval_ms,
+                        COALESCE(s.enabled, c.default_enabled) AS enabled,
+                        hb.instance_id,
+                        hb.host,
+                        hb.pid,
+                        hb.started_at,
+                        hb.last_heartbeat_at,
+                        hb.status,
+                        hb.last_error_at,
+                        hb.last_error_message
+                    FROM scheduler_components c
+                    LEFT JOIN scheduler_component_settings s ON s.component_id = c.component_id
+                    LEFT JOIN latest_hb hb ON hb.component_id = c.component_id
+                    ORDER BY c.group_name, c.kind, c.component_id
+                    """
+                )
+                rows = cursor.fetchall()
+
+        jobs = {}
+        for r in rows or []:
+            jobs[r["component_id"]] = {
+                "job_id": r["component_id"],
+                "description": r.get("description"),
+                "kind": r.get("kind"),
+                "group_name": r.get("group_name"),
+                "enabled": bool(r.get("enabled")),
+                "expected_interval_ms": r.get("expected_interval_ms"),
+                "status": r.get("status") or "unavailable",
+                "instance_id": r.get("instance_id"),
+                "host": r.get("host"),
+                "pid": r.get("pid"),
+                "started_at": r["started_at"].isoformat() if r.get("started_at") else None,
+                "last_heartbeat_at": r["last_heartbeat_at"].isoformat() if r.get("last_heartbeat_at") else None,
+                "last_error_at": r["last_error_at"].isoformat() if r.get("last_error_at") else None,
+                "last_error_message": r.get("last_error_message"),
+            }
+
+        return jsonify({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "jobs": jobs,
+        })
     except Exception as e:
         logger.error(f"Get scheduler status failed: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/scheduler/components', methods=['GET'])
+def scheduler_components():
+    """
+    Canonical scheduler components endpoint for the dashboard.
+    Computes health using heartbeat freshness + enabled flag.
+    """
+    try:
+        from scheduler.component_registry import ensure_default_components_registered
+        ensure_default_components_registered()
+
+        # psycopg2 returns naive datetimes for TIMESTAMP (no time zone) columns.
+        # Use naive UTC for comparisons to avoid offset-aware/naive subtraction errors.
+        now = datetime.utcnow()
+
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Latest heartbeat per component + last run per job_id (from job_execution_metrics)
+                cursor.execute(
+                    """
+                    WITH latest_hb AS (
+                        SELECT DISTINCT ON (component_id)
+                            component_id, instance_id, host, pid, started_at,
+                            last_heartbeat_at, status, last_error_at, last_error_message
+                        FROM scheduler_component_heartbeats
+                        ORDER BY component_id, last_heartbeat_at DESC
+                    ),
+                    last_run AS (
+                        SELECT job_id AS component_id, MAX(started_at) AS last_run_at
+                        FROM job_execution_metrics
+                        GROUP BY job_id
+                    )
+                    SELECT
+                        c.component_id,
+                        c.kind,
+                        c.group_name,
+                        c.description,
+                        c.expected_interval_ms,
+                        c.default_enabled,
+                        COALESCE(s.enabled, c.default_enabled) AS enabled,
+                        hb.instance_id,
+                        hb.host,
+                        hb.pid,
+                        hb.started_at,
+                        hb.last_heartbeat_at,
+                        hb.status AS hb_status,
+                        hb.last_error_at,
+                        hb.last_error_message,
+                        lr.last_run_at
+                    FROM scheduler_components c
+                    LEFT JOIN scheduler_component_settings s ON s.component_id = c.component_id
+                    LEFT JOIN latest_hb hb ON hb.component_id = c.component_id
+                    LEFT JOIN last_run lr ON lr.component_id = c.component_id
+                    ORDER BY c.group_name, c.kind, c.component_id
+                    """
+                )
+                rows = cursor.fetchall()
+
+        components = []
+        for r in rows or []:
+            enabled = bool(r.get("enabled"))
+            hb_at = r.get("last_heartbeat_at")
+            if hb_at is not None and getattr(hb_at, "tzinfo", None) is not None:
+                hb_at = hb_at.replace(tzinfo=None)
+            hb_status = r.get("hb_status") or "unavailable"
+
+            timeout_s = 30.0
+            expected_ms = r.get("expected_interval_ms")
+            if expected_ms:
+                timeout_s = max(timeout_s, (float(expected_ms) / 1000.0) * 3.0)
+
+            healthy = False
+            health_reason = "unavailable"
+            if not enabled:
+                healthy = False
+                health_reason = "disabled"
+            elif hb_at is None:
+                healthy = False
+                health_reason = "no_heartbeat"
+            else:
+                age_s = (now - hb_at).total_seconds()
+                if age_s > timeout_s:
+                    healthy = False
+                    health_reason = f"stale_heartbeat_{age_s:.0f}s"
+                elif hb_status in ("running", "idle"):
+                    healthy = True
+                    health_reason = "ok"
+                else:
+                    healthy = False
+                    health_reason = hb_status
+
+            components.append({
+                "component_id": r["component_id"],
+                "kind": r.get("kind"),
+                "group_name": r.get("group_name"),
+                "description": r.get("description"),
+                "expected_interval_ms": r.get("expected_interval_ms"),
+                "default_enabled": bool(r.get("default_enabled")),
+                "enabled": enabled,
+                "healthy": healthy,
+                "health_reason": health_reason,
+                "last_run_at": r["last_run_at"].isoformat() if r.get("last_run_at") else None,
+                "heartbeat": {
+                    "instance_id": r.get("instance_id"),
+                    "host": r.get("host"),
+                    "pid": r.get("pid"),
+                    "started_at": r["started_at"].isoformat() if r.get("started_at") else None,
+                    "last_heartbeat_at": r["last_heartbeat_at"].isoformat() if r.get("last_heartbeat_at") else None,
+                    "status": hb_status,
+                    "last_error_at": r["last_error_at"].isoformat() if r.get("last_error_at") else None,
+                    "last_error_message": r.get("last_error_message"),
+                }
+            })
+
+        return jsonify({
+            "status": "ok",
+            "timestamp": now.replace(tzinfo=timezone.utc).isoformat(),
+            "components": components,
+        })
+    except Exception as e:
+        # If tables aren't migrated yet, still return the full component list so the UI
+        # can show everything as "off / not running" instead of showing nothing.
+        logger.error(f"Get scheduler components failed: {e}", exc_info=True)
+        try:
+            from scheduler.component_registry import DEFAULT_COMPONENT_DEFS
+            fallback = []
+            for c in DEFAULT_COMPONENT_DEFS:
+                fallback.append({
+                    "component_id": c.component_id,
+                    "kind": c.kind,
+                    "group_name": c.group_name,
+                    "description": c.description,
+                    "expected_interval_ms": c.expected_interval_ms,
+                    "default_enabled": c.default_enabled,
+                    "enabled": c.default_enabled,
+                    "healthy": False,
+                    "health_reason": "db_unavailable",
+                    "last_run_at": None,
+                    "heartbeat": {
+                        "instance_id": None,
+                        "host": None,
+                        "pid": None,
+                        "started_at": None,
+                        "last_heartbeat_at": None,
+                        "status": "unavailable",
+                        "last_error_at": None,
+                        "last_error_message": None,
+                    },
+                })
+            return jsonify({
+                "status": "degraded",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "components": fallback,
+                "warning": "scheduler tables not available; showing static component list",
+                "error": str(e),
+            }), 200
+        except Exception:
+            return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.route('/scheduler/components/<component_id>', methods=['PUT'])
+def update_scheduler_component(component_id):
+    """Enable/disable a scheduler component."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        enabled = payload.get("enabled")
+        note = payload.get("note")
+
+        if enabled is None or not isinstance(enabled, bool):
+            return jsonify({"success": False, "error": "Missing boolean field: enabled"}), 400
+
+        from scheduler.control import set_component_enabled
+        ok = set_component_enabled(
+            component_id=component_id,
+            enabled=enabled,
+            updated_by=request.remote_addr,
+            note=note,
+        )
+        if not ok:
+            return jsonify({"success": False, "error": "Unknown component_id"}), 404
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Update scheduler component failed: {e}", exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/scheduler/errors', methods=['GET'])
+def scheduler_errors():
+    """Return recent scheduler error events (optionally filtered by component_id)."""
+    try:
+        component_id = request.args.get("component_id")
+        hours = float(request.args.get("hours", 24.0))
+        hours = max(0.01, min(168.0, hours))  # 1 minute to 7 days
+        limit = min(int(request.args.get("limit", 200)), 1000)
+
+        hours_str = str(hours)
+
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                if component_id:
+                    cursor.execute(
+                        """
+                        SELECT id, component_id, occurred_at, host, pid, instance_id, message, traceback, context
+                        FROM scheduler_error_events
+                        WHERE component_id = %s
+                          AND occurred_at >= NOW() - (%s || ' hours')::interval
+                        ORDER BY occurred_at DESC
+                        LIMIT %s
+                        """,
+                        [component_id, hours_str, limit],
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT id, component_id, occurred_at, host, pid, instance_id, message, traceback, context
+                        FROM scheduler_error_events
+                        WHERE occurred_at >= NOW() - (%s || ' hours')::interval
+                        ORDER BY occurred_at DESC
+                        LIMIT %s
+                        """,
+                        [hours_str, limit],
+                    )
+                rows = cursor.fetchall()
+
+        events = []
+        for r in rows or []:
+            events.append({
+                "id": r.get("id"),
+                "component_id": r.get("component_id"),
+                "occurred_at": r["occurred_at"].isoformat() if r.get("occurred_at") else None,
+                "host": r.get("host"),
+                "pid": r.get("pid"),
+                "instance_id": r.get("instance_id"),
+                "message": r.get("message"),
+                "traceback": r.get("traceback"),
+                "context": r.get("context"),
+            })
+
+        return jsonify({
+            "status": "ok",
+            "hours": hours,
+            "count": len(events),
+            "events": events,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        logger.error(f"Get scheduler errors failed: {e}", exc_info=True)
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
 @app.route('/job_metrics', methods=['GET'])
@@ -1683,14 +1985,14 @@ def get_trades():
 
 @app.route('/trail/buyin/<int:buyin_id>', methods=['GET'])
 def get_trail_for_buyin(buyin_id):
-    """Get 15-minute trail data for a specific buyin."""
+    """Get 30-second interval trail data for a specific buyin (30 rows)."""
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT * FROM buyin_trail_minutes
                     WHERE buyin_id = %s
-                    ORDER BY minute ASC
+                    ORDER BY minute ASC, sub_minute ASC
                 """, [buyin_id])
                 
                 results = cursor.fetchall()

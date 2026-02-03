@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-02-03T11:57:07.084055+00:00",
+  "wallet": "Gi9p3zkQuSctJmK1XxWWnLXCJ4uaByRbxdV3SaBwB9DE",
+  "initial_usdc": 10.015774,
+  "initial_sol": 0.108489938,
+  "swaps": [
+    {
+      "direction": "USDC->SOL",
+      "signature": "6tumBcQsah4F5FGDYFzJPERLJ8Cn8bf7ptZtacnsosRFSiYTg9YD9eitDfD2CxKKensDVjDmwng3WnQFvzK8vsh",
+      "input_amount": 5.0,
+      "output_amount": 0.048466964000000015,
+      "input_symbol": "USDC",
+      "output_symbol": "SOL",
+      "price_impact_pct": 1.470343057431723e-05,
+      "platform_fee": 9693.0,
+      "slippage_pct": 99.99999989999999,
+      "num_hops": 1,
+      "dexes_used": [
+        "JupiterZ"
+      ]
+    },
+    {
+      "direction": "SOL->USDC",
+      "signature": "3FBmECpzjjXBNT9UzS4GU1gE78L8wiPGEVPVzJ4QYCkj8bwDnSjKQzt7Lk8GHwjK7jgQNWDPFGjgQnFffbyqJgFz",
+      "input_amount": 0.04798229436000002,
+      "output_amount": 0.0,
+      "input_symbol": "SOL",
+      "output_symbol": "USDC",
+      "price_impact_pct": -0.0004560604110650208,
+      "platform_fee": 0.0,
+      "slippage_pct": 100.0,
+      "num_hops": 1,
+      "dexes_used": [
+        "BisonFi"
+      ]
+    }
+  ],
+  "final_usdc": 5.015774,
+  "final_sol": 0.156956902,
+  "total_cost_usdc": 5.0,
+  "total_cost_pct": 100.0
+}

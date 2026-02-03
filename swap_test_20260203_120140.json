@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-02-03T12:01:10.501016+00:00",
+  "wallet": "Gi9p3zkQuSctJmK1XxWWnLXCJ4uaByRbxdV3SaBwB9DE",
+  "initial_usdc": 9.906057,
+  "initial_sol": 0.107410077,
+  "swaps": [
+    {
+      "direction": "USDC->SOL",
+      "signature": "4FuwhJNaHBY2xijFYD32iM5msSNmj7Jc8GeNrU5isrVtNuhsiJB793JZfNKDqF8nK3GYs2pPWJ7KJ8zHq3kkB2Aw",
+      "input_amount": 5.0,
+      "output_amount": 0.04855555099999999,
+      "input_symbol": "USDC",
+      "output_symbol": "SOL",
+      "price_impact_pct": 8.946537045886267e-05,
+      "platform_fee": 0.0,
+      "slippage_pct": 99.99999990005242,
+      "num_hops": 1,
+      "dexes_used": [
+        "PancakeSwap"
+      ]
+    },
+    {
+      "direction": "SOL->USDC",
+      "signature": "34Fqmy2PomjwRmT9uhgxbp96rZA5M8BiA5Svdo6y4G7nhXWahrzB7mkZfTq7JxiqWBXjyBVza9NcppMYPhXM2x6A",
+      "input_amount": 0.04806999548999999,
+      "output_amount": 4.789894000000001,
+      "input_symbol": "SOL",
+      "output_symbol": "USDC",
+      "price_impact_pct": -0.0004268791436037032,
+      "platform_fee": 0.0,
+      "slippage_pct": 99.99989999901877,
+      "num_hops": 4,
+      "dexes_used": [
+        "PancakeSwap",
+        "Manifest",
+        "Whirlpool"
+      ]
+    }
+  ],
+  "final_usdc": 9.695951,
+  "final_sol": 0.109402785,
+  "total_cost_usdc": 0.005115317007845732,
+  "total_cost_pct": 0.10230634015691464
+}

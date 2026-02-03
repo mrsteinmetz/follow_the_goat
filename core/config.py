@@ -74,10 +74,13 @@ class Settings:
     # PostgreSQL settings (for archive database)
     postgres: PostgresSettings = field(default_factory=PostgresSettings.from_env)
     
-    # Jupiter API key (required as of Jan 31, 2026)
-    # Get free key at: https://portal.jup.ag
-    # Free tier: 60 requests/minute
+    # Jupiter API key (required; get free at https://portal.jup.ag)
     jupiter_api_key: str = ""
+
+    # Jupiter Ultra Swap API (recommended; lite-api.jup.ag deprecated Jan 31 2026)
+    # https://dev.jup.ag/docs/ultra/get-started
+    # GET /ultra/v1/order (quote + unsigned tx), POST /ultra/v1/execute (submit signed tx)
+    jupiter_ultra_api_base: str = "https://api.jup.ag"
     
     # DuckDB central database path
     @property

@@ -565,6 +565,113 @@ CREATE INDEX IF NOT EXISTS idx_trail_created_at ON buyin_trail_minutes(created_a
 CREATE INDEX IF NOT EXISTS idx_trail_breakout_score ON buyin_trail_minutes(pat_breakout_score);
 
 -- =============================================================================
+-- MIGRATION: Micro-Movement Detection Enhancement
+-- Adds velocity, cross-asset, 30-second, and micro-move composite fields
+-- =============================================================================
+
+-- Price Movements Velocity (pm_) - 15 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_price_velocity_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_price_velocity_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_velocity_acceleration DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_momentum_persistence DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_realized_vol_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_vol_of_vol DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_volatility_regime SMALLINT;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_trend_strength_ema DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_price_vs_vwap_pct DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_price_vs_twap_pct DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_higher_highs_5m SMALLINT;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_higher_lows_5m SMALLINT;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_dist_resistance_pct DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_dist_support_pct DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pm_breakout_imminence DOUBLE PRECISION;
+
+-- Order Book Velocity (ob_) - 13 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_imbalance_velocity_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_imbalance_velocity_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_imbalance_acceleration DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_bid_depth_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_ask_depth_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_depth_ratio_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_spread_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_spread_percentile_1h DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_liquidity_score DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_liquidity_gap_score DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_liquidity_concentration DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_cumulative_imbalance_5m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ob_imbalance_consistency_5m DOUBLE PRECISION;
+
+-- Transaction Velocity (tx_) - 15 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_volume_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_volume_acceleration DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_volume_percentile_1h DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_cumulative_delta DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_cumulative_delta_5m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_delta_divergence DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_trade_intensity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_intensity_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_large_trade_intensity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_vpin_estimate DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_order_flow_toxicity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_kyle_lambda DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_aggressive_buy_ratio DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_aggressive_sell_ratio DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS tx_aggression_imbalance DOUBLE PRECISION;
+
+-- Whale Velocity (wh_) - 8 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_flow_velocity DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_flow_acceleration DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_cumulative_flow_10m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_stealth_acc_score DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_distribution_urgency DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_activity_regime SMALLINT;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_time_since_large DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS wh_large_freq_5m DOUBLE PRECISION;
+
+-- Cross-Asset Correlation (xa_) - 11 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_btc_sol_corr_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_btc_sol_corr_5m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_btc_leads_sol_1 DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_btc_leads_sol_2 DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_sol_beta_btc DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_eth_sol_corr_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_eth_leads_sol_1 DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_sol_beta_eth DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_btc_sol_divergence DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_eth_sol_divergence DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS xa_momentum_alignment DOUBLE PRECISION;
+
+-- 30-Second Interval Data (ts_) - 7 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_price_change_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_volume_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_buy_sell_pressure_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_imbalance_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_trade_count_30s INTEGER;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_momentum_30s DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS ts_volatility_30s DOUBLE PRECISION;
+
+-- Micro-Move Composite Scores (mm_) - 12 new columns
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_probability DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_direction DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_confidence DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_expected_timeframe DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_order_flow_score DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_whale_alignment DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_momentum_quality DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_volatility_regime DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_cross_asset_score DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_false_signal_risk DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_adverse_selection DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_slippage_estimate DOUBLE PRECISION;
+
+-- Sub-minute interval support
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS sub_minute SMALLINT DEFAULT 0;
+
+-- New indexes for micro-move queries
+CREATE INDEX IF NOT EXISTS idx_trail_mm_probability ON buyin_trail_minutes(mm_probability);
+CREATE INDEX IF NOT EXISTS idx_trail_composite ON buyin_trail_minutes(buyin_id, mm_probability, mm_direction);
+
+-- =============================================================================
 -- TRADE FILTER VALUES (normalized filter storage)
 -- =============================================================================
 
@@ -723,6 +830,66 @@ CREATE INDEX IF NOT EXISTS idx_scenario_results_created_at ON filter_scenario_re
 -- JOB EXECUTION METRICS (for scheduler monitoring)
 -- =============================================================================
 
+-- =============================================================================
+-- SCHEDULER COMPONENT CONTROL (enable/disable + heartbeats + errors)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS scheduler_components (
+    component_id VARCHAR(100) PRIMARY KEY,
+    kind VARCHAR(20) NOT NULL,               -- job|service|stream
+    group_name VARCHAR(20) NOT NULL,         -- master|master2|shared
+    description VARCHAR(300),
+    expected_interval_ms INTEGER,            -- used for health checks
+    default_enabled BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_components_group ON scheduler_components(group_name);
+CREATE INDEX IF NOT EXISTS idx_scheduler_components_kind ON scheduler_components(kind);
+
+CREATE TABLE IF NOT EXISTS scheduler_component_settings (
+    component_id VARCHAR(100) PRIMARY KEY REFERENCES scheduler_components(component_id) ON DELETE CASCADE,
+    enabled BOOLEAN NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_by VARCHAR(100),
+    note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS scheduler_component_heartbeats (
+    component_id VARCHAR(100) NOT NULL REFERENCES scheduler_components(component_id) ON DELETE CASCADE,
+    instance_id VARCHAR(64) NOT NULL,
+    host VARCHAR(255),
+    pid INTEGER,
+    started_at TIMESTAMP,
+    last_heartbeat_at TIMESTAMP NOT NULL,
+    status VARCHAR(20) NOT NULL,             -- running|idle|error|disabled|locked
+    last_error_at TIMESTAMP,
+    last_error_message VARCHAR(500),
+    PRIMARY KEY (component_id, instance_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_heartbeats_component_time
+ON scheduler_component_heartbeats(component_id, last_heartbeat_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_heartbeats_status
+ON scheduler_component_heartbeats(status);
+
+CREATE TABLE IF NOT EXISTS scheduler_error_events (
+    id BIGSERIAL PRIMARY KEY,
+    component_id VARCHAR(100) NOT NULL REFERENCES scheduler_components(component_id) ON DELETE CASCADE,
+    occurred_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    host VARCHAR(255),
+    pid INTEGER,
+    instance_id VARCHAR(64),
+    message VARCHAR(500) NOT NULL,
+    traceback TEXT,
+    context JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduler_errors_component_time
+ON scheduler_error_events(component_id, occurred_at DESC);
+
 CREATE TABLE IF NOT EXISTS job_execution_metrics (
     id BIGSERIAL PRIMARY KEY,
     job_id VARCHAR(100) NOT NULL,
@@ -757,7 +924,10 @@ BEGIN
         'price_points', 'price_analysis', 'wallet_profiles', 'wallet_profiles_state',
         'pattern_config_projects', 'pattern_config_filters', 'buyin_trail_minutes',
         'trade_filter_values', 'filter_fields_catalog', 'filter_reference_suggestions',
-        'filter_combinations', 'ai_play_updates', 'job_execution_metrics'
+        'filter_combinations', 'ai_play_updates',
+        'scheduler_components', 'scheduler_component_settings',
+        'scheduler_component_heartbeats', 'scheduler_error_events',
+        'job_execution_metrics'
     );
     
     RAISE NOTICE 'Schema migration complete! Created % tables.', table_count;

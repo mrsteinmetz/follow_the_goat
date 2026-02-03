@@ -1,0 +1,44 @@
+{
+  "timestamp": "2026-02-03T12:03:31.817024+00:00",
+  "wallet": "Gi9p3zkQuSctJmK1XxWWnLXCJ4uaByRbxdV3SaBwB9DE",
+  "initial_usdc": 9.695951,
+  "initial_sol": 0.109402785,
+  "swaps": [
+    {
+      "direction": "USDC->SOL",
+      "signature": "5TL4bEW2WCCMTG3h3pU5kJLu2Te4sh5WBtnpnN1RzsDjP8euRvRLo3Wkw6pm1zQRGBeWjaR3eWZR5t8FTAPoTUdd",
+      "input_amount": 5.0,
+      "output_amount": 0.048722039999999994,
+      "input_symbol": "USDC",
+      "output_symbol": "SOL",
+      "price_impact_pct": -0.000493981484630899,
+      "platform_fee": 9744.0,
+      "slippage_pct": 99.99999989999999,
+      "num_hops": 1,
+      "dexes_used": [
+        "JupiterZ"
+      ]
+    },
+    {
+      "direction": "SOL->USDC",
+      "signature": "5vnVy2sv1eDn7X9rhNTmYyGKyu3zMutJgjd8Ma5MVerCypRvwQwcp2hhBRwf5wKGFYmz3qvbGFyyoY3EZDxPSMM7",
+      "input_amount": 0.04823481959999999,
+      "output_amount": 4.892245,
+      "input_symbol": "SOL",
+      "output_symbol": "USDC",
+      "price_impact_pct": 0.00026760583851251357,
+      "platform_fee": 0.0,
+      "slippage_pct": 99.9999,
+      "num_hops": 3,
+      "dexes_used": [
+        "Raydium CLMM",
+        "PancakeSwap",
+        "Stabble Stable Swap"
+      ]
+    }
+  ],
+  "final_usdc": 9.588196,
+  "final_sol": 0.110391457,
+  "total_cost_usdc": 0.006350449439747052,
+  "total_cost_pct": 0.12700898879494105
+}

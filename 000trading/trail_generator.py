@@ -1550,6 +1550,1150 @@ def detect_microstructure_shift(
 
 
 # =============================================================================
+# VELOCITY AND ACCELERATION CALCULATIONS FOR MICRO-MOVEMENT DETECTION
+# =============================================================================
+
+def calculate_velocity_metrics(
+    current_values: List[float],
+    timestamps: List[datetime],
+    lookback_periods: int = 5
+) -> Dict[str, float]:
+    """
+    Calculate velocity (first derivative) and acceleration (second derivative).
+    
+    Args:
+        current_values: List of values ordered oldest to newest
+        timestamps: Corresponding timestamps
+        lookback_periods: Number of periods to use for calculation
+        
+    Returns:
+        Dictionary with velocity and acceleration metrics
+    """
+    if len(current_values) < 3:
+        return {"velocity": 0.0, "acceleration": 0.0, "jerk": 0.0}
+    
+    # Calculate time deltas in seconds
+    time_deltas = []
+    for i in range(1, len(timestamps)):
+        delta = (timestamps[i] - timestamps[i-1]).total_seconds()
+        time_deltas.append(delta if delta > 0 else 1.0)
+    
+    # Calculate velocity (first derivative)
+    velocities = []
+    for i in range(1, len(current_values)):
+        velocity = (current_values[i] - current_values[i-1]) / time_deltas[i-1]
+        velocities.append(velocity)
+    
+    # Calculate acceleration (second derivative)
+    accelerations = []
+    for i in range(1, len(velocities)):
+        if i < len(time_deltas):
+            accel = (velocities[i] - velocities[i-1]) / time_deltas[i]
+            accelerations.append(accel)
+    
+    # Calculate jerk (third derivative) for momentum quality
+    jerks = []
+    for i in range(1, len(accelerations)):
+        if i + 1 < len(time_deltas):
+            jerk = (accelerations[i] - accelerations[i-1]) / time_deltas[i+1]
+            jerks.append(jerk)
+    
+    return {
+        "velocity": velocities[-1] if velocities else 0.0,
+        "velocity_avg": float(np.mean(velocities[-lookback_periods:])) if velocities else 0.0,
+        "acceleration": accelerations[-1] if accelerations else 0.0,
+        "acceleration_avg": float(np.mean(accelerations[-lookback_periods:])) if accelerations else 0.0,
+        "jerk": jerks[-1] if jerks else 0.0,
+        "momentum_persistence": _calculate_momentum_persistence(velocities),
+    }
+
+
+def _calculate_momentum_persistence(velocities: List[float], threshold: float = 0.0) -> float:
+    """
+    Calculate how consistently velocity stays in one direction.
+    Returns ratio of periods velocity stayed positive (or negative).
+    """
+    if not velocities:
+        return 0.0
+    
+    # Count consecutive same-sign periods
+    if velocities[-1] > threshold:
+        # Currently positive - count backwards
+        count = 0
+        for v in reversed(velocities):
+            if v > threshold:
+                count += 1
+            else:
+                break
+        return count / len(velocities)
+    else:
+        # Currently negative
+        count = 0
+        for v in reversed(velocities):
+            if v <= threshold:
+                count += 1
+            else:
+                break
+        return -count / len(velocities)
+
+
+def calculate_order_book_velocities(
+    order_book_rows: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Calculate velocity metrics for order book data.
+    
+    Key insight: Order book tilting SPEED is more predictive than tilt level.
+    """
+    if len(order_book_rows) < 3:
+        return {}
+    
+    # Sort by minute (ascending)
+    sorted_rows = sorted(order_book_rows, key=lambda x: x.get('minute_number', 0))
+    
+    # Extract time series
+    imbalances = [float(r.get('volume_imbalance', 0) or 0) for r in sorted_rows]
+    depth_ratios = [float(r.get('depth_imbalance_ratio', 1.0) or 1.0) for r in sorted_rows]
+    spreads = [float(r.get('spread_bps', 10) or 10) for r in sorted_rows]
+    bid_depths = [float(r.get('bid_depth_10', 0) or 0) for r in sorted_rows]
+    ask_depths = [float(r.get('ask_depth_10', 0) or 0) for r in sorted_rows]
+    
+    # Create dummy timestamps (1 minute apart)
+    base_time = datetime.now()
+    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    
+    # Calculate velocities
+    imbalance_vel = calculate_velocity_metrics(imbalances, timestamps)
+    depth_ratio_vel = calculate_velocity_metrics(depth_ratios, timestamps)
+    spread_vel = calculate_velocity_metrics(spreads, timestamps)
+    
+    # Bid/Ask depth velocities
+    bid_changes = [bid_depths[i] - bid_depths[i-1] for i in range(1, len(bid_depths))]
+    ask_changes = [ask_depths[i] - ask_depths[i-1] for i in range(1, len(ask_depths))]
+    
+    # Cumulative imbalance (5-minute sum)
+    cumulative_imbalance = sum(imbalances[-5:]) if len(imbalances) >= 5 else sum(imbalances)
+    
+    # Imbalance consistency (% of periods with same sign)
+    recent_imbalances = imbalances[-5:] if len(imbalances) >= 5 else imbalances
+    if recent_imbalances:
+        positive_count = sum(1 for x in recent_imbalances if x > 0)
+        consistency = max(positive_count, len(recent_imbalances) - positive_count) / len(recent_imbalances)
+    else:
+        consistency = 0.5
+    
+    # Liquidity gap score
+    latest = sorted_rows[-1]
+    bid_liq = float(latest.get('bid_liquidity_share_pct', 50) or 50)
+    ask_liq = float(latest.get('ask_liquidity_share_pct', 50) or 50)
+    liquidity_gap = abs(bid_liq - ask_liq) / 100.0
+    
+    # Liquidity score (composite)
+    total_liq = float(latest.get('total_liquidity', 0) or 0)
+    liquidity_score = min(1.0, total_liq / 100000) if total_liq > 0 else 0.5  # Normalize to 100k
+    
+    return {
+        "imbalance_velocity_1m": imbalance_vel["velocity"],
+        "imbalance_velocity_30s": imbalance_vel["velocity"] / 2,  # Estimate 30s
+        "imbalance_acceleration": imbalance_vel["acceleration"],
+        "depth_ratio_velocity": depth_ratio_vel["velocity"],
+        "spread_velocity": spread_vel["velocity"],
+        "bid_depth_velocity": float(np.mean(bid_changes[-3:])) if bid_changes else 0,
+        "ask_depth_velocity": float(np.mean(ask_changes[-3:])) if ask_changes else 0,
+        "cumulative_imbalance_5m": cumulative_imbalance,
+        "imbalance_consistency_5m": consistency,
+        "liquidity_gap_score": liquidity_gap,
+        "liquidity_score": liquidity_score,
+        "liquidity_concentration": 0.5,  # Default - would need more detailed order book data
+        "spread_percentile_1h": 0.5,  # Default - would need historical spread data
+        "imbalance_momentum_persistence": imbalance_vel["momentum_persistence"],
+    }
+
+
+def calculate_transaction_velocities(
+    transaction_rows: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Calculate velocity metrics for transaction data.
+    
+    Key insight: Volume ACCELERATION predicts breakouts better than volume level.
+    """
+    if len(transaction_rows) < 3:
+        return {}
+    
+    sorted_rows = sorted(transaction_rows, key=lambda x: x.get('minute_number', 0))
+    
+    # Extract time series
+    volumes = [float(r.get('total_volume_usd', 0) or 0) for r in sorted_rows]
+    buy_pressures = [float(r.get('buy_sell_pressure', 0) or 0) for r in sorted_rows]
+    trade_counts = [int(r.get('trade_count', 0) or 0) for r in sorted_rows]
+    buy_vol_pcts = [float(r.get('buy_volume_pct', 50) or 50) for r in sorted_rows]
+    sell_vol_pcts = [float(r.get('sell_volume_pct', 50) or 50) for r in sorted_rows]
+    
+    buy_volumes = [buy_vol_pcts[i] / 100 * volumes[i] for i in range(len(volumes))]
+    sell_volumes = [sell_vol_pcts[i] / 100 * volumes[i] for i in range(len(volumes))]
+    
+    base_time = datetime.now()
+    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    
+    volume_vel = calculate_velocity_metrics(volumes, timestamps)
+    pressure_vel = calculate_velocity_metrics(buy_pressures, timestamps)
+    
+    # Cumulative delta (running sum of buy - sell)
+    deltas = [b - s for b, s in zip(buy_volumes, sell_volumes)]
+    cumulative_delta = sum(deltas)
+    cumulative_delta_5m = sum(deltas[-5:]) if len(deltas) >= 5 else cumulative_delta
+    
+    # Trade intensity (trades per second, normalized)
+    avg_trade_count = float(np.mean(trade_counts)) if trade_counts else 1
+    trade_intensity = trade_counts[-1] / max(avg_trade_count, 1) if trade_counts else 1.0
+    
+    # Intensity velocity
+    intensity_series = [tc / max(avg_trade_count, 1) for tc in trade_counts]
+    intensity_vel = calculate_velocity_metrics(intensity_series, timestamps)
+    
+    # Large trade intensity
+    large_trades = [int(r.get('large_trade_count', 0) or 0) for r in sorted_rows]
+    large_trade_intensity = float(np.mean(large_trades[-3:])) if large_trades else 0
+    
+    # Delta divergence (cumulative delta vs price direction)
+    price_changes = [float(r.get('price_change_1m', 0) or 0) for r in sorted_rows]
+    cumulative_price = sum(price_changes)
+    
+    # Divergence: positive delta but negative price = bearish divergence
+    if cumulative_delta > 0 and cumulative_price < 0:
+        delta_divergence = -abs(cumulative_delta) * abs(cumulative_price)
+    elif cumulative_delta < 0 and cumulative_price > 0:
+        delta_divergence = -abs(cumulative_delta) * abs(cumulative_price)
+    else:
+        delta_divergence = abs(cumulative_delta) * abs(cumulative_price) * np.sign(cumulative_delta)
+    
+    # Volume percentile (simplified - would need historical data for real percentile)
+    volume_percentile = min(1.0, volumes[-1] / max(float(np.mean(volumes)), 1)) if volumes else 0.5
+    
+    return {
+        "volume_velocity": volume_vel["velocity"],
+        "volume_acceleration": volume_vel["acceleration"],
+        "volume_percentile_1h": volume_percentile,
+        "cumulative_delta": cumulative_delta,
+        "cumulative_delta_5m": cumulative_delta_5m,
+        "delta_divergence": delta_divergence,
+        "trade_intensity": trade_intensity,
+        "trade_intensity_velocity": intensity_vel["velocity"],
+        "large_trade_intensity": large_trade_intensity,
+        "pressure_velocity": pressure_vel["velocity"],
+        "pressure_acceleration": pressure_vel["acceleration"],
+    }
+
+
+def calculate_whale_velocities(
+    whale_rows: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Calculate velocity metrics for whale activity data.
+    """
+    if len(whale_rows) < 2:
+        return {}
+    
+    sorted_rows = sorted(whale_rows, key=lambda x: x.get('minute_number', 0))
+    
+    # Extract time series
+    net_flows = [float(r.get('net_flow_ratio', 0) or 0) for r in sorted_rows]
+    total_moved = [float(r.get('total_sol_moved', 0) or 0) for r in sorted_rows]
+    
+    base_time = datetime.now()
+    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    
+    flow_vel = calculate_velocity_metrics(net_flows, timestamps)
+    
+    # Cumulative flow (10-minute sum)
+    cumulative_flow = sum(net_flows[-10:]) if len(net_flows) >= 10 else sum(net_flows)
+    
+    # Stealth accumulation score (buying without price impact)
+    # High net inflow but low price change = stealth accumulation
+    latest = sorted_rows[-1]
+    net_flow = float(latest.get('net_flow_ratio', 0) or 0)
+    stealth_score = 0.0
+    if net_flow > 0.2:  # Significant accumulation
+        stealth_score = min(1.0, net_flow / 0.5)
+    
+    # Distribution urgency (how fast are whales selling)
+    distribution_urgency = 0.0
+    if net_flow < -0.1:
+        distribution_urgency = min(1.0, abs(net_flow) / 0.4)
+    
+    # Activity regime (0=quiet, 1=normal, 2=active)
+    total_sol = float(latest.get('total_sol_moved', 0) or 0)
+    if total_sol < 1000:
+        activity_regime = 0
+    elif total_sol < 10000:
+        activity_regime = 1
+    else:
+        activity_regime = 2
+    
+    # Time since last large move and frequency
+    movement_count = int(latest.get('movement_count', 0) or 0)
+    massive_count = int(latest.get('massive_move_count', 0) or 0)
+    
+    return {
+        "flow_velocity": flow_vel["velocity"],
+        "flow_acceleration": flow_vel["acceleration"],
+        "cumulative_flow_10m": cumulative_flow,
+        "stealth_accumulation_score": stealth_score,
+        "distribution_urgency": distribution_urgency,
+        "whale_activity_regime": activity_regime,
+        "time_since_last_large_move": 60.0,  # Default - would need timestamp tracking
+        "large_move_frequency_5m": massive_count / 5.0 if massive_count else 0,
+    }
+
+
+def calculate_price_velocities(
+    price_rows: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Calculate velocity metrics for price movements.
+    """
+    if len(price_rows) < 3:
+        return {}
+    
+    sorted_rows = sorted(price_rows, key=lambda x: x.get('minute_number', 0))
+    
+    # Extract price changes
+    price_changes = [float(r.get('price_change_1m', 0) or 0) for r in sorted_rows]
+    volatilities = [float(r.get('volatility_pct', 0) or 0) for r in sorted_rows]
+    close_prices = [float(r.get('close_price', 0) or 0) for r in sorted_rows]
+    high_prices = [float(r.get('high_price', 0) or 0) for r in sorted_rows]
+    low_prices = [float(r.get('low_price', 0) or 0) for r in sorted_rows]
+    
+    base_time = datetime.now()
+    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    
+    price_vel = calculate_velocity_metrics(price_changes, timestamps)
+    vol_vel = calculate_velocity_metrics(volatilities, timestamps)
+    
+    # Realized volatility (std of returns)
+    realized_vol = float(np.std(price_changes)) if len(price_changes) >= 2 else 0
+    
+    # Volatility of volatility
+    vol_of_vol = float(np.std(volatilities)) if len(volatilities) >= 2 else 0
+    
+    # Volatility regime
+    avg_vol = float(np.mean(volatilities)) if volatilities else 0
+    if avg_vol < 0.1:
+        vol_regime = 0  # Low
+    elif avg_vol < 0.3:
+        vol_regime = 1  # Normal
+    else:
+        vol_regime = 2  # High
+    
+    # Higher highs/lows count (5 minutes)
+    recent_highs = high_prices[-5:] if len(high_prices) >= 5 else high_prices
+    recent_lows = low_prices[-5:] if len(low_prices) >= 5 else low_prices
+    
+    higher_highs = sum(1 for i in range(1, len(recent_highs)) if recent_highs[i] > recent_highs[i-1])
+    higher_lows = sum(1 for i in range(1, len(recent_lows)) if recent_lows[i] > recent_lows[i-1])
+    
+    # Trend strength (EMA crossover approximation)
+    if len(close_prices) >= 5:
+        short_ma = float(np.mean(close_prices[-3:]))
+        long_ma = float(np.mean(close_prices[-5:]))
+        trend_strength = (short_ma - long_ma) / long_ma * 100 if long_ma != 0 else 0
+    else:
+        trend_strength = 0
+    
+    # Support/resistance distance (simplified)
+    if close_prices and high_prices and low_prices:
+        current_price = close_prices[-1]
+        recent_high = max(high_prices[-10:]) if len(high_prices) >= 10 else max(high_prices)
+        recent_low = min(low_prices[-10:]) if len(low_prices) >= 10 else min(low_prices)
+        
+        dist_resistance = (recent_high - current_price) / current_price * 100 if current_price else 0
+        dist_support = (current_price - recent_low) / current_price * 100 if current_price else 0
+        
+        # Breakout imminence (closer to resistance with momentum = higher score)
+        if dist_resistance < 0.5 and price_vel["velocity"] > 0:
+            breakout_imminence = min(1.0, (0.5 - dist_resistance) / 0.5 + abs(price_vel["velocity"]) / 0.01)
+        else:
+            breakout_imminence = 0
+    else:
+        dist_resistance = 0
+        dist_support = 0
+        breakout_imminence = 0
+    
+    return {
+        "price_velocity_1m": price_vel["velocity"],
+        "price_velocity_30s": price_vel["velocity"] / 2,  # Estimate
+        "velocity_acceleration": price_vel["acceleration"],
+        "momentum_persistence": price_vel["momentum_persistence"],
+        "realized_volatility_1m": realized_vol,
+        "volatility_of_volatility": vol_of_vol,
+        "volatility_regime": vol_regime,
+        "trend_strength_ema": trend_strength,
+        "price_vs_vwap_pct": 0,  # Would need VWAP calculation
+        "price_vs_twap_pct": 0,  # Would need TWAP calculation
+        "higher_highs_count_5m": higher_highs,
+        "higher_lows_count_5m": higher_lows,
+        "distance_to_resistance_pct": dist_resistance,
+        "distance_to_support_pct": dist_support,
+        "breakout_imminence_score": breakout_imminence,
+    }
+
+
+def calculate_vpin_estimate(
+    transaction_rows: List[Dict[str, Any]],
+    num_buckets: int = 10
+) -> float:
+    """
+    Estimate Volume-Synchronized Probability of Informed Trading (VPIN).
+    
+    Higher VPIN = more informed trading = higher probability of directional move.
+    
+    Simplified VPIN calculation:
+    VPIN = |sum(buy_volume) - sum(sell_volume)| / total_volume
+    """
+    if not transaction_rows:
+        return 0.0
+    
+    total_buy = sum(
+        float(r.get('buy_volume_pct', 50) or 50) / 100 * float(r.get('total_volume_usd', 0) or 0)
+        for r in transaction_rows
+    )
+    total_sell = sum(
+        float(r.get('sell_volume_pct', 50) or 50) / 100 * float(r.get('total_volume_usd', 0) or 0)
+        for r in transaction_rows
+    )
+    total_volume = total_buy + total_sell
+    
+    if total_volume == 0:
+        return 0.0
+    
+    vpin = abs(total_buy - total_sell) / total_volume
+    return min(1.0, vpin)
+
+
+def calculate_order_flow_toxicity(
+    transaction_rows: List[Dict[str, Any]],
+    order_book_rows: List[Dict[str, Any]]
+) -> float:
+    """
+    Calculate order flow toxicity (adverse selection metric).
+    
+    High toxicity = orders tend to move price against you = institutional flow.
+    """
+    if not transaction_rows or not order_book_rows:
+        return 0.0
+    
+    # Get latest data
+    latest_tx = transaction_rows[0] if transaction_rows else {}
+    latest_ob = order_book_rows[0] if order_book_rows else {}
+    
+    # Components of toxicity
+    volume_imbalance = abs(float(latest_ob.get('volume_imbalance', 0) or 0))
+    whale_volume_pct = float(latest_tx.get('whale_volume_pct', 0) or 0) / 100
+    spread_bps = float(latest_ob.get('spread_bps', 10) or 10)
+    
+    # Higher toxicity when:
+    # 1. Volume imbalance is high (directional flow)
+    # 2. Whale participation is high (informed traders)
+    # 3. Spread is wide (market makers protecting themselves)
+    
+    toxicity = (
+        volume_imbalance * 0.4 +
+        whale_volume_pct * 0.35 +
+        min(1.0, spread_bps / 20) * 0.25  # Normalize spread contribution
+    )
+    
+    return min(1.0, max(0.0, toxicity))
+
+
+# =============================================================================
+# CROSS-ASSET CORRELATION AND LEAD-LAG ANALYSIS
+# =============================================================================
+
+def calculate_cross_asset_metrics(
+    sol_price_rows: List[Dict[str, Any]],
+    btc_price_rows: List[Dict[str, Any]],
+    eth_price_rows: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    """
+    Calculate cross-asset correlations and lead-lag relationships.
+    
+    Key insight: BTC often leads SOL by 1-2 minutes. ETH can diverge.
+    """
+    result = {
+        "btc_sol_correlation_1m": 0.0,
+        "btc_sol_correlation_5m": 0.0,
+        "btc_leads_sol_lag1": 0.0,
+        "btc_leads_sol_lag2": 0.0,
+        "sol_beta_to_btc": 1.0,
+        "eth_sol_correlation_1m": 0.0,
+        "eth_leads_sol_lag1": 0.0,
+        "sol_beta_to_eth": 1.0,
+        "btc_sol_divergence": 0.0,
+        "eth_sol_divergence": 0.0,
+        "cross_asset_momentum_align": 0.0,
+    }
+    
+    if not all([sol_price_rows, btc_price_rows, eth_price_rows]):
+        return result
+    
+    # Extract price change series (sorted oldest to newest)
+    def get_changes(rows, field='price_change_1m'):
+        sorted_rows = sorted(rows, key=lambda x: x.get('minute_number', 0))
+        return [float(r.get(field, 0) or 0) for r in sorted_rows]
+    
+    sol_changes = get_changes(sol_price_rows)
+    btc_changes = get_changes(btc_price_rows)
+    eth_changes = get_changes(eth_price_rows)
+    
+    min_len = min(len(sol_changes), len(btc_changes), len(eth_changes))
+    if min_len < 5:
+        return result
+    
+    # Trim to same length
+    sol_changes = sol_changes[-min_len:]
+    btc_changes = btc_changes[-min_len:]
+    eth_changes = eth_changes[-min_len:]
+    
+    # Calculate correlations (handle edge cases)
+    try:
+        if len(btc_changes) > 2 and np.std(btc_changes) > 0 and np.std(sol_changes) > 0:
+            result["btc_sol_correlation_1m"] = float(np.corrcoef(btc_changes, sol_changes)[0, 1])
+        if len(eth_changes) > 2 and np.std(eth_changes) > 0 and np.std(sol_changes) > 0:
+            result["eth_sol_correlation_1m"] = float(np.corrcoef(eth_changes, sol_changes)[0, 1])
+    except (ValueError, FloatingPointError):
+        pass
+    
+    # 5-minute correlation (using 5-minute changes if available)
+    sol_5m = get_changes(sol_price_rows, 'price_change_5m')[-min_len:]
+    btc_5m = get_changes(btc_price_rows, 'price_change_5m')[-min_len:]
+    try:
+        if len(sol_5m) > 2 and len(btc_5m) > 2 and np.std(sol_5m) > 0 and np.std(btc_5m) > 0:
+            result["btc_sol_correlation_5m"] = float(np.corrcoef(btc_5m, sol_5m)[0, 1])
+    except (ValueError, FloatingPointError):
+        pass
+    
+    # Lead-lag: Does BTC[t-1] predict SOL[t]?
+    try:
+        if len(btc_changes) > 3 and len(sol_changes) > 3:
+            btc_lagged_1 = btc_changes[:-1]  # BTC at t-1
+            sol_current = sol_changes[1:]    # SOL at t
+            if np.std(btc_lagged_1) > 0 and np.std(sol_current) > 0:
+                result["btc_leads_sol_lag1"] = float(np.corrcoef(btc_lagged_1, sol_current)[0, 1])
+            
+            if len(btc_changes) > 4:
+                btc_lagged_2 = btc_changes[:-2]  # BTC at t-2
+                sol_current_2 = sol_changes[2:]  # SOL at t
+                if np.std(btc_lagged_2) > 0 and np.std(sol_current_2) > 0:
+                    result["btc_leads_sol_lag2"] = float(np.corrcoef(btc_lagged_2, sol_current_2)[0, 1])
+    except (ValueError, FloatingPointError):
+        pass
+    
+    try:
+        if len(eth_changes) > 3 and len(sol_changes) > 3:
+            eth_lagged_1 = eth_changes[:-1]
+            sol_current = sol_changes[1:]
+            if np.std(eth_lagged_1) > 0 and np.std(sol_current) > 0:
+                result["eth_leads_sol_lag1"] = float(np.corrcoef(eth_lagged_1, sol_current)[0, 1])
+    except (ValueError, FloatingPointError):
+        pass
+    
+    # Beta calculation (sensitivity)
+    # SOL_return = alpha + beta * BTC_return
+    try:
+        if len(btc_changes) > 2:
+            btc_var = np.var(btc_changes)
+            if btc_var > 0:
+                covariance = np.cov(sol_changes, btc_changes)[0, 1]
+                result["sol_beta_to_btc"] = float(covariance / btc_var)
+    except (ValueError, FloatingPointError):
+        pass
+    
+    try:
+        if len(eth_changes) > 2:
+            eth_var = np.var(eth_changes)
+            if eth_var > 0:
+                covariance = np.cov(sol_changes, eth_changes)[0, 1]
+                result["sol_beta_to_eth"] = float(covariance / eth_var)
+    except (ValueError, FloatingPointError):
+        pass
+    
+    # Divergence: SOL outperforming/underperforming vs BTC/ETH
+    recent_sol = sum(sol_changes[-3:]) if len(sol_changes) >= 3 else sol_changes[-1] if sol_changes else 0
+    recent_btc = sum(btc_changes[-3:]) if len(btc_changes) >= 3 else btc_changes[-1] if btc_changes else 0
+    recent_eth = sum(eth_changes[-3:]) if len(eth_changes) >= 3 else eth_changes[-1] if eth_changes else 0
+    
+    # Positive divergence = SOL outperforming
+    result["btc_sol_divergence"] = recent_sol - recent_btc * result["sol_beta_to_btc"]
+    result["eth_sol_divergence"] = recent_sol - recent_eth * result["sol_beta_to_eth"]
+    
+    # Momentum alignment: Are all three moving same direction?
+    sol_direction = np.sign(recent_sol)
+    btc_direction = np.sign(recent_btc)
+    eth_direction = np.sign(recent_eth)
+    
+    if sol_direction == btc_direction == eth_direction and sol_direction != 0:
+        # All aligned
+        result["cross_asset_momentum_align"] = sol_direction * (abs(recent_sol) + abs(recent_btc) + abs(recent_eth)) / 3
+    else:
+        # Mixed signals
+        result["cross_asset_momentum_align"] = (sol_direction + btc_direction + eth_direction) / 3 * 0.3
+    
+    # Handle NaN values
+    for key in result:
+        if isinstance(result[key], float) and (np.isnan(result[key]) or np.isinf(result[key])):
+            result[key] = 0.0
+    
+    return result
+
+
+# =============================================================================
+# 30-SECOND INTERVAL CALCULATIONS
+# =============================================================================
+
+def fetch_30_second_data(
+    start_time: datetime,
+    end_time: datetime,
+    token: str = "SOL"
+) -> List[Dict[str, Any]]:
+    """
+    Fetch and aggregate data at 30-second intervals for the full 15-minute window.
+    Returns 30 buckets (one per 30-second interval).
+    """
+    # Query raw second-level data and bucket into 30-second intervals
+    query = """
+        WITH thirty_sec_buckets AS (
+            SELECT 
+                DATE_TRUNC('minute', timestamp) + 
+                    INTERVAL '30 seconds' * FLOOR(EXTRACT(SECOND FROM timestamp) / 30) AS bucket_ts,
+                price,
+                timestamp
+            FROM prices
+            WHERE timestamp >= %s AND timestamp <= %s AND token = %s
+        ),
+        aggregated AS (
+            SELECT 
+                bucket_ts,
+                (ARRAY_AGG(price ORDER BY timestamp ASC))[1] AS open_price,
+                (ARRAY_AGG(price ORDER BY timestamp DESC))[1] AS close_price,
+                MIN(price) AS low_price,
+                MAX(price) AS high_price,
+                AVG(price) AS avg_price,
+                STDDEV(price) AS price_stddev,
+                COUNT(*) AS tick_count
+            FROM thirty_sec_buckets
+            GROUP BY bucket_ts
+        )
+        SELECT 
+            bucket_ts,
+            open_price,
+            close_price,
+            high_price,
+            low_price,
+            avg_price,
+            price_stddev,
+            tick_count,
+            ROUND(CAST((close_price - open_price) / NULLIF(open_price, 0) * 100 AS NUMERIC), 6) AS price_change_30s,
+            ROUND(CAST((high_price - low_price) / NULLIF(avg_price, 0) * 100 AS NUMERIC), 6) AS volatility_30s
+        FROM aggregated
+        ORDER BY bucket_ts ASC
+    """
+    
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, [start_time, end_time, token])
+                results = cursor.fetchall()
+                return results if results else []
+    except Exception as e:
+        logger.error(f"Failed to fetch 30-second data: {e}")
+        return []
+
+
+def calculate_30_second_interval_metrics(
+    thirty_sec_rows: List[Dict[str, Any]],
+    interval_index: int
+) -> Dict[str, Any]:
+    """
+    Calculate metrics for a specific 30-second interval.
+    
+    Args:
+        thirty_sec_rows: All 30-second buckets (sorted oldest to newest)
+        interval_index: Which interval (0-29) to calculate for
+        
+    Returns:
+        Metrics specific to this 30-second interval
+    """
+    result = {
+        "ts_price_change_30s": 0.0,
+        "ts_volume_30s": 0.0,
+        "ts_buy_sell_pressure_30s": 0.0,
+        "ts_imbalance_30s": 0.0,
+        "ts_trade_count_30s": 0,
+        "ts_momentum_30s": 0.0,
+        "ts_volatility_30s": 0.0,
+        "ts_open_price": 0.0,
+        "ts_close_price": 0.0,
+        "ts_high_price": 0.0,
+        "ts_low_price": 0.0,
+    }
+    
+    if not thirty_sec_rows or interval_index >= len(thirty_sec_rows):
+        return result
+    
+    current = thirty_sec_rows[interval_index]
+    
+    result["ts_price_change_30s"] = float(current.get("price_change_30s", 0) or 0)
+    result["ts_volatility_30s"] = float(current.get("volatility_30s", 0) or 0)
+    result["ts_open_price"] = float(current.get("open_price", 0) or 0)
+    result["ts_close_price"] = float(current.get("close_price", 0) or 0)
+    result["ts_high_price"] = float(current.get("high_price", 0) or 0)
+    result["ts_low_price"] = float(current.get("low_price", 0) or 0)
+    result["ts_trade_count_30s"] = int(current.get("tick_count", 0) or 0)
+    
+    # Calculate momentum (change in price change)
+    if interval_index > 0:
+        prev = thirty_sec_rows[interval_index - 1]
+        prev_change = float(prev.get("price_change_30s", 0) or 0)
+        curr_change = result["ts_price_change_30s"]
+        result["ts_momentum_30s"] = curr_change - prev_change
+    
+    return result
+
+
+def calculate_30_second_velocity_at_interval(
+    thirty_sec_rows: List[Dict[str, Any]],
+    interval_index: int,
+    lookback: int = 5
+) -> Dict[str, float]:
+    """
+    Calculate velocity metrics at a specific 30-second interval using rolling window.
+    
+    This gives per-interval velocity which is crucial for detecting momentum shifts.
+    """
+    result = {
+        "ts_price_velocity": 0.0,
+        "ts_price_acceleration": 0.0,
+        "ts_momentum_persistence": 0.0,
+        "ts_volatility_regime": 0,
+    }
+    
+    if not thirty_sec_rows or interval_index < 2:
+        return result
+    
+    # Get lookback window of price changes
+    start_idx = max(0, interval_index - lookback + 1)
+    window = thirty_sec_rows[start_idx:interval_index + 1]
+    
+    if len(window) < 3:
+        return result
+    
+    # Extract price changes
+    changes = [float(r.get("price_change_30s", 0) or 0) for r in window]
+    
+    # Velocity = rate of change of price changes (acceleration of price)
+    velocities = [changes[i] - changes[i-1] for i in range(1, len(changes))]
+    result["ts_price_velocity"] = velocities[-1] if velocities else 0.0
+    
+    # Acceleration = rate of change of velocity
+    if len(velocities) >= 2:
+        accelerations = [velocities[i] - velocities[i-1] for i in range(1, len(velocities))]
+        result["ts_price_acceleration"] = accelerations[-1] if accelerations else 0.0
+    
+    # Momentum persistence = how many consecutive periods in same direction
+    if velocities:
+        current_sign = np.sign(velocities[-1])
+        count = 0
+        for v in reversed(velocities):
+            if np.sign(v) == current_sign and current_sign != 0:
+                count += 1
+            else:
+                break
+        result["ts_momentum_persistence"] = count / len(velocities) * current_sign
+    
+    # Volatility regime (based on recent volatility)
+    volatilities = [float(r.get("volatility_30s", 0) or 0) for r in window]
+    avg_vol = np.mean(volatilities) if volatilities else 0
+    if avg_vol < 0.05:
+        result["ts_volatility_regime"] = 0  # Low
+    elif avg_vol < 0.15:
+        result["ts_volatility_regime"] = 1  # Normal
+    else:
+        result["ts_volatility_regime"] = 2  # High
+    
+    return result
+
+
+def calculate_30_second_metrics(
+    thirty_sec_rows: List[Dict[str, Any]],
+    transaction_rows: List[Dict[str, Any]] = None,
+    order_book_rows: List[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Calculate metrics at 30-second granularity.
+    """
+    result = {
+        "price_change_30s": 0.0,
+        "volume_30s": 0.0,
+        "buy_sell_pressure_30s": 0.0,
+        "imbalance_30s": 0.0,
+        "trade_count_30s": 0,
+        "momentum_30s": 0.0,
+        "volatility_30s": 0.0,
+    }
+    
+    if not thirty_sec_rows:
+        return result
+    
+    # Sort newest first
+    sorted_rows = sorted(thirty_sec_rows, key=lambda x: x.get('bucket_ts', datetime.min), reverse=True)
+    
+    # Price metrics
+    if len(sorted_rows) >= 2:
+        current = sorted_rows[0]
+        previous = sorted_rows[1]
+        
+        result["price_change_30s"] = float(current.get("price_change_30s", 0) or 0)
+        result["volatility_30s"] = float(current.get("volatility_30s", 0) or 0)
+        
+        # Momentum at 30s
+        curr_change = float(current.get("price_change_30s", 0) or 0)
+        prev_change = float(previous.get("price_change_30s", 0) or 0)
+        result["momentum_30s"] = curr_change - prev_change
+    elif len(sorted_rows) == 1:
+        current = sorted_rows[0]
+        result["price_change_30s"] = float(current.get("price_change_30s", 0) or 0)
+        result["volatility_30s"] = float(current.get("volatility_30s", 0) or 0)
+    
+    # Aggregate volume for 30-second window (from transactions)
+    if transaction_rows:
+        # Estimate 30-second volume as half of 1-minute volume
+        latest_tx = transaction_rows[0] if transaction_rows else {}
+        result["volume_30s"] = float(latest_tx.get("total_volume_usd", 0) or 0) / 2
+        result["buy_sell_pressure_30s"] = float(latest_tx.get("buy_sell_pressure", 0) or 0)
+        result["trade_count_30s"] = int(latest_tx.get("trade_count", 0) or 0) // 2
+    
+    # Order book at 30s
+    if order_book_rows:
+        latest_ob = order_book_rows[0] if order_book_rows else {}
+        result["imbalance_30s"] = float(latest_ob.get("volume_imbalance", 0) or 0)
+    
+    return result
+
+
+# =============================================================================
+# COMPOSITE MICRO-MOVE PROBABILITY SCORING
+# =============================================================================
+
+def calculate_micro_move_composite_score(
+    order_book_rows: List[Dict[str, Any]],
+    transaction_rows: List[Dict[str, Any]],
+    whale_rows: List[Dict[str, Any]],
+    price_rows: List[Dict[str, Any]],
+    cross_asset_metrics: Dict[str, float],
+    velocity_metrics: Dict[str, float],
+    micro_patterns: Dict[str, Any],
+    target_move_pct: float = 0.5
+) -> Dict[str, Any]:
+    """
+    Calculate comprehensive probability score for 0.4-0.6% move.
+    
+    This is the PRIMARY signal your bot should use for entry decisions.
+    
+    Args:
+        target_move_pct: Target move size (default 0.5%)
+        
+    Returns:
+        Dictionary with probability, direction, confidence, and component scores
+    """
+    result = {
+        "micro_move_probability": 0.0,
+        "micro_move_direction": 0.0,
+        "micro_move_confidence": 0.0,
+        "micro_move_timeframe": 5.0,  # Minutes
+        "order_flow_score": 0.0,
+        "whale_alignment_score": 0.0,
+        "momentum_quality_score": 0.0,
+        "volatility_regime_score": 0.0,
+        "cross_asset_score": 0.0,
+        "false_signal_risk": 0.5,
+        "adverse_selection_risk": 0.0,
+        "slippage_estimate_bps": 5.0,  # bps
+    }
+    
+    if not all([order_book_rows, transaction_rows, price_rows]):
+        return result
+    
+    # Get latest data
+    latest_ob = order_book_rows[0] if order_book_rows else {}
+    latest_tx = transaction_rows[0] if transaction_rows else {}
+    latest_whale = whale_rows[0] if whale_rows else {}
+    latest_price = price_rows[0] if price_rows else {}
+    
+    def _safe_float(val, default=0.0):
+        try:
+            if val is None:
+                return default
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+    
+    # =========================================================================
+    # COMPONENT 1: ORDER FLOW SCORE (30% weight)
+    # =========================================================================
+    order_flow_components = []
+    
+    # 1a. Volume imbalance (10%)
+    vol_imbalance = _safe_float(latest_ob.get("volume_imbalance", 0))
+    vol_imbalance_score = min(1.0, abs(vol_imbalance) / 0.3)  # 0.3 = strong imbalance
+    order_flow_components.append(vol_imbalance_score * 0.10)
+    
+    # 1b. Depth imbalance ratio (8%)
+    depth_ratio = _safe_float(latest_ob.get("depth_imbalance_ratio", 1.0), 1.0)
+    if depth_ratio > 1.0:
+        depth_score = min(1.0, (depth_ratio - 1.0) / 0.2)  # 1.2 ratio = strong
+    else:
+        depth_score = min(1.0, (1.0 - depth_ratio) / 0.2)
+    order_flow_components.append(depth_score * 0.08)
+    
+    # 1c. Imbalance velocity (7%)
+    imb_velocity = _safe_float(velocity_metrics.get("imbalance_velocity_1m", 0))
+    imb_vel_score = min(1.0, abs(imb_velocity) / 0.1)
+    order_flow_components.append(imb_vel_score * 0.07)
+    
+    # 1d. Buy/sell pressure (5%)
+    buy_pressure = _safe_float(latest_tx.get("buy_sell_pressure", 0))
+    pressure_score = min(1.0, abs(buy_pressure) / 0.25)
+    order_flow_components.append(pressure_score * 0.05)
+    
+    order_flow_total = sum(order_flow_components)
+    result["order_flow_score"] = round(order_flow_total / 0.30, 3)  # Normalize to 0-1
+    
+    # =========================================================================
+    # COMPONENT 2: MOMENTUM QUALITY (25% weight)
+    # =========================================================================
+    momentum_components = []
+    
+    # 2a. Price velocity (8%)
+    price_vel = _safe_float(velocity_metrics.get("price_velocity_1m", 0))
+    price_vel_score = min(1.0, abs(price_vel) / 0.005)  # 0.5%/min = strong
+    momentum_components.append(price_vel_score * 0.08)
+    
+    # 2b. Momentum acceleration (7%)
+    mom_accel = _safe_float(latest_price.get("momentum_acceleration_1m", 0))
+    mom_accel_score = min(1.0, abs(mom_accel) / 0.2)
+    momentum_components.append(mom_accel_score * 0.07)
+    
+    # 2c. Volume acceleration (6%)
+    vol_accel = _safe_float(velocity_metrics.get("volume_acceleration", 0))
+    vol_accel_score = min(1.0, abs(vol_accel) / 50000)  # $50k/min² = strong
+    momentum_components.append(vol_accel_score * 0.06)
+    
+    # 2d. Momentum persistence (4%)
+    persistence = _safe_float(velocity_metrics.get("momentum_persistence", 0))
+    persistence_score = abs(persistence)
+    momentum_components.append(persistence_score * 0.04)
+    
+    momentum_total = sum(momentum_components)
+    result["momentum_quality_score"] = round(momentum_total / 0.25, 3)
+    
+    # =========================================================================
+    # COMPONENT 3: WHALE ALIGNMENT (20% weight)
+    # =========================================================================
+    whale_components = []
+    
+    if whale_rows:
+        # 3a. Net flow ratio (8%)
+        net_flow = _safe_float(latest_whale.get("net_flow_ratio", 0))
+        net_flow_score = min(1.0, abs(net_flow) / 0.6)
+        whale_components.append(net_flow_score * 0.08)
+        
+        # 3b. Accumulation pattern (6%)
+        acc_ratio = _safe_float(latest_whale.get("accumulation_ratio", 1.0), 1.0)
+        if acc_ratio > 1.0:
+            acc_score = min(1.0, (acc_ratio - 1.0) / 3.0)  # 4x = strong
+        else:
+            acc_score = min(1.0, (1.0 - acc_ratio) / 0.75)  # 0.25 = strong selling
+        whale_components.append(acc_score * 0.06)
+        
+        # 3c. Stealth accumulation detection (4%)
+        stealth_detected = micro_patterns.get("whale_stealth_accumulation", {}).get("detected", False)
+        stealth_conf = _safe_float(micro_patterns.get("whale_stealth_accumulation", {}).get("confidence", 0))
+        whale_components.append(stealth_conf * 0.04 if stealth_detected else 0)
+        
+        # 3d. Flow velocity (2%)
+        flow_vel = _safe_float(velocity_metrics.get("flow_velocity", 0))
+        flow_vel_score = min(1.0, abs(flow_vel) / 10000)  # 10k SOL/min = strong
+        whale_components.append(flow_vel_score * 0.02)
+    
+    whale_total = sum(whale_components) if whale_components else 0
+    result["whale_alignment_score"] = round(whale_total / 0.20, 3) if whale_components else 0
+    
+    # =========================================================================
+    # COMPONENT 4: VOLATILITY REGIME (15% weight)
+    # =========================================================================
+    vol_components = []
+    
+    # 4a. Current volatility level (5%)
+    volatility = _safe_float(latest_price.get("volatility_pct", 0))
+    # Sweet spot: 0.1-0.3% volatility - high enough for moves, low enough for signal
+    if 0.1 <= volatility <= 0.4:
+        vol_level_score = 1.0
+    elif volatility < 0.1:
+        vol_level_score = volatility / 0.1  # Too quiet
+    else:
+        vol_level_score = max(0, 1.0 - (volatility - 0.4) / 0.6)  # Too noisy
+    vol_components.append(vol_level_score * 0.05)
+    
+    # 4b. Volatility compression (5%)
+    # Decreasing volatility often precedes breakouts
+    vol_of_vol = _safe_float(velocity_metrics.get("volatility_of_volatility", 0))
+    compression_score = max(0, 1.0 - vol_of_vol) if vol_of_vol < 1.0 else 0
+    vol_components.append(compression_score * 0.05)
+    
+    # 4c. Spread tightness (5%)
+    spread = _safe_float(latest_ob.get("spread_bps", 10), 10)
+    spread_score = max(0, 1.0 - spread / 15)  # <15 bps = good
+    vol_components.append(spread_score * 0.05)
+    
+    vol_total = sum(vol_components)
+    result["volatility_regime_score"] = round(vol_total / 0.15, 3)
+    
+    # =========================================================================
+    # COMPONENT 5: CROSS-ASSET ALIGNMENT (10% weight)
+    # =========================================================================
+    xa_components = []
+    
+    # 5a. BTC leading signal (4%)
+    btc_lead = _safe_float(cross_asset_metrics.get("btc_leads_sol_lag1", 0))
+    btc_lead_score = min(1.0, abs(btc_lead))
+    xa_components.append(btc_lead_score * 0.04)
+    
+    # 5b. Momentum alignment (4%)
+    momentum_align = _safe_float(cross_asset_metrics.get("cross_asset_momentum_align", 0))
+    align_score = min(1.0, abs(momentum_align) / 0.3)
+    xa_components.append(align_score * 0.04)
+    
+    # 5c. SOL outperformance (2%)
+    divergence = _safe_float(cross_asset_metrics.get("btc_sol_divergence", 0))
+    div_score = min(1.0, abs(divergence) / 0.3)
+    xa_components.append(div_score * 0.02)
+    
+    xa_total = sum(xa_components)
+    result["cross_asset_score"] = round(xa_total / 0.10, 3)
+    
+    # =========================================================================
+    # AGGREGATE PROBABILITY
+    # =========================================================================
+    raw_probability = (
+        order_flow_total +
+        momentum_total +
+        whale_total +
+        vol_total +
+        xa_total
+    )
+    
+    # =========================================================================
+    # DIRECTION DETERMINATION
+    # =========================================================================
+    direction_signals = []
+    
+    # Volume imbalance direction
+    direction_signals.append(np.sign(vol_imbalance) * vol_imbalance_score)
+    
+    # Depth ratio direction
+    if depth_ratio > 1.0:
+        direction_signals.append(1 * depth_score)
+    else:
+        direction_signals.append(-1 * depth_score)
+    
+    # Buy/sell pressure direction
+    direction_signals.append(np.sign(buy_pressure) * pressure_score)
+    
+    # Whale net flow direction
+    if whale_rows:
+        direction_signals.append(np.sign(net_flow) * net_flow_score)
+    
+    # Price momentum direction
+    price_change = _safe_float(latest_price.get("price_change_1m", 0))
+    direction_signals.append(np.sign(price_change) * price_vel_score)
+    
+    # Cross-asset alignment direction
+    direction_signals.append(np.sign(momentum_align) * align_score)
+    
+    # Weighted direction
+    direction = float(np.mean(direction_signals)) if direction_signals else 0
+    result["micro_move_direction"] = round(np.clip(direction, -1, 1), 3)
+    
+    # =========================================================================
+    # RISK ADJUSTMENTS
+    # =========================================================================
+    
+    # False signal risk (reduces probability)
+    false_signal_factors = []
+    
+    # Low volume = higher false signal risk
+    total_volume = _safe_float(latest_tx.get("total_volume_usd", 0))
+    if total_volume < 100000:  # $100k minimum
+        false_signal_factors.append(0.3)
+    
+    # Wide spread = higher risk
+    if spread > 12:
+        false_signal_factors.append(0.2)
+    
+    # Conflicting signals = higher risk
+    if len(set(np.sign(s) for s in direction_signals if s != 0)) > 1:
+        false_signal_factors.append(0.15)
+    
+    # Low whale activity = lower confidence
+    if not whale_rows or _safe_float(latest_whale.get("total_sol_moved", 0)) < 10000:
+        false_signal_factors.append(0.1)
+    
+    false_signal_risk = min(0.8, sum(false_signal_factors))
+    result["false_signal_risk"] = round(false_signal_risk, 3)
+    
+    # Adverse selection (from order flow toxicity)
+    toxicity = calculate_order_flow_toxicity(transaction_rows, order_book_rows)
+    result["adverse_selection_risk"] = round(toxicity, 3)
+    
+    # Slippage estimate (based on liquidity and spread)
+    liquidity = _safe_float(latest_ob.get("total_liquidity", 0))
+    base_slippage = spread / 2  # Half spread minimum
+    liquidity_impact = 0 if liquidity > 50000 else (50000 - liquidity) / 50000 * 5
+    result["slippage_estimate_bps"] = round(base_slippage + liquidity_impact, 2)
+    
+    # =========================================================================
+    # FINAL PROBABILITY
+    # =========================================================================
+    # Apply risk deductions
+    adjusted_probability = raw_probability * (1 - false_signal_risk * 0.5)
+    
+    # Boost if micro-patterns detected
+    micro_pattern_boost = 0
+    for pattern_name in ["volume_divergence", "order_book_squeeze", "microstructure_shift"]:
+        pattern = micro_patterns.get(pattern_name, {})
+        if pattern.get("detected"):
+            micro_pattern_boost += _safe_float(pattern.get("confidence", 0)) * 0.05
+    
+    final_probability = min(0.95, adjusted_probability + micro_pattern_boost)
+    result["micro_move_probability"] = round(final_probability, 3)
+    
+    # Confidence (how certain we are in the prediction)
+    signal_strength = abs(direction)
+    signal_consistency = 1 - false_signal_risk
+    result["micro_move_confidence"] = round((signal_strength * 0.5 + signal_consistency * 0.5), 3)
+    
+    # Expected timeframe (minutes until move)
+    # Faster if: high velocity, high volume, aligned signals
+    base_timeframe = 5.0
+    velocity_factor = min(1.0, abs(price_vel) / 0.003)  # Higher velocity = faster
+    volume_factor = min(1.0, total_volume / 500000)  # Higher volume = faster
+    result["micro_move_timeframe"] = round(base_timeframe * (1 - velocity_factor * 0.3 - volume_factor * 0.2), 1)
+    
+    return result
+
+
+# =============================================================================
 # ENHANCED SCORING SYSTEM FOR 0.5% CLIMBS
 # =============================================================================
 
@@ -2363,14 +3507,22 @@ def generate_trail_payload(
     symbol: Optional[str] = None,
     lookback_minutes: Optional[int] = None,
     persist: bool = True,
+    include_30_second: bool = True,
 ) -> Dict[str, Any]:
     """Generate the 15-minute trail payload for a buy-in with enhanced micro-pattern detection.
+
+    NEW: Now includes:
+    - 30-second interval data
+    - Velocity/acceleration metrics
+    - Cross-asset lead-lag analysis
+    - Composite micro-move probability scoring
 
     Args:
         buyin_id: Target identifier in follow_the_goat_buyins.
         symbol: Optional override for the order book symbol (default: SOLUSDT).
         lookback_minutes: Window size in minutes (default: 15).
         persist: If True (default), store data in buyin_trail_minutes table.
+        include_30_second: If True (default), include 30-second interval data.
 
     Returns:
         JSON-serializable dictionary containing all analytics and pattern detection.
@@ -2461,6 +3613,62 @@ def generate_trail_payload(
         if micro_shift.get("detected"):
             logger.info(f"✓ Microstructure shift detected (confidence: {micro_shift.get('confidence'):.2f})")
 
+        # === NEW: FETCH 30-SECOND DATA ===
+        thirty_second_rows = []
+        thirty_second_metrics = {}
+        if include_30_second:
+            thirty_second_rows = fetch_30_second_data(window_start, window_end, "SOL")
+            thirty_second_metrics = calculate_30_second_metrics(
+                thirty_second_rows, transaction_rows, order_book_rows
+            )
+            if thirty_second_metrics:
+                logger.debug(f"30-second data: {len(thirty_second_rows)} rows")
+
+        # === NEW: CALCULATE VELOCITY METRICS ===
+        ob_velocity_metrics = calculate_order_book_velocities(order_book_rows)
+        tx_velocity_metrics = calculate_transaction_velocities(transaction_rows)
+        whale_velocity_metrics = calculate_whale_velocities(whale_rows)
+        price_velocity_metrics = calculate_price_velocities(price_rows)
+        
+        # Combine velocity metrics into single dict
+        velocity_metrics = {
+            **ob_velocity_metrics,
+            **tx_velocity_metrics,
+            **whale_velocity_metrics,
+            **price_velocity_metrics,
+        }
+        
+        # Add VPIN and toxicity estimates
+        velocity_metrics["vpin_estimate"] = calculate_vpin_estimate(transaction_rows)
+        velocity_metrics["order_flow_toxicity"] = calculate_order_flow_toxicity(transaction_rows, order_book_rows)
+        
+        logger.debug(f"Velocity metrics calculated: {len(velocity_metrics)} fields")
+
+        # === NEW: CALCULATE CROSS-ASSET METRICS ===
+        cross_asset_metrics = calculate_cross_asset_metrics(
+            price_rows, btc_price_rows, eth_price_rows
+        )
+        if cross_asset_metrics.get("btc_leads_sol_lag1", 0) > 0.5:
+            logger.info(f"✓ Strong BTC lead-lag correlation: {cross_asset_metrics['btc_leads_sol_lag1']:.2f}")
+
+        # === NEW: CALCULATE COMPOSITE MICRO-MOVE SCORE ===
+        micro_move_score = calculate_micro_move_composite_score(
+            order_book_rows=order_book_rows,
+            transaction_rows=transaction_rows,
+            whale_rows=whale_rows,
+            price_rows=price_rows,
+            cross_asset_metrics=cross_asset_metrics,
+            velocity_metrics=velocity_metrics,
+            micro_patterns=micro_patterns,
+            target_move_pct=0.5
+        )
+        
+        logger.info(
+            f"Micro-move probability: {micro_move_score.get('micro_move_probability', 0):.2f} "
+            f"direction: {micro_move_score.get('micro_move_direction', 0):.2f} "
+            f"confidence: {micro_move_score.get('micro_move_confidence', 0):.2f}"
+        )
+
         # === CALCULATE OVERALL BREAKOUT PROBABILITY ===
         breakout_analysis = calculate_breakout_probability(
             traditional_patterns,
@@ -2494,6 +3702,7 @@ def generate_trail_payload(
                 "end": window_end,
                 "minutes": minutes,
             },
+            # Existing data sections
             "order_book_signals": order_book_rows,
             "transactions": transaction_rows,
             "whale_activity": whale_rows,
@@ -2511,6 +3720,12 @@ def generate_trail_payload(
             "minute_spans": build_minute_span_view(
                 order_book_rows, transaction_rows, whale_rows, price_rows
             ),
+            # NEW: Enhanced metrics for micro-movement detection
+            "thirty_second_data": thirty_second_rows,
+            "thirty_second_metrics": thirty_second_metrics,
+            "velocity_metrics": velocity_metrics,
+            "cross_asset_metrics": cross_asset_metrics,
+            "micro_move_score": micro_move_score,  # PRIMARY SIGNAL
         }
 
         if buyin.get("existing_trail") is not None:

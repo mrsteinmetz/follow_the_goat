@@ -6,8 +6,9 @@ when data falls too far behind.
 
 This script:
 1. Checks the average latency of the last 10 trades (created_at - trade_timestamp)
-2. If latency exceeds 30 seconds, restarts both QuickNode streams via API
-3. Logs all actions to the 'actions' table for monitoring
+2. Checks if trade ingestion has stalled (no new inserts / stale timestamps)
+3. If any threshold exceeds 30 seconds, restarts both QuickNode streams via API
+4. Logs all actions to the 'actions' table for monitoring
 
 Usage:
     python restart_streams.py
@@ -49,6 +50,12 @@ QUICKNODE_API_BASE = "https://api.quicknode.com/streams/rest/v1"
 
 # Latency threshold (in seconds)
 LATENCY_THRESHOLD = 30.0
+
+# If no new transactions within this window, restart streams (seconds)
+STALE_TRANSACTION_THRESHOLD = 30.0
+
+# Minimum time between restarts (seconds) to avoid hammering QuickNode
+RESTART_COOLDOWN_SECONDS = 60.0
 
 # Number of recent trades to check
 TRADES_SAMPLE_SIZE = 10
@@ -100,6 +107,79 @@ def check_trade_latency() -> Optional[float]:
                     
     except Exception as e:
         logger.error(f"Error checking trade latency: {e}", exc_info=True)
+        return None
+
+
+def check_trade_staleness() -> Dict[str, Any]:
+    """
+    Check whether new trades are still arriving.
+    
+    We check BOTH:
+    - seconds_since_last_insert: NOW - MAX(created_at)
+    - seconds_since_last_trade_timestamp: NOW - MAX(trade_timestamp)
+    
+    Returns:
+        Dict with seconds_since_last_insert/seconds_since_last_trade_timestamp and timestamps.
+        If there is no data, seconds will be None.
+    """
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        MAX(created_at) AS last_created_at,
+                        MAX(trade_timestamp) AS last_trade_timestamp,
+                        EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - MAX(created_at))) AS seconds_since_last_insert,
+                        EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - MAX(trade_timestamp))) AS seconds_since_last_trade_timestamp
+                    FROM sol_stablecoin_trades
+                    """
+                )
+                row = cursor.fetchone() or {}
+
+        return {
+            "last_created_at": row.get("last_created_at"),
+            "last_trade_timestamp": row.get("last_trade_timestamp"),
+            "seconds_since_last_insert": float(row["seconds_since_last_insert"]) if row.get("seconds_since_last_insert") is not None else None,
+            "seconds_since_last_trade_timestamp": float(row["seconds_since_last_trade_timestamp"]) if row.get("seconds_since_last_trade_timestamp") is not None else None,
+        }
+    except Exception as e:
+        logger.error(f"Error checking trade staleness: {e}", exc_info=True)
+        return {
+            "error": str(e),
+            "last_created_at": None,
+            "last_trade_timestamp": None,
+            "seconds_since_last_insert": None,
+            "seconds_since_last_trade_timestamp": None,
+        }
+
+
+def seconds_since_last_restart() -> Optional[float]:
+    """
+    Return seconds since last successful stream restart, or None if no history.
+    """
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT MAX(created_at) AS last_restart_at
+                    FROM actions
+                    WHERE event_type = 'stream_restart' AND success = TRUE
+                    """
+                )
+                row = cursor.fetchone() or {}
+                last = row.get("last_restart_at")
+                if not last:
+                    return None
+                cursor.execute(
+                    "SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - %s)) AS seconds",
+                    [last],
+                )
+                age_row = cursor.fetchone() or {}
+                return float(age_row["seconds"]) if age_row.get("seconds") is not None else None
+    except Exception as e:
+        logger.warning(f"Failed to check last restart age: {e}")
         return None
 
 
@@ -233,7 +313,7 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
         }
 
 
-def restart_all_streams(latency: float) -> Dict[str, Any]:
+def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict[str, Any]:
     """
     Restart all configured QuickNode streams.
     
@@ -254,7 +334,7 @@ def restart_all_streams(latency: float) -> Dict[str, Any]:
     results = {}
     
     # Restart stream 1
-    logger.info(f"Latency threshold exceeded ({latency:.2f}s > {LATENCY_THRESHOLD}s)")
+    logger.info(f"Restart trigger ({reason}): {trigger_seconds:.2f}s")
     logger.info("Restarting all QuickNode streams...")
     
     results['stream_1'] = restart_stream(QUICKNODE_STREAM_1)
@@ -272,7 +352,8 @@ def restart_all_streams(latency: float) -> Dict[str, Any]:
     return {
         'success': all_success,
         'results': results,
-        'latency': latency,
+        'trigger_seconds': trigger_seconds,
+        'reason': reason,
         'stream_ids': [QUICKNODE_STREAM_1, QUICKNODE_STREAM_2]
     }
 
@@ -289,48 +370,147 @@ def run_monitoring_cycle() -> Dict[str, Any]:
         Dict with cycle results
     """
     try:
-        # Step 1: Check latency
-        latency = check_trade_latency()
-        
-        if latency is None:
+        # Cooldown guard (avoid restarting too frequently)
+        last_restart_age = seconds_since_last_restart()
+        if last_restart_age is not None and last_restart_age < RESTART_COOLDOWN_SECONDS:
+            logger.info(
+                f"Restart cooldown active ({last_restart_age:.1f}s < {RESTART_COOLDOWN_SECONDS}s) - skipping restart"
+            )
             return {
-                'success': False,
-                'error': 'Unable to check latency'
+                'success': True,
+                'action_taken': False,
+                'reason': 'cooldown',
+                'seconds_since_last_restart': last_restart_age
             }
-        
-        # Step 2: Check if restart needed
-        if latency > LATENCY_THRESHOLD:
-            # Restart streams
-            restart_result = restart_all_streams(latency)
-            
-            # Log to actions table
+
+        # Step 1: staleness checks (no transactions / stale timestamps)
+        staleness = check_trade_staleness()
+        sec_since_insert = staleness.get("seconds_since_last_insert")
+        sec_since_trade_ts = staleness.get("seconds_since_last_trade_timestamp")
+
+        # If we have no usable data, treat as stalled
+        if sec_since_insert is None or sec_since_trade_ts is None:
+            reason = "no_transactions"
+            trigger_val = max(sec_since_insert or 0.0, sec_since_trade_ts or 0.0, STALE_TRANSACTION_THRESHOLD + 1.0)
+            restart_result = restart_all_streams(trigger_val, reason=reason)
             log_action(
                 event_type='stream_restart',
                 success=restart_result['success'],
                 error_message=restart_result.get('error'),
                 metadata={
+                    'reason': reason,
+                    'trigger_seconds': trigger_val,
+                    'stale_transaction_threshold': STALE_TRANSACTION_THRESHOLD,
+                    'last_created_at': staleness.get("last_created_at").isoformat() if staleness.get("last_created_at") else None,
+                    'last_trade_timestamp': staleness.get("last_trade_timestamp").isoformat() if staleness.get("last_trade_timestamp") else None,
+                    'seconds_since_last_insert': sec_since_insert,
+                    'seconds_since_last_trade_timestamp': sec_since_trade_ts,
+                    'results': restart_result.get('results', {}),
+                }
+            )
+            return {
+                'success': True,
+                'action_taken': True,
+                'restart_success': restart_result['success'],
+                'reason': reason,
+                'trigger_seconds': trigger_val,
+            }
+
+        # If no new transactions (insert) within threshold, restart
+        if sec_since_insert > STALE_TRANSACTION_THRESHOLD:
+            reason = "no_recent_transactions"
+            trigger_val = float(sec_since_insert)
+            restart_result = restart_all_streams(trigger_val, reason=reason)
+            log_action(
+                event_type='stream_restart',
+                success=restart_result['success'],
+                error_message=restart_result.get('error'),
+                metadata={
+                    'reason': reason,
+                    'trigger_seconds': trigger_val,
+                    'stale_transaction_threshold': STALE_TRANSACTION_THRESHOLD,
+                    'last_created_at': staleness.get("last_created_at").isoformat() if staleness.get("last_created_at") else None,
+                    'results': restart_result.get('results', {}),
+                }
+            )
+            return {
+                'success': True,
+                'action_taken': True,
+                'restart_success': restart_result['success'],
+                'reason': reason,
+                'trigger_seconds': trigger_val,
+            }
+
+        # If trade_timestamp is stale (older than threshold), restart
+        if sec_since_trade_ts > STALE_TRANSACTION_THRESHOLD:
+            reason = "stale_trade_timestamp"
+            trigger_val = float(sec_since_trade_ts)
+            restart_result = restart_all_streams(trigger_val, reason=reason)
+            log_action(
+                event_type='stream_restart',
+                success=restart_result['success'],
+                error_message=restart_result.get('error'),
+                metadata={
+                    'reason': reason,
+                    'trigger_seconds': trigger_val,
+                    'stale_transaction_threshold': STALE_TRANSACTION_THRESHOLD,
+                    'last_trade_timestamp': staleness.get("last_trade_timestamp").isoformat() if staleness.get("last_trade_timestamp") else None,
+                    'results': restart_result.get('results', {}),
+                }
+            )
+            return {
+                'success': True,
+                'action_taken': True,
+                'restart_success': restart_result['success'],
+                'reason': reason,
+                'trigger_seconds': trigger_val,
+            }
+
+        # Step 2: latency check (created_at - trade_timestamp)
+        latency = check_trade_latency()
+        if latency is None:
+            return {
+                'success': False,
+                'error': 'Unable to check latency'
+            }
+
+        if latency > LATENCY_THRESHOLD:
+            reason = "latency"
+            restart_result = restart_all_streams(float(latency), reason=reason)
+            log_action(
+                event_type='stream_restart',
+                success=restart_result['success'],
+                error_message=restart_result.get('error'),
+                metadata={
+                    'reason': reason,
                     'latency_seconds': latency,
                     'threshold_seconds': LATENCY_THRESHOLD,
+                    'stale_transaction_threshold': STALE_TRANSACTION_THRESHOLD,
+                    'seconds_since_last_insert': sec_since_insert,
+                    'seconds_since_last_trade_timestamp': sec_since_trade_ts,
                     'stream_1_id': QUICKNODE_STREAM_1,
                     'stream_2_id': QUICKNODE_STREAM_2,
                     'results': restart_result.get('results', {})
                 }
             )
-            
             return {
                 'success': True,
                 'action_taken': True,
                 'restart_success': restart_result['success'],
+                'reason': reason,
                 'latency': latency
             }
-        else:
-            # No action needed
-            logger.debug(f"Latency OK ({latency:.2f}s <= {LATENCY_THRESHOLD}s)")
-            return {
-                'success': True,
-                'action_taken': False,
-                'latency': latency
-            }
+
+        logger.debug(
+            f"OK: insert_age={sec_since_insert:.1f}s trade_ts_age={sec_since_trade_ts:.1f}s latency={latency:.2f}s"
+        )
+        return {
+            'success': True,
+            'action_taken': False,
+            'latency': latency,
+            'seconds_since_last_insert': sec_since_insert,
+            'seconds_since_last_trade_timestamp': sec_since_trade_ts,
+        }
             
     except Exception as e:
         logger.error(f"Error in monitoring cycle: {e}", exc_info=True)

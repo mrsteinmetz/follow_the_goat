@@ -29,9 +29,10 @@ except:
 
 
 class Config:
-    """Configuration"""
-    JUPITER_API_URL = "https://quote-api.jup.ag/v6"
-    JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "")
+    """Configuration - Jupiter Ultra API (lite-api deprecated Jan 31 2026)"""
+    JUPITER_API_BASE = "https://api.jup.ag"
+    JUPITER_ORDER_URL = f"{JUPITER_API_BASE}/ultra/v1/order"
+    JUPITER_API_KEY = os.getenv("JUPITER_API_KEY", "") or os.getenv("jupiter_api_key", "")
     
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
     SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -47,39 +48,40 @@ def get_quote_analysis(
     input_mint: str,
     output_mint: str,
     amount: int,
-    only_direct: bool = False
+    only_direct: bool = False,
 ) -> Optional[Dict]:
-    """Get quote and analyze fees"""
+    """Get order from Jupiter Ultra API (GET /ultra/v1/order) and analyze fees."""
     try:
         headers = {}
         if Config.JUPITER_API_KEY:
             headers["x-api-key"] = Config.JUPITER_API_KEY
-        
+
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount),
-            "slippageBps": "10",  # Low tolerance for low-fee targeting
-            "onlyDirectRoutes": "true" if only_direct else "false",
-            "asLegacyTransaction": "false"
+            "slippageBps": "10",
         }
-        
+
         response = requests.get(
-            f"{Config.JUPITER_API_URL}/quote",
+            Config.JUPITER_ORDER_URL,
             params=params,
             headers=headers,
-            timeout=10
+            timeout=10,
         )
-        
+
         if response.status_code != 200:
             return None
-        
+
         quote = response.json()
-        
-        # Analyze the quote
-        in_amount = int(quote["inAmount"])
-        out_amount = int(quote["outAmount"])
-        price_impact_pct = abs(float(quote.get("priceImpactPct", 0)))
+        if quote.get("error"):
+            return None
+
+        # Ultra response: inAmount, outAmount (str); priceImpactPct (str) or priceImpact (number)
+        in_amount = int(quote.get("inAmount", 0))
+        out_amount = int(quote.get("outAmount", 0))
+        price_impact_raw = quote.get("priceImpactPct") or quote.get("priceImpact") or 0
+        price_impact_pct = abs(float(price_impact_raw))
         
         # Get route info
         route_plan = quote.get("routePlan", [])

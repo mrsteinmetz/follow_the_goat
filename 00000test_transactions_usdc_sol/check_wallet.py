@@ -23,21 +23,21 @@ def check_wallet():
     print("Wallet Configuration Check")
     print("="*60 + "\n")
     
-    # Check for private key
-    private_key = os.getenv("SOLANA_PRIVATE_KEY", "")
+    # Prefer usdc_private_key (from .env), fallback to SOLANA_PRIVATE_KEY
+    private_key = os.getenv("usdc_private_key", "") or os.getenv("SOLANA_PRIVATE_KEY", "")
     
     if not private_key:
-        print("❌ SOLANA_PRIVATE_KEY not set")
-        print("\nAdd to your .env file:")
-        print("SOLANA_PRIVATE_KEY=your_base58_private_key_here")
+        print("❌ No wallet private key set")
+        print("\nAdd to .env in project root:")
+        print("usdc_private_key=your_base58_private_key_here")
         return False
     
     if private_key == "your_base58_private_key_here":
-        print("❌ SOLANA_PRIVATE_KEY is placeholder value")
+        print("❌ Private key is placeholder value")
         print("\nReplace with your actual private key in .env file")
         return False
     
-    print("✅ SOLANA_PRIVATE_KEY found")
+    print("✅ usdc_private_key (or SOLANA_PRIVATE_KEY) found")
     
     # Check if packages are installed
     try:
@@ -65,14 +65,21 @@ def check_wallet():
         keypair = Keypair.from_bytes(secret_key)
         
         print("✅ Wallet loaded successfully")
-        print(f"\n📍 Wallet Address: {keypair.pubkey()}")
+        expected_wallet = os.getenv("usdc_wallet", "").strip()
+        pubkey_str = str(keypair.pubkey())
+        print(f"\n📍 Wallet Address: {pubkey_str}")
+        if expected_wallet and expected_wallet != pubkey_str:
+            print(f"   ⚠️  .env usdc_wallet is different: {expected_wallet}")
         
         # Check balances
         print("\n⏳ Checking balances...")
         
         import requests
         
-        rpc_url = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+        rpc_url = os.getenv("SOLANA_RPC_URL") or (
+            f"https://mainnet.helius-rpc.com/?api-key={os.getenv('helius_key', '')}"
+            if os.getenv("helius_key") else "https://api.mainnet-beta.solana.com"
+        )
         wallet_address = str(keypair.pubkey())
         
         # Check SOL balance

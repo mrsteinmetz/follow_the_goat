@@ -1173,7 +1173,8 @@ def validate_buyin_signal(
                 pre_entry_metrics = calculate_pre_entry_metrics(entry_time, entry_price)
                 
                 # Check if should enter based on price movement
-                should_enter, reason = should_enter_based_on_price_movement(pre_entry_metrics, min_change_10m=0.15)
+                # Uses 3-minute window (optimal for SOL's fast cycles based on 8,515 trade analysis)
+                should_enter, reason = should_enter_based_on_price_movement(pre_entry_metrics, min_change_3m=0.08)
                 
                 # Log analysis
                 log_pre_entry_analysis(pre_entry_metrics, logger)

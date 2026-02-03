@@ -1,7 +1,7 @@
 <?php
 /**
- * Trade Detail Page - View Trade with 15-Minute Trail Data
- * Shows complete trade information and loops through all 15 minutes of trail data
+ * Trade Detail Page - View Trade with 30-Second Interval Trail Data
+ * Shows complete trade information with 30 data points (one per 30-second interval)
  */
 
 // --- Database API Client ---
@@ -37,9 +37,11 @@ if (!$trade_id) {
     $trail_response = $db->getTrailForBuyin($trade_id, $source);
     if ($trail_response && isset($trail_response['trail_data'])) {
         $trail_data = $trail_response['trail_data'];
-        // Sort by minute to ensure proper ordering
+        // Sort by minute and sub_minute to ensure proper ordering (30-second intervals)
         usort($trail_data, function($a, $b) {
-            return ($a['minute'] ?? 0) <=> ($b['minute'] ?? 0);
+            $minute_cmp = ($a['minute'] ?? 0) <=> ($b['minute'] ?? 0);
+            if ($minute_cmp !== 0) return $minute_cmp;
+            return ($a['sub_minute'] ?? 0) <=> ($b['sub_minute'] ?? 0);
         });
     }
 } else {
@@ -96,6 +98,35 @@ $chart_field_configs = [
         'eth_price_change_1m' => ['label' => 'ETH Change 1m', 'format' => 'percent', 'color' => 'rgb(98, 126, 234)'],
         'eth_price_change_5m' => ['label' => 'ETH Change 5m', 'format' => 'percent', 'color' => 'rgb(130, 150, 245)'],
         'eth_volatility_pct' => ['label' => 'ETH Volatility', 'format' => 'percent', 'color' => 'rgb(156, 39, 176)'],
+    ],
+    // NEW: Velocity metrics charts
+    'velocity_metrics' => [
+        'pm_price_velocity_1m' => ['label' => 'Price Velocity 1m', 'format' => 'decimal', 'color' => 'rgb(59, 130, 246)'],
+        'pm_momentum_persistence' => ['label' => 'Momentum Persistence', 'format' => 'decimal', 'color' => 'rgb(16, 185, 129)'],
+        'tx_volume_velocity' => ['label' => 'Volume Velocity', 'format' => 'money', 'color' => 'rgb(245, 158, 11)'],
+        'tx_vpin_estimate' => ['label' => 'VPIN', 'format' => 'decimal', 'color' => 'rgb(239, 68, 68)'],
+    ],
+    // NEW: Cross-asset charts
+    'cross_asset' => [
+        'xa_btc_sol_corr_1m' => ['label' => 'BTC-SOL Corr 1m', 'format' => 'decimal', 'color' => 'rgb(247, 147, 26)'],
+        'xa_btc_leads_sol_1' => ['label' => 'BTC Leads SOL', 'format' => 'decimal', 'color' => 'rgb(255, 193, 7)'],
+        'xa_momentum_alignment' => ['label' => 'Momentum Alignment', 'format' => 'decimal', 'color' => 'rgb(34, 197, 94)'],
+    ],
+    // NEW: 30-second per-interval charts (key for micro-movement prediction)
+    'thirty_second' => [
+        'ts_price_change_30s' => ['label' => 'Price Change 30s', 'format' => 'percent', 'color' => 'rgb(139, 92, 246)'],
+        'ts_price_velocity' => ['label' => 'Price Velocity', 'format' => 'decimal', 'color' => 'rgb(59, 130, 246)'],
+        'ts_price_acceleration' => ['label' => 'Price Accel', 'format' => 'decimal', 'color' => 'rgb(16, 185, 129)'],
+        'ts_momentum_30s' => ['label' => 'Momentum 30s', 'format' => 'decimal', 'color' => 'rgb(236, 72, 153)'],
+        'ts_momentum_persistence' => ['label' => 'Momentum Persist', 'format' => 'decimal', 'color' => 'rgb(245, 158, 11)'],
+        'ts_volatility_30s' => ['label' => 'Volatility 30s', 'format' => 'percent', 'color' => 'rgb(239, 68, 68)'],
+    ],
+    // NEW: Micro-move composite charts
+    'micro_move' => [
+        'mm_probability' => ['label' => 'Move Probability', 'format' => 'decimal', 'color' => 'rgb(34, 197, 94)'],
+        'mm_direction' => ['label' => 'Direction', 'format' => 'decimal', 'color' => 'rgb(59, 130, 246)'],
+        'mm_confidence' => ['label' => 'Confidence', 'format' => 'decimal', 'color' => 'rgb(245, 158, 11)'],
+        'mm_false_signal_risk' => ['label' => 'False Signal Risk', 'format' => 'decimal', 'color' => 'rgb(239, 68, 68)'],
     ],
 ];
 
@@ -196,6 +227,66 @@ $field_groups = [
         'eth_open_price' => ['label' => 'ETH Open', 'format' => 'price'],
         'eth_close_price' => ['label' => 'ETH Close', 'format' => 'price'],
     ],
+    // NEW: Velocity Metrics (rate of change analysis)
+    'Velocity Metrics' => [
+        'pm_price_velocity_1m' => ['label' => 'Price Velocity 1m', 'format' => 'decimal'],
+        'pm_velocity_acceleration' => ['label' => 'Velocity Accel', 'format' => 'decimal'],
+        'pm_momentum_persistence' => ['label' => 'Momentum Persistence', 'format' => 'decimal'],
+        'pm_volatility_regime' => ['label' => 'Volatility Regime', 'format' => 'number'],
+        'pm_trend_strength_ema' => ['label' => 'Trend Strength', 'format' => 'decimal'],
+        'pm_breakout_imminence' => ['label' => 'Breakout Imminence', 'format' => 'decimal'],
+        'ob_imbalance_velocity_1m' => ['label' => 'Imbalance Velocity', 'format' => 'decimal'],
+        'ob_spread_velocity' => ['label' => 'Spread Velocity', 'format' => 'decimal'],
+        'ob_liquidity_score' => ['label' => 'Liquidity Score', 'format' => 'decimal'],
+        'tx_volume_velocity' => ['label' => 'Volume Velocity', 'format' => 'money'],
+        'tx_volume_acceleration' => ['label' => 'Volume Accel', 'format' => 'money'],
+        'tx_trade_intensity' => ['label' => 'Trade Intensity', 'format' => 'decimal'],
+        'tx_cumulative_delta' => ['label' => 'Cumulative Delta', 'format' => 'money'],
+        'tx_vpin_estimate' => ['label' => 'VPIN Estimate', 'format' => 'decimal'],
+        'tx_order_flow_toxicity' => ['label' => 'Flow Toxicity', 'format' => 'decimal'],
+    ],
+    // NEW: Cross-Asset Correlation (BTC/ETH lead-lag)
+    'Cross-Asset Correlation' => [
+        'xa_btc_sol_corr_1m' => ['label' => 'BTC-SOL Corr 1m', 'format' => 'decimal'],
+        'xa_btc_sol_corr_5m' => ['label' => 'BTC-SOL Corr 5m', 'format' => 'decimal'],
+        'xa_btc_leads_sol_1' => ['label' => 'BTC Leads SOL (1m)', 'format' => 'decimal'],
+        'xa_btc_leads_sol_2' => ['label' => 'BTC Leads SOL (2m)', 'format' => 'decimal'],
+        'xa_sol_beta_btc' => ['label' => 'SOL Beta to BTC', 'format' => 'decimal'],
+        'xa_eth_sol_corr_1m' => ['label' => 'ETH-SOL Corr 1m', 'format' => 'decimal'],
+        'xa_eth_leads_sol_1' => ['label' => 'ETH Leads SOL (1m)', 'format' => 'decimal'],
+        'xa_sol_beta_eth' => ['label' => 'SOL Beta to ETH', 'format' => 'decimal'],
+        'xa_btc_sol_divergence' => ['label' => 'BTC-SOL Divergence', 'format' => 'decimal'],
+        'xa_eth_sol_divergence' => ['label' => 'ETH-SOL Divergence', 'format' => 'decimal'],
+        'xa_momentum_alignment' => ['label' => 'Momentum Alignment', 'format' => 'decimal'],
+    ],
+    // NEW: 30-Second Data (per-interval velocity - key for prediction)
+    '30-Second Data' => [
+        'ts_price_change_30s' => ['label' => 'Price Change 30s', 'format' => 'percent'],
+        'ts_price_velocity' => ['label' => 'Price Velocity', 'format' => 'decimal'],
+        'ts_price_acceleration' => ['label' => 'Price Acceleration', 'format' => 'decimal'],
+        'ts_momentum_30s' => ['label' => 'Momentum 30s', 'format' => 'decimal'],
+        'ts_momentum_persistence' => ['label' => 'Momentum Persist', 'format' => 'decimal'],
+        'ts_volatility_30s' => ['label' => 'Volatility 30s', 'format' => 'percent'],
+        'ts_open_price' => ['label' => 'Open 30s', 'format' => 'price'],
+        'ts_close_price' => ['label' => 'Close 30s', 'format' => 'price'],
+        'ts_high_price' => ['label' => 'High 30s', 'format' => 'price'],
+        'ts_low_price' => ['label' => 'Low 30s', 'format' => 'price'],
+    ],
+    // NEW: Micro-Move Composite (PRIMARY SIGNAL)
+    'Micro-Move Score' => [
+        'mm_probability' => ['label' => 'Move Probability', 'format' => 'decimal'],
+        'mm_direction' => ['label' => 'Direction (-1 to 1)', 'format' => 'decimal'],
+        'mm_confidence' => ['label' => 'Confidence', 'format' => 'decimal'],
+        'mm_expected_timeframe' => ['label' => 'Expected Timeframe (min)', 'format' => 'decimal'],
+        'mm_order_flow_score' => ['label' => 'Order Flow Score', 'format' => 'decimal'],
+        'mm_whale_alignment' => ['label' => 'Whale Alignment', 'format' => 'decimal'],
+        'mm_momentum_quality' => ['label' => 'Momentum Quality', 'format' => 'decimal'],
+        'mm_volatility_regime' => ['label' => 'Volatility Regime', 'format' => 'decimal'],
+        'mm_cross_asset_score' => ['label' => 'Cross-Asset Score', 'format' => 'decimal'],
+        'mm_false_signal_risk' => ['label' => 'False Signal Risk', 'format' => 'decimal'],
+        'mm_adverse_selection' => ['label' => 'Adverse Selection', 'format' => 'decimal'],
+        'mm_slippage_estimate' => ['label' => 'Slippage Est (bps)', 'format' => 'decimal'],
+    ],
 ];
 
 /**
@@ -207,10 +298,13 @@ function calculateHeatmapData($trail_data, $field_groups) {
         return [];
     }
     
-    // Build minute lookup map
-    $minute_data = [];
+    // Build interval lookup map (minute + sub_minute -> 30 intervals)
+    $interval_data = [];
     foreach ($trail_data as $row) {
-        $minute_data[$row['minute']] = $row;
+        $minute = $row['minute'] ?? 0;
+        $sub_minute = $row['sub_minute'] ?? 0;
+        $interval = $minute * 2 + $sub_minute; // 0-29
+        $interval_data[$interval] = $row;
     }
     
     $heatmap_data = [];
@@ -219,13 +313,13 @@ function calculateHeatmapData($trail_data, $field_groups) {
         $heatmap_data[$groupName] = [];
         
         foreach ($fields as $fieldKey => $fieldConfig) {
-            // Collect all values for this field across all minutes
+            // Collect all values for this field across all 30 intervals
             $values = [];
             $raw_values = [];
             
-            for ($m = 0; $m < 15; $m++) {
-                $val = $minute_data[$m][$fieldKey] ?? null;
-                $raw_values[$m] = $val;
+            for ($i = 0; $i < 30; $i++) {
+                $val = $interval_data[$i][$fieldKey] ?? null;
+                $raw_values[$i] = $val;
                 
                 if ($val !== null && $val !== '' && is_numeric($val)) {
                     $values[] = floatval($val);
@@ -237,13 +331,13 @@ function calculateHeatmapData($trail_data, $field_groups) {
             $max = !empty($values) ? max($values) : 0;
             $range = $max - $min;
             
-            // Calculate normalized percentages for each minute
+            // Calculate normalized percentages for each interval
             $normalized = [];
-            for ($m = 0; $m < 15; $m++) {
-                $val = $raw_values[$m];
+            for ($i = 0; $i < 30; $i++) {
+                $val = $raw_values[$i];
                 
                 if ($val === null || $val === '' || !is_numeric($val)) {
-                    $normalized[$m] = [
+                    $normalized[$i] = [
                         'raw' => null,
                         'pct' => null,
                         'pct_bucket' => 'null'
@@ -261,7 +355,7 @@ function calculateHeatmapData($trail_data, $field_groups) {
                     // Round to nearest 10 for color bucket
                     $pct_bucket = min(100, max(0, round($pct / 10) * 10));
                     
-                    $normalized[$m] = [
+                    $normalized[$i] = [
                         'raw' => $numVal,
                         'pct' => round($pct, 1),
                         'pct_bucket' => $pct_bucket
@@ -274,7 +368,7 @@ function calculateHeatmapData($trail_data, $field_groups) {
                 'format' => $fieldConfig['format'],
                 'min' => $min,
                 'max' => $max,
-                'minutes' => $normalized
+                'intervals' => $normalized
             ];
         }
     }
@@ -933,11 +1027,11 @@ $category_colors = [
     </div>
 </div>
 
-<!-- Data Table View (All Fields, All Minutes) -->
+<!-- Data Table View (All Fields, All 30-Second Intervals) -->
 <div class="table-container">
     <div class="section-header">
         <i class="ri-table-line"></i>
-        Complete Data Table - All Fields Across All 15 Minutes
+        Complete Data Table - All Fields Across 30 Intervals (30-second granularity)
     </div>
     <div class="section-body">
         <div class="data-table-wrapper">
@@ -945,30 +1039,36 @@ $category_colors = [
                 <thead>
                     <tr>
                         <th>Field</th>
-                        <?php for ($m = 0; $m < 15; $m++): ?>
-                        <th>Min <?php echo $m; ?></th>
+                        <?php for ($i = 0; $i < 30; $i++): 
+                            $min = intdiv($i, 2);
+                            $sec = ($i % 2) * 30;
+                        ?>
+                        <th><?php echo $min; ?>:<?php echo str_pad($sec, 2, '0', STR_PAD_LEFT); ?></th>
                         <?php endfor; ?>
                     </tr>
                 </thead>
                 <tbody>
                     <?php 
-                    // Build a map of minute => data for quick lookup
-                    $minute_data = [];
+                    // Build a map of interval => data for quick lookup (30-second intervals)
+                    $interval_data = [];
                     foreach ($trail_data as $row) {
-                        $minute_data[$row['minute']] = $row;
+                        $minute = $row['minute'] ?? 0;
+                        $sub_minute = $row['sub_minute'] ?? 0;
+                        $interval = $minute * 2 + $sub_minute; // 0-29
+                        $interval_data[$interval] = $row;
                     }
                     
                     // Display all fields from all sections
                     foreach ($field_groups as $groupName => $fields): 
                     ?>
                     <tr class="section-header-row">
-                        <td colspan="16"><?php echo $groupName; ?></td>
+                        <td colspan="31"><?php echo $groupName; ?></td>
                     </tr>
                     <?php foreach ($fields as $fieldKey => $fieldConfig): ?>
                     <tr>
                         <td><?php echo $fieldConfig['label']; ?></td>
-                        <?php for ($m = 0; $m < 15; $m++): 
-                            $value = $minute_data[$m][$fieldKey] ?? null;
+                        <?php for ($i = 0; $i < 30; $i++): 
+                            $value = $interval_data[$i][$fieldKey] ?? null;
                         ?>
                         <td><?php echo formatValue($value, $fieldConfig['format']); ?></td>
                         <?php endfor; ?>
@@ -981,12 +1081,15 @@ $category_colors = [
     </div>
 </div>
 
-<!-- Minute Navigation (for chart highlighting) -->
+<!-- Interval Navigation (for chart highlighting) -->
 <div class="minute-nav" style="margin-top: 1.5rem;">
-    <span style="margin-right: 1rem; font-weight: 600; color: var(--text-muted);">Highlight Minute in Charts:</span>
-    <?php for ($i = 1; $i < 15; $i++): ?>
-    <button type="button" class="minute-btn" onclick="showMinute(<?php echo $i; ?>)">
-        Min <?php echo $i; ?>
+    <span style="margin-right: 1rem; font-weight: 600; color: var(--text-muted);">Highlight Interval in Charts:</span>
+    <?php for ($i = 0; $i < 30; $i++): 
+        $min = intdiv($i, 2);
+        $sec = ($i % 2) * 30;
+    ?>
+    <button type="button" class="minute-btn" onclick="showMinute(<?php echo $i; ?>)" style="font-size: 0.7rem; padding: 0.25rem 0.4rem;">
+        <?php echo $min; ?>:<?php echo str_pad($sec, 2, '0', STR_PAD_LEFT); ?>
     </button>
     <?php endfor; ?>
     <button type="button" class="minute-btn" onclick="showAllMinutes()" style="margin-left: auto;">
@@ -1114,13 +1217,19 @@ $category_colors = [
                 const canvas = document.getElementById(canvasId);
                 if (!canvas) return;
                 
-                // Sort trail data by minute to ensure proper ordering
+                // Sort trail data by minute and sub_minute for 30-second intervals
                 const sortedData = trailData.slice().sort(function(a, b) {
-                    return (a.minute || 0) - (b.minute || 0);
+                    const minuteCmp = (a.minute || 0) - (b.minute || 0);
+                    if (minuteCmp !== 0) return minuteCmp;
+                    return (a.sub_minute || 0) - (b.sub_minute || 0);
                 });
                 
-                // Extract data for all 15 minutes
-                const minutes = sortedData.map(function(row) { return row.minute; });
+                // Extract data for all 30 intervals (30-second each)
+                const intervalLabels = sortedData.map(function(row) {
+                    const minute = row.minute || 0;
+                    const subMinute = row.sub_minute || 0;
+                    return minute + ':' + (subMinute === 0 ? '00' : '30');
+                });
                 const values = sortedData.map(function(row) { 
                     const val = row[config.key];
                     if (val === null || val === undefined || val === '') {
@@ -1142,7 +1251,7 @@ $category_colors = [
                 charts[canvasId] = new Chart(ctx, {
                     type: 'line',
                     data: {
-                        labels: minutes.map(function(m) { return 'Min ' + m; }),
+                        labels: intervalLabels,
                         datasets: [{
                             label: config.label,
                             data: values,
@@ -1303,9 +1412,17 @@ $category_colors = [
         
         const ctx = canvas.getContext('2d');
         
-        // Sort trail data by minute
-        const sortedData = trailData.slice().sort((a, b) => (a.minute || 0) - (b.minute || 0));
-        const minutes = sortedData.map(row => row.minute);
+        // Sort trail data by minute and sub_minute for 30-second intervals
+        const sortedData = trailData.slice().sort((a, b) => {
+            const minuteCmp = (a.minute || 0) - (b.minute || 0);
+            if (minuteCmp !== 0) return minuteCmp;
+            return (a.sub_minute || 0) - (b.sub_minute || 0);
+        });
+        const intervalLabels = sortedData.map(row => {
+            const minute = row.minute || 0;
+            const subMinute = row.sub_minute || 0;
+            return minute + ':' + (subMinute === 0 ? '00' : '30');
+        });
         
         // Extract price data for the line chart (use close price)
         const priceData = sortedData.map(row => {
@@ -1348,13 +1465,15 @@ $category_colors = [
                 const fieldData = fields[fieldKey];
                 const points = [];
                 
-                for (let m = 0; m < 15; m++) {
-                    const minuteData = fieldData.minutes[m];
-                    if (minuteData && minuteData.pct !== null) {
+                // Use intervals (30 data points for 30-second granularity)
+                const intervals = fieldData.intervals || fieldData.minutes || {};
+                for (let i = 0; i < 30; i++) {
+                    const intervalData = intervals[i];
+                    if (intervalData && intervalData.pct !== null) {
                         points.push({
-                            x: m,
-                            y: minuteData.pct,
-                            raw: minuteData.raw,
+                            x: i,
+                            y: intervalData.pct,
+                            raw: intervalData.raw,
                             field: fieldData.label,
                             min: fieldData.min,
                             max: fieldData.max
@@ -1383,7 +1502,7 @@ $category_colors = [
         scatterChart = new Chart(ctx, {
             type: 'scatter',
             data: {
-                labels: minutes.map(m => 'Min ' + m),
+                labels: intervalLabels,
                 datasets: [
                     // Price line (as background reference)
                     {

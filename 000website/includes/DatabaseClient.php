@@ -166,6 +166,37 @@ class DatabaseClient {
     public function getSchedulerStatus(): ?array {
         return $this->get('/scheduler_status');
     }
+
+    /**
+     * Get scheduler components (canonical dashboard source).
+     */
+    public function getSchedulerComponents(): ?array {
+        return $this->get('/scheduler/components');
+    }
+
+    /**
+     * Enable/disable a scheduler component.
+     */
+    public function setSchedulerComponentEnabled(string $componentId, bool $enabled, ?string $note = null): ?array {
+        return $this->put("/scheduler/components/{$componentId}", [
+            'enabled' => $enabled,
+            'note' => $note
+        ]);
+    }
+
+    /**
+     * Get recent scheduler errors.
+     */
+    public function getSchedulerErrors(?string $componentId = null, float $hours = 24.0, int $limit = 200): ?array {
+        $params = [
+            'hours' => $hours,
+            'limit' => $limit
+        ];
+        if ($componentId !== null && $componentId !== '') {
+            $params['component_id'] = $componentId;
+        }
+        return $this->get('/scheduler/errors', $params);
+    }
     
     /**
      * Get trades diagnostic - compare trade counts across all data sources

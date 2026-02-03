@@ -165,17 +165,17 @@ def calculate_pre_entry_metrics(entry_time: datetime, entry_price: float) -> Dic
 
 def should_enter_based_on_price_movement(
     pre_entry_metrics: Dict[str, Any],
-    min_change_3m: float = 0.08
+    min_change_3m: float = 0.20  # Increased from 0.08 to prevent weak entries
 ) -> tuple[bool, str]:
     """
     Determine if trade should be entered based on price movement.
     
-    UPDATED: Now uses 3-minute window (optimal for SOL's fast cycles).
-    Based on analysis of 8,515 trades showing 3-minute window has 80-100% win rate.
+    UPDATED: Uses 3-minute window (optimal for SOL's fast cycles).
+    Threshold increased to 0.20% to prevent "buying the top" entries.
     
     Args:
         pre_entry_metrics: Dict returned by calculate_pre_entry_metrics()
-        min_change_3m: Minimum 3m price change % required (default 0.08%)
+        min_change_3m: Minimum 3m price change % required (default 0.20%)
     
     Returns:
         Tuple of (should_enter: bool, reason: str)

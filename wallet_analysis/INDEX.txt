@@ -1,0 +1,203 @@
+WALLET ANALYSIS TOOLKIT - INDEX
+===============================
+
+Quick Start
+-----------
+1. cd /root/follow_the_goat/wallet_analysis
+2. python3 quick_wallet_query.py
+3. See top performing wallets!
+
+Files in This Directory
+-----------------------
+
+DOCUMENTATION:
+- README.txt              Detailed overview and explanation of the system
+- SUMMARY.txt             Quick reference and key concepts
+- SQL_EXAMPLES.txt        10+ SQL query examples for custom analysis
+- INDEX.txt               This file - navigation guide
+
+PYTHON SCRIPTS:
+- quick_wallet_query.py           Fast CLI for common queries (RECOMMENDED START HERE)
+- find_high_potential_wallets.py  Comprehensive analysis with 3 strategies
+- advanced_wallet_filter.py       Flexible filtering with many parameters
+- monitor_wallets.py              Real-time monitoring of wallet activity
+
+UTILITIES:
+- test_queries.sh                 Test script to verify everything works
+
+Quick Usage Guide
+-----------------
+
+1. SEE TOP WALLETS
+   python3 quick_wallet_query.py 10
+
+2. ANALYZE SPECIFIC WALLET
+   python3 quick_wallet_query.py <wallet_address>
+
+3. FIND HIGH-PERFORMERS
+   python3 find_high_potential_wallets.py
+
+4. CUSTOM FILTER
+   python3 advanced_wallet_filter.py --min-trades 10 --min-gain 2.0 --min-winrate 70
+
+5. MONITOR IN REAL-TIME
+   python3 monitor_wallets.py --top 20
+
+6. RUN ALL TESTS
+   ./test_queries.sh
+
+File Descriptions
+-----------------
+
+quick_wallet_query.py
+  Best for: Quick checks, daily monitoring
+  Output: Simple table of top wallets
+  Speed: Very fast (1-2 seconds)
+  Use when: You want a quick overview
+
+find_high_potential_wallets.py
+  Best for: In-depth analysis
+  Output: 3 different rankings (high-potential, consistent winners, early entry)
+  Speed: Fast (3-5 seconds)
+  Use when: You want comprehensive analysis
+
+advanced_wallet_filter.py
+  Best for: Finding specific types of wallets
+  Output: Filtered list based on your criteria
+  Speed: Fast (2-4 seconds)
+  Features: CSV export, many filter options
+  Use when: You have specific requirements
+
+monitor_wallets.py
+  Best for: Real-time tracking
+  Output: Live stream of new trades
+  Speed: Continuous (checks every 30s)
+  Use when: You want to catch trades as they happen
+
+Data Source
+-----------
+All scripts read from the wallet_profiles PostgreSQL table, which is automatically
+populated by the create_profiles.py job running in the scheduler.
+
+The data shows:
+- Which wallets are buying SOL
+- When they bought (timestamp and position in price cycle)
+- What happened after they bought (cycle peak, potential gains)
+- Trade sizes
+
+Key Metrics
+-----------
+Trades:    Number of buy transactions
+Avg%:      Average potential gain (entry to cycle peak)
+Win%:      Percentage of profitable trades (>0.5% gain)
+Entry%:    Average timing in cycle (0%=start, 100%=end)
+Score:     Combined metric (trades × avg% × win%)
+AvgSize:   Average trade size in USD
+
+Typical Values
+--------------
+Trades:     5+ for significance, 20+ for strong signal
+Avg%:       1-2% typical, 3%+ excellent
+Win%:       50% average, 70%+ very good
+Entry%:     30% or less is early entry
+Score:      Higher is better (no fixed scale)
+
+Performance Tips
+----------------
+1. Use 24h lookback for recent activity
+2. Require min 5-10 trades for statistical validity
+3. Look for consistency (high win rate) over lucky streaks (one big win)
+4. Early entry (low Entry%) usually correlates with better gains
+5. Check recent activity - wallets can change behavior
+
+Common Queries
+--------------
+
+"Who are the best traders?"
+  python3 quick_wallet_query.py 20
+
+"Show me consistent winners"
+  python3 find_high_potential_wallets.py
+  (Look at section 2: CONSISTENT WINNERS)
+
+"Find whales (large trades)"
+  python3 advanced_wallet_filter.py --min-trade-size 1000
+
+"Find early entry specialists"
+  python3 advanced_wallet_filter.py --max-entry-timing 20 --min-gain 1.5
+
+"Track top 10 wallets in real-time"
+  python3 monitor_wallets.py --top 10
+
+"Export top 50 to CSV"
+  python3 advanced_wallet_filter.py --min-trades 5 --limit 50 --export top50.csv
+
+Troubleshooting
+---------------
+
+No results found:
+  - Try shorter lookback period (--hours 12)
+  - Lower minimum thresholds (--min-trades 3)
+  - Check if wallet_profiles table has recent data
+
+Database connection error:
+  - Verify PostgreSQL is running
+  - Check credentials in /root/follow_the_goat/.env
+  - Ensure you're running from project root
+
+Query too slow:
+  - Reduce lookback period
+  - Add indexes (see SQL_EXAMPLES.txt)
+  - Use quick_wallet_query.py instead of complex queries
+
+Integration with Trading System
+--------------------------------
+
+Once you've identified high-performing wallets, you can:
+
+1. Add them to follow_the_goat plays
+   - Configure plays to prioritize these wallets
+   - Set up alerts when they make new trades
+
+2. Create custom patterns
+   - Use wallet addresses in pattern definitions
+   - Weight trades from these wallets higher
+
+3. Monitor in real-time
+   - Use monitor_wallets.py to track their activity
+   - Set up notifications for their trades
+
+4. Backtest strategies
+   - Export historical data
+   - Analyze if following these wallets would be profitable
+
+Further Customization
+---------------------
+
+All scripts are Python and can be modified:
+1. Open the .py file in a text editor
+2. Adjust constants at the top (MIN_BUYS, THRESHOLDS, etc.)
+3. Modify SQL queries to change calculations
+4. Add new metrics or filters
+
+For SQL experts:
+- See SQL_EXAMPLES.txt for query templates
+- Connect directly to PostgreSQL for custom analysis
+- All data is in the wallet_profiles table
+
+Support
+-------
+
+Questions about:
+- Data: See README.txt
+- Queries: See SQL_EXAMPLES.txt
+- Usage: Run scripts with --help flag
+- Architecture: See /root/follow_the_goat/.cursorrules
+
+Database Schema:
+  psql -d your_database -c "\d wallet_profiles"
+
+View source data:
+  See /root/follow_the_goat/000data_feeds/5_create_profiles/create_profiles.py
+
+Contact: Check project documentation for support channels

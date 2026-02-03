@@ -1151,6 +1151,149 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
     return column_to_id
 
 
+# =============================================================================
+# PRE-ENTRY FILTER ANALYSIS
+# =============================================================================
+
+def analyze_pre_entry_thresholds(df: pd.DataFrame, threshold: float = 0.3) -> Dict[str, Any]:
+    """
+    Analyze pre-entry metrics to find optimal minimum thresholds.
+    
+    Learns from historical data to determine the best pre-entry requirements
+    that maximize bad trade removal while preserving good trades.
+    
+    Uses minute 0 data (entry point) to check:
+    - pre_entry_change_1m, pre_entry_change_2m (momentum before entry)
+    - Entry signal alignment (buy pressure, whale flow)
+    
+    Args:
+        df: DataFrame with potential_gains and minute 0 columns
+        threshold: Good trade threshold (default 0.3%)
+    
+    Returns:
+        Dict mapping field_name to suggested threshold with metrics
+    """
+    logger.info("Analyzing pre-entry thresholds...")
+    
+    # Filter to minute 0 only (entry decision point)
+    if 'minute' in df.columns:
+        df_m0 = df[df['minute'] == 0].copy()
+    elif 'interval_idx' in df.columns:
+        df_m0 = df[df['interval_idx'] == 0].copy()
+    else:
+        df_m0 = df.copy()
+    
+    if len(df_m0) < 50:
+        logger.warning(f"Insufficient data for pre-entry analysis ({len(df_m0)} trades)")
+        return {}
+    
+    # Classify trades
+    df_m0['is_good'] = df_m0['potential_gains'] >= threshold
+    good_df = df_m0[df_m0['is_good'] == True]
+    bad_df = df_m0[df_m0['is_good'] == False]
+    
+    logger.info(f"  Total trades at entry: {len(df_m0)} (good: {len(good_df)}, bad: {len(bad_df)})")
+    
+    suggestions = {}
+    
+    # Analyze pre_entry_change_2m (preferred - fastest reliable signal)
+    if 'pre_entry_change_2m' in df_m0.columns:
+        good_2m = good_df['pre_entry_change_2m'].dropna()
+        bad_2m = bad_df['pre_entry_change_2m'].dropna()
+        
+        if len(good_2m) > 10 and len(bad_2m) > 10:
+            # Try different percentiles to find best balance
+            best_percentile = None
+            best_score = 0
+            
+            for percentile in [10, 15, 20, 25, 30]:
+                min_threshold = good_2m.quantile(percentile / 100)
+                
+                good_kept = (good_2m >= min_threshold).sum() / len(good_2m) * 100
+                bad_removed = (bad_2m < min_threshold).sum() / len(bad_2m) * 100
+                
+                # Score: prioritize bad removal but keep enough good trades
+                score = bad_removed * (good_kept / 100)
+                
+                if bad_removed >= 25 and good_kept >= 70 and score > best_score:
+                    best_score = score
+                    best_percentile = percentile
+                    suggestions['pre_entry_change_2m'] = {
+                        'min_value': float(min_threshold),
+                        'good_kept_pct': round(good_kept, 2),
+                        'bad_removed_pct': round(bad_removed, 2),
+                        'percentile': percentile,
+                        'priority': 'CRITICAL',
+                        'good_count': len(good_2m),
+                        'bad_count': len(bad_2m)
+                    }
+            
+            if best_percentile:
+                logger.info(f"  ✓ pre_entry_change_2m: >= {suggestions['pre_entry_change_2m']['min_value']:.4f}% "
+                          f"(removes {suggestions['pre_entry_change_2m']['bad_removed_pct']:.1f}% bad)")
+    
+    # Analyze pre_entry_change_1m (momentum check)
+    if 'pre_entry_change_1m' in df_m0.columns:
+        good_1m = good_df['pre_entry_change_1m'].dropna()
+        bad_1m = bad_df['pre_entry_change_1m'].dropna()
+        
+        if len(good_1m) > 10 and len(bad_1m) > 10:
+            min_threshold = good_1m.quantile(0.15)  # 15th percentile
+            
+            good_kept = (good_1m >= min_threshold).sum() / len(good_1m) * 100
+            bad_removed = (bad_1m < min_threshold).sum() / len(bad_1m) * 100
+            
+            if bad_removed >= 20 and good_kept >= 75:
+                suggestions['pre_entry_change_1m'] = {
+                    'min_value': float(min_threshold),
+                    'good_kept_pct': round(good_kept, 2),
+                    'bad_removed_pct': round(bad_removed, 2),
+                    'priority': 'HIGH',
+                    'good_count': len(good_1m),
+                    'bad_count': len(bad_1m)
+                }
+                logger.info(f"  ✓ pre_entry_change_1m: >= {min_threshold:.4f}% "
+                          f"(removes {bad_removed:.1f}% bad)")
+    
+    # Analyze entry signal alignment
+    signal_columns = {
+        'tx_buy_sell_pressure': 'entry_buy_pressure',
+        'wh_net_flow_ratio': 'entry_whale_flow'
+    }
+    
+    for orig_col, new_col in signal_columns.items():
+        if orig_col in df_m0.columns:
+            good_signal = good_df[orig_col].dropna()
+            bad_signal = bad_df[orig_col].dropna()
+            
+            if len(good_signal) > 10 and len(bad_signal) > 10:
+                # Minimum must be non-negative (reject if selling)
+                min_threshold = max(0.0, good_signal.quantile(0.10))
+                
+                good_kept = (good_signal >= min_threshold).sum() / len(good_signal) * 100
+                bad_removed = (bad_signal < min_threshold).sum() / len(bad_signal) * 100
+                
+                if bad_removed >= 15:
+                    suggestions[new_col] = {
+                        'min_value': float(min_threshold),
+                        'good_kept_pct': round(good_kept, 2),
+                        'bad_removed_pct': round(bad_removed, 2),
+                        'priority': 'MEDIUM',
+                        'good_count': len(good_signal),
+                        'bad_count': len(bad_signal),
+                        'source_column': orig_col
+                    }
+                    logger.info(f"  ✓ {new_col}: >= {min_threshold:.4f} "
+                              f"(removes {bad_removed:.1f}% bad)")
+    
+    if not suggestions:
+        logger.warning("  No pre-entry filters met criteria")
+    else:
+        logger.info(f"  Generated {len(suggestions)} pre-entry filters")
+    
+    return suggestions
+
+
 def save_suggestions(engine, suggestions: List[Dict[str, Any]], column_to_id: Dict[str, int], hours: int):
     """Save filter suggestions directly to PostgreSQL."""
     try:
@@ -1308,8 +1451,9 @@ def get_or_create_auto_project(engine) -> int:
         return 1
 
 
-def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], project_id: int) -> Dict[str, Any]:
-    """Sync the best filter combination to the project's pattern_config_filters."""
+def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], project_id: int, 
+                                  pre_entry_suggestions: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Sync the best filter combination AND pre-entry filters to the project's pattern_config_filters."""
     
     # ALWAYS clear existing filters first (regardless of whether we have new combinations)
     # This ensures old absolute filters are removed when switching to ratio-only mode
@@ -1372,9 +1516,48 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
         except Exception as e:
             logger.error(f"Failed to insert filter {f['column_name']}: {e}")
     
+    # Insert pre-entry filters if available
+    pre_entry_count = 0
+    if pre_entry_suggestions:
+        logger.info(f"Adding {len(pre_entry_suggestions)} pre-entry filters...")
+        
+        for field_name, suggestion in pre_entry_suggestions.items():
+            min_value = suggestion['min_value']
+            priority = suggestion.get('priority', 'MEDIUM')
+            
+            try:
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("""
+                            INSERT INTO pattern_config_filters
+                            (id, project_id, name, section, minute, field_name, field_column,
+                             from_value, to_value, include_null, is_active)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """, [
+                            90000 + project_id + pre_entry_count,  # Special ID range for pre-entry
+                            project_id,
+                            f"Pre-Entry: {field_name}",
+                            "pre_entry",  # Special section
+                            0,  # Always minute 0
+                            field_name,
+                            field_name,
+                            min_value,
+                            999999,  # No upper limit
+                            0,  # don't include null
+                            1   # active
+                        ])
+                    conn.commit()
+                
+                pre_entry_count += 1
+                logger.info(f"  Added PRE-ENTRY filter: {field_name} >= {min_value:.4f} "
+                           f"[{priority}] (removes {suggestion['bad_removed_pct']:.1f}% bad)")
+            except Exception as e:
+                logger.error(f"Failed to insert pre-entry filter {field_name}: {e}")
+    
     return {
         "success": True,
         "filters_synced": filters_inserted,
+        "pre_entry_filters_synced": pre_entry_count,
         "bad_removed_pct": best_combo['bad_trades_removed_pct'],
         "good_kept_pct": best_combo['good_trades_kept_pct'],
     }
@@ -1924,6 +2107,19 @@ def run() -> Dict[str, Any]:
             logger.info(f"  Best interval: {interval_label} (index {best_interval})")
             logger.info(f"  Found {len(combinations)} valid combinations")
         
+        # Step 5: Analyze pre-entry thresholds (NEW)
+        logger.info("\n[Step 4.5/6] Analyzing pre-entry thresholds...")
+        pre_entry_suggestions = analyze_pre_entry_thresholds(df, threshold)
+        
+        if pre_entry_suggestions:
+            logger.info(f"Found {len(pre_entry_suggestions)} pre-entry filters:")
+            for field, suggestion in pre_entry_suggestions.items():
+                logger.info(f"  {field}: >= {suggestion['min_value']:.4f}% "
+                           f"(removes {suggestion['bad_removed_pct']:.1f}% bad, "
+                           f"keeps {suggestion['good_kept_pct']:.1f}% good)")
+        else:
+            logger.warning("  No pre-entry filters met criteria - using default 0.20% threshold")
+        
         # Step 5: Sync to pattern config
         logger.info("\n[Step 5/6] Syncing filters to pattern config...")
         project_id = get_or_create_auto_project(engine)
@@ -1948,8 +2144,10 @@ def run() -> Dict[str, Any]:
             logger.warning(result['error'])
             save_combinations(engine, [], max_hours)
         else:
-            sync_result = sync_best_filters_to_project(engine, combinations, project_id)
+            sync_result = sync_best_filters_to_project(engine, combinations, project_id, 
+                                                       pre_entry_suggestions=pre_entry_suggestions)
             result['filters_synced'] = sync_result.get('filters_synced', 0)
+            result['pre_entry_filters_synced'] = sync_result.get('pre_entry_filters_synced', 0)
             save_combinations(engine, combinations, max_hours)
         
         # Step 6: Update AI-enabled plays
@@ -1967,6 +2165,7 @@ def run() -> Dict[str, Any]:
         logger.info(f"  Suggestions generated: {result['suggestions_count']}")
         logger.info(f"  Combinations found: {result['combinations_count']}")
         logger.info(f"  Filters synced: {result['filters_synced']}")
+        logger.info(f"  Pre-entry filters synced: {result.get('pre_entry_filters_synced', 0)}")
         logger.info(f"  Plays updated: {result['plays_updated']}")
         if combinations:
             best = combinations[-1]

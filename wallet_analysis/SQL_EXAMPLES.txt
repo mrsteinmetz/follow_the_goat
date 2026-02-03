@@ -1,0 +1,353 @@
+SQL QUERY EXAMPLES FOR WALLET ANALYSIS
+=======================================
+
+This file contains SQL query examples you can run directly in PostgreSQL
+or adapt for your own analysis scripts.
+
+All queries use the wallet_profiles table which is automatically populated
+by the create_profiles.py job.
+
+Connect to PostgreSQL:
+  psql -h localhost -U your_user -d your_database
+
+---
+
+EXAMPLE 1: Top 10 Wallets by Score (Frequency × Potential × Win Rate)
+----------------------------------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trade_count,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_potential_pct,
+    ROUND((SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100)::numeric, 1) as win_rate_pct,
+    ROUND((COUNT(*) * AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    ) * (SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100) / 100)::numeric, 2) as score
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY wallet_address
+HAVING COUNT(*) >= 5
+ORDER BY score DESC
+LIMIT 10;
+
+---
+
+EXAMPLE 2: Wallets with High Win Rate (>70%)
+---------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trades,
+    ROUND((SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100)::numeric, 1) as win_rate_pct,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY wallet_address
+HAVING COUNT(*) >= 5
+AND (SUM(
+    CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+    THEN 1 ELSE 0 END
+)::FLOAT / COUNT(*) * 100) >= 70
+ORDER BY win_rate_pct DESC, trades DESC
+LIMIT 20;
+
+---
+
+EXAMPLE 3: Early Entry Specialists (Enter in First 25% of Cycle)
+-----------------------------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trades,
+    ROUND(AVG(
+        EXTRACT(EPOCH FROM (trade_timestamp - price_cycle_start_time)) / 
+        EXTRACT(EPOCH FROM (price_cycle_end_time - price_cycle_start_time)) * 100
+    )::numeric, 1) as avg_entry_timing_pct,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY wallet_address
+HAVING COUNT(*) >= 5
+AND AVG(
+    EXTRACT(EPOCH FROM (trade_timestamp - price_cycle_start_time)) / 
+    EXTRACT(EPOCH FROM (price_cycle_end_time - price_cycle_start_time)) * 100
+) <= 25
+ORDER BY avg_entry_timing_pct ASC, avg_gain_pct DESC
+LIMIT 20;
+
+---
+
+EXAMPLE 4: Whales (Large Average Trade Size > $1000)
+-----------------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trades,
+    ROUND(AVG(stablecoin_amount)::numeric, 2) as avg_trade_size,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct,
+    ROUND((SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100)::numeric, 1) as win_rate_pct
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY wallet_address
+HAVING COUNT(*) >= 3
+AND AVG(stablecoin_amount) >= 1000
+ORDER BY avg_trade_size DESC
+LIMIT 20;
+
+---
+
+EXAMPLE 5: Recent Activity (Wallets Active in Last Hour)
+---------------------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trades_last_hour,
+    MAX(trade_timestamp) as last_trade,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '1 hour'
+GROUP BY wallet_address
+ORDER BY trades_last_hour DESC, last_trade DESC
+LIMIT 20;
+
+---
+
+EXAMPLE 6: Detailed Trade History for Specific Wallet
+------------------------------------------------------
+
+SELECT 
+    trade_timestamp,
+    price_cycle,
+    ROUND(trade_entry_price::numeric, 4) as entry_price,
+    ROUND(highest_price_reached::numeric, 4) as cycle_peak,
+    ROUND(lowest_price_reached::numeric, 4) as cycle_low,
+    ROUND((
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as potential_gain_pct,
+    ROUND((
+        EXTRACT(EPOCH FROM (trade_timestamp - price_cycle_start_time)) / 
+        EXTRACT(EPOCH FROM (price_cycle_end_time - price_cycle_start_time)) * 100
+    )::numeric, 1) as entry_timing_pct,
+    ROUND(stablecoin_amount::numeric, 2) as trade_size,
+    long_short
+FROM wallet_profiles
+WHERE wallet_address = 'YOUR_WALLET_ADDRESS_HERE'
+AND threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+ORDER BY trade_timestamp DESC
+LIMIT 50;
+
+---
+
+EXAMPLE 7: Compare Multiple Wallets Side by Side
+-------------------------------------------------
+
+SELECT 
+    wallet_address,
+    COUNT(*) as trades,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct,
+    ROUND((SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100)::numeric, 1) as win_rate_pct,
+    ROUND(AVG(
+        EXTRACT(EPOCH FROM (trade_timestamp - price_cycle_start_time)) / 
+        EXTRACT(EPOCH FROM (price_cycle_end_time - price_cycle_start_time)) * 100
+    )::numeric, 1) as avg_entry_timing_pct,
+    MAX(trade_timestamp) as last_trade
+FROM wallet_profiles
+WHERE wallet_address IN (
+    'WALLET_1_ADDRESS',
+    'WALLET_2_ADDRESS',
+    'WALLET_3_ADDRESS'
+)
+AND threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+GROUP BY wallet_address
+ORDER BY avg_gain_pct DESC;
+
+---
+
+EXAMPLE 8: Find Wallets with Improving Performance (Recent vs Historical)
+--------------------------------------------------------------------------
+
+WITH recent AS (
+    SELECT 
+        wallet_address,
+        AVG(((highest_price_reached - trade_entry_price) / trade_entry_price) * 100) as recent_avg
+    FROM wallet_profiles
+    WHERE threshold = 0.3
+    AND trade_timestamp >= NOW() - INTERVAL '12 hours'
+    GROUP BY wallet_address
+    HAVING COUNT(*) >= 5
+),
+historical AS (
+    SELECT 
+        wallet_address,
+        AVG(((highest_price_reached - trade_entry_price) / trade_entry_price) * 100) as historical_avg
+    FROM wallet_profiles
+    WHERE threshold = 0.3
+    AND trade_timestamp >= NOW() - INTERVAL '48 hours'
+    AND trade_timestamp < NOW() - INTERVAL '12 hours'
+    GROUP BY wallet_address
+    HAVING COUNT(*) >= 5
+)
+SELECT 
+    r.wallet_address,
+    ROUND(h.historical_avg::numeric, 2) as historical_avg_pct,
+    ROUND(r.recent_avg::numeric, 2) as recent_avg_pct,
+    ROUND((r.recent_avg - h.historical_avg)::numeric, 2) as improvement_pct,
+    ROUND(((r.recent_avg / h.historical_avg - 1) * 100)::numeric, 1) as improvement_percent
+FROM recent r
+JOIN historical h ON r.wallet_address = h.wallet_address
+WHERE r.recent_avg > h.historical_avg * 1.2  -- 20% improvement
+ORDER BY improvement_pct DESC
+LIMIT 20;
+
+---
+
+EXAMPLE 9: Distribution of Entry Timings (When Do Top Wallets Enter?)
+----------------------------------------------------------------------
+
+WITH top_wallets AS (
+    SELECT wallet_address
+    FROM wallet_profiles
+    WHERE threshold = 0.3
+    AND trade_timestamp >= NOW() - INTERVAL '24 hours'
+    GROUP BY wallet_address
+    HAVING COUNT(*) >= 10
+    ORDER BY (COUNT(*) * AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )) DESC
+    LIMIT 50
+)
+SELECT 
+    CASE 
+        WHEN entry_timing < 10 THEN '0-10% (Very Early)'
+        WHEN entry_timing < 25 THEN '10-25% (Early)'
+        WHEN entry_timing < 50 THEN '25-50% (Mid-Early)'
+        WHEN entry_timing < 75 THEN '50-75% (Mid-Late)'
+        ELSE '75-100% (Late)'
+    END as entry_period,
+    COUNT(*) as trade_count,
+    ROUND(AVG(potential_gain)::numeric, 2) as avg_gain_pct
+FROM (
+    SELECT 
+        EXTRACT(EPOCH FROM (wp.trade_timestamp - wp.price_cycle_start_time)) / 
+        EXTRACT(EPOCH FROM (wp.price_cycle_end_time - wp.price_cycle_start_time)) * 100 as entry_timing,
+        ((wp.highest_price_reached - wp.trade_entry_price) / wp.trade_entry_price) * 100 as potential_gain
+    FROM wallet_profiles wp
+    JOIN top_wallets tw ON wp.wallet_address = tw.wallet_address
+    WHERE wp.threshold = 0.3
+    AND wp.trade_timestamp >= NOW() - INTERVAL '24 hours'
+) t
+GROUP BY entry_period
+ORDER BY entry_period;
+
+---
+
+EXAMPLE 10: Wallet Performance by Time of Day
+----------------------------------------------
+
+SELECT 
+    EXTRACT(HOUR FROM trade_timestamp) as hour_of_day,
+    COUNT(*) as trades,
+    ROUND(AVG(
+        ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+    )::numeric, 2) as avg_gain_pct,
+    ROUND((SUM(
+        CASE WHEN highest_price_reached > trade_entry_price * 1.005 
+        THEN 1 ELSE 0 END
+    )::FLOAT / COUNT(*) * 100)::numeric, 1) as win_rate_pct
+FROM wallet_profiles
+WHERE threshold = 0.3
+AND trade_timestamp >= NOW() - INTERVAL '7 days'
+GROUP BY hour_of_day
+ORDER BY hour_of_day;
+
+---
+
+TIPS FOR CUSTOM QUERIES
+------------------------
+
+1. Always filter by threshold (usually 0.3 for 0.3% cycles)
+
+2. Use appropriate time ranges:
+   - Short-term analysis: INTERVAL '24 hours'
+   - Medium-term: INTERVAL '7 days'
+   - Long-term: INTERVAL '30 days'
+
+3. Require minimum trade counts (HAVING COUNT(*) >= 5) to avoid 
+   statistical flukes from wallets with only 1-2 trades
+
+4. Calculate potential gain as:
+   ((highest_price_reached - trade_entry_price) / trade_entry_price) * 100
+
+5. Calculate win rate as:
+   SUM(CASE WHEN highest_price_reached > trade_entry_price * 1.005 THEN 1 ELSE 0 END)::FLOAT / COUNT(*) * 100
+   (The 1.005 means >0.5% gain to count as a "win")
+
+6. Calculate entry timing as:
+   EXTRACT(EPOCH FROM (trade_timestamp - price_cycle_start_time)) / 
+   EXTRACT(EPOCH FROM (price_cycle_end_time - price_cycle_start_time)) * 100
+
+7. Always use ROUND() for cleaner output:
+   ROUND(value::numeric, 2) for 2 decimal places
+
+8. Indexes for performance:
+   - wallet_address (for filtering)
+   - trade_timestamp (for time ranges)
+   - threshold (for cycle size filtering)
+
+---
+
+UNDERSTANDING THE DATA
+----------------------
+
+wallet_profiles table contains one row per wallet trade within a price cycle.
+
+Key fields:
+- wallet_address: Who made the trade
+- trade_timestamp: When they bought
+- trade_entry_price: Actual SOL price at entry
+- highest_price_reached: Peak of that cycle
+- lowest_price_reached: Bottom of that cycle
+- price_cycle_start_time: When cycle started
+- price_cycle_end_time: When cycle ended
+- stablecoin_amount: Trade size in USD
+- threshold: Cycle threshold (0.3 = 0.3%)
+
+The difference between highest_price_reached and trade_entry_price tells us
+the maximum potential gain if they had sold at the perfect time.
+
+High-performing wallets consistently enter early (low entry timing %)
+and catch cycles with good upside potential.

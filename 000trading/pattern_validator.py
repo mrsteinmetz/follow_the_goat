@@ -47,8 +47,10 @@ try:
         log_pre_entry_analysis,
     )
     PRE_ENTRY_AVAILABLE = True
-except ImportError:
-    logger.warning("pre_entry_price_movement module not available - pre-entry filtering disabled")
+except ImportError as e:
+    logger.error("⚠️  CRITICAL: pre_entry_price_movement module not available - pre-entry filtering disabled!")
+    logger.error(f"⚠️  Import error details: {e}")
+    logger.error("⚠️  This means trades may enter on falling prices - CHECK IMMEDIATELY")
     PRE_ENTRY_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -1146,6 +1148,13 @@ def validate_buyin_signal(
         f" (projects={projects_to_validate})" if projects_to_validate else ""
     )
     
+    # Warn if pre-entry filter is not available
+    if not PRE_ENTRY_AVAILABLE:
+        logger.warning(
+            "⚠️  Pre-entry filter is DISABLED for buyin #%s - trade may enter on falling price!",
+            buyin_id
+        )
+    
     # =========================================================================
     # CRITICAL PRE-ENTRY PRICE MOVEMENT CHECK
     # This runs FIRST before any other validation
@@ -1174,7 +1183,8 @@ def validate_buyin_signal(
                 
                 # Check if should enter based on price movement
                 # Uses 3-minute window (optimal for SOL's fast cycles based on 8,515 trade analysis)
-                should_enter, reason = should_enter_based_on_price_movement(pre_entry_metrics, min_change_3m=0.08)
+                # Threshold: 0.20% (prevents "buying the top" - increased from 0.08%)
+                should_enter, reason = should_enter_based_on_price_movement(pre_entry_metrics, min_change_3m=0.20)
                 
                 # Log analysis
                 log_pre_entry_analysis(pre_entry_metrics, logger)
@@ -1199,8 +1209,25 @@ def validate_buyin_signal(
                 logger.warning(f"Could not find buyin #{buyin_id} for pre-entry check")
                 
         except Exception as e:
-            logger.error(f"Error in pre-entry check for buyin #{buyin_id}: {e}", exc_info=True)
-            # Allow trade to proceed if pre-entry check fails (graceful degradation)
+            logger.error(f"⚠️  CRITICAL ERROR in pre-entry check for buyin #{buyin_id}: {e}", exc_info=True)
+            logger.error(f"⚠️  Trade will be REJECTED due to pre-entry check failure (safety measure)")
+            # REJECT trade if pre-entry check fails (fail-safe approach)
+            return {
+                "buyin_id": buyin_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "NO_GO",
+                "reason": f"Pre-entry check failed with error: {str(e)}",
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "schema_source": "pre_entry_filter_error",
+                "schema_play_id": play_id,
+                "project_ids": projects_to_validate,
+                "validator_version": "v4_pre_entry_filter",
+                "filter_stage": "pre_entry_error",
+            }
+    else:
+        # Pre-entry filter not available - log warning
+        logger.warning(f"⚠️  Pre-entry filter DISABLED for buyin #{buyin_id} - PRE_ENTRY_AVAILABLE=False")
     
     schema_source = 'default'
     validator_version = "v1_schema_based"

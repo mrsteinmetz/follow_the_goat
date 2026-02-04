@@ -290,34 +290,9 @@ def start_webhook_api_in_background(host: str = "0.0.0.0", port: int = 8001):
     
     import threading
     import uvicorn
-    from fastapi import FastAPI, Request
-    from fastapi.middleware.cors import CORSMiddleware
-    from core.database import postgres_insert
+    from features.webhook.app import app  # Use the proper webhook app
     
-    app = FastAPI(title="Trade Webhook Receiver", version="1.0.0")
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    
-    @app.get("/health")
-    async def health():
-        return {"status": "ok", "service": "webhook_receiver"}
-    
-    @app.post("/webhook/trade")
-    async def receive_trade(request: Request):
-        """Receive trade data from QuickNode stream."""
-        try:
-            data = await request.json()
-            # Insert into PostgreSQL
-            postgres_insert("sol_stablecoin_trades", data)
-            return {"status": "ok"}
-        except Exception as e:
-            logger.error(f"Webhook trade error: {e}")
-            return {"status": "error", "message": str(e)}
+    # The app from features/webhook/app.py already has CORS middleware and all endpoints
     
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)

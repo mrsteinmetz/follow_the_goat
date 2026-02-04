@@ -224,9 +224,79 @@ def log_action(
 # QUICKNODE API OPERATIONS
 # =============================================================================
 
+def check_webhook_health() -> bool:
+    """
+    Check if the webhook server is responding.
+    
+    Returns:
+        True if webhook is healthy, False otherwise
+    """
+    try:
+        response = requests.get("http://localhost:8001/health", timeout=5)
+        if response.status_code == 200:
+            logger.info("✓ Webhook server is healthy")
+            return True
+        else:
+            logger.warning(f"⚠️  Webhook server returned status {response.status_code}")
+            return False
+    except Exception as e:
+        logger.error(f"❌ Webhook server is not responding: {e}")
+        return False
+
+
+def get_stream_status(stream_id: str) -> Dict[str, Any]:
+    """
+    Get the current status of a QuickNode stream.
+    
+    Args:
+        stream_id: QuickNode stream ID
+    
+    Returns:
+        Dict with 'success' (bool), 'status' (str), and optional 'error' or 'data'
+    """
+    if not QUICKNODE_API_KEY:
+        return {
+            'success': False,
+            'error': 'QuickNode API key not configured'
+        }
+    
+    url = f"{QUICKNODE_API_BASE}/streams/{stream_id}"
+    headers = {
+        'accept': 'application/json',
+        'x-api-key': QUICKNODE_API_KEY
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            status = data.get('status', 'unknown')
+            logger.info(f"Stream {stream_id[:8]}... status: {status}")
+            return {
+                'success': True,
+                'status': status,
+                'data': data
+            }
+        else:
+            return {
+                'success': False,
+                'error': f"API returned status {response.status_code}",
+                'status': 'unknown'
+            }
+    except Exception as e:
+        logger.error(f"Failed to get stream status: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'status': 'unknown'
+        }
+
+
 def restart_stream(stream_id: str) -> Dict[str, Any]:
     """
     Restart a QuickNode stream by updating it to start from the latest block.
+    Handles both active and terminated streams.
     
     Args:
         stream_id: QuickNode stream ID
@@ -251,22 +321,54 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
     try:
         logger.info(f"Restarting stream {stream_id}...")
         
-        # Step 1: Pause the stream first (QuickNode requires pausing before updating)
-        pause_payload = {'status': 'paused'}
-        pause_response = requests.patch(url, headers=headers, json=pause_payload, timeout=10)
+        # Step 1: Check current stream status
+        status_result = get_stream_status(stream_id)
+        current_status = status_result.get('status', 'unknown')
         
-        if pause_response.status_code != 200:
-            error_msg = f"Failed to pause stream (status {pause_response.status_code}): {pause_response.text}"
-            logger.error(f"✗ {error_msg}")
-            return {
-                'success': False,
-                'error': error_msg,
-                'status_code': pause_response.status_code
+        # Step 2: Handle based on current status
+        if current_status == 'terminated':
+            logger.warning(f"⚠️  Stream {stream_id[:8]}... is TERMINATED - activating directly")
+            # For terminated streams, directly activate them
+            activate_payload = {
+                'start_range': -1,  # Start from latest block
+                'status': 'active'
             }
+            activate_response = requests.patch(url, headers=headers, json=activate_payload, timeout=10)
+            
+            if activate_response.status_code == 200:
+                logger.info(f"✓ Stream {stream_id[:8]}... activated successfully from terminated state")
+                return {
+                    'success': True,
+                    'response': activate_response.json(),
+                    'was_terminated': True
+                }
+            else:
+                error_msg = f"Failed to activate terminated stream (status {activate_response.status_code}): {activate_response.text}"
+                logger.error(f"✗ {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'status_code': activate_response.status_code
+                }
         
-        logger.debug(f"Stream {stream_id} paused")
+        # For active/paused streams, use the normal restart flow
+        # Step 2a: Pause the stream first (QuickNode requires pausing before updating)
+        if current_status != 'paused':
+            pause_payload = {'status': 'paused'}
+            pause_response = requests.patch(url, headers=headers, json=pause_payload, timeout=10)
+            
+            if pause_response.status_code != 200:
+                error_msg = f"Failed to pause stream (status {pause_response.status_code}): {pause_response.text}"
+                logger.error(f"✗ {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'status_code': pause_response.status_code
+                }
+            
+            logger.debug(f"Stream {stream_id[:8]}... paused")
         
-        # Step 2: Update to start from latest block and reactivate
+        # Step 2b: Update to start from latest block and reactivate
         restart_payload = {
             'start_range': -1,  # Start from latest block
             'status': 'active'
@@ -274,14 +376,14 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
         restart_response = requests.patch(url, headers=headers, json=restart_payload, timeout=10)
         
         if restart_response.status_code == 200:
-            logger.info(f"✓ Stream {stream_id} restarted successfully")
+            logger.info(f"✓ Stream {stream_id[:8]}... restarted successfully")
             return {
                 'success': True,
                 'response': restart_response.json()
             }
         else:
             error_msg = f"API returned status {restart_response.status_code}: {restart_response.text}"
-            logger.error(f"✗ Failed to restart stream {stream_id}: {error_msg}")
+            logger.error(f"✗ Failed to restart stream {stream_id[:8]}...: {error_msg}")
             return {
                 'success': False,
                 'error': error_msg,
@@ -290,7 +392,7 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
             
     except requests.exceptions.Timeout:
         error_msg = "API request timed out"
-        logger.error(f"✗ Failed to restart stream {stream_id}: {error_msg}")
+        logger.error(f"✗ Failed to restart stream {stream_id[:8]}...: {error_msg}")
         return {
             'success': False,
             'error': error_msg
@@ -298,7 +400,7 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
         
     except requests.exceptions.RequestException as e:
         error_msg = f"Network error: {str(e)}"
-        logger.error(f"✗ Failed to restart stream {stream_id}: {error_msg}")
+        logger.error(f"✗ Failed to restart stream {stream_id[:8]}...: {error_msg}")
         return {
             'success': False,
             'error': error_msg
@@ -306,7 +408,7 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
         
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
-        logger.error(f"✗ Failed to restart stream {stream_id}: {error_msg}", exc_info=True)
+        logger.error(f"✗ Failed to restart stream {stream_id[:8]}...: {error_msg}", exc_info=True)
         return {
             'success': False,
             'error': error_msg
@@ -316,9 +418,11 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
 def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict[str, Any]:
     """
     Restart all configured QuickNode streams.
+    Checks webhook health first before attempting restart.
     
     Args:
-        latency: The latency value that triggered the restart
+        trigger_seconds: The value that triggered the restart
+        reason: Reason for restart (latency, no_transactions, etc.)
     
     Returns:
         Dict with overall success status and details
@@ -331,9 +435,23 @@ def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict
             'error': error_msg
         }
     
+    # CRITICAL: Check webhook health first
+    logger.info("Checking webhook server health before restarting streams...")
+    webhook_healthy = check_webhook_health()
+    
+    if not webhook_healthy:
+        error_msg = "Webhook server is not responding - cannot restart streams safely"
+        logger.error(f"❌ {error_msg}")
+        logger.error("   Please check if webhook_server component is running!")
+        return {
+            'success': False,
+            'error': error_msg,
+            'webhook_healthy': False
+        }
+    
     results = {}
     
-    # Restart stream 1
+    # Restart streams
     logger.info(f"Restart trigger ({reason}): {trigger_seconds:.2f}s")
     logger.info("Restarting all QuickNode streams...")
     
@@ -345,6 +463,7 @@ def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict
     
     if all_success:
         logger.info("✓ All streams restarted successfully")
+        logger.info("  Streams should now be sending data to webhook...")
     else:
         failed = [k for k, v in results.items() if not v['success']]
         logger.error(f"✗ Failed to restart: {', '.join(failed)}")
@@ -354,7 +473,8 @@ def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict
         'results': results,
         'trigger_seconds': trigger_seconds,
         'reason': reason,
-        'stream_ids': [QUICKNODE_STREAM_1, QUICKNODE_STREAM_2]
+        'stream_ids': [QUICKNODE_STREAM_1, QUICKNODE_STREAM_2],
+        'webhook_healthy': webhook_healthy
     }
 
 
@@ -552,14 +672,12 @@ def main():
     
     result = run_monitoring_cycle()
     
-    if result['success']:
-        if result.get('action_taken'):
-            logger.info(f"Monitoring cycle complete: Stream restart triggered (latency: {result['latency']:.2f}s)")
-        else:
-            logger.info(f"Monitoring cycle complete: No action needed (latency: {result['latency']:.2f}s)")
+    if result.get('action_taken'):
+        logger.info(f"✓ Restart action taken")
+    elif result.get('reason') == 'cooldown':
+        logger.info(f"Monitoring cycle complete: In cooldown (no action taken)")
     else:
-        logger.error(f"Monitoring cycle failed: {result.get('error', 'Unknown error')}")
-        sys.exit(1)
+        logger.info(f"Monitoring cycle complete: No action needed")
 
 
 if __name__ == "__main__":

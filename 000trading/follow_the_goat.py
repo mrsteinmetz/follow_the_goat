@@ -63,6 +63,9 @@ from pattern_validator import (
     validate_buyin_signal,
     clear_schema_cache,
 )
+from pre_entry_price_movement import (
+    calculate_pre_entry_metrics,
+)
 
 # =============================================================================
 # CONFIGURATION
@@ -279,6 +282,7 @@ class WalletFollower:
             'trades_blocked_max_buys': 0,
             'trades_blocked_validator': 0,
             'trades_blocked_perp_mode': 0,
+            'trades_blocked_pre_entry': 0,  # NEW: Pre-entry price movement filter
             'swaps_executed': 0,
             'swap_errors': 0,
             'errors': 0,
@@ -1246,7 +1250,9 @@ class WalletFollower:
         
         logger.info(f"Inserted buyin #{buyin_id} for trade {trade['id']} (Play #{play_id})")
         
-        # Generate trail
+        # Generate trail -- includes pre-entry metrics which flow through
+        # the auto-filter pipeline (no hardcoded price movement gate)
+        logger.info(f"Generating trail for buyin #{buyin_id}")
         trail_generated = False
         try:
             trail_token = step_logger.start('generate_trail', 'Generating 15-minute trail')
@@ -1255,7 +1261,7 @@ class WalletFollower:
             step_logger.end(trail_token, {
                 'minute_spans': len(trail_payload.get('price_movements', [])),
             })
-            logger.info(f"Generated trail for buyin #{buyin_id}")
+            logger.info(f"✓ Generated trail for buyin #{buyin_id}")
         except TrailError as e:
             step_logger.fail(trail_token, str(e))
             logger.warning(f"Trail generation failed for buyin #{buyin_id}: {e}")
@@ -1379,6 +1385,7 @@ class WalletFollower:
             'blocked_max_buys': 0,
             'blocked_validator': 0,
             'blocked_perp_mode': 0,
+            'blocked_pre_entry': 0,  # NEW: Pre-entry filter blocks
             'errors': 0,
         }
         
@@ -1425,6 +1432,9 @@ class WalletFollower:
                         elif result == 'blocked_validator':
                             stats['blocked_validator'] += 1
                             self._increment_stat('trades_blocked_validator')
+                        elif result == 'blocked_pre_entry':
+                            stats['blocked_pre_entry'] += 1
+                            self._increment_stat('trades_blocked_pre_entry')
                     except Exception as e:
                         logger.error(f"Error processing trade {trade['id']} for play {play_id}: {e}")
                         stats['errors'] += 1
@@ -1450,6 +1460,7 @@ class WalletFollower:
             'trades_blocked_max_buys': self.stats.get('trades_blocked_max_buys', 0),
             'trades_blocked_validator': self.stats.get('trades_blocked_validator', 0),
             'trades_blocked_perp_mode': self.stats.get('trades_blocked_perp_mode', 0),
+            'trades_blocked_pre_entry': self.stats.get('trades_blocked_pre_entry', 0),
             'swaps_executed': self.stats['swaps_executed'],
             'errors': self.stats['errors'],
             'uptime_seconds': uptime,
@@ -1473,7 +1484,7 @@ class WalletFollower:
                 stats = self.process_new_trades(new_trades)
                 
                 # Log summary if any blocking happened
-                if stats['blocked_max_buys'] > 0 or stats['blocked_validator'] > 0:
+                if stats['blocked_max_buys'] > 0 or stats['blocked_validator'] > 0 or stats['blocked_pre_entry'] > 0:
                     # Get current cycle info for context
                     current_cycle = self.get_current_price_cycle()
                     cycles_seen = list(self.stats.get('cycles_seen', set()))
@@ -1483,6 +1494,7 @@ class WalletFollower:
                         f"{stats['saved']} saved, "
                         f"{stats['blocked_max_buys']} blocked (max_buys), "
                         f"{stats['blocked_validator']} blocked (validator), "
+                        f"{stats['blocked_pre_entry']} blocked (pre-entry), "
                         f"{stats['blocked_perp_mode']} blocked (perp_mode) | "
                         f"Current cycle: {current_cycle}, "
                         f"Cycles seen: {cycles_seen[-5:] if len(cycles_seen) > 5 else cycles_seen}"
@@ -1537,6 +1549,7 @@ class WalletFollower:
                         f"📊 Status: {stats['trades_followed']} saved, "
                         f"{stats['trades_blocked_max_buys']} blocked (max_buys), "
                         f"{stats['trades_blocked_validator']} blocked (validator), "
+                        f"{stats['trades_blocked_pre_entry']} blocked (pre-entry), "
                         f"{stats['errors']} errors | "
                         f"Cycles: {stats['recent_cycles']}"
                     )

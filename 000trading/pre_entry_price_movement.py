@@ -165,33 +165,17 @@ def calculate_pre_entry_metrics(entry_time: datetime, entry_price: float) -> Dic
 
 def should_enter_based_on_price_movement(
     pre_entry_metrics: Dict[str, Any],
-    min_change_3m: float = 0.20  # Increased from 0.08 to prevent weak entries
+    min_change_3m: float = 0.20
 ) -> tuple[bool, str]:
     """
-    Determine if trade should be entered based on price movement.
+    DEPRECATED: Always returns True. Price movement filtering is now handled
+    by the auto-filter pipeline via pattern_config_filters. Pre-entry metrics
+    are stored in trade_filter_values and analysed by create_new_patterns.py
+    alongside all other filter columns.
     
-    UPDATED: Uses 3-minute window (optimal for SOL's fast cycles).
-    Threshold increased to 0.20% to prevent "buying the top" entries.
-    
-    Args:
-        pre_entry_metrics: Dict returned by calculate_pre_entry_metrics()
-        min_change_3m: Minimum 3m price change % required (default 0.20%)
-    
-    Returns:
-        Tuple of (should_enter: bool, reason: str)
+    Kept for backward compatibility -- callers should be migrated to remove
+    this call entirely.
     """
-    change_3m = pre_entry_metrics.get('pre_entry_change_3m')
-    
-    if change_3m is None:
-        logger.warning("No price data 3m before entry - allowing trade (no filter)")
-        return True, "NO_PRICE_DATA"
-    
-    # CRITICAL FILTER: Price must be rising (catches quick reversals early)
-    if change_3m < min_change_3m:
-        logger.info(f"Trade filtered: price change 3m = {change_3m:.3f}% (need >= {min_change_3m}%)")
-        return False, f"FALLING_PRICE (change_3m={change_3m:.3f}%)"
-    
-    logger.debug(f"Trade passes price movement filter: change_3m = {change_3m:.3f}%")
     return True, "PASS"
 
 

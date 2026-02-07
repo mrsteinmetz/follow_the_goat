@@ -667,6 +667,19 @@ ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS mm_slippage_estimate DO
 -- Sub-minute interval support
 ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS sub_minute SMALLINT DEFAULT 0;
 
+-- Pre-entry price movement metrics (computed before trade entry)
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_price_1m_before DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_price_2m_before DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_price_3m_before DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_price_5m_before DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_price_10m_before DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_change_1m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_change_2m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_change_3m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_change_5m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_change_10m DOUBLE PRECISION;
+ALTER TABLE buyin_trail_minutes ADD COLUMN IF NOT EXISTS pre_entry_trend TEXT;
+
 -- New indexes for micro-move queries
 CREATE INDEX IF NOT EXISTS idx_trail_mm_probability ON buyin_trail_minutes(mm_probability);
 CREATE INDEX IF NOT EXISTS idx_trail_composite ON buyin_trail_minutes(buyin_id, mm_probability, mm_direction);
@@ -679,6 +692,7 @@ CREATE TABLE IF NOT EXISTS trade_filter_values (
     id BIGSERIAL PRIMARY KEY,
     buyin_id BIGINT NOT NULL,
     minute INTEGER NOT NULL,
+    sub_minute INTEGER DEFAULT 0,
     filter_name VARCHAR(100) NOT NULL,
     filter_value DOUBLE PRECISION,
     is_ratio SMALLINT DEFAULT 0,

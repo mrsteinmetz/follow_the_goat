@@ -4,7 +4,13 @@ Update Potential Gains
 PostgreSQL Version - Jan 2026
 
 Calculates and updates potential_gains for buyins where the price cycle has completed.
-Formula: ((highest_price_reached - our_entry_price) / our_entry_price) * 100
+Formula: ((cycle_end_price - our_entry_price) / our_entry_price) * 100
+
+Uses the price at cycle_end_time (from the prices table) as the outcome price.
+This gives the REAL outcome: price at cycle close vs entry, which CAN be negative.
+
+Previous (WRONG) formula used highest_price_reached, which always gave positive results
+because it measured the peak, not what actually happened when the cycle closed.
 
 Uses threshold = 0.3 for cycle_tracker lookup.
 Only updates records where:
@@ -17,8 +23,8 @@ CRITICAL: Also includes no_go trades!
 - They tell us what filter values would have avoided bad trades
 
 Fallback mechanism:
-- If cycle not found, uses trade's own higest_price_reached field
-- Updated by trailing_stop monitor
+- If cycle not found, looks up price 15 minutes after followed_at (trail window)
+- Falls back to trade's own higest_price_reached only as last resort
 """
 
 import sys
@@ -52,13 +58,22 @@ def get_records_to_update():
     Returns:
         list: List of tuples (buyin_id, calculated_potential_gains)
     """
-    # Query 1: Trades with existing cycle_tracker records (use cycle's highest_price)
+    # Query 1: Trades with existing cycle_tracker records
+    # Uses LATERAL JOIN to look up the actual SOL price at cycle_end_time.
+    # This gives the REAL outcome (can be negative) instead of the peak.
     query_with_cycle = """
     SELECT 
         buyins.id,
-        ((ct.highest_price_reached - buyins.our_entry_price) / buyins.our_entry_price) * 100 AS potential_gains
+        ((p_end.price - buyins.our_entry_price) / buyins.our_entry_price) * 100 AS potential_gains
     FROM follow_the_goat_buyins buyins
     INNER JOIN cycle_tracker ct ON ct.id = buyins.price_cycle
+    CROSS JOIN LATERAL (
+        SELECT price FROM prices
+        WHERE token = 'SOL'
+          AND timestamp <= ct.cycle_end_time
+        ORDER BY timestamp DESC
+        LIMIT 1
+    ) p_end
     WHERE buyins.potential_gains IS NULL 
       AND ct.cycle_end_time IS NOT NULL
       AND ct.threshold = %s
@@ -66,24 +81,34 @@ def get_records_to_update():
       AND buyins.our_entry_price > 0
     """
     
-    # Query 2: Orphaned trades (cycle archived/deleted) - use trade's own higest_price_reached
-    # This handles trades where the cycle was cleaned up from hot storage
-    # INCLUDES no_go trades!
+    # Query 2: Orphaned trades (cycle archived/deleted)
+    # Look up SOL price 15 minutes after entry (the trail window duration).
+    # This gives the real outcome at the point the system would have evaluated.
+    # Falls back to higest_price_reached only if no price data is available.
     query_orphaned = """
     SELECT 
         buyins.id,
-        ((buyins.higest_price_reached - buyins.our_entry_price) / buyins.our_entry_price) * 100 AS potential_gains
+        COALESCE(
+            ((p_end.price - buyins.our_entry_price) / buyins.our_entry_price) * 100,
+            ((buyins.higest_price_reached - buyins.our_entry_price) / buyins.our_entry_price) * 100
+        ) AS potential_gains
     FROM follow_the_goat_buyins buyins
+    LEFT JOIN LATERAL (
+        SELECT price FROM prices
+        WHERE token = 'SOL'
+          AND timestamp <= buyins.followed_at + INTERVAL '15 minutes'
+        ORDER BY timestamp DESC
+        LIMIT 1
+    ) p_end ON true
     WHERE buyins.potential_gains IS NULL
       AND buyins.price_cycle IS NOT NULL
       AND buyins.our_status IN ('sold', 'completed', 'no_go')
-      AND buyins.higest_price_reached IS NOT NULL
-      AND buyins.higest_price_reached > 0
       AND buyins.our_entry_price IS NOT NULL
       AND buyins.our_entry_price > 0
       AND NOT EXISTS (
           SELECT 1 FROM cycle_tracker ct WHERE ct.id = buyins.price_cycle
       )
+      AND (p_end.price IS NOT NULL OR (buyins.higest_price_reached IS NOT NULL AND buyins.higest_price_reached > 0))
     """
     
     try:

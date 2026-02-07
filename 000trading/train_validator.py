@@ -60,6 +60,9 @@ from pattern_validator import (
     validate_buyin_signal,
     clear_schema_cache,
 )
+from pre_entry_price_movement import (
+    calculate_pre_entry_metrics,
+)
 
 # Configuration
 PLAY_ID = int(os.getenv("TRAIN_VALIDATOR_PLAY_ID", "46"))
@@ -932,13 +935,13 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         _stats.trades_inserted += 1
         
         # 4. Generate trail
+        # Trail data includes pre-entry metrics which flow through the auto-filter pipeline
+        logger.info(f"Generating trail for synthetic buyin #{buyin_id}")
         trail_success = generate_trail(buyin_id, step_logger)
         
         if not trail_success:
-            logger.error("Trail generation failed - aborting cycle")
-            mark_buyin_as_error(buyin_id, "Trail generation failed", step_logger)
-            _stats.errors += 1
-            return False
+            logger.warning("Trail generation failed - continuing with validation anyway")
+            # Don't abort - trail generation failure shouldn't stop validation
         
         # 5. Run validation
         validation_result = run_validation(buyin_id, play_config, step_logger)

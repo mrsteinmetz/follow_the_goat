@@ -3,27 +3,35 @@
 Auto Pattern Filter Generator
 =============================
 Analyzes trade data to find optimal filter combinations that maximize
-bad trade removal while preserving good trades.
+precision (% of passing trades that are good) using:
+
+  - Cohen's d for feature ranking (statistical separation)
+  - Youden's J for optimal cutpoints (not arbitrary percentiles)
+  - Exhaustive combinatorial search (pairs, triples, quads from top features)
+  - Time-based train/test validation (70/30 chronological split)
 
 This script:
-1. Loads trade data from PostgreSQL (follow_the_goat_buyins + trade_filter_values)
-2. Analyzes each filter field to find optimal ranges
-3. Generates filter combinations using a greedy algorithm
-4. Syncs best filters to pattern_config_filters
-5. Updates plays with pattern_update_by_ai=1
-
-PERFORMANCE: Uses PostgreSQL pivot (crosstab) to avoid loading millions of rows into Python.
+1. Loads trade data from DuckDB cache (synced from PostgreSQL)
+2. Splits data chronologically into train (70%) / test (30%)
+3. Ranks features by Cohen's d statistical separation
+4. Finds optimal ranges via Youden's J statistic
+5. Exhaustively tests filter combinations (pairs, triples, quads)
+6. Validates on test set to prevent overfitting
+7. Syncs best filters to pattern_config_filters
+8. Updates plays with pattern_update_by_ai=1
 
 Usage:
     # Run standalone
     python create_new_paterns.py
     
-    # Integrated via scheduler/master2.py (runs every 5 minutes)
+    # Integrated via scheduler (runs every 10 minutes)
 """
 
 import json
 import logging
 import sys
+import time
+from itertools import combinations as iter_combinations
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple
@@ -42,6 +50,52 @@ from core.filter_cache import sync_cache_incremental, get_cached_trades, get_cac
 
 # Setup logging
 logger = logging.getLogger("create_new_patterns")
+
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+# Columns to never use as filters
+SKIP_COLUMNS = frozenset([
+    'trade_id', 'play_id', 'wallet_address', 'followed_at',
+    'our_status', 'minute', 'sub_minute', 'interval_idx',
+    'potential_gains', 'pat_detected_list', 'pat_swing_trend',
+    'is_good',
+])
+
+# Absolute value columns that don't generalize across time periods.
+# Prices/volumes change daily, so filters like "sol_price > 150" break tomorrow.
+ABSOLUTE_PRICE_COLUMNS = frozenset([
+    # SOL prices
+    'pm_open_price', 'pm_close_price', 'pm_high_price', 'pm_low_price', 'pm_avg_price',
+    # BTC prices
+    'btc_open_price', 'btc_close_price', 'btc_high_price', 'btc_low_price',
+    # ETH prices
+    'eth_open_price', 'eth_close_price', 'eth_high_price', 'eth_low_price',
+    # Second-prices (absolute)
+    'sp_min_price', 'sp_max_price', 'sp_avg_price', 'sp_start_price', 'sp_end_price',
+    'sp_price_count',
+    # 30-second interval prices
+    'ts_open_price', 'ts_close_price', 'ts_high_price', 'ts_low_price',
+    # Pre-entry absolute prices
+    'pre_entry_price_1m_before', 'pre_entry_price_2m_before',
+    'pre_entry_price_3m_before', 'pre_entry_price_5m_before',
+    'pre_entry_price_10m_before',
+    # Order book absolute prices / volumes
+    'ob_mid_price', 'ob_total_liquidity', 'ob_bid_total', 'ob_ask_total',
+    # Transaction absolute volumes / prices
+    'tx_vwap', 'tx_total_volume_usd', 'tx_buy_volume_usd', 'tx_sell_volume_usd',
+    'tx_delta_divergence', 'tx_cumulative_delta',
+    # Whale absolute volumes
+    'wh_total_sol_moved', 'wh_inflow_sol', 'wh_outflow_sol',
+    # Pattern absolute price levels
+    'pat_asc_tri_resistance_level', 'pat_asc_tri_support_level',
+    'pat_inv_hs_neckline', 'pat_cup_handle_rim',
+])
+
+# Train/test split ratio
+TRAIN_FRAC = 0.70
 
 
 def _read_from_postgres(query: str, params: list = None) -> list:
@@ -74,6 +128,7 @@ def _get_filter_columns(hours: int, ratio_only: bool = False) -> List[str]:
     """
     results = _read_from_postgres(query, [hours])
     return [r['filter_name'] for r in results] if results else []
+
 
 # =============================================================================
 # Configuration
@@ -135,10 +190,10 @@ def load_config() -> Dict[str, Any]:
             "pat_": "patterns",
             "btc_": "btc_correlation",
             "eth_": "eth_correlation",
-            # NEW: Velocity and micro-move sections
             "xa_": "cross_asset",
             "ts_": "thirty_second",
-            "mm_": "micro_move"
+            "mm_": "micro_move",
+            "pre_entry_": "pre_entry"
         }
     }
     
@@ -201,15 +256,7 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
     
     OPTIMIZED: Uses DuckDB cache for 10-50x faster queries vs PostgreSQL.
     Cache is automatically synced incrementally on each run.
-    
-    Args:
-        engine: TradingDataEngine instance (not used, kept for compatibility)
-        hours: Number of hours to look back
-        
-    Returns:
-        DataFrame with trade data and all trail minute features (pivoted to wide format)
     """
-    import time
     start_time = time.time()
     
     config = load_config()
@@ -260,10 +307,7 @@ def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
 def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.DataFrame:
     """
     Fallback to load trade data directly from PostgreSQL (if DuckDB cache fails).
-    
-    This is the original implementation preserved for reliability.
     """
-    import time
     start_time = time.time()
     
     # Step 1: Get distinct filter columns (fast query)
@@ -279,14 +323,13 @@ def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.Da
     # Step 2: Build pivoted query using conditional aggregation
     pivot_columns = []
     for col in filter_columns:
-        safe_col = col.replace("'", "''")  # Escape single quotes
+        safe_col = col.replace("'", "''")
         pivot_columns.append(
             f"MAX(tfv.filter_value) FILTER (WHERE tfv.filter_name = '{safe_col}') AS \"{col}\""
         )
     
     pivot_sql = ",\n                ".join(pivot_columns)
     
-    # Build query with all buyins in the time window
     query = f"""
         SELECT 
             b.id as trade_id,
@@ -306,7 +349,6 @@ def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.Da
         ORDER BY b.id, tfv.minute, tfv.sub_minute
     """
     
-    # Step 3: Execute pivoted query
     logger.info("  Executing pivoted query in PostgreSQL...")
     query_start = time.time()
     results = _read_from_postgres(query, [])
@@ -317,10 +359,8 @@ def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.Da
     
     logger.info(f"  Query returned {len(results)} rows in {time.time() - query_start:.1f}s")
     
-    # Step 4: Convert to DataFrame
     df = pd.DataFrame(results)
     
-    # Convert numeric columns
     for col in filter_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -334,28 +374,26 @@ def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.Da
 
 def get_filterable_columns(df: pd.DataFrame) -> List[str]:
     """
-    Get list of numeric columns that can be used as filters.
+    Get list of numeric columns suitable for filtering.
     
     Excludes:
-    - ID columns
-    - Timestamp columns
-    - String columns
-    - Columns in skip_columns config
+    - ID / timestamp / string columns (SKIP_COLUMNS)
+    - Absolute price/volume columns (ABSOLUTE_PRICE_COLUMNS) that don't generalize
+    - Columns with >90% null values
+    - Columns in user's skip_columns config
     """
     config = load_config()
     skip_columns = set(config.get('skip_columns', []))
-    skip_columns.update(['trade_id', 'play_id', 'wallet_address', 'followed_at', 
-                         'our_status', 'minute', 'sub_minute', 'interval_idx', 
-                         'potential_gains', 'pat_detected_list', 'pat_swing_trend'])
+    skip_columns.update(SKIP_COLUMNS)
     
     filterable = []
     for col in df.columns:
         if col in skip_columns:
             continue
+        if col in ABSOLUTE_PRICE_COLUMNS:
+            continue
         
-        # Check if column is numeric
         if df[col].dtype in ['float64', 'int64', 'float32', 'int32']:
-            # Check if it has enough non-null values
             null_pct = df[col].isna().sum() / len(df) * 100
             if null_pct < 90:
                 filterable.append(col)
@@ -384,7 +422,7 @@ def get_field_name_from_column(column_name: str) -> str:
 
 
 # =============================================================================
-# Filter Analysis
+# Filter Effectiveness Testing
 # =============================================================================
 
 def test_filter_effectiveness(
@@ -397,15 +435,7 @@ def test_filter_effectiveness(
     """
     Test how effective a filter would be at removing bad trades.
     
-    Args:
-        df: Trade data DataFrame
-        column_name: Column to filter on
-        from_val: Minimum value
-        to_val: Maximum value
-        threshold: Good trade threshold (e.g., 0.3%)
-        
-    Returns:
-        Dictionary with effectiveness metrics or None if column not found
+    Returns dictionary with effectiveness metrics or None if column not found.
     """
     if column_name not in df.columns:
         return None
@@ -413,17 +443,14 @@ def test_filter_effectiveness(
     values = df[column_name]
     potential_gains = df['potential_gains']
     
-    # Classify trades
     is_good = potential_gains >= threshold
     is_bad = potential_gains < threshold
     
-    # Bad trade breakdown
     is_negative = potential_gains < 0
     is_0_to_01 = (potential_gains >= 0) & (potential_gains < 0.1)
     is_01_to_02 = (potential_gains >= 0.1) & (potential_gains < 0.2)
     is_02_to_03 = (potential_gains >= 0.2) & (potential_gains < threshold)
     
-    # Before filter counts
     good_before = int(is_good.sum())
     bad_before = int(is_bad.sum())
     total = good_before + bad_before
@@ -431,20 +458,16 @@ def test_filter_effectiveness(
     if total == 0:
         return None
     
-    # Apply filter (trade passes if value is within range)
     passes_filter = (values >= from_val) & (values <= to_val)
     
-    # After filter counts
     good_after = int((is_good & passes_filter).sum())
     bad_after = int((is_bad & passes_filter).sum())
     
-    # Bad trade breakdown after filter
     bad_negative_after = int((is_negative & passes_filter).sum())
     bad_0_to_01_after = int((is_0_to_01 & passes_filter).sum())
     bad_01_to_02_after = int((is_01_to_02 & passes_filter).sum())
     bad_02_to_03_after = int((is_02_to_03 & passes_filter).sum())
     
-    # Calculate percentages
     good_kept_pct = (good_after / good_before * 100) if good_before > 0 else 0
     bad_removed = bad_before - bad_after
     bad_removed_pct = (bad_removed / bad_before * 100) if bad_before > 0 else 0
@@ -464,622 +487,266 @@ def test_filter_effectiveness(
     }
 
 
-def find_optimal_threshold(
+# =============================================================================
+# NEW Algorithm Core: Statistical Ranking + Exhaustive Combo Search
+# =============================================================================
+
+def split_train_test(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Time-based train/test split.
+    Sorts trades by followed_at, earliest 70% = train, latest 30% = test.
+    """
+    trade_times = df.groupby('trade_id')['followed_at'].first().sort_values()
+    n_train = int(len(trade_times) * TRAIN_FRAC)
+    train_ids = set(trade_times.iloc[:n_train].index)
+    return df[df['trade_id'].isin(train_ids)].copy(), df[~df['trade_id'].isin(train_ids)].copy()
+
+
+def rank_and_range_features(
     df: pd.DataFrame,
-    column_name: str,
+    columns: List[str],
     threshold: float,
-    override_settings: Optional[Dict[str, Any]] = None
-) -> Optional[Tuple[float, float, Dict[str, Any]]]:
+) -> List[Dict[str, Any]]:
     """
-    Find optimal from/to values that maximize bad trade removal while keeping good trades.
+    Rank features by Cohen's d (statistical separation) and compute optimal
+    filter ranges via Youden's J statistic.
     
-    Tests multiple percentile combinations and returns the best one.
-    Uses settings-driven percentiles with additional test ranges for better coverage.
+    This replaces the old percentile-based approach. Cohen's d measures how
+    well a feature separates good from bad trades. Youden's J finds the
+    statistically optimal cutpoint rather than arbitrary P10/P90.
     
-    Args:
-        df: Trade data filtered to specific minute
-        column_name: Column to analyze
-        threshold: Good trade threshold
-        override_settings: Optional dict to override config settings
-        
-    Returns:
-        Tuple of (from_val, to_val, metrics) or None if no valid threshold found
+    Returns list sorted by |Cohen's d| descending.
     """
-    if column_name not in df.columns:
-        return None
-    
-    values = df[column_name].dropna()
     is_good = df['potential_gains'] >= threshold
-    good_values = df.loc[is_good, column_name].dropna()
-    
-    # Need minimum good trades for reliable percentile calculations
-    # With < 100 good trades, P10-P90 range can be artificially narrow
-    MIN_GOOD_TRADES = 100
-    if len(good_values) < MIN_GOOD_TRADES or len(values) < 20:
-        if len(good_values) < MIN_GOOD_TRADES and len(good_values) >= 10:
-            logger.debug(f"Skipping {column_name}: only {len(good_values)} good trades (need {MIN_GOOD_TRADES} for reliable percentiles)")
-        return None
-    
-    # Use override settings if provided (for scenario testing)
-    # Otherwise use VERY PERMISSIVE defaults for initial suggestion generation
-    if override_settings:
-        config = load_config()
-        config.update(override_settings)
-        min_good_kept = config.get('min_good_trades_kept_pct', 50)
-        min_bad_removed = config.get('min_bad_trades_removed_pct', 10)
-    else:
-        # PERMISSIVE: Generate lots of candidates, let scenario testing filter
-        min_good_kept = 10  # Accept filters that keep just 10% of good trades
-        min_bad_removed = 10  # Accept filters that remove just 10% of bad trades
-    
-    config = load_config()  # Still need config for percentiles
-    
-    # Get user's preferred percentiles from settings
-    user_p_low = config.get('percentile_low', 10)
-    user_p_high = config.get('percentile_high', 90)
-    
-    best_score = -1
-    best_result = None
-    
-    # Build list of percentile pairs to test
-    # Start with user's preferred range, then test variations
-    percentile_pairs = [
-        (user_p_low, user_p_high),           # User's preferred range
-    ]
-    
-    # Add wider ranges if possible
-    if user_p_low >= 5:
-        percentile_pairs.append((user_p_low - 5, min(user_p_high + 5, 99)))
-    
-    # Add tighter ranges if possible
-    if user_p_low <= 20 and user_p_high >= 80:
-        percentile_pairs.append((user_p_low + 5, max(user_p_high - 5, user_p_low + 10)))
-    
-    # Add very aggressive range for maximum coverage
-    if (1, 99) not in percentile_pairs:
-        percentile_pairs.append((1, 99))
-    
-    # Add conservative fallback
-    if (10, 90) not in percentile_pairs:
-        percentile_pairs.append((10, 90))
-    
-    # Add moderate options
-    if (5, 95) not in percentile_pairs:
-        percentile_pairs.append((5, 95))
-    if (15, 85) not in percentile_pairs:
-        percentile_pairs.append((15, 85))
-    
-    # Calculate the overall data range to detect suspiciously narrow filters
-    all_values = df[column_name].dropna()
-    data_range = float(all_values.max() - all_values.min()) if len(all_values) > 0 else 0
-    min_acceptable_range = data_range * 0.05  # Filter range should be at least 5% of data range
-    
-    # Test each percentile combination
-    for p_low, p_high in percentile_pairs:
-        try:
-            from_val = float(np.percentile(good_values, p_low))
-            to_val = float(np.percentile(good_values, p_high))
-            
-            if from_val >= to_val:
-                continue
-            
-            # VALIDATION: Reject suspiciously narrow ranges
-            # If the filter range is < 5% of total data range, it's likely due to insufficient good trades
-            filter_range = to_val - from_val
-            if data_range > 0 and filter_range < min_acceptable_range:
-                logger.debug(f"Rejecting narrow filter for {column_name}: range {filter_range:.6f} < min {min_acceptable_range:.6f}")
-                continue
-            
-            metrics = test_filter_effectiveness(df, column_name, from_val, to_val, threshold)
-            
-            if metrics is None:
-                continue
-            
-            good_kept = metrics['good_trades_kept_pct']
-            bad_removed = metrics['bad_trades_removed_pct']
-            
-            # Skip if doesn't meet minimum requirements
-            if good_kept < min_good_kept:
-                continue
-            if bad_removed < min_bad_removed:
-                continue
-            
-            # Score: prioritize bad removal while keeping good trades
-            score = bad_removed * (good_kept / 100)
-            
-            if score > best_score:
-                best_score = score
-                best_result = (from_val, to_val, metrics)
-                
-        except Exception:
-            continue
-    
-    return best_result
-
-
-def generate_cycle_bottom_filters(
-    df: pd.DataFrame,
-    interval_idx: int = 0
-) -> List[Dict[str, Any]]:
-    """
-    Generate filter suggestions based on cycle bottom signature analysis.
-    
-    These thresholds were discovered by analyzing exact cycle bottoms - the optimal
-    buy moments in good cycles (0.8%+ gains). Cycle bottoms are characterized by:
-    - Recent price drops (capitulation)
-    - High volatility  
-    - Correlated drops in ETH/BTC
-    - Draining liquidity
-    
-    Args:
-        df: Trade data DataFrame
-        interval_idx: 30-second interval index (0-29, where 0=0:00, 1=0:30, 2=1:00, etc.)
-    
-    Returns:
-        List of filter suggestions with specific thresholds
-    """
-    config = load_config()
-    threshold = config.get('good_trade_threshold', 0.6)
-    
-    # Filter to specific interval (30-second granularity)
-    if 'interval_idx' in df.columns:
-        df_filtered = df[df['interval_idx'] == interval_idx].copy()
-    elif 'minute' in df.columns:
-        # Fallback for old data without interval_idx
-        minute = interval_idx // 2
-        df_filtered = df[df['minute'] == minute].copy()
-    else:
-        df_filtered = df
-    
-    if len(df_filtered) == 0:
-        return []
-    
-    suggestions = []
-    
-    # Cycle bottom signature rules based on analysis of 6 good cycles
-    # These represent the "capitulation signature" - rapid drop before reversal
-    cycle_bottom_rules = [
-        # Price momentum - looking for recent drops
-        ('pm_price_change_1m', -999, -0.04, 'Price dropped > 0.04% in last minute'),
-        ('pm_price_change_5m', -999, -0.09, 'Price dropped > 0.09% in last 5 min'),
-        ('sp_total_change_pct', -999, -0.10, 'Session price down > 0.1%'),
-        
-        # Volatility - high volatility indicates capitulation
-        ('pm_volatility_pct', 0.08, 999, 'High volatility > 0.08%'),
-        ('sp_volatility_pct', 0.08, 999, 'Session volatility > 0.08%'),
-        
-        # Correlated market - ETH/BTC also dropping
-        ('eth_price_change_5m', -999, -0.01, 'ETH dropped in last 5 min'),
-        ('btc_price_change_5m', -999, 0.02, 'BTC not rallying alone'),
-        
-        # Order book stress - liquidity draining
-        ('ob_liquidity_change_3m', -999, -5.0, 'Liquidity draining from book'),
-        ('ob_depth_imbalance_ratio', 0.5, 1.1, 'Order book not heavily bid-biased'),
-        
-        # Momentum acceleration - downward momentum
-        ('pm_momentum_acceleration_1m', -999, -0.02, 'Momentum accelerating down'),
-    ]
-    
-    for column, from_val, to_val, description in cycle_bottom_rules:
-        if column not in df_filtered.columns:
-            continue
-        
-        # Test this specific threshold
-        metrics = test_filter_effectiveness(df_filtered, column, from_val, to_val, threshold)
-        
-        if metrics is None:
-            continue
-        
-        # Only include if it has some effect
-        if metrics['bad_trades_removed_pct'] < 5:
-            continue
-        
-        suggestion = {
-            'column_name': column,
-            'section': get_section_from_column(column),
-            'field_name': get_field_name_from_column(column),
-            'from_value': round(from_val, 6),
-            'to_value': round(to_val, 6),
-            'minute_analyzed': interval_idx,  # Now stores 30-second interval index
-            'source': 'cycle_bottom_signature',
-            'description': description,
-            **metrics
-        }
-        suggestions.append(suggestion)
-        logger.debug(f"Cycle bottom filter: {column} [{from_val}, {to_val}] - "
-                    f"bad removed: {metrics['bad_trades_removed_pct']:.1f}%, "
-                    f"good kept: {metrics['good_trades_kept_pct']:.1f}%")
-    
-    return suggestions
-
-
-def analyze_field(
-    df: pd.DataFrame,
-    column_name: str,
-    interval_idx: Optional[int] = None,
-    override_settings: Optional[Dict[str, Any]] = None
-) -> Optional[Dict[str, Any]]:
-    """
-    Analyze a single field and generate filter suggestion.
-    
-    Args:
-        df: Trade data DataFrame (may include multiple intervals)
-        column_name: Column name to analyze
-        interval_idx: If provided, filter to this 30-second interval (0-29) before analysis
-        override_settings: Optional dict to override config settings
-        
-    Returns:
-        Dictionary with suggestion details or None if no valid suggestion
-    """
-    # Filter by interval if specified (30-second granularity)
-    if interval_idx is not None:
-        if 'interval_idx' in df.columns:
-            df_filtered = df[df['interval_idx'] == interval_idx].copy()
-        elif 'minute' in df.columns:
-            # Fallback for old data without interval_idx
-            minute = interval_idx // 2
-            df_filtered = df[df['minute'] == minute].copy()
-        else:
-            df_filtered = df
-        if len(df_filtered) == 0:
-            return None
-    else:
-        df_filtered = df
-    
-    config = load_config()
-    if override_settings:
-        config.update(override_settings)
-    
-    threshold = config.get('good_trade_threshold', 0.3)
-    result = find_optimal_threshold(df_filtered, column_name, threshold, override_settings)
-    
-    if result is None:
-        return None
-    
-    from_val, to_val, metrics = result
-    
-    return {
-        'column_name': column_name,
-        'section': get_section_from_column(column_name),
-        'field_name': get_field_name_from_column(column_name),
-        'from_value': round(from_val, 6),
-        'to_value': round(to_val, 6),
-        'minute_analyzed': interval_idx if interval_idx is not None else 0,
-        **metrics
-    }
-
-
-def find_best_interval_for_field(
-    df: pd.DataFrame,
-    column_name: str
-) -> Optional[Tuple[int, Dict[str, Any]]]:
-    """
-    Find the best 30-second interval (0-29) for a filter field by testing all 30 intervals.
-    
-    Returns the interval that produces the best effectiveness score.
-    
-    Args:
-        df: DataFrame with ALL intervals of trade data
-        column_name: Column name to analyze
-        
-    Returns:
-        Tuple of (best_interval_idx, suggestion_dict) or None if no valid suggestion found
-    """
-    # Check if we have interval data
-    has_intervals = 'interval_idx' in df.columns or 'minute' in df.columns
-    if not has_intervals:
-        return None
-    
-    best_score = -1
-    best_interval = None
-    best_suggestion = None
-    
-    # Test all 30 intervals (30-second granularity)
-    for interval_idx in range(30):
-        suggestion = analyze_field(df, column_name, interval_idx=interval_idx)
-        
-        if suggestion is None:
-            continue
-        
-        good_kept = suggestion.get('good_trades_kept_pct', 0)
-        bad_removed = suggestion.get('bad_trades_removed_pct', 0)
-        
-        score = bad_removed * (good_kept / 100)
-        
-        if score > best_score:
-            best_score = score
-            best_interval = interval_idx
-            best_suggestion = suggestion.copy()
-            best_suggestion['effectiveness_score'] = round(score, 4)
-    
-    if best_suggestion is None:
-        return None
-    
-    return (best_interval, best_suggestion)
-
-
-# Alias for backwards compatibility
-find_best_minute_for_field = find_best_interval_for_field
-
-
-# =============================================================================
-# Filter Combinations
-# =============================================================================
-
-def apply_filter(df: pd.DataFrame, column_name: str, from_val: float, to_val: float) -> pd.Series:
-    """Apply a filter and return boolean series of trades that pass."""
-    if column_name not in df.columns:
-        return pd.Series([True] * len(df), index=df.index)
-    
-    values = df[column_name]
-    return (values >= from_val) & (values <= to_val)
-
-
-def apply_filter_combination(df: pd.DataFrame, filters: List[Dict]) -> pd.Series:
-    """Apply multiple filters (AND logic) and return trades that pass ALL."""
-    passes = pd.Series([True] * len(df), index=df.index)
-    
-    for f in filters:
-        filter_passes = apply_filter(df, f['column_name'], f['from_value'], f['to_value'])
-        passes = passes & filter_passes
-    
-    return passes
-
-
-def calculate_combination_metrics(df: pd.DataFrame, passes: pd.Series) -> Dict[str, Any]:
-    """Calculate effectiveness metrics for a filter combination."""
-    config = load_config()
-    threshold = config.get('good_trade_threshold', 0.3)
-    potential_gains = df['potential_gains']
-    
-    is_good = potential_gains >= threshold
-    is_bad = potential_gains < threshold
-    
-    is_negative = potential_gains < 0
-    is_0_to_01 = (potential_gains >= 0) & (potential_gains < 0.1)
-    is_01_to_02 = (potential_gains >= 0.1) & (potential_gains < 0.2)
-    is_02_to_03 = (potential_gains >= 0.2) & (potential_gains < threshold)
-    
-    good_before = int(is_good.sum())
-    bad_before = int(is_bad.sum())
-    
-    good_after = int((is_good & passes).sum())
-    bad_after = int((is_bad & passes).sum())
-    
-    good_kept_pct = (good_after / good_before * 100) if good_before > 0 else 0
-    bad_removed_pct = ((bad_before - bad_after) / bad_before * 100) if bad_before > 0 else 0
-    
-    return {
-        'total_trades': len(df),
-        'good_trades_before': good_before,
-        'bad_trades_before': bad_before,
-        'good_trades_after': good_after,
-        'bad_trades_after': bad_after,
-        'good_trades_kept_pct': round(good_kept_pct, 2),
-        'bad_trades_removed_pct': round(bad_removed_pct, 2),
-        'bad_negative_count': int((is_negative & passes).sum()),
-        'bad_0_to_01_count': int((is_0_to_01 & passes).sum()),
-        'bad_01_to_02_count': int((is_01_to_02 & passes).sum()),
-        'bad_02_to_03_count': int((is_02_to_03 & passes).sum()),
-    }
-
-
-def find_best_combinations(
-    df: pd.DataFrame,
-    suggestions: List[Dict[str, Any]],
-    minute: int = 0,
-    override_settings: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-    """
-    Find optimal filter combinations using a greedy algorithm.
-    
-    Args:
-        df: DataFrame with trade data (should be filtered to specific minute)
-        suggestions: List of filter suggestions
-        minute: The minute being analyzed
-        override_settings: Optional dict to override config settings for testing scenarios
-        
-    Returns:
-        List of combination dicts
-    """
-    config = load_config()
-    if override_settings:
-        config.update(override_settings)
-    
-    max_filters = config.get('max_filters_in_combo', 6)
-    min_good_kept = config.get('combo_min_good_kept_pct', 25)
-    min_improvement = config.get('combo_min_improvement', 1.0)
-    
     results = []
-    
-    if not suggestions:
-        logger.warning("No suggestions to combine")
-        return results
-    
-    logger.info(f"[Minute {minute}] Testing combinations of up to {max_filters} filters from {len(suggestions)} candidates")
-    
-    # Pre-compute which trades pass each filter
-    filter_passes = {}
-    for s in suggestions:
-        passes = apply_filter(df, s['column_name'], s['from_value'], s['to_value'])
-        filter_passes[s['column_name']] = passes
-    
-    # Track best combination at each size
-    best_at_size = {}
-    
-    # Start with single filters
-    for s in suggestions:
-        passes = filter_passes[s['column_name']]
-        metrics = calculate_combination_metrics(df, passes)
-        
-        if metrics['good_trades_kept_pct'] >= min_good_kept:
-            combo = {
-                'filters': [s],
-                'filter_columns': [s['column_name']],
-                'passes': passes,
-                'minute_analyzed': minute,
-                **metrics
-            }
-            
-            if 1 not in best_at_size or combo['bad_trades_removed_pct'] > best_at_size[1]['bad_trades_removed_pct']:
-                best_at_size[1] = combo
-    
-    if 1 not in best_at_size:
-        logger.warning(f"[Minute {minute}] No single filter meets the minimum good trade retention threshold ({min_good_kept}%)")
-        return results
-    
-    best_single = best_at_size[1]
-    results.append(best_single)
-    
-    logger.info(f"[Minute {minute}] Best single filter: {best_single['filter_columns'][0]} "
-                f"({best_single['bad_trades_removed_pct']:.1f}% bad removed, {best_single['good_trades_kept_pct']:.1f}% good kept)")
-    
-    # Greedy expansion
-    current_best = best_single
-    
-    for size in range(2, max_filters + 1):
-        best_next = None
-        best_improvement = 0
-        
-        current_columns = set(current_best['filter_columns'])
-        
-        # Try adding each unused filter
-        for s in suggestions:
-            if s['column_name'] in current_columns:
-                continue
-            
-            # Combine passes (AND logic)
-            combined_passes = current_best['passes'] & filter_passes[s['column_name']]
-            
-            metrics = calculate_combination_metrics(df, combined_passes)
-            
-            # Check if meets minimum retention
-            if metrics['good_trades_kept_pct'] < min_good_kept:
-                continue
-            
-            # Calculate improvement
-            improvement = metrics['bad_trades_removed_pct'] - current_best['bad_trades_removed_pct']
-            
-            if improvement >= min_improvement and improvement > best_improvement:
-                best_improvement = improvement
-                best_next = {
-                    'filters': current_best['filters'] + [s],
-                    'filter_columns': current_best['filter_columns'] + [s['column_name']],
-                    'passes': combined_passes,
-                    'minute_analyzed': minute,
-                    **metrics
-                }
-        
-        if best_next:
-            best_at_size[size] = best_next
-            current_best = best_next
-            results.append(best_next)
-            
-            logger.info(f"[Minute {minute}] Best {size}-filter combo: +{best_next['filter_columns'][-1]} "
-                        f"({best_next['bad_trades_removed_pct']:.1f}% bad removed, "
-                        f"{best_next['good_trades_kept_pct']:.1f}% good kept, +{best_improvement:.1f}% improvement)")
+
+    for col in columns:
+        good_vals = df.loc[is_good, col].dropna()
+        bad_vals = df.loc[~is_good, col].dropna()
+
+        if len(good_vals) < 20 or len(bad_vals) < 20:
+            continue
+
+        # Cohen's d: effect size measuring separation between distributions
+        pooled_std = np.sqrt(
+            ((len(good_vals) - 1) * good_vals.std() ** 2 +
+             (len(bad_vals) - 1) * bad_vals.std() ** 2) /
+            (len(good_vals) + len(bad_vals) - 2)
+        )
+        if pooled_std == 0:
+            continue
+        cohens_d = abs(good_vals.mean() - bad_vals.mean()) / pooled_std
+
+        if cohens_d < 0.05:
+            continue
+
+        # Youden's J for optimal cutpoint
+        all_vals = pd.concat([good_vals, bad_vals])
+        test_thresholds = np.quantile(all_vals, np.linspace(0.05, 0.95, 40))
+
+        best_j = -1
+        best_cut = None
+        best_dir = None
+
+        for cut in test_thresholds:
+            j_above = (good_vals >= cut).mean() + (bad_vals < cut).mean() - 1
+            j_below = (good_vals <= cut).mean() + (bad_vals > cut).mean() - 1
+
+            if j_above > best_j:
+                best_j, best_cut, best_dir = j_above, cut, 'above'
+            if j_below > best_j:
+                best_j, best_cut, best_dir = j_below, cut, 'below'
+
+        if best_cut is None or best_j <= 0:
+            continue
+
+        if best_dir == 'above':
+            from_val = float(best_cut)
+            to_val = float(good_vals.quantile(0.98))
         else:
-            logger.debug(f"[Minute {minute}] No beneficial {size}-filter combination found")
-            break
-    
+            from_val = float(good_vals.quantile(0.02))
+            to_val = float(best_cut)
+
+        if from_val >= to_val:
+            continue
+
+        results.append({
+            'column': col,
+            'from': round(from_val, 8),
+            'to': round(to_val, 8),
+            'cohens_d': round(cohens_d, 4),
+            'youdens_j': round(best_j, 4),
+        })
+
+    results.sort(key=lambda x: x['cohens_d'], reverse=True)
     return results
 
 
-def find_best_combinations_all_intervals(
+def precompute_filter_masks(
     df: pd.DataFrame,
-    suggestions_by_interval: Dict[int, List[Dict[str, Any]]]
-) -> Tuple[List[Dict[str, Any]], int]:
-    """
-    Find the best filter combinations by testing across all 30-second intervals.
-    
-    Returns combinations from the interval that produces the best results.
-    
-    Args:
-        df: Trade data DataFrame with interval_idx column
-        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
-    
-    Returns:
-        Tuple of (best_combinations, best_interval_idx)
-    """
-    config = load_config()
-    min_filters = config.get('min_filters_in_combo', 2)
-    
-    # Check for interval data
-    has_interval_idx = 'interval_idx' in df.columns
-    has_minute = 'minute' in df.columns
-    
-    if not has_interval_idx and not has_minute:
-        logger.warning("No interval/minute column found, falling back to interval 0")
-        suggestions = suggestions_by_interval.get(0, [])
-        return find_best_combinations(df, suggestions, minute=0), 0
-    
-    best_combinations = []
-    best_interval = 0
-    best_score = -1
-    
-    interval_results = {}
-    
-    # Test all 30 intervals (30-second granularity)
-    for interval_idx in range(30):
-        if has_interval_idx:
-            interval_df = df[df['interval_idx'] == interval_idx]
-        else:
-            # Fallback: use minute (maps 2 intervals per minute)
-            minute = interval_idx // 2
-            interval_df = df[df['minute'] == minute]
-        
-        if len(interval_df) < 20:
+    ranked_features: List[Dict[str, Any]],
+) -> Dict[str, np.ndarray]:
+    """Pre-compute boolean pass/fail masks for each filter."""
+    masks = {}
+    for feat in ranked_features:
+        col = feat['column']
+        if col not in df.columns:
             continue
-        
-        suggestions = suggestions_by_interval.get(interval_idx, [])
-        if not suggestions:
-            continue
-        
-        combinations = find_best_combinations(interval_df, suggestions, minute=interval_idx)
-        
-        if not combinations:
-            continue
-        
-        # Filter to only include combinations with minimum required filters
-        valid_combinations = [c for c in combinations if len(c['filter_columns']) >= min_filters]
-        
-        if not valid_combinations:
-            continue
-        
-        # Score by best combination's effectiveness
-        final_combo = valid_combinations[-1]
-        score = final_combo['bad_trades_removed_pct'] * (final_combo['good_trades_kept_pct'] / 100)
-        
-        interval_results[interval_idx] = {
-            'combinations': valid_combinations,
-            'score': score,
-            'bad_removed': final_combo['bad_trades_removed_pct'],
-            'good_kept': final_combo['good_trades_kept_pct'],
-            'filter_count': len(final_combo['filter_columns'])
-        }
-        
-        if score > best_score:
-            best_score = score
-            best_interval = interval_idx
-            best_combinations = valid_combinations
-    
-    # Log summary (format interval as M:SS)
-    if interval_results:
-        logger.info("=" * 60)
-        logger.info("INTERVAL COMPARISON SUMMARY (30-second granularity)")
-        logger.info("=" * 60)
-        for idx in sorted(interval_results.keys()):
-            r = interval_results[idx]
-            marker = " <-- BEST" if idx == best_interval else ""
-            interval_label = f"{idx // 2}:{(idx % 2) * 30:02d}"
-            logger.info(f"  Interval {interval_label}: {r['bad_removed']:.1f}% bad removed, "
-                        f"{r['good_kept']:.1f}% good kept, {r['filter_count']} filters (score: {r['score']:.2f}){marker}")
-    
-    return best_combinations, best_interval
+        vals = df[col].values
+        masks[col] = (vals >= feat['from']) & (vals <= feat['to'])
+    return masks
 
 
-# Alias for backwards compatibility
-find_best_combinations_all_minutes = find_best_combinations_all_intervals
+def score_combo_fast(
+    combo_cols: Tuple[str, ...],
+    masks: Dict[str, np.ndarray],
+    is_good: np.ndarray,
+    is_bad: np.ndarray,
+    n_total: int,
+) -> Optional[Dict[str, float]]:
+    """
+    Score a filter combination using pre-computed masks.
+    Returns metrics dict or None if combo has too few passing trades.
+    """
+    combined = masks[combo_cols[0]]
+    for col in combo_cols[1:]:
+        combined = combined & masks[col]
+
+    good_after = int((is_good & combined).sum())
+    bad_after = int((is_bad & combined).sum())
+    total_after = good_after + bad_after
+
+    if total_after < 5:
+        return None
+
+    good_before = int(is_good.sum())
+    bad_before = int(is_bad.sum())
+
+    precision = good_after / total_after * 100 if total_after else 0
+    good_kept_pct = good_after / good_before * 100 if good_before else 0
+    bad_removed_pct = (bad_before - bad_after) / bad_before * 100 if bad_before else 0
+    pass_rate = total_after / n_total * 100
+
+    return {
+        'precision': round(precision, 2),
+        'good_kept_pct': round(good_kept_pct, 2),
+        'bad_removed_pct': round(bad_removed_pct, 2),
+        'pass_rate': round(pass_rate, 2),
+        'good_after': good_after,
+        'bad_after': bad_after,
+    }
+
+
+def find_best_combo_for_minute(
+    df_train: pd.DataFrame,
+    df_test: pd.DataFrame,
+    columns: List[str],
+    minute: int,
+    threshold: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find the best filter combination for a specific minute using:
+    1. Cohen's d ranking on train data
+    2. Exhaustive combo search (pairs, triples, quads)
+    3. Validation on test data (must beat baseline precision)
+    
+    Returns the best combo dict or None.
+    """
+    # Rank features on training data
+    ranked = rank_and_range_features(df_train, columns, threshold)
+    if len(ranked) < 2:
+        return None
+
+    # Pre-compute masks
+    is_good_train = (df_train['potential_gains'] >= threshold).values
+    is_bad_train = ~is_good_train
+    n_train = len(df_train)
+
+    is_good_test = (df_test['potential_gains'] >= threshold).values
+    is_bad_test = ~is_good_test
+    n_test = len(df_test)
+
+    baseline_train = is_good_train.sum() / n_train * 100 if n_train > 0 else 0
+    baseline_test = is_good_test.sum() / n_test * 100 if n_test > 0 else 0
+
+    masks_train = precompute_filter_masks(df_train, ranked)
+    masks_test = precompute_filter_masks(df_test, ranked)
+
+    candidates = []  # (test_precision, combo_dict)
+
+    def test_combo(cols: Tuple[str, ...]):
+        if not all(c in masks_train and c in masks_test for c in cols):
+            return
+
+        # Score on train -- must beat baseline
+        train_m = score_combo_fast(cols, masks_train, is_good_train, is_bad_train, n_train)
+        if train_m is None or train_m['precision'] <= baseline_train:
+            return
+        # Must keep at least 3% of good trades on train
+        if train_m['good_kept_pct'] < 3:
+            return
+
+        # Score on test -- must beat baseline
+        test_m = score_combo_fast(cols, masks_test, is_good_test, is_bad_test, n_test)
+        if test_m is None or test_m['precision'] <= baseline_test:
+            return
+
+        overfit = round(train_m['precision'] - test_m['precision'], 2)
+
+        candidates.append({
+            'minute': minute,
+            'columns': list(cols),
+            'n_filters': len(cols),
+            'train_precision': train_m['precision'],
+            'test_precision': test_m['precision'],
+            'test_good_kept': test_m['good_kept_pct'],
+            'test_bad_removed': test_m['bad_removed_pct'],
+            'test_pass_rate': test_m['pass_rate'],
+            'test_good_after': test_m['good_after'],
+            'test_bad_after': test_m['bad_after'],
+            'overfit_delta': overfit,
+            'ranked_features': ranked,  # Keep for range lookup
+        })
+
+    # Get column names at various top-N levels
+    top30 = [r['column'] for r in ranked[:30]]
+    top20 = [r['column'] for r in ranked[:20]]
+    top15 = [r['column'] for r in ranked[:15]]
+
+    # Exhaustive pairs from top 30
+    for combo in iter_combinations(top30, 2):
+        test_combo(combo)
+
+    # Exhaustive triples from top 20
+    for combo in iter_combinations(top20, 3):
+        test_combo(combo)
+
+    # Exhaustive quads from top 15
+    for combo in iter_combinations(top15, 4):
+        test_combo(combo)
+
+    # Greedy 5-6 expansion from best quads
+    quad_candidates = [c for c in candidates if c['n_filters'] == 4]
+    if quad_candidates:
+        best_quads = sorted(quad_candidates, key=lambda x: x['test_precision'], reverse=True)[:5]
+        for base in best_quads:
+            base_cols = set(base['columns'])
+            for extra_col in top20:
+                if extra_col in base_cols:
+                    continue
+                test_combo(tuple(sorted(base_cols | {extra_col})))
+                # Try adding 2 more
+                for extra_col2 in top20:
+                    if extra_col2 in base_cols or extra_col2 == extra_col:
+                        continue
+                    test_combo(tuple(sorted(base_cols | {extra_col, extra_col2})))
+
+    if not candidates:
+        return None
+
+    # Select best by test precision, then by lower overfit
+    candidates.sort(key=lambda x: (x['test_precision'], -abs(x['overfit_delta'])), reverse=True)
+    return candidates[0]
 
 
 # =============================================================================
@@ -1091,34 +758,25 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
     Save/update filter fields catalog directly to PostgreSQL.
     
     Returns dict mapping column_name to id.
-    
-    Note: Multiple columns can map to the same field_name (e.g., pm_price_change_10m and tx_price_change_10m
-    both become price_change_10m). We deduplicate by field_name and use ON CONFLICT to handle this.
     """
     column_to_id = {}
     
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Clear existing catalog
                 cursor.execute("DELETE FROM filter_fields_catalog")
                 
-                # Build mapping of field_name -> (column_name, section) to handle duplicates
                 field_name_to_info = {}
                 for col in columns:
-                    config = load_config()
                     section = get_section_from_column(col)
                     field_name = get_field_name_from_column(col)
                     
-                    # If multiple columns map to same field_name, keep the first one encountered
-                    # (or we could merge sections, but keeping first is simpler)
                     if field_name not in field_name_to_info:
                         field_name_to_info[field_name] = {
                             'column_name': col,
                             'section': section
                         }
                 
-                # Insert unique field_names
                 next_id = 1
                 for field_name, info in field_name_to_info.items():
                     cursor.execute("""
@@ -1137,7 +795,6 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
                         f"Filter field: {info['column_name']}"
                     ])
                     
-                    # Map all columns that share this field_name to the same ID
                     for col in columns:
                         if get_field_name_from_column(col) == field_name:
                             column_to_id[col] = next_id
@@ -1151,155 +808,11 @@ def save_filter_catalog(engine, columns: List[str]) -> Dict[str, int]:
     return column_to_id
 
 
-# =============================================================================
-# PRE-ENTRY FILTER ANALYSIS
-# =============================================================================
-
-def analyze_pre_entry_thresholds(df: pd.DataFrame, threshold: float = 0.3) -> Dict[str, Any]:
-    """
-    Analyze pre-entry metrics to find optimal minimum thresholds.
-    
-    Learns from historical data to determine the best pre-entry requirements
-    that maximize bad trade removal while preserving good trades.
-    
-    Uses minute 0 data (entry point) to check:
-    - pre_entry_change_1m, pre_entry_change_2m (momentum before entry)
-    - Entry signal alignment (buy pressure, whale flow)
-    
-    Args:
-        df: DataFrame with potential_gains and minute 0 columns
-        threshold: Good trade threshold (default 0.3%)
-    
-    Returns:
-        Dict mapping field_name to suggested threshold with metrics
-    """
-    logger.info("Analyzing pre-entry thresholds...")
-    
-    # Filter to minute 0 only (entry decision point)
-    if 'minute' in df.columns:
-        df_m0 = df[df['minute'] == 0].copy()
-    elif 'interval_idx' in df.columns:
-        df_m0 = df[df['interval_idx'] == 0].copy()
-    else:
-        df_m0 = df.copy()
-    
-    if len(df_m0) < 50:
-        logger.warning(f"Insufficient data for pre-entry analysis ({len(df_m0)} trades)")
-        return {}
-    
-    # Classify trades
-    df_m0['is_good'] = df_m0['potential_gains'] >= threshold
-    good_df = df_m0[df_m0['is_good'] == True]
-    bad_df = df_m0[df_m0['is_good'] == False]
-    
-    logger.info(f"  Total trades at entry: {len(df_m0)} (good: {len(good_df)}, bad: {len(bad_df)})")
-    
-    suggestions = {}
-    
-    # Analyze pre_entry_change_2m (preferred - fastest reliable signal)
-    if 'pre_entry_change_2m' in df_m0.columns:
-        good_2m = good_df['pre_entry_change_2m'].dropna()
-        bad_2m = bad_df['pre_entry_change_2m'].dropna()
-        
-        if len(good_2m) > 10 and len(bad_2m) > 10:
-            # Try different percentiles to find best balance
-            best_percentile = None
-            best_score = 0
-            
-            for percentile in [10, 15, 20, 25, 30]:
-                min_threshold = good_2m.quantile(percentile / 100)
-                
-                good_kept = (good_2m >= min_threshold).sum() / len(good_2m) * 100
-                bad_removed = (bad_2m < min_threshold).sum() / len(bad_2m) * 100
-                
-                # Score: prioritize bad removal but keep enough good trades
-                score = bad_removed * (good_kept / 100)
-                
-                if bad_removed >= 25 and good_kept >= 70 and score > best_score:
-                    best_score = score
-                    best_percentile = percentile
-                    suggestions['pre_entry_change_2m'] = {
-                        'min_value': float(min_threshold),
-                        'good_kept_pct': round(good_kept, 2),
-                        'bad_removed_pct': round(bad_removed, 2),
-                        'percentile': percentile,
-                        'priority': 'CRITICAL',
-                        'good_count': len(good_2m),
-                        'bad_count': len(bad_2m)
-                    }
-            
-            if best_percentile:
-                logger.info(f"  ✓ pre_entry_change_2m: >= {suggestions['pre_entry_change_2m']['min_value']:.4f}% "
-                          f"(removes {suggestions['pre_entry_change_2m']['bad_removed_pct']:.1f}% bad)")
-    
-    # Analyze pre_entry_change_1m (momentum check)
-    if 'pre_entry_change_1m' in df_m0.columns:
-        good_1m = good_df['pre_entry_change_1m'].dropna()
-        bad_1m = bad_df['pre_entry_change_1m'].dropna()
-        
-        if len(good_1m) > 10 and len(bad_1m) > 10:
-            min_threshold = good_1m.quantile(0.15)  # 15th percentile
-            
-            good_kept = (good_1m >= min_threshold).sum() / len(good_1m) * 100
-            bad_removed = (bad_1m < min_threshold).sum() / len(bad_1m) * 100
-            
-            if bad_removed >= 20 and good_kept >= 75:
-                suggestions['pre_entry_change_1m'] = {
-                    'min_value': float(min_threshold),
-                    'good_kept_pct': round(good_kept, 2),
-                    'bad_removed_pct': round(bad_removed, 2),
-                    'priority': 'HIGH',
-                    'good_count': len(good_1m),
-                    'bad_count': len(bad_1m)
-                }
-                logger.info(f"  ✓ pre_entry_change_1m: >= {min_threshold:.4f}% "
-                          f"(removes {bad_removed:.1f}% bad)")
-    
-    # Analyze entry signal alignment
-    signal_columns = {
-        'tx_buy_sell_pressure': 'entry_buy_pressure',
-        'wh_net_flow_ratio': 'entry_whale_flow'
-    }
-    
-    for orig_col, new_col in signal_columns.items():
-        if orig_col in df_m0.columns:
-            good_signal = good_df[orig_col].dropna()
-            bad_signal = bad_df[orig_col].dropna()
-            
-            if len(good_signal) > 10 and len(bad_signal) > 10:
-                # Minimum must be non-negative (reject if selling)
-                min_threshold = max(0.0, good_signal.quantile(0.10))
-                
-                good_kept = (good_signal >= min_threshold).sum() / len(good_signal) * 100
-                bad_removed = (bad_signal < min_threshold).sum() / len(bad_signal) * 100
-                
-                if bad_removed >= 15:
-                    suggestions[new_col] = {
-                        'min_value': float(min_threshold),
-                        'good_kept_pct': round(good_kept, 2),
-                        'bad_removed_pct': round(bad_removed, 2),
-                        'priority': 'MEDIUM',
-                        'good_count': len(good_signal),
-                        'bad_count': len(bad_signal),
-                        'source_column': orig_col
-                    }
-                    logger.info(f"  ✓ {new_col}: >= {min_threshold:.4f} "
-                              f"(removes {bad_removed:.1f}% bad)")
-    
-    if not suggestions:
-        logger.warning("  No pre-entry filters met criteria")
-    else:
-        logger.info(f"  Generated {len(suggestions)} pre-entry filters")
-    
-    return suggestions
-
-
 def save_suggestions(engine, suggestions: List[Dict[str, Any]], column_to_id: Dict[str, int], hours: int):
     """Save filter suggestions directly to PostgreSQL."""
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Clear existing suggestions
                 cursor.execute("DELETE FROM filter_reference_suggestions")
                 
                 for i, s in enumerate(suggestions, 1):
@@ -1341,7 +854,6 @@ def save_suggestions(engine, suggestions: List[Dict[str, Any]], column_to_id: Di
 
 def save_combinations(engine, combinations: List[Dict[str, Any]], hours: int):
     """Save filter combinations directly to PostgreSQL."""
-    # Clear existing combinations
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
@@ -1416,7 +928,6 @@ def get_or_create_auto_project(engine) -> int:
     config = load_config()
     project_name = config.get('auto_project_name', 'AutoFilters')
     
-    # Check pattern_config_projects table
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
@@ -1430,7 +941,6 @@ def get_or_create_auto_project(engine) -> int:
     except Exception as e:
         logger.warning(f"Could not query pattern_config_projects: {e}")
     
-    # Create project
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
@@ -1451,12 +961,16 @@ def get_or_create_auto_project(engine) -> int:
         return 1
 
 
-def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], project_id: int, 
-                                  pre_entry_suggestions: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Sync the best filter combination AND pre-entry filters to the project's pattern_config_filters."""
+def sync_best_filters_to_project(engine, combo: Dict[str, Any], project_id: int) -> Dict[str, Any]:
+    """
+    Sync the best filter combination to the project's pattern_config_filters.
     
-    # ALWAYS clear existing filters first (regardless of whether we have new combinations)
-    # This ensures old absolute filters are removed when switching to ratio-only mode
+    Args:
+        engine: TradingDataEngine instance
+        combo: Best combo dict with 'filters' list and metrics
+        project_id: Pattern config project ID
+    """
+    # Clear existing filters
     logger.info("Clearing existing filters for project...")
     try:
         with get_postgres() as conn:
@@ -1467,29 +981,22 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
     except Exception as e:
         logger.warning(f"Could not clear existing filters: {e}")
     
-    if not combinations:
-        logger.warning("No filter combinations to sync")
-        return {"success": False, "error": "No combinations found"}
+    if not combo or 'filters' not in combo or not combo['filters']:
+        logger.warning("No filters to sync")
+        return {"success": False, "error": "No filters to sync"}
     
-    # Get the best combination (last one has most filters)
-    config = load_config()
-    min_filters = config.get('min_filters_in_combo', 2)
-    valid_combos = [c for c in combinations if len(c['filter_columns']) >= min_filters]
+    logger.info(f"Syncing {len(combo['filters'])} filters "
+                f"(test precision: {combo.get('test_precision', 0):.1f}%, "
+                f"bad removed: {combo.get('bad_trades_removed_pct', 0):.1f}%, "
+                f"good kept: {combo.get('good_trades_kept_pct', 0):.1f}%)")
     
-    if not valid_combos:
-        logger.warning(f"No combinations with >= {min_filters} filters")
-        return {"success": False, "error": f"No combinations with >= {min_filters} filters"}
-    
-    best_combo = valid_combos[-1]  # Most filters that still meets criteria
-    
-    logger.info(f"Best combination: {len(best_combo['filter_columns'])} filters "
-                f"(bad removed: {best_combo['bad_trades_removed_pct']:.1f}%, "
-                f"good kept: {best_combo['good_trades_kept_pct']:.1f}%)")
-    
-    # Insert new filters
     filters_inserted = 0
-    for i, f in enumerate(best_combo['filters'], 1):
+    for i, f in enumerate(combo['filters'], 1):
         try:
+            # FIX: Convert interval index to actual minute for pattern_validator.py
+            # pattern_validator matches on minute_span_from (0-14), not interval (0-29)
+            minute_val = f.get('minute_analyzed', 0)
+            
             with get_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
@@ -1498,75 +1005,36 @@ def sync_best_filters_to_project(engine, combinations: List[Dict[str, Any]], pro
                          from_value, to_value, include_null, is_active)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """, [
-                        i + (project_id * 1000),  # Ensure unique ID
+                        i + (project_id * 1000),
                         project_id,
                         f"Auto: {f['column_name']}",
                         f.get('section', get_section_from_column(f['column_name'])),
-                        f.get('minute_analyzed', 0),
+                        minute_val,
                         f.get('field_name', get_field_name_from_column(f['column_name'])),
                         f['column_name'],
                         f['from_value'],
                         f['to_value'],
-                        0,  # include_null = SMALLINT
-                        1   # is_active = SMALLINT
+                        0,
+                        1
                     ])
                 conn.commit()
             filters_inserted += 1
-            logger.info(f"  Added filter: {f['column_name']} [{f['from_value']:.6f} - {f['to_value']:.6f}]")
+            logger.info(f"  Added filter: {f['column_name']} [{f['from_value']:.6f} - {f['to_value']:.6f}] (minute={minute_val})")
         except Exception as e:
             logger.error(f"Failed to insert filter {f['column_name']}: {e}")
-    
-    # Insert pre-entry filters if available
-    pre_entry_count = 0
-    if pre_entry_suggestions:
-        logger.info(f"Adding {len(pre_entry_suggestions)} pre-entry filters...")
-        
-        for field_name, suggestion in pre_entry_suggestions.items():
-            min_value = suggestion['min_value']
-            priority = suggestion.get('priority', 'MEDIUM')
-            
-            try:
-                with get_postgres() as conn:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            INSERT INTO pattern_config_filters
-                            (id, project_id, name, section, minute, field_name, field_column,
-                             from_value, to_value, include_null, is_active)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, [
-                            90000 + project_id + pre_entry_count,  # Special ID range for pre-entry
-                            project_id,
-                            f"Pre-Entry: {field_name}",
-                            "pre_entry",  # Special section
-                            0,  # Always minute 0
-                            field_name,
-                            field_name,
-                            min_value,
-                            999999,  # No upper limit
-                            0,  # don't include null
-                            1   # active
-                        ])
-                    conn.commit()
-                
-                pre_entry_count += 1
-                logger.info(f"  Added PRE-ENTRY filter: {field_name} >= {min_value:.4f} "
-                           f"[{priority}] (removes {suggestion['bad_removed_pct']:.1f}% bad)")
-            except Exception as e:
-                logger.error(f"Failed to insert pre-entry filter {field_name}: {e}")
     
     return {
         "success": True,
         "filters_synced": filters_inserted,
-        "pre_entry_filters_synced": pre_entry_count,
-        "bad_removed_pct": best_combo['bad_trades_removed_pct'],
-        "good_kept_pct": best_combo['good_trades_kept_pct'],
+        "test_precision": combo.get('test_precision', 0),
+        "bad_removed_pct": combo.get('bad_trades_removed_pct', 0),
+        "good_kept_pct": combo.get('good_trades_kept_pct', 0),
     }
 
 
 def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0) -> int:
     """Update all plays with pattern_update_by_ai=1 to use the AutoFilters project and log updates."""
     try:
-        # Get plays with AI updates enabled
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute(
@@ -1589,14 +1057,12 @@ def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0
             try:
                 with get_postgres() as conn:
                     with conn.cursor() as cursor:
-                        # Update the play
                         cursor.execute("""
                             UPDATE follow_the_goat_plays 
                             SET project_ids = %s 
                             WHERE id = %s AND pattern_update_by_ai = 1
                         """, [project_ids_json, play_id])
                         
-                        # Log the update to ai_play_updates table
                         cursor.execute("""
                             INSERT INTO ai_play_updates 
                             (play_id, play_name, project_id, project_name, pattern_count, filters_applied, run_id, status)
@@ -1608,7 +1074,6 @@ def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0
                 logger.info(f"  Updated play #{play_id} ({play_name}) with project_ids=[{project_id}]")
             except Exception as e:
                 logger.error(f"Failed to update play {play_id}: {e}")
-                # Log failure
                 try:
                     with get_postgres() as conn:
                         with conn.cursor() as cursor:
@@ -1630,297 +1095,6 @@ def update_ai_plays(engine, project_id: int, run_id: str, pattern_count: int = 0
 
 
 # =============================================================================
-# Multi-Scenario Testing
-# =============================================================================
-
-def calculate_scenario_score(bad_removed_pct: float, good_kept_pct: float) -> float:
-    """
-    Calculate score for a scenario, heavily prioritizing bad trade removal.
-    
-    Target: 95%+ bad removal (VERY AGGRESSIVE)
-    Accept: 20-30% good retention (MORE AGGRESSIVE - prefer fewer but better trades)
-    
-    Scoring:
-    - Bad removal weighted 15x (1425 points for 95% removal) - INCREASED from 10x
-    - Good retention weighted 1x (20-30 points for 20-30% retention)
-    - Penalty for bad removal < 90% (STRICTER - was 85%)
-    """
-    bad_removal_score = bad_removed_pct * 15  # 1425 points for 95% removal (was 10x)
-    good_retention_score = good_kept_pct * 1  # 20-30 points for 20-30% retention
-    
-    # Penalty if bad removal < 90% (STRICTER - was 85%)
-    if bad_removed_pct < 90:
-        bad_removal_score *= 0.3  # Harsher penalty (was 0.5)
-    
-    return bad_removal_score + good_retention_score
-
-
-def generate_test_scenarios() -> List[Dict[str, Any]]:
-    """
-    Generate optimized set of test scenarios.
-    
-    Uses smart filtering to test ~48 combinations instead of all 192.
-    Focus on configurations likely to achieve 95%+ bad removal.
-    """
-    scenarios = []
-    
-    # Aggressive configurations for maximum bad removal
-    # Minimum 2 filters for more robust filtering
-    min_filters_options = [2, 3, 4]
-    analysis_hours_options = [6, 12, 24, 48]
-    
-    # For each time window, test filter count combinations
-    for hours in analysis_hours_options:
-        for min_filters in min_filters_options:
-            # Very aggressive: prioritize bad removal over good retention (MORE AGGRESSIVE)
-            scenarios.append({
-                'name': f'H{hours}_F{min_filters}_VeryAgg',
-                'settings': {
-                    'analysis_hours': hours,
-                    'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 15,  # LOWER - accept fewer good trades (was 20)
-                    'min_bad_trades_removed_pct': 97,  # HIGHER - remove more bad trades (was 95)
-                    'percentile_low': 1,
-                    'percentile_high': 99,
-                }
-            })
-            
-            # Aggressive: good balance (MORE AGGRESSIVE)
-            scenarios.append({
-                'name': f'H{hours}_F{min_filters}_Agg',
-                'settings': {
-                    'analysis_hours': hours,
-                    'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 25,  # LOWER (was 30)
-                    'min_bad_trades_removed_pct': 95,  # HIGHER (was 90)
-                    'percentile_low': 5,
-                    'percentile_high': 95,
-                }
-            })
-            
-            # Moderate: fallback if aggressive fails (MORE AGGRESSIVE)
-            scenarios.append({
-                'name': f'H{hours}_F{min_filters}_Mod',
-                'settings': {
-                    'analysis_hours': hours,
-                    'min_filters_in_combo': min_filters,
-                    'min_good_trades_kept_pct': 30,  # LOWER (was 40)
-                    'min_bad_trades_removed_pct': 90,  # HIGHER (was 85)
-                    'percentile_low': 10,
-                    'percentile_high': 90,
-                }
-            })
-    
-    return scenarios
-
-
-def test_scenario(
-    df: pd.DataFrame,
-    scenario: Dict[str, Any],
-    suggestions_by_interval: Dict[int, List[Dict[str, Any]]],
-    threshold: float
-) -> Optional[Dict[str, Any]]:
-    """
-    Test a single scenario configuration.
-    
-    Args:
-        df: Trade data DataFrame with interval_idx column
-        scenario: Scenario configuration
-        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
-        threshold: Good trade threshold
-    
-    Returns results dict or None if no valid combinations found.
-    """
-    settings = scenario['settings']
-    
-    # Filter dataframe by analysis hours
-    analysis_hours = settings.get('analysis_hours', 24)
-    cutoff_time = df['followed_at'].max() - pd.Timedelta(hours=analysis_hours)
-    df_filtered = df[df['followed_at'] >= cutoff_time].copy()
-    
-    if len(df_filtered) < 100:  # Need minimum data
-        return None
-    
-    # Check for interval data
-    has_interval_idx = 'interval_idx' in df_filtered.columns
-    has_minute = 'minute' in df_filtered.columns
-    
-    # Test across all 30 intervals (30-second granularity)
-    best_combinations = []
-    best_interval = 0
-    best_score = -1
-    
-    for interval_idx in range(30):
-        if has_interval_idx:
-            interval_df = df_filtered[df_filtered['interval_idx'] == interval_idx]
-        elif has_minute:
-            minute = interval_idx // 2
-            interval_df = df_filtered[df_filtered['minute'] == minute]
-        else:
-            continue
-        
-        if len(interval_df) < 20:
-            continue
-        
-        suggestions = suggestions_by_interval.get(interval_idx, [])
-        if not suggestions:
-            continue
-        
-        # Find combinations with scenario settings
-        combinations = find_best_combinations(interval_df, suggestions, minute=interval_idx, override_settings=settings)
-        
-        if not combinations:
-            continue
-        
-        # Filter by min_filters requirement
-        min_filters = settings['min_filters_in_combo']
-        valid_combinations = [c for c in combinations if len(c['filter_columns']) >= min_filters]
-        
-        if not valid_combinations:
-            continue
-        
-        # Score the best combination from this interval
-        final_combo = valid_combinations[-1]
-        score = calculate_scenario_score(
-            final_combo['bad_trades_removed_pct'],
-            final_combo['good_trades_kept_pct']
-        )
-        
-        if score > best_score:
-            best_score = score
-            best_interval = interval_idx
-            best_combinations = valid_combinations
-    
-    if not best_combinations:
-        return None
-    
-    best_combo = best_combinations[-1]
-    
-    return {
-        'scenario': scenario,
-        'combinations': best_combinations,
-        'best_combo': best_combo,
-        'best_minute': best_interval,  # Keep as 'best_minute' for backward compatibility with DB schema
-        'score': best_score,
-        'bad_removed_pct': best_combo['bad_trades_removed_pct'],
-        'good_kept_pct': best_combo['good_trades_kept_pct'],
-        'filter_count': len(best_combo['filter_columns']),
-        'filter_columns': best_combo['filter_columns'],
-        'filters': best_combo['filters']
-    }
-
-
-def save_scenario_results(run_id: str, results: List[Dict[str, Any]], selected_idx: int):
-    """Save scenario testing results to database."""
-    try:
-        with get_postgres() as conn:
-            with conn.cursor() as cursor:
-                for idx, result in enumerate(results):
-                    scenario = result['scenario']
-                    best_combo = result['best_combo']
-                    
-                    cursor.execute("""
-                        INSERT INTO filter_scenario_results
-                        (run_id, scenario_name, settings, filter_count, 
-                         bad_trades_removed_pct, good_trades_kept_pct, score,
-                         filters_applied, rank, was_selected)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """, [
-                        run_id,
-                        scenario['name'],
-                        json.dumps(scenario['settings']),
-                        result['filter_count'],
-                        result['bad_removed_pct'],
-                        result['good_kept_pct'],
-                        result['score'],
-                        json.dumps(result['filter_columns']),
-                        idx + 1,
-                        idx == selected_idx
-                    ])
-            conn.commit()
-        logger.info(f"Saved {len(results)} scenario results to database")
-    except Exception as e:
-        logger.error(f"Failed to save scenario results: {e}", exc_info=True)
-
-
-def run_multi_scenario_analysis(
-    df: pd.DataFrame,
-    suggestions_by_interval: Dict[int, List[Dict[str, Any]]],
-    threshold: float,
-    run_id: str
-) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
-    """
-    Run multi-scenario testing to find optimal filter configuration.
-    
-    Args:
-        df: Trade data DataFrame with interval_idx column
-        suggestions_by_interval: Dict mapping interval index (0-29) to suggestions
-        threshold: Good trade threshold
-        run_id: Unique run identifier
-    
-    Returns:
-        - List of best combinations from winning scenario
-        - Best interval index (0-29, now 30-second granularity)
-        - Selected scenario details
-    """
-    logger.info("\n" + "=" * 80)
-    logger.info("MULTI-SCENARIO ANALYSIS - Testing configurations for 95%+ bad removal")
-    logger.info("=" * 80)
-    
-    # Generate test scenarios
-    scenarios = generate_test_scenarios()
-    logger.info(f"Generated {len(scenarios)} test scenarios")
-    logger.info(f"Testing on {len(df):,} data points ({df['trade_id'].nunique():,} unique trades)")
-    
-    # Test each scenario
-    results = []
-    for idx, scenario in enumerate(scenarios, 1):
-        result = test_scenario(df, scenario, suggestions_by_interval, threshold)
-        if result:
-            results.append(result)
-            logger.debug(f"  [{idx:3d}/{len(scenarios)}] {scenario['name']:<25} "
-                        f"Score: {result['score']:6.1f} | "
-                        f"Bad: {result['bad_removed_pct']:5.1f}% | "
-                        f"Good: {result['good_kept_pct']:5.1f}% | "
-                        f"Filters: {result['filter_count']}")
-    
-    if not results:
-        logger.warning("No scenarios produced valid filter combinations!")
-        return [], 0, {}
-    
-    # Sort by score (highest first)
-    results.sort(key=lambda x: x['score'], reverse=True)
-    
-    # Log top results
-    logger.info("\n" + "-" * 80)
-    logger.info("TOP 5 SCENARIOS BY SCORE:")
-    logger.info("-" * 80)
-    
-    for idx, result in enumerate(results[:5], 1):
-        scenario = result['scenario']
-        marker = " ⭐ SELECTED" if idx == 1 else ""
-        logger.info(f"  #{idx}: {scenario['name']:<25} | "
-                   f"Score: {result['score']:6.1f} | "
-                   f"Bad: {result['bad_removed_pct']:5.1f}% | "
-                   f"Good: {result['good_kept_pct']:5.1f}% | "
-                   f"Filters: {result['filter_count']}{marker}")
-        if idx == 1:
-            logger.info(f"       Settings: {json.dumps(scenario['settings'], indent=15)[1:]}")
-            logger.info(f"       Filters: {', '.join(result['filter_columns'][:3])}"
-                       f"{' + ' + str(result['filter_count'] - 3) + ' more' if result['filter_count'] > 3 else ''}")
-    
-    logger.info("-" * 80)
-    
-    # Select best scenario
-    best_result = results[0]
-    
-    # Save all scenario results to database
-    save_scenario_results(run_id, results[:10], 0)  # Save top 10
-    
-    return best_result['combinations'], best_result['best_minute'], best_result
-
-
-# =============================================================================
 # Main Entry Point
 # =============================================================================
 
@@ -1928,57 +1102,39 @@ def run() -> Dict[str, Any]:
     """
     Main entry point - called by scheduler every 10 minutes.
     
-    Auto-tests multiple scenarios to find optimal filter configuration.
-    Only Good Trade Threshold is user-locked, all other settings auto-optimized.
-    
-    Returns dict with run results.
+    Uses the sweep-proven algorithm:
+    1. Load data, split train/test chronologically
+    2. For each minute, rank features (Cohen's d) and find optimal ranges (Youden's J)
+    3. Exhaustive combo search (pairs, triples, quads) on train
+    4. Validate on test set -- only sync if test precision beats baseline
+    5. Sync best combo to pattern_config_filters
     """
     run_id = str(uuid.uuid4())[:8]
     
-    # START: Critical error logging wrapper
     try:
         logger.info("=" * 80)
-        logger.info(f"AUTO FILTER PATTERN GENERATOR [AUTO-OPTIMIZE MODE] - Run ID: {run_id}")
+        logger.info(f"AUTO FILTER PATTERN GENERATOR [SWEEP-PROVEN ALGORITHM] - Run ID: {run_id}")
         logger.info(f"Timestamp: {datetime.now(timezone.utc).isoformat()}")
         logger.info("=" * 80)
     except Exception as e:
-        # If even logging fails, write to stderr
-        import sys
-        sys.stderr.write(f"CRITICAL: Logging initialization failed: {e}\n")
         import traceback
+        sys.stderr.write(f"CRITICAL: Logging initialization failed: {e}\n")
         traceback.print_exc()
-        return {
-            'run_id': run_id,
-            'success': False,
-            'error': f'Logging initialization failed: {e}'
-        }
+        return {'run_id': run_id, 'success': False, 'error': f'Logging init failed: {e}'}
     
-    # Load config fresh from database (never cached)
+    # Load config
     try:
         config = load_config()
-        logger.info("✓ Config loaded successfully")
+        logger.info("Config loaded successfully")
     except Exception as e:
         logger.error(f"CRITICAL: Failed to load config: {e}", exc_info=True)
-        return {
-            'run_id': run_id,
-            'success': False,
-            'error': f'Config load failed: {e}'
-        }
+        return {'run_id': run_id, 'success': False, 'error': f'Config load failed: {e}'}
     
-    threshold = config.get('good_trade_threshold', 0.6)
-    ratio_only = config.get('is_ratio', False)
+    threshold = config.get('good_trade_threshold', 0.3)
+    max_hours = 48
     
-    logger.info(f"User-locked threshold: {threshold}% (good trades must exceed this)")
-    logger.info(f"Ratio-only mode: {'ENABLED ✅' if ratio_only else 'DISABLED (using absolute values)'}")
-    logger.info("AUTO-OPTIMIZING: Testing ~48 scenarios (various hours, filters, thresholds)")
-    logger.info("TARGET: 95%+ bad trade removal (VERY AGGRESSIVE)")
-    
-    if ratio_only:
-        logger.info("  ⚠️  RATIO MODE: Only percentage/ratio filters will be created")
-        logger.info("  ⚠️  This prevents filters from breaking when market prices change")
-    else:
-        logger.info("  ⚠️  ABSOLUTE MODE: Filters will use actual price values")
-        logger.info("  ⚠️  These filters may break if market prices change significantly")
+    logger.info(f"Threshold: {threshold}% | Hours: {max_hours} | Train/Test: {TRAIN_FRAC*100:.0f}/{(1-TRAIN_FRAC)*100:.0f}")
+    logger.info("Algorithm: Cohen's d ranking + Youden's J cutpoints + Exhaustive combo search")
     
     result = {
         'run_id': run_id,
@@ -1987,15 +1143,16 @@ def run() -> Dict[str, Any]:
         'combinations_count': 0,
         'filters_synced': 0,
         'plays_updated': 0,
+        'pre_entry_filters_synced': 0,
         'error': None
     }
     
     try:
-        # Get engine
-        logger.info("Getting TradingDataEngine instance...")
+        # Step 1: Get engine
+        logger.info("\n[Step 1/6] Getting engine...")
         try:
             engine = get_engine()
-            logger.info(f"✓ Engine acquired: {type(engine).__name__}")
+            logger.info(f"Engine acquired: {type(engine).__name__}")
         except Exception as e:
             logger.error(f"CRITICAL: Failed to get engine: {e}", exc_info=True)
             result['error'] = f'Engine acquisition failed: {e}'
@@ -2005,18 +1162,17 @@ def run() -> Dict[str, Any]:
             logger.warning("TradingDataEngine not running, starting it...")
             try:
                 engine.start()
-                logger.info("✓ Engine started")
+                logger.info("Engine started")
             except Exception as e:
                 logger.error(f"CRITICAL: Failed to start engine: {e}", exc_info=True)
                 result['error'] = f'Engine start failed: {e}'
                 return result
         
-        # Step 1: Load trade data (use maximum window for multi-scenario testing)
-        logger.info("\n[Step 1/6] Loading trade data...")
-        max_hours = 48  # Load 48 hours - crypto is volatile, this provides enough data
+        # Step 2: Load trade data
+        logger.info("\n[Step 2/6] Loading trade data...")
         try:
             df = load_trade_data(engine, max_hours)
-            logger.info(f"✓ Data loaded: {len(df)} rows")
+            logger.info(f"Data loaded: {len(df)} rows")
         except Exception as e:
             logger.error(f"CRITICAL: Failed to load trade data: {e}", exc_info=True)
             result['error'] = f'Data load failed: {e}'
@@ -2028,130 +1184,188 @@ def run() -> Dict[str, Any]:
             return result
         
         # Show data summary
-        config = load_config()
-        threshold = config.get('good_trade_threshold', 0.3)
         good_count = (df['potential_gains'] >= threshold).sum()
         bad_count = (df['potential_gains'] < threshold).sum()
-        logger.info(f"  Total rows: {len(df):,}")
-        logger.info(f"  Unique trades: {df['trade_id'].nunique():,}")
+        unique_trades = df['trade_id'].nunique()
+        logger.info(f"  Total rows: {len(df):,} | Unique trades: {unique_trades:,}")
         logger.info(f"  Good trades (>= {threshold}%): {good_count:,} ({good_count/len(df)*100:.1f}%)")
         logger.info(f"  Bad trades (< {threshold}%): {bad_count:,} ({bad_count/len(df)*100:.1f}%)")
         
-        # Step 2: Build filter catalog
-        logger.info("\n[Step 2/6] Building filter fields catalog...")
+        # Step 3: Build catalog + get filterable columns
+        logger.info("\n[Step 3/6] Building filter catalog and splitting train/test...")
         filterable_columns = get_filterable_columns(df)
         column_to_id = save_filter_catalog(engine, filterable_columns)
-        logger.info(f"  Found {len(filterable_columns)} filterable columns")
+        logger.info(f"  {len(filterable_columns)} filterable columns (absolute prices excluded)")
         
-        # Step 3: Generate filter suggestions for each 30-second interval
-        logger.info("\n[Step 3/6] Generating filter suggestions (30-second granularity)...")
-        suggestions_by_interval = {}
+        # Train/test split (chronological by trade)
+        df_train_all, df_test_all = split_train_test(df)
+        train_trades = df_train_all['trade_id'].nunique()
+        test_trades = df_test_all['trade_id'].nunique()
+        logger.info(f"  Train: {train_trades} trades | Test: {test_trades} trades")
+        
+        # Step 4: Search for best combo across all minutes
+        logger.info("\n[Step 4/6] Exhaustive combo search across minutes...")
+        
         all_suggestions = []
+        best_combo_overall = None
+        best_minute = 0
+        minute_results = {}
         
-        for column in filterable_columns:
-            result_tuple = find_best_interval_for_field(df, column)
-            if result_tuple:
-                best_interval, suggestion = result_tuple
-                if best_interval not in suggestions_by_interval:
-                    suggestions_by_interval[best_interval] = []
-                suggestions_by_interval[best_interval].append(suggestion)
-                all_suggestions.append(suggestion)
-        
-        # Add cycle bottom signature filters (based on analysis of optimal buy moments)
-        logger.info("  Adding cycle bottom signature filters...")
-        # Test at early intervals (0-7 = first 4 minutes) when signal is freshest
-        for interval_idx in range(8):
-            cycle_bottom_suggestions = generate_cycle_bottom_filters(df, interval_idx)
-            for suggestion in cycle_bottom_suggestions:
-                col = suggestion['column_name']
-                # Check if we already have this column at this interval
-                existing_cols = [s['column_name'] for s in suggestions_by_interval.get(interval_idx, [])]
-                if col not in existing_cols:
-                    if interval_idx not in suggestions_by_interval:
-                        suggestions_by_interval[interval_idx] = []
-                    suggestions_by_interval[interval_idx].append(suggestion)
-                    all_suggestions.append(suggestion)
-        
-        cycle_bottom_count = sum(1 for s in all_suggestions if s.get('source') == 'cycle_bottom_signature')
-        logger.info(f"  Added {cycle_bottom_count} cycle bottom signature filters")
+        for minute in range(15):
+            # Filter to this minute
+            if 'minute' in df_train_all.columns:
+                df_train_min = df_train_all[df_train_all['minute'] == minute]
+                df_test_min = df_test_all[df_test_all['minute'] == minute]
+            elif 'interval_idx' in df_train_all.columns:
+                # Fallback: use interval_idx, take both sub-intervals for this minute
+                df_train_min = df_train_all[df_train_all['interval_idx'].isin([minute * 2, minute * 2 + 1])]
+                df_test_min = df_test_all[df_test_all['interval_idx'].isin([minute * 2, minute * 2 + 1])]
+            else:
+                continue
+            
+            if len(df_train_min) < 50 or len(df_test_min) < 20:
+                continue
+            
+            # Generate individual suggestions for this minute (for save_suggestions)
+            ranked = rank_and_range_features(df_train_min, filterable_columns, threshold)
+            for feat in ranked[:40]:  # Top 40 features
+                metrics = test_filter_effectiveness(
+                    df_train_min, feat['column'], feat['from'], feat['to'], threshold
+                )
+                if metrics:
+                    all_suggestions.append({
+                        'column_name': feat['column'],
+                        'section': get_section_from_column(feat['column']),
+                        'field_name': get_field_name_from_column(feat['column']),
+                        'from_value': feat['from'],
+                        'to_value': feat['to'],
+                        'minute_analyzed': minute,
+                        'cohens_d': feat['cohens_d'],
+                        **metrics
+                    })
+            
+            # Find best combo for this minute
+            combo = find_best_combo_for_minute(
+                df_train_min, df_test_min, filterable_columns, minute, threshold
+            )
+            
+            if combo:
+                minute_results[minute] = combo
+                logger.info(f"  Minute {minute:2d}: test_prec={combo['test_precision']:.1f}%, "
+                           f"bad_rem={combo['test_bad_removed']:.1f}%, "
+                           f"good_kept={combo['test_good_kept']:.1f}%, "
+                           f"filters={combo['n_filters']}, "
+                           f"overfit={combo['overfit_delta']:+.1f}%")
+                
+                if (best_combo_overall is None or 
+                    combo['test_precision'] > best_combo_overall['test_precision'] or
+                    (combo['test_precision'] == best_combo_overall['test_precision'] and
+                     combo['test_good_kept'] > best_combo_overall['test_good_kept'])):
+                    best_combo_overall = combo
+                    best_minute = minute
+            else:
+                logger.info(f"  Minute {minute:2d}: no combo beat baseline on test")
         
         result['suggestions_count'] = len(all_suggestions)
-        logger.info(f"  Generated {len(all_suggestions)} filter suggestions total")
-        
-        if not all_suggestions:
-            result['error'] = "No filter suggestions could be generated"
-            logger.error(result['error'])
-            return result
         
         # Save suggestions
-        save_suggestions(engine, all_suggestions, column_to_id, 48)  # Use max hours for suggestions
+        if all_suggestions:
+            save_suggestions(engine, all_suggestions, column_to_id, max_hours)
         
-        # Step 4: Run multi-scenario analysis to find optimal configuration
-        logger.info("\n[Step 4/6] Running multi-scenario analysis...")
-        combinations, best_interval, selected_scenario = run_multi_scenario_analysis(
-            df, suggestions_by_interval, threshold, run_id
-        )
+        # Step 5: Sync best combo to pattern config
+        logger.info("\n[Step 5/6] Syncing best filters to pattern config...")
         
-        result['combinations_count'] = len(combinations)
-        result['selected_scenario'] = selected_scenario.get('scenario', {}).get('name', 'none') if selected_scenario else 'none'
-        result['scenario_score'] = selected_scenario.get('score', 0) if selected_scenario else 0
-        
-        if not combinations:
-            result['error'] = "No valid filter combinations found"
+        if not best_combo_overall:
+            result['error'] = "No filter combinations beat baseline on test set"
             logger.warning(result['error'])
-            # Still save what we have
             save_combinations(engine, [], max_hours)
-        else:
-            save_combinations(engine, combinations, max_hours)
-            interval_label = f"{best_interval // 2}:{(best_interval % 2) * 30:02d}"
-            logger.info(f"  Best interval: {interval_label} (index {best_interval})")
-            logger.info(f"  Found {len(combinations)} valid combinations")
-        
-        # Step 5: Analyze pre-entry thresholds (NEW)
-        logger.info("\n[Step 4.5/6] Analyzing pre-entry thresholds...")
-        pre_entry_suggestions = analyze_pre_entry_thresholds(df, threshold)
-        
-        if pre_entry_suggestions:
-            logger.info(f"Found {len(pre_entry_suggestions)} pre-entry filters:")
-            for field, suggestion in pre_entry_suggestions.items():
-                logger.info(f"  {field}: >= {suggestion['min_value']:.4f}% "
-                           f"(removes {suggestion['bad_removed_pct']:.1f}% bad, "
-                           f"keeps {suggestion['good_kept_pct']:.1f}% good)")
-        else:
-            logger.warning("  No pre-entry filters met criteria - using default 0.20% threshold")
-        
-        # Step 5: Sync to pattern config
-        logger.info("\n[Step 5/6] Syncing filters to pattern config...")
-        project_id = get_or_create_auto_project(engine)
-        
-        if not combinations:
-            # No new combinations found, but still clear old filters if in ratio_only mode
-            # This prevents absolute filters from lingering when switching to ratio mode
-            config = load_config()
-            if config.get('is_ratio', False):
-                logger.warning("No valid combinations found in ratio-only mode")
-                logger.info("Clearing old absolute filters to prevent market price issues...")
-                try:
-                    with get_postgres() as conn:
-                        with conn.cursor() as cursor:
-                            cursor.execute("DELETE FROM pattern_config_filters WHERE project_id = %s", [project_id])
-                        conn.commit()
-                    logger.info("Old filters cleared successfully")
-                except Exception as e:
-                    logger.error(f"Failed to clear old filters: {e}")
             
-            result['error'] = "No valid filter combinations found"
-            logger.warning(result['error'])
-            save_combinations(engine, [], max_hours)
+            # Still clear old filters to prevent stale filters
+            project_id = get_or_create_auto_project(engine)
+            try:
+                with get_postgres() as conn:
+                    with conn.cursor() as cursor:
+                        cursor.execute("DELETE FROM pattern_config_filters WHERE project_id = %s", [project_id])
+                    conn.commit()
+                logger.info("Old filters cleared (no new combo qualified)")
+            except Exception as e:
+                logger.error(f"Failed to clear old filters: {e}")
         else:
-            sync_result = sync_best_filters_to_project(engine, combinations, project_id, 
-                                                       pre_entry_suggestions=pre_entry_suggestions)
+            # Build combo in format expected by save_combinations and sync
+            ranked_features = best_combo_overall['ranked_features']
+            combo_columns = best_combo_overall['columns']
+            
+            # Build filter dicts for each column
+            filters_list = []
+            for col in combo_columns:
+                feat = next((r for r in ranked_features if r['column'] == col), None)
+                if feat:
+                    filters_list.append({
+                        'column_name': col,
+                        'section': get_section_from_column(col),
+                        'field_name': get_field_name_from_column(col),
+                        'from_value': feat['from'],
+                        'to_value': feat['to'],
+                        'minute_analyzed': best_minute,
+                    })
+            
+            # Compute full metrics on test data for saving
+            if 'minute' in df_test_all.columns:
+                df_test_best = df_test_all[df_test_all['minute'] == best_minute]
+            elif 'interval_idx' in df_test_all.columns:
+                df_test_best = df_test_all[df_test_all['interval_idx'].isin([best_minute * 2, best_minute * 2 + 1])]
+            else:
+                df_test_best = df_test_all
+            
+            # Apply filter combination on test data for detailed metrics
+            passes = pd.Series([True] * len(df_test_best), index=df_test_best.index)
+            for f in filters_list:
+                if f['column_name'] in df_test_best.columns:
+                    passes = passes & (df_test_best[f['column_name']] >= f['from_value']) & (df_test_best[f['column_name']] <= f['to_value'])
+            
+            potential_gains = df_test_best['potential_gains']
+            is_good = potential_gains >= threshold
+            is_bad = potential_gains < threshold
+            is_negative = potential_gains < 0
+            is_0_to_01 = (potential_gains >= 0) & (potential_gains < 0.1)
+            is_01_to_02 = (potential_gains >= 0.1) & (potential_gains < 0.2)
+            is_02_to_03 = (potential_gains >= 0.2) & (potential_gains < threshold)
+            
+            good_before = int(is_good.sum())
+            bad_before = int(is_bad.sum())
+            good_after = int((is_good & passes).sum())
+            bad_after = int((is_bad & passes).sum())
+            
+            combo_for_save = {
+                'filters': filters_list,
+                'filter_columns': combo_columns,
+                'minute_analyzed': best_minute,
+                'total_trades': len(df_test_best),
+                'good_trades_before': good_before,
+                'bad_trades_before': bad_before,
+                'good_trades_after': good_after,
+                'bad_trades_after': bad_after,
+                'good_trades_kept_pct': round(good_after / good_before * 100, 2) if good_before > 0 else 0,
+                'bad_trades_removed_pct': round((bad_before - bad_after) / bad_before * 100, 2) if bad_before > 0 else 0,
+                'bad_negative_count': int((is_negative & passes).sum()),
+                'bad_0_to_01_count': int((is_0_to_01 & passes).sum()),
+                'bad_01_to_02_count': int((is_01_to_02 & passes).sum()),
+                'bad_02_to_03_count': int((is_02_to_03 & passes).sum()),
+                'test_precision': best_combo_overall['test_precision'],
+            }
+            
+            save_combinations(engine, [combo_for_save], max_hours)
+            result['combinations_count'] = 1
+            
+            # Sync to pattern_config_filters
+            project_id = get_or_create_auto_project(engine)
+            sync_result = sync_best_filters_to_project(engine, combo_for_save, project_id)
             result['filters_synced'] = sync_result.get('filters_synced', 0)
-            result['pre_entry_filters_synced'] = sync_result.get('pre_entry_filters_synced', 0)
-            save_combinations(engine, combinations, max_hours)
         
         # Step 6: Update AI-enabled plays
         logger.info("\n[Step 6/6] Updating AI-enabled plays...")
+        if 'project_id' not in dir():
+            project_id = get_or_create_auto_project(engine)
         filters_synced = result.get('filters_synced', 0)
         result['plays_updated'] = update_ai_plays(engine, project_id, run_id, filters_synced)
         
@@ -2163,17 +1377,29 @@ def run() -> Dict[str, Any]:
         logger.info("=" * 60)
         logger.info(f"  Run ID: {run_id}")
         logger.info(f"  Suggestions generated: {result['suggestions_count']}")
-        logger.info(f"  Combinations found: {result['combinations_count']}")
         logger.info(f"  Filters synced: {result['filters_synced']}")
-        logger.info(f"  Pre-entry filters synced: {result.get('pre_entry_filters_synced', 0)}")
         logger.info(f"  Plays updated: {result['plays_updated']}")
-        if combinations:
-            best = combinations[-1]
-            logger.info(f"  Best result: {best['bad_trades_removed_pct']:.1f}% bad removed, "
-                        f"{best['good_trades_kept_pct']:.1f}% good kept")
-        if result.get('selected_scenario'):
-            logger.info(f"  Selected scenario: {result['selected_scenario']}")
-            logger.info(f"  Scenario score: {result.get('scenario_score', 0):.1f}")
+        if best_combo_overall:
+            logger.info(f"  Best minute: {best_minute}")
+            logger.info(f"  Test precision: {best_combo_overall['test_precision']:.1f}%")
+            logger.info(f"  Bad removed: {best_combo_overall['test_bad_removed']:.1f}%")
+            logger.info(f"  Good kept: {best_combo_overall['test_good_kept']:.1f}%")
+            logger.info(f"  Overfit delta: {best_combo_overall['overfit_delta']:+.1f}%")
+            logger.info(f"  Filters: {', '.join(best_combo_overall['columns'])}")
+        else:
+            logger.info("  No combo qualified -- old filters cleared")
+        
+        # Log per-minute comparison
+        if minute_results:
+            logger.info("\n  MINUTE COMPARISON:")
+            for m in sorted(minute_results.keys()):
+                r = minute_results[m]
+                marker = " <-- BEST" if m == best_minute else ""
+                logger.info(f"    M{m:2d}: test_prec={r['test_precision']:5.1f}%, "
+                           f"bad_rem={r['test_bad_removed']:5.1f}%, "
+                           f"good_kept={r['test_good_kept']:5.1f}%, "
+                           f"n={r['n_filters']}, overfit={r['overfit_delta']:+5.1f}%{marker}")
+        
         logger.info("=" * 60)
         
         return result
@@ -2209,4 +1435,3 @@ if __name__ == "__main__":
     else:
         logger.error(f"Pattern generation failed: {result.get('error')}")
         sys.exit(1)
-

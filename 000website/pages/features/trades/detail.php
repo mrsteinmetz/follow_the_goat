@@ -128,6 +128,21 @@ $chart_field_configs = [
         'mm_confidence' => ['label' => 'Confidence', 'format' => 'decimal', 'color' => 'rgb(245, 158, 11)'],
         'mm_false_signal_risk' => ['label' => 'False Signal Risk', 'format' => 'decimal', 'color' => 'rgb(239, 68, 68)'],
     ],
+    // Pre-entry price movement (only interval 0)
+    'pre_entry' => [
+        'pre_entry_change_1m' => ['label' => 'Pre-Entry 1m Change', 'format' => 'percent', 'color' => 'rgb(220, 38, 38)'],
+        'pre_entry_change_2m' => ['label' => 'Pre-Entry 2m Change', 'format' => 'percent', 'color' => 'rgb(239, 68, 68)'],
+        'pre_entry_change_3m' => ['label' => 'Pre-Entry 3m Change', 'format' => 'percent', 'color' => 'rgb(248, 113, 113)'],
+        'pre_entry_change_5m' => ['label' => 'Pre-Entry 5m Change', 'format' => 'percent', 'color' => 'rgb(252, 165, 165)'],
+        'pre_entry_change_10m' => ['label' => 'Pre-Entry 10m Change', 'format' => 'percent', 'color' => 'rgb(254, 202, 202)'],
+    ],
+    // Whale velocity / flow analysis
+    'whale_velocity' => [
+        'wh_flow_velocity' => ['label' => 'Flow Velocity', 'format' => 'decimal', 'color' => 'rgb(139, 92, 246)'],
+        'wh_flow_acceleration' => ['label' => 'Flow Acceleration', 'format' => 'decimal', 'color' => 'rgb(167, 139, 250)'],
+        'wh_stealth_acc_score' => ['label' => 'Stealth Acc Score', 'format' => 'decimal', 'color' => 'rgb(196, 181, 253)'],
+        'wh_cumulative_flow_10m' => ['label' => 'Cumulative Flow 10m', 'format' => 'decimal', 'color' => 'rgb(109, 40, 217)'],
+    ],
 ];
 
 // --- Field Groups for Display ---
@@ -287,6 +302,75 @@ $field_groups = [
         'mm_adverse_selection' => ['label' => 'Adverse Selection', 'format' => 'decimal'],
         'mm_slippage_estimate' => ['label' => 'Slippage Est (bps)', 'format' => 'decimal'],
     ],
+    // Pre-Entry Price Movement (shows how price moved BEFORE this trade entry)
+    'Pre-Entry Price Movement' => [
+        'pre_entry_change_1m' => ['label' => '1m Before Entry', 'format' => 'percent'],
+        'pre_entry_change_2m' => ['label' => '2m Before Entry', 'format' => 'percent'],
+        'pre_entry_change_3m' => ['label' => '3m Before Entry', 'format' => 'percent'],
+        'pre_entry_change_5m' => ['label' => '5m Before Entry', 'format' => 'percent'],
+        'pre_entry_change_10m' => ['label' => '10m Before Entry', 'format' => 'percent'],
+        'pre_entry_price_1m_before' => ['label' => 'Price 1m Before', 'format' => 'price'],
+        'pre_entry_price_2m_before' => ['label' => 'Price 2m Before', 'format' => 'price'],
+        'pre_entry_price_3m_before' => ['label' => 'Price 3m Before', 'format' => 'price'],
+        'pre_entry_price_5m_before' => ['label' => 'Price 5m Before', 'format' => 'price'],
+        'pre_entry_price_10m_before' => ['label' => 'Price 10m Before', 'format' => 'price'],
+        'pre_entry_trend' => ['label' => 'Trend Direction', 'format' => 'text'],
+    ],
+    // Whale Velocity & Flow Analysis
+    'Whale Velocity' => [
+        'wh_flow_velocity' => ['label' => 'Flow Velocity', 'format' => 'decimal'],
+        'wh_flow_acceleration' => ['label' => 'Flow Acceleration', 'format' => 'decimal'],
+        'wh_cumulative_flow_10m' => ['label' => 'Cumulative Flow 10m', 'format' => 'decimal'],
+        'wh_stealth_acc_score' => ['label' => 'Stealth Accumulation Score', 'format' => 'decimal'],
+        'wh_distribution_urgency' => ['label' => 'Distribution Urgency', 'format' => 'decimal'],
+        'wh_activity_regime' => ['label' => 'Activity Regime', 'format' => 'number'],
+        'wh_time_since_large' => ['label' => 'Time Since Large Move', 'format' => 'decimal'],
+        'wh_large_freq_5m' => ['label' => 'Large Move Freq 5m', 'format' => 'decimal'],
+    ],
+    // Advanced Order Book Metrics
+    'Order Book Advanced' => [
+        'ob_imbalance_velocity_1m' => ['label' => 'Imbalance Velocity 1m', 'format' => 'decimal'],
+        'ob_imbalance_velocity_30s' => ['label' => 'Imbalance Velocity 30s', 'format' => 'decimal'],
+        'ob_imbalance_acceleration' => ['label' => 'Imbalance Acceleration', 'format' => 'decimal'],
+        'ob_bid_depth_velocity' => ['label' => 'Bid Depth Velocity', 'format' => 'decimal'],
+        'ob_ask_depth_velocity' => ['label' => 'Ask Depth Velocity', 'format' => 'decimal'],
+        'ob_depth_ratio_velocity' => ['label' => 'Depth Ratio Velocity', 'format' => 'decimal'],
+        'ob_spread_velocity' => ['label' => 'Spread Velocity', 'format' => 'decimal'],
+        'ob_spread_percentile_1h' => ['label' => 'Spread Percentile 1h', 'format' => 'decimal'],
+        'ob_liquidity_score' => ['label' => 'Liquidity Score', 'format' => 'decimal'],
+        'ob_liquidity_gap_score' => ['label' => 'Liquidity Gap Score', 'format' => 'decimal'],
+        'ob_liquidity_concentration' => ['label' => 'Liquidity Concentration', 'format' => 'decimal'],
+        'ob_cumulative_imbalance_5m' => ['label' => 'Cumul Imbalance 5m', 'format' => 'decimal'],
+        'ob_imbalance_consistency_5m' => ['label' => 'Imbalance Consistency 5m', 'format' => 'decimal'],
+    ],
+    // Advanced Transaction Metrics
+    'Transaction Advanced' => [
+        'tx_cumulative_delta' => ['label' => 'Cumulative Delta', 'format' => 'money'],
+        'tx_cumulative_delta_5m' => ['label' => 'Cumul Delta 5m', 'format' => 'money'],
+        'tx_delta_divergence' => ['label' => 'Delta Divergence', 'format' => 'decimal'],
+        'tx_trade_intensity' => ['label' => 'Trade Intensity', 'format' => 'decimal'],
+        'tx_intensity_velocity' => ['label' => 'Intensity Velocity', 'format' => 'decimal'],
+        'tx_large_trade_intensity' => ['label' => 'Large Trade Intensity', 'format' => 'decimal'],
+        'tx_vpin_estimate' => ['label' => 'VPIN Estimate', 'format' => 'decimal'],
+        'tx_order_flow_toxicity' => ['label' => 'Order Flow Toxicity', 'format' => 'decimal'],
+        'tx_kyle_lambda' => ['label' => 'Kyle Lambda', 'format' => 'decimal'],
+        'tx_aggressive_buy_ratio' => ['label' => 'Aggressive Buy Ratio', 'format' => 'decimal'],
+        'tx_aggressive_sell_ratio' => ['label' => 'Aggressive Sell Ratio', 'format' => 'decimal'],
+        'tx_aggression_imbalance' => ['label' => 'Aggression Imbalance', 'format' => 'decimal'],
+    ],
+    // Advanced Price Velocity Metrics
+    'Price Velocity Advanced' => [
+        'pm_price_velocity_30s' => ['label' => 'Price Velocity 30s', 'format' => 'decimal'],
+        'pm_realized_vol_1m' => ['label' => 'Realized Vol 1m', 'format' => 'decimal'],
+        'pm_vol_of_vol' => ['label' => 'Vol of Vol', 'format' => 'decimal'],
+        'pm_price_vs_vwap_pct' => ['label' => 'Price vs VWAP %', 'format' => 'percent'],
+        'pm_price_vs_twap_pct' => ['label' => 'Price vs TWAP %', 'format' => 'percent'],
+        'pm_higher_highs_5m' => ['label' => 'Higher Highs 5m', 'format' => 'number'],
+        'pm_higher_lows_5m' => ['label' => 'Higher Lows 5m', 'format' => 'number'],
+        'pm_dist_resistance_pct' => ['label' => 'Dist to Resistance %', 'format' => 'percent'],
+        'pm_dist_support_pct' => ['label' => 'Dist to Support %', 'format' => 'percent'],
+        'pm_breakout_imminence' => ['label' => 'Breakout Imminence', 'format' => 'decimal'],
+    ],
 ];
 
 /**
@@ -408,6 +492,13 @@ function formatValue($value, $format) {
         case 'bool':
             $isTrue = in_array(strtolower((string)$value), ['1', 'true', 'yes', 'on'], true) || $value === 1;
             return $isTrue ? '<span class="text-success">✓</span>' : '<span class="text-muted">-</span>';
+        
+        case 'text':
+            $text = strtolower((string)$value);
+            if ($text === 'rising') return '<span class="text-success fw-bold">RISING</span>';
+            if ($text === 'falling') return '<span class="text-danger fw-bold">FALLING</span>';
+            if ($text === 'flat') return '<span class="text-muted fw-bold">FLAT</span>';
+            return '<span>' . htmlspecialchars($value) . '</span>';
         
         default:
             return htmlspecialchars($value);
@@ -958,6 +1049,15 @@ $category_colors = [
     'Second Prices' => '#06b6d4',     // Cyan
     'BTC Prices' => '#f97316',        // Orange
     'ETH Prices' => '#6366f1',        // Indigo
+    'Velocity Metrics' => '#0ea5e9',  // Sky
+    'Cross-Asset Correlation' => '#84cc16', // Lime
+    '30-Second Data' => '#a855f7',    // Violet
+    'Micro-Move Score' => '#22c55e',  // Emerald
+    'Pre-Entry Price Movement' => '#dc2626', // Red
+    'Whale Velocity' => '#7c3aed',    // Dark purple
+    'Order Book Advanced' => '#059669', // Dark green
+    'Transaction Advanced' => '#d97706', // Dark amber
+    'Price Velocity Advanced' => '#2563eb', // Dark blue
 ];
 ?>
 
@@ -1111,6 +1211,15 @@ $category_colors = [
         'Second Prices' => 'second_prices',
         'BTC Prices' => 'btc_prices',
         'ETH Prices' => 'eth_prices',
+        'Velocity Metrics' => 'velocity_metrics',
+        'Cross-Asset Correlation' => 'cross_asset',
+        '30-Second Data' => 'thirty_second',
+        'Micro-Move Score' => 'micro_move',
+        'Pre-Entry Price Movement' => 'pre_entry',
+        'Whale Velocity' => 'whale_velocity',
+        'Order Book Advanced' => 'order_book_advanced',
+        'Transaction Advanced' => 'transaction_advanced',
+        'Price Velocity Advanced' => 'price_velocity_advanced',
     ];
     
     foreach ($field_groups as $groupName => $fields): 
@@ -1206,6 +1315,57 @@ $category_colors = [
                 { key: 'eth_price_change_1m', label: 'ETH Change 1m', color: 'rgb(98, 126, 234)' },
                 { key: 'eth_price_change_5m', label: 'ETH Change 5m', color: 'rgb(130, 150, 245)' },
                 { key: 'eth_volatility_pct', label: 'ETH Volatility', color: 'rgb(156, 39, 176)' },
+            ],
+            'velocity_metrics': [
+                { key: 'pm_price_velocity_1m', label: 'Price Velocity 1m', color: 'rgb(59, 130, 246)' },
+                { key: 'pm_momentum_persistence', label: 'Momentum Persistence', color: 'rgb(16, 185, 129)' },
+                { key: 'tx_volume_velocity', label: 'Volume Velocity', color: 'rgb(245, 158, 11)' },
+                { key: 'tx_vpin_estimate', label: 'VPIN', color: 'rgb(239, 68, 68)' },
+            ],
+            'cross_asset': [
+                { key: 'xa_btc_sol_corr_1m', label: 'BTC-SOL Corr 1m', color: 'rgb(247, 147, 26)' },
+                { key: 'xa_btc_leads_sol_1', label: 'BTC Leads SOL', color: 'rgb(255, 193, 7)' },
+                { key: 'xa_momentum_alignment', label: 'Momentum Alignment', color: 'rgb(34, 197, 94)' },
+            ],
+            'thirty_second': [
+                { key: 'ts_price_change_30s', label: 'Price Change 30s', color: 'rgb(139, 92, 246)' },
+                { key: 'ts_momentum_30s', label: 'Momentum 30s', color: 'rgb(236, 72, 153)' },
+                { key: 'ts_volatility_30s', label: 'Volatility 30s', color: 'rgb(239, 68, 68)' },
+            ],
+            'micro_move': [
+                { key: 'mm_probability', label: 'Move Probability', color: 'rgb(34, 197, 94)' },
+                { key: 'mm_direction', label: 'Direction', color: 'rgb(59, 130, 246)' },
+                { key: 'mm_confidence', label: 'Confidence', color: 'rgb(245, 158, 11)' },
+                { key: 'mm_false_signal_risk', label: 'False Signal Risk', color: 'rgb(239, 68, 68)' },
+            ],
+            'pre_entry': [
+                { key: 'pre_entry_change_1m', label: 'Pre-Entry 1m', color: 'rgb(220, 38, 38)' },
+                { key: 'pre_entry_change_2m', label: 'Pre-Entry 2m', color: 'rgb(239, 68, 68)' },
+                { key: 'pre_entry_change_3m', label: 'Pre-Entry 3m', color: 'rgb(248, 113, 113)' },
+                { key: 'pre_entry_change_5m', label: 'Pre-Entry 5m', color: 'rgb(252, 165, 165)' },
+                { key: 'pre_entry_change_10m', label: 'Pre-Entry 10m', color: 'rgb(254, 202, 202)' },
+            ],
+            'whale_velocity': [
+                { key: 'wh_flow_velocity', label: 'Flow Velocity', color: 'rgb(139, 92, 246)' },
+                { key: 'wh_flow_acceleration', label: 'Flow Acceleration', color: 'rgb(167, 139, 250)' },
+                { key: 'wh_stealth_acc_score', label: 'Stealth Acc Score', color: 'rgb(196, 181, 253)' },
+                { key: 'wh_cumulative_flow_10m', label: 'Cumulative Flow 10m', color: 'rgb(109, 40, 217)' },
+            ],
+            'order_book_advanced': [
+                { key: 'ob_imbalance_velocity_1m', label: 'Imbalance Velocity 1m', color: 'rgb(5, 150, 105)' },
+                { key: 'ob_liquidity_score', label: 'Liquidity Score', color: 'rgb(16, 185, 129)' },
+                { key: 'ob_cumulative_imbalance_5m', label: 'Cumul Imbalance 5m', color: 'rgb(52, 211, 153)' },
+            ],
+            'transaction_advanced': [
+                { key: 'tx_cumulative_delta', label: 'Cumulative Delta', color: 'rgb(217, 119, 6)' },
+                { key: 'tx_trade_intensity', label: 'Trade Intensity', color: 'rgb(245, 158, 11)' },
+                { key: 'tx_order_flow_toxicity', label: 'Flow Toxicity', color: 'rgb(251, 191, 36)' },
+                { key: 'tx_aggression_imbalance', label: 'Aggression Imbalance', color: 'rgb(252, 211, 77)' },
+            ],
+            'price_velocity_advanced': [
+                { key: 'pm_price_velocity_30s', label: 'Price Velocity 30s', color: 'rgb(37, 99, 235)' },
+                { key: 'pm_price_vs_vwap_pct', label: 'Price vs VWAP %', color: 'rgb(59, 130, 246)' },
+                { key: 'pm_breakout_imminence', label: 'Breakout Imminence', color: 'rgb(96, 165, 250)' },
             ],
         };
         
@@ -1451,9 +1611,19 @@ $category_colors = [
             'Transactions': 'transactions',
             'Whale Activity': 'whale_activity',
             'Patterns': 'patterns',
+            'Micro Patterns': 'micro_patterns',
             'Second Prices': 'second_prices',
             'BTC Prices': 'btc_prices',
             'ETH Prices': 'eth_prices',
+            'Velocity Metrics': 'velocity_metrics',
+            'Cross-Asset Correlation': 'cross_asset',
+            '30-Second Data': 'thirty_second',
+            'Micro-Move Score': 'micro_move',
+            'Pre-Entry Price Movement': 'pre_entry',
+            'Whale Velocity': 'whale_velocity',
+            'Order Book Advanced': 'order_book_advanced',
+            'Transaction Advanced': 'transaction_advanced',
+            'Price Velocity Advanced': 'price_velocity_advanced',
         };
         
         Object.keys(scatterData).forEach(function(categoryName) {

@@ -120,6 +120,19 @@ SECTION_PREFIX_MAP = {
     "mp_": "micro_patterns",
     "btc_": "btc_price_movements",
     "eth_": "eth_price_movements",
+    # Velocity and micro-move sections
+    "xa_": "cross_asset",
+    "ts_": "thirty_second",
+    "mm_": "micro_move",
+    # Pre-entry price movement metrics (stored in trail row interval 0)
+    "pre_entry_": "pre_entry",
+}
+
+# Legacy alias mapping: old field names created by analyze_pre_entry_thresholds()
+# mapped to their actual trail data column names and sections.
+PRE_ENTRY_ALIAS_MAP = {
+    "entry_buy_pressure": ("tx_buy_sell_pressure", "transactions"),
+    "entry_whale_flow": ("wh_net_flow_ratio", "whale_activity"),
 }
 
 
@@ -484,7 +497,7 @@ def _fetch_project_filters(project_id: int) -> List[Dict[str, Any]]:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT id, name, section, minute, field_name, field_column, 
-                           from_value, to_value, is_active
+                           from_value, to_value, include_null, is_active
                     FROM pattern_config_filters
                     WHERE project_id = %s AND is_active = 1
                     ORDER BY id ASC
@@ -646,6 +659,16 @@ def _find_minute_data(
     if section == "micro_patterns":
         return _extract_micro_pattern_data_flat(trail_data)
     
+    # Pre-entry data is stored as flat keys in the trail payload (not in a section list).
+    # The keys are stored at minute 0, interval 0 of the trail rows.
+    if section == "pre_entry":
+        # Pre-entry metrics are stored at the top level of the trail payload
+        # (added by trail_data.py flatten_trail_to_rows for interval 0)
+        pre_entry_keys = [k for k in trail_data.keys() if k.startswith("pre_entry_")]
+        if pre_entry_keys:
+            return {k: trail_data[k] for k in pre_entry_keys}
+        return None
+    
     section_data = trail_data.get(section, [])
     if not isinstance(section_data, list):
         return None
@@ -660,11 +683,12 @@ def _find_minute_data(
 def _evaluate_filter_condition(
     value: Optional[float],
     from_value: Optional[float],
-    to_value: Optional[float]
+    to_value: Optional[float],
+    include_null: bool = False
 ) -> bool:
     """Check if a value is within the filter range."""
     if value is None:
-        return False
+        return include_null
     
     try:
         value = float(value)
@@ -723,28 +747,44 @@ def validate_with_project_filters(
         from_value = filter_def.get("from_value")
         to_value = filter_def.get("to_value")
         minute = filter_def.get("minute")
+        include_null = bool(filter_def.get("include_null", 0))
         
         if minute is None:
             minute = 0
         else:
             minute = int(minute)
         
-        section = _get_section_from_field_column(field_column)
-        if not section:
-            section = filter_def.get("section")
-            if section:
-                section_map = {
-                    "price_movements": "price_movements",
-                    "transactions": "transactions", 
-                    "order_book_signals": "order_book_signals",
-                    "whale_activity": "whale_activity",
-                    "second_prices": "second_prices",
-                    "patterns": "patterns",
-                }
-                section = section_map.get(section, section)
+        # Resolve legacy pre-entry aliases (e.g. entry_buy_pressure -> tx_buy_sell_pressure)
+        alias_key = field_name or field_column
+        if alias_key in PRE_ENTRY_ALIAS_MAP:
+            real_column, real_section = PRE_ENTRY_ALIAS_MAP[alias_key]
+            logger.debug("Resolved alias %s -> %s (section=%s)", alias_key, real_column, real_section)
+            field_column = real_column
+            section = real_section
+        else:
+            section = _get_section_from_field_column(field_column)
+            if not section:
+                section = filter_def.get("section")
+                if section:
+                    section_map = {
+                        "price_movements": "price_movements",
+                        "transactions": "transactions", 
+                        "order_book_signals": "order_book_signals",
+                        "whale_activity": "whale_activity",
+                        "second_prices": "second_prices",
+                        "patterns": "patterns",
+                        "micro_patterns": "micro_patterns",
+                        "btc_price_movements": "btc_price_movements",
+                        "eth_price_movements": "eth_price_movements",
+                        "cross_asset": "cross_asset",
+                        "thirty_second": "thirty_second",
+                        "micro_move": "micro_move",
+                        "pre_entry": "pre_entry",
+                    }
+                    section = section_map.get(section, section)
         
         if not section:
-            logger.warning("Could not determine section for filter id=%s", filter_id)
+            logger.warning("Could not determine section for filter id=%s, field=%s", filter_id, field_column or field_name)
             filter_results.append({
                 "filter_id": filter_id,
                 "filter_name": filter_name,
@@ -772,16 +812,24 @@ def validate_with_project_filters(
                 "from_value": float(from_value) if from_value is not None else None,
                 "to_value": float(to_value) if to_value is not None else None,
                 "actual_value": None,
-                "passed": False,
+                "passed": include_null,
                 "error": "no_minute_data",
             })
-            filters_failed += 1
+            if include_null:
+                filters_passed += 1
+            else:
+                filters_failed += 1
             continue
         
-        lookup_field = _get_field_name_from_column(field_column) or field_name
+        # For pre_entry section, the keys are stored as full column names (e.g. pre_entry_change_3m)
+        # For other sections, strip the prefix to get the field name (e.g. tx_buy_sell_pressure -> buy_sell_pressure)
+        if section == "pre_entry":
+            lookup_field = field_column or field_name
+        else:
+            lookup_field = _get_field_name_from_column(field_column) or field_name
         actual_value = minute_data.get(lookup_field)
         
-        passed = _evaluate_filter_condition(actual_value, from_value, to_value)
+        passed = _evaluate_filter_condition(actual_value, from_value, to_value, include_null=include_null)
         
         filter_result = {
             "filter_id": filter_id,

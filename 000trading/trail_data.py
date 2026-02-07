@@ -913,8 +913,9 @@ def flatten_trail_to_rows(buyin_id: int, trail_payload: Dict[str, Any]) -> List[
         # Set sub_minute for 30-second granularity
         row["sub_minute"] = sub_minute
         
-        # Add pre-entry data to interval 0 only
-        if interval == 0 and pre_entry_data:
+        # Add pre-entry data to ALL intervals (values are constant for the trade)
+        # This ensures pre-entry filters can be combined with filters at any interval
+        if pre_entry_data:
             row.update(pre_entry_data)
         
         rows.append(row)
@@ -975,10 +976,12 @@ def _get_all_columns() -> List[str]:
     pre_entry_cols = [
         "pre_entry_price_1m_before",
         "pre_entry_price_2m_before",
+        "pre_entry_price_3m_before",
         "pre_entry_price_5m_before",
         "pre_entry_price_10m_before",
         "pre_entry_change_1m",
         "pre_entry_change_2m",
+        "pre_entry_change_3m",
         "pre_entry_change_5m",
         "pre_entry_change_10m",
         "pre_entry_trend",
@@ -1144,6 +1147,8 @@ COLUMN_SECTION_MAP = {
     "xa_": "cross_asset",
     "ts_": "thirty_second",
     "mm_": "micro_move",
+    # Pre-entry price movement metrics
+    "pre_entry_": "pre_entry",
 }
 
 
@@ -1205,6 +1210,17 @@ def _get_filterable_columns() -> List[str]:
     columns.extend(CROSS_ASSET_FIELDS.values())
     columns.extend(THIRTY_SECOND_FIELDS.values())
     columns.extend(MICRO_MOVE_COMPOSITE_FIELDS.values())
+    
+    # Pre-entry price movement columns (percentage changes before entry)
+    # These flow through the auto-filter pipeline like all other columns
+    pre_entry_change_cols = [
+        "pre_entry_change_1m",
+        "pre_entry_change_2m",
+        "pre_entry_change_3m",
+        "pre_entry_change_5m",
+        "pre_entry_change_10m",
+    ]
+    columns.extend(pre_entry_change_cols)
     
     return columns
 

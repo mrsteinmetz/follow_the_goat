@@ -1052,9 +1052,9 @@ def detect_volume_divergence(
     early_price = price_sorted[:mid_point]
     late_price = price_sorted[mid_point:]
     
-    # Calculate average volume for each period
-    early_vol = np.mean([x.get('total_volume_usd', 0) for x in early_tx])
-    late_vol = np.mean([x.get('total_volume_usd', 0) for x in late_tx])
+    # Calculate average volume for each period (convert to float for Decimal safety)
+    early_vol = float(np.mean([float(x.get('total_volume_usd', 0) or 0) for x in early_tx]))
+    late_vol = float(np.mean([float(x.get('total_volume_usd', 0) or 0) for x in late_tx]))
     
     if early_vol <= 0:
         result["error"] = "no_early_volume"
@@ -1063,33 +1063,29 @@ def detect_volume_divergence(
     volume_increase_pct = ((late_vol - early_vol) / early_vol) * 100
     
     # Calculate price movement for each period
-    early_price_change = np.mean([x.get('price_change_1m', 0) for x in early_price])
-    late_price_change = np.mean([x.get('price_change_1m', 0) for x in late_price])
+    early_price_change = float(np.mean([float(x.get('price_change_1m', 0) or 0) for x in early_price]))
+    late_price_change = float(np.mean([float(x.get('price_change_1m', 0) or 0) for x in late_price]))
     
     # Calculate price volatility
-    early_volatility = np.mean([x.get('volatility_pct', 0) for x in early_price])
-    late_volatility = np.mean([x.get('volatility_pct', 0) for x in late_price])
+    early_volatility = float(np.mean([float(x.get('volatility_pct', 0) or 0) for x in early_price]))
+    late_volatility = float(np.mean([float(x.get('volatility_pct', 0) or 0) for x in late_price]))
     
     # Divergence occurs when:
     # 1. Volume is increasing (>15% increase)
     # 2. Price is flat or slightly declining (-0.3% to +0.2%)
     # 3. Volatility is decreasing (consolidation)
     
-    volume_increasing = volume_increase_pct > 15
+    volume_increasing = volume_increase_pct > 5  # Lowered from 15% to capture subtler accumulation
     price_consolidating = -0.3 <= late_price_change <= 0.2
     volatility_decreasing = late_volatility < early_volatility
     
-    if not volume_increasing:
-        result["error"] = "volume_not_increasing"
-        return result
-    
-    # Calculate buy pressure trend
-    buy_pressure_early = np.mean([x.get('buy_sell_pressure', 0) for x in early_tx])
-    buy_pressure_late = np.mean([x.get('buy_sell_pressure', 0) for x in late_tx])
+    # Calculate buy pressure trend (always compute for scoring)
+    buy_pressure_early = float(np.mean([float(x.get('buy_sell_pressure', 0) or 0) for x in early_tx]))
+    buy_pressure_late = float(np.mean([float(x.get('buy_sell_pressure', 0) or 0) for x in late_tx]))
     buy_pressure_improving = buy_pressure_late > buy_pressure_early
     
-    # Scoring
-    volume_score = min(1.0, volume_increase_pct / 50)  # Scale: 50% increase = 1.0
+    # Scoring -- always computed, even when volume isn't strongly increasing
+    volume_score = min(1.0, max(0.0, volume_increase_pct / 50))  # Scale: 50% increase = 1.0
     consolidation_score = 1.0 if price_consolidating else max(0, 1.0 - abs(late_price_change) / 0.5)
     volatility_score = 0.5 if volatility_decreasing else 0.0
     pressure_score = 0.3 if buy_pressure_improving else 0.0
@@ -1097,13 +1093,18 @@ def detect_volume_divergence(
     confidence = (volume_score * 0.4 + consolidation_score * 0.35 + volatility_score * 0.15 + pressure_score * 0.1)
     confidence = min(1.0, max(0.0, confidence))
     
-    if confidence >= 0.5:
+    # Always store the raw score for filter analysis, even below detection threshold
+    result["confidence"] = round(confidence, 3)
+    result["volume_increase_pct"] = round(volume_increase_pct, 2)
+    result["late_price_change"] = round(late_price_change, 4)
+    result["buy_pressure_trend"] = "improving" if buy_pressure_improving else "declining"
+    
+    if confidence >= 0.35:  # Lowered from 0.5 -- let auto-filters decide the real threshold
         result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["volume_increase_pct"] = round(volume_increase_pct, 2)
-        result["late_price_change"] = round(late_price_change, 4)
-        result["buy_pressure_trend"] = "improving" if buy_pressure_improving else "declining"
         result["interpretation"] = "Smart money accumulation - volume rising while price stable"
+    else:
+        logger.debug(f"Volume divergence: score={confidence:.3f} (vol_inc={volume_increase_pct:.1f}%, "
+                    f"price={late_price_change:.4f}%, vol_dec={volatility_decreasing})")
     
     return result
 
@@ -1162,42 +1163,43 @@ def detect_order_book_squeeze(order_book_rows: List[Dict[str, Any]]) -> Dict[str
         result["error"] = "invalid_ratio_baseline"
         return result
     
-    ratio_improving = late_ratio > early_ratio * 1.05  # 5% improvement
-    spread_tightening = late_spread < early_spread * 0.95 if early_spread else False  # 5% tighter
+    ratio_improving = late_ratio > early_ratio * 1.02  # Lowered from 5% to 2% improvement
+    spread_tightening = late_spread < early_spread * 0.97 if early_spread else False  # Lowered from 5% to 3%
     liquidity_stable = avg_liquidity_change > -5  # Not dropping significantly
     
-    if not ratio_improving:
-        result["error"] = "ratio_not_improving"
-        return result
-    
-    # Calculate volume imbalance trend
+    # Calculate volume imbalance trend (always compute)
     early_vol_imbalance = np.mean([_to_float(x.get('volume_imbalance', 0), 0.0) for x in early])
     late_vol_imbalance = np.mean([_to_float(x.get('volume_imbalance', 0), 0.0) for x in late])
     vol_imbalance_improving = late_vol_imbalance > early_vol_imbalance
     
-    # Scoring
+    # Scoring -- always computed
     ratio_change_pct = ((late_ratio - early_ratio) / early_ratio) * 100
-    ratio_score = min(1.0, ratio_change_pct / 20)  # 20% improvement = 1.0
+    ratio_score = min(1.0, max(0.0, ratio_change_pct / 20))  # 20% improvement = 1.0
     
     if early_spread:
         spread_change_pct = ((early_spread - late_spread) / early_spread) * 100
-        spread_score = min(1.0, spread_change_pct / 10) if spread_tightening else 0
+        spread_score = min(1.0, max(0.0, spread_change_pct / 10)) if spread_tightening else 0
     else:
         spread_change_pct = 0
         spread_score = 0
     
-    liquidity_score = min(1.0, (avg_liquidity_change + 10) / 20) if liquidity_stable else 0
+    liquidity_score = min(1.0, max(0.0, (avg_liquidity_change + 10) / 20)) if liquidity_stable else 0
     imbalance_score = 0.2 if vol_imbalance_improving else 0
     
     confidence = (ratio_score * 0.45 + spread_score * 0.30 + liquidity_score * 0.15 + imbalance_score * 0.10)
     confidence = min(1.0, max(0.0, confidence))
     
-    if confidence >= 0.5:
+    # Always store raw score for filter analysis
+    result["confidence"] = round(confidence, 3)
+    result["ratio_change_pct"] = round(ratio_change_pct, 2)
+    result["spread_tightening_pct"] = round(spread_change_pct, 2) if spread_tightening else 0
+    
+    if confidence >= 0.35:  # Lowered from 0.5
         result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["ratio_change_pct"] = round(ratio_change_pct, 2)
-        result["spread_tightening_pct"] = round(spread_change_pct, 2) if spread_tightening else 0
         result["interpretation"] = "Order book squeeze - buyers stepping up, sellers backing off"
+    else:
+        logger.debug(f"Order book squeeze: score={confidence:.3f} (ratio_chg={ratio_change_pct:.1f}%, "
+                    f"spread_tight={spread_tightening}, liq_stable={liquidity_stable})")
     
     return result
 
@@ -1233,18 +1235,18 @@ def detect_whale_stealth_accumulation(
     recent_whale = whale_sorted[-7:] if len(whale_sorted) >= 7 else whale_sorted[-5:]
     recent_price = price_sorted[-7:] if len(price_sorted) >= 7 else price_sorted[-5:]
     
-    # Calculate net flow ratio trend
-    net_flow_ratios = [x.get('net_flow_ratio', 0) for x in recent_whale]
-    net_flow_trend = np.mean(net_flow_ratios)
+    # Calculate net flow ratio trend (convert to float for Decimal safety)
+    net_flow_ratios = [float(x.get('net_flow_ratio', 0) or 0) for x in recent_whale]
+    net_flow_trend = float(np.mean(net_flow_ratios))
     
     # Calculate strong accumulation percentage
-    strong_acc_pcts = [x.get('strong_accumulation_pct', 0) for x in recent_whale]
-    avg_strong_acc = np.mean(strong_acc_pcts)
+    strong_acc_pcts = [float(x.get('strong_accumulation_pct', 0) or 0) for x in recent_whale]
+    avg_strong_acc = float(np.mean(strong_acc_pcts))
     
-    # Calculate price stability
-    price_changes = [x.get('price_change_1m', 0) for x in recent_price]
-    avg_price_change = np.mean(price_changes)
-    price_volatility = np.std(price_changes)
+    # Calculate price stability (convert to float to avoid Decimal arithmetic issues)
+    price_changes = [float(x.get('price_change_1m', 0) or 0) for x in recent_price]
+    avg_price_change = float(np.mean(price_changes))
+    price_volatility = float(np.std(price_changes))
     
     # Stealth accumulation occurs when:
     # 1. Net flow ratio is increasingly positive (>0.3)
@@ -1252,23 +1254,19 @@ def detect_whale_stealth_accumulation(
     # 3. Price is stable or declining (-0.3% to +0.2%)
     # 4. Price volatility is low
     
-    net_flow_positive = net_flow_trend > 0.3
-    accumulation_significant = avg_strong_acc > 10
+    net_flow_positive = net_flow_trend > 0.1  # Lowered from 0.3 to capture subtler accumulation
+    accumulation_significant = avg_strong_acc > 5  # Lowered from 10
     price_stable = -0.3 <= avg_price_change <= 0.2
     low_volatility = price_volatility < 0.3
     
-    if not net_flow_positive:
-        result["error"] = "net_flow_not_positive"
-        return result
+    # Calculate accumulation ratio trend (always compute)
+    acc_ratios = [float(x.get('accumulation_ratio', 1.0) or 1.0) for x in recent_whale]
+    avg_acc_ratio = float(np.mean(acc_ratios))
+    acc_ratio_improving = avg_acc_ratio > 1.5  # Lowered from 2.0
     
-    # Calculate accumulation ratio trend
-    acc_ratios = [x.get('accumulation_ratio', 1.0) for x in recent_whale]
-    avg_acc_ratio = np.mean(acc_ratios)
-    acc_ratio_improving = avg_acc_ratio > 2.0  # More than 2x inflow vs outflow
-    
-    # Scoring
-    net_flow_score = min(1.0, net_flow_trend / 0.7)  # 0.7 net flow = 1.0
-    accumulation_score = min(1.0, avg_strong_acc / 30)  # 30% strong acc = 1.0
+    # Scoring -- always computed
+    net_flow_score = min(1.0, max(0.0, net_flow_trend / 0.7))  # 0.7 net flow = 1.0
+    accumulation_score = min(1.0, max(0.0, avg_strong_acc / 30))  # 30% strong acc = 1.0
     stability_score = 1.0 if price_stable else max(0, 1.0 - abs(avg_price_change) / 0.5)
     volatility_score = max(0, 1.0 - price_volatility / 0.5) if low_volatility else 0
     ratio_score = 0.2 if acc_ratio_improving else 0
@@ -1282,14 +1280,19 @@ def detect_whale_stealth_accumulation(
     )
     confidence = min(1.0, max(0.0, confidence))
     
-    if confidence >= 0.5:
+    # Always store raw score for filter analysis
+    result["confidence"] = round(confidence, 3)
+    result["net_flow_ratio"] = round(net_flow_trend, 3)
+    result["strong_accumulation_pct"] = round(avg_strong_acc, 2)
+    result["price_change"] = round(avg_price_change, 4)
+    result["accumulation_ratio"] = round(avg_acc_ratio, 2)
+    
+    if confidence >= 0.35:  # Lowered from 0.5
         result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["net_flow_ratio"] = round(net_flow_trend, 3)
-        result["strong_accumulation_pct"] = round(avg_strong_acc, 2)
-        result["price_change"] = round(avg_price_change, 4)
-        result["accumulation_ratio"] = round(avg_acc_ratio, 2)
         result["interpretation"] = "Whale stealth accumulation - smart money buying without price impact"
+    else:
+        logger.debug(f"Whale stealth: score={confidence:.3f} (net_flow={net_flow_trend:.3f}, "
+                    f"strong_acc={avg_strong_acc:.1f}%, price_chg={avg_price_change:.4f}%)")
     
     return result
 
@@ -1356,20 +1359,16 @@ def detect_momentum_acceleration(price_rows: List[Dict[str, Any]]) -> Dict[str, 
     trend_sustained = avg_price_change_5m > avg_price_change_1m
     volatility_decreasing = late_vol < early_vol
     
-    if not acceleration_improving:
-        result["error"] = "acceleration_not_improving"
-        return result
-    
-    # Calculate momentum volatility ratio trend
+    # Calculate momentum volatility ratio trend (always compute)
     mvr_values = [_to_float(x.get('momentum_volatility_ratio', 0), 0.0) for x in sorted_rows[-5:]]
     avg_mvr = np.mean(mvr_values)
     mvr_positive = avg_mvr > 0
     
-    # Scoring
+    # Scoring -- always computed, no hard gate on acceleration
     accel_change = avg_late_accel - avg_early_accel
-    accel_score = min(1.0, abs(accel_change) / 0.3)  # 0.3% acceleration = 1.0
+    accel_score = min(1.0, max(0.0, abs(accel_change) / 0.3)) if acceleration_improving else 0
     
-    price_score = min(1.0, avg_price_change_1m / 0.3) if price_positive else 0
+    price_score = min(1.0, max(0.0, avg_price_change_1m / 0.3)) if price_positive else 0
     trend_score = 0.3 if trend_sustained else 0
     vol_score = 0.2 if volatility_decreasing else 0
     mvr_score = 0.15 if mvr_positive else 0
@@ -1383,13 +1382,18 @@ def detect_momentum_acceleration(price_rows: List[Dict[str, Any]]) -> Dict[str, 
     )
     confidence = min(1.0, max(0.0, confidence))
     
-    if confidence >= 0.5:
+    # Always store raw score for filter analysis
+    result["confidence"] = round(confidence, 3)
+    result["momentum_acceleration"] = round(avg_late_accel, 4)
+    result["price_change_1m"] = round(avg_price_change_1m, 4)
+    result["price_change_5m"] = round(avg_price_change_5m, 4)
+    
+    if confidence >= 0.35:  # Lowered from 0.5
         result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["momentum_acceleration"] = round(avg_late_accel, 4)
-        result["price_change_1m"] = round(avg_price_change_1m, 4)
-        result["price_change_5m"] = round(avg_price_change_5m, 4)
         result["interpretation"] = "Momentum accelerating - trend gaining strength"
+    else:
+        logger.debug(f"Momentum accel: score={confidence:.3f} (accel_chg={accel_change:.4f}, "
+                    f"price_1m={avg_price_change_1m:.4f}%, improving={acceleration_improving})")
     
     return result
 
@@ -1438,21 +1442,21 @@ def detect_microstructure_shift(
     recent_tx = tx_sorted[-5:]
     recent_whale = whale_sorted[-3:] if len(whale_sorted) >= 3 else whale_sorted
     
-    # === ORDER BOOK COMPONENT ===
-    volume_imbalances = [x.get('volume_imbalance', 0) for x in recent_ob]
-    avg_vol_imbalance = np.mean(volume_imbalances)
+    # === ORDER BOOK COMPONENT === (convert to float for Decimal safety)
+    volume_imbalances = [float(x.get('volume_imbalance', 0) or 0) for x in recent_ob]
+    avg_vol_imbalance = float(np.mean(volume_imbalances))
     vol_imbalance_positive = avg_vol_imbalance > 0.1
     
-    depth_ratios = [x.get('depth_imbalance_ratio', 1.0) for x in recent_ob]
-    avg_depth_ratio = np.mean(depth_ratios)
+    depth_ratios = [float(x.get('depth_imbalance_ratio', 1.0) or 1.0) for x in recent_ob]
+    avg_depth_ratio = float(np.mean(depth_ratios))
     depth_ratio_bullish = avg_depth_ratio > 1.05  # Bids > asks by 5%
     
-    microprice_devs = [x.get('microprice_deviation', 0) for x in recent_ob]
-    avg_microprice_dev = np.mean(microprice_devs)
+    microprice_devs = [float(x.get('microprice_deviation', 0) or 0) for x in recent_ob]
+    avg_microprice_dev = float(np.mean(microprice_devs))
     microprice_bullish = avg_microprice_dev > 0
     
-    aggression_ratios = [x.get('aggression_ratio', 1.0) for x in recent_ob]
-    avg_aggression = np.mean(aggression_ratios)
+    aggression_ratios = [float(x.get('aggression_ratio', 1.0) or 1.0) for x in recent_ob]
+    avg_aggression = float(np.mean(aggression_ratios))
     aggression_bullish = avg_aggression > 1.0  # Bids more aggressive
     
     ob_score = sum([
@@ -1469,21 +1473,21 @@ def detect_microstructure_shift(
         "microprice_dev": round(avg_microprice_dev, 3)
     }
     
-    # === TRANSACTION COMPONENT ===
-    buy_pressures = [x.get('buy_sell_pressure', 0) for x in recent_tx]
-    avg_buy_pressure = np.mean(buy_pressures)
+    # === TRANSACTION COMPONENT === (convert to float for Decimal safety)
+    buy_pressures = [float(x.get('buy_sell_pressure', 0) or 0) for x in recent_tx]
+    avg_buy_pressure = float(np.mean(buy_pressures))
     buy_pressure_positive = avg_buy_pressure > 0.15
     
-    volume_accel = [x.get('volume_acceleration_ratio', 1.0) for x in recent_tx]
-    avg_vol_accel = np.mean(volume_accel)
+    volume_accel = [float(x.get('volume_acceleration_ratio', 1.0) or 1.0) for x in recent_tx]
+    avg_vol_accel = float(np.mean(volume_accel))
     volume_accelerating = avg_vol_accel > 1.1  # 10% increase
     
-    whale_vol_pcts = [x.get('whale_volume_pct', 0) for x in recent_tx]
-    avg_whale_vol = np.mean(whale_vol_pcts)
+    whale_vol_pcts = [float(x.get('whale_volume_pct', 0) or 0) for x in recent_tx]
+    avg_whale_vol = float(np.mean(whale_vol_pcts))
     whale_participation = avg_whale_vol > 20  # Whales active
     
-    buy_trade_pcts = [x.get('buy_trade_pct', 50) for x in recent_tx]
-    avg_buy_trade_pct = np.mean(buy_trade_pcts)
+    buy_trade_pcts = [float(x.get('buy_trade_pct', 50) or 50) for x in recent_tx]
+    avg_buy_trade_pct = float(np.mean(buy_trade_pcts))
     buy_trades_dominant = avg_buy_trade_pct > 55
     
     tx_score = sum([
@@ -1500,17 +1504,17 @@ def detect_microstructure_shift(
         "whale_volume_pct": round(avg_whale_vol, 2)
     }
     
-    # === WHALE COMPONENT ===
-    net_flow_ratios = [x.get('net_flow_ratio', 0) for x in recent_whale]
-    avg_net_flow = np.mean(net_flow_ratios)
+    # === WHALE COMPONENT === (convert to float for Decimal safety)
+    net_flow_ratios = [float(x.get('net_flow_ratio', 0) or 0) for x in recent_whale]
+    avg_net_flow = float(np.mean(net_flow_ratios))
     net_flow_bullish = avg_net_flow > 0.2
     
-    acc_ratios = [x.get('accumulation_ratio', 1.0) for x in recent_whale]
-    avg_acc_ratio = np.mean(acc_ratios)
+    acc_ratios = [float(x.get('accumulation_ratio', 1.0) or 1.0) for x in recent_whale]
+    avg_acc_ratio = float(np.mean(acc_ratios))
     accumulation_strong = avg_acc_ratio > 1.5
     
-    strong_acc_pcts = [x.get('strong_accumulation_pct', 0) for x in recent_whale]
-    avg_strong_acc = np.mean(strong_acc_pcts)
+    strong_acc_pcts = [float(x.get('strong_accumulation_pct', 0) or 0) for x in recent_whale]
+    avg_strong_acc = float(np.mean(strong_acc_pcts))
     strong_acc_present = avg_strong_acc > 5
     
     whale_score = sum([
@@ -1531,20 +1535,25 @@ def detect_microstructure_shift(
     aggregate_score = (ob_score * 0.35 + tx_score * 0.40 + whale_score * 0.25)
     
     # Additional bonus for all three aligned
-    all_aligned = (ob_score > 0.6 and tx_score > 0.6 and whale_score > 0.6)
+    all_aligned = (ob_score > 0.5 and tx_score > 0.5 and whale_score > 0.5)  # Lowered from 0.6
     if all_aligned:
         aggregate_score = min(1.0, aggregate_score * 1.15)  # 15% bonus
     
     confidence = min(1.0, max(0.0, aggregate_score))
     
-    if confidence >= 0.5:
+    # Always store raw score for filter analysis
+    result["confidence"] = round(confidence, 3)
+    result["all_aligned"] = all_aligned
+    
+    if confidence >= 0.35:  # Lowered from 0.5
         result["detected"] = True
-        result["confidence"] = round(confidence, 3)
-        result["all_aligned"] = all_aligned
         result["interpretation"] = (
             "Strong microstructure shift - all signals aligned bullishly" if all_aligned
             else "Microstructure shift detected - majority of signals bullish"
         )
+    else:
+        logger.debug(f"Microstructure shift: score={confidence:.3f} (ob={ob_score:.3f}, "
+                    f"tx={tx_score:.3f}, whale={whale_score:.3f})")
     
     return result
 

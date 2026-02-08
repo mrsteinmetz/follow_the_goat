@@ -92,7 +92,7 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         "process_price_cycles": IntervalJobSpec("process_price_cycles", 2.0, process_price_cycles_job),
         "follow_the_goat": IntervalJobSpec("follow_the_goat", 1.0, run_follow_the_goat),
         "trailing_stop_seller": IntervalJobSpec("trailing_stop_seller", 1.0, run_trailing_stop_seller),
-        "train_validator": IntervalJobSpec("train_validator", 20.0, run_train_validator),
+        "train_validator": IntervalJobSpec("train_validator", 5.0, run_train_validator),
         "update_potential_gains": IntervalJobSpec("update_potential_gains", 15.0, run_update_potential_gains),
         "create_new_patterns": IntervalJobSpec("create_new_patterns", 600.0, run_create_new_patterns),
         "create_profiles": IntervalJobSpec("create_profiles", 30.0, run_create_profiles),

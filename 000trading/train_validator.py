@@ -68,6 +68,7 @@ from pre_entry_price_movement import (
 PLAY_ID = int(os.getenv("TRAIN_VALIDATOR_PLAY_ID", "46"))
 TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "15"))
 TRAINING_ENABLED = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
+PUMP_SIGNAL_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "0"))
 
 # Setup logging
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -942,6 +943,19 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         if not trail_success:
             logger.warning("Trail generation failed - continuing with validation anyway")
             # Don't abort - trail generation failure shouldn't stop validation
+        
+        # 4.5 Pump signal check (if enabled)
+        if PUMP_SIGNAL_PLAY_ID and trail_success:
+            try:
+                from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
+                maybe_refresh_rules()  # refreshes every 5 min, no-op otherwise
+                check_and_fire_pump_signal(
+                    buyin_id=buyin_id,
+                    market_price=market_price,
+                    price_cycle=price_cycle,
+                )
+            except Exception as pump_err:
+                logger.error(f"Pump signal check error (non-fatal): {pump_err}", exc_info=True)
         
         # 5. Run validation
         validation_result = run_validation(buyin_id, play_config, step_logger)

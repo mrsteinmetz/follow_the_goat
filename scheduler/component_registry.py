@@ -24,7 +24,7 @@ DEFAULT_COMPONENT_DEFS = [
     # master2.py jobs
     ComponentDef("follow_the_goat", "job", "master2", "Follow The Goat - Wallet Tracker (every 1s)", expected_interval_ms=1000),
     ComponentDef("trailing_stop_seller", "job", "master2", "Trailing Stop Seller (every 1s)", expected_interval_ms=1000),
-    ComponentDef("train_validator", "job", "master2", "Train Validator (every 20s)", expected_interval_ms=20000),
+    ComponentDef("train_validator", "job", "master2", "Train Validator (every 5s)", expected_interval_ms=5000),
     ComponentDef("update_potential_gains", "job", "master2", "Update Potential Gains (every 15s)", expected_interval_ms=15000),
     ComponentDef("create_new_patterns", "job", "master2", "Create New Patterns (every 10 min)", expected_interval_ms=600000),
     ComponentDef("create_profiles", "job", "master2", "Create Wallet Profiles (every 30s)", expected_interval_ms=30000),

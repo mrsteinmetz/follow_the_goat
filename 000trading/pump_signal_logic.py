@@ -38,32 +38,44 @@ logger = logging.getLogger("train_validator.pump_signal")
 # =============================================================================
 
 TRADE_COST_PCT = 0.1           # Cost per wrong trade (%)
-MIN_PUMP_PCT = 0.3             # Min forward return to label as continuation (up from 0.2)
+MIN_PUMP_PCT = 0.3             # Min forward return to label as clean pump (0.3%)
+MAX_DRAWDOWN_PCT = 0.15        # Max acceptable dip in path to peak (0.15%)
 FORWARD_WINDOW = 10            # Look N minutes ahead for forward returns
-LOOKBACK_HOURS = 48            # Hours of historical data for rule calculation
+LOOKBACK_HOURS = 72            # Hours of historical data for rule calculation (was 48)
 TRAIN_FRAC = 0.70              # Train/test time-based split
 RULES_REFRESH_INTERVAL = 300   # Re-calculate rules every 5 minutes
-MIN_PRECISION = 95.0           # Minimum test precision to accept a combo
-COOLDOWN_SECONDS = 120         # Don't re-enter within 2 minutes
+MIN_PRECISION = 45.0           # Min test precision (breakeven=23.5%, 45% is 2x margin)
+COOLDOWN_SECONDS = 300         # Don't re-enter within 5 minutes (was 120)
 
-# ── Uptrend gate thresholds ──────────────────────────────────────────────────
-# These must ALL pass BEFORE statistical filters are even checked.
-# The idea: only enter when the wave is already going up, then filters
-# confirm the wave will keep going.
+# ── Safety gate thresholds ────────────────────────────────────────────────────
+# IMPORTANT: Data analysis on ~10k trail snapshots shows that uptrend gates
+# provide ZERO selectivity between clean pumps and non-pumps:
+#   - pm_price_change_1m > 0: passes 45% clean, 46% no-pump (useless)
+#   - pm_price_change_5m > 0: passes 44% clean, 49% no-pump (negative select!)
+#   - micro-trend 15s/30s: similarly useless
 #
-# We use a real-time price buffer (updated every ~5s) for fast micro-trend
-# detection, plus trail data for broader trend confirmation.
-MICRO_TREND_15S_MIN = 0.005    # Price must be up >= 0.005% over last 15 seconds
-MICRO_TREND_30S_MIN = 0.01     # Price must be up >= 0.01% over last 30 seconds
-MIN_5M_CLIMB = 0.0             # pm_price_change_5m must be > 0 (broader uptrend)
+# Clean pumps start from FLAT price action (avg pre-1m change = -0.002%),
+# not from already-rising prices. Requiring uptrend gates actually BLOCKS
+# most clean pumps while providing no filtering of bad entries.
+#
+# Instead, we use SAFETY-ONLY gates (prevent entry during crashes) and let
+# the STATISTICAL FILTERS (200+ features: order book, cross-asset correlation,
+# volatility, patterns) do the selection -- they have features with Cohen's d
+# of 0.25-0.50 that genuinely distinguish clean pumps from noise.
+#
+# Real-time price buffer is still maintained for the safety crash check.
+CRASH_GATE_5M = -0.3           # Don't enter if 5m change < -0.3% (crash protection)
+CRASH_GATE_MICRO_30S = -0.05   # Don't enter if 30s trend < -0.05% (active selloff)
 PRICE_BUFFER_MAX_AGE = 600     # Keep 10 min of price history in memory
 
-# Columns to never use as filters (metadata, labels, computed)
+# Columns to never use as filters (metadata, labels, computed, forward-looking)
 SKIP_COLUMNS = frozenset([
     'buyin_id', 'trade_id', 'play_id', 'wallet_address', 'followed_at',
     'our_status', 'minute', 'sub_minute', 'interval_idx',
     'potential_gains', 'pat_detected_list', 'pat_swing_trend',
     'is_good', 'label', 'created_at', 'pre_entry_trend',
+    # Forward-looking columns from DuckDB analysis -- NOT available in live trail data
+    'max_fwd_return', 'min_fwd_return',
 ])
 
 # Absolute price columns -- won't generalize across time
@@ -94,6 +106,16 @@ _active_rules: List[Dict[str, Any]] = []     # [{"column": str, "from_val": floa
 _rules_metadata: Dict[str, Any] = {}         # precision, n_signals, timestamp, etc.
 _last_rules_refresh: float = 0.0
 _last_entry_time: float = 0.0
+_last_gate_summary_time: float = 0.0
+_gate_stats: Dict[str, int] = {              # Track gate failure reasons for periodic summary
+    'no_rules': 0,
+    'crash_gate_fail': 0,
+    'crash_5m_fail': 0,
+    'gates_passed': 0,
+    'filters_fail': 0,
+    'signal_fired': 0,
+    'total_checks': 0,
+}
 
 # Real-time price buffer: stores (timestamp, price) every ~5 seconds.
 # This gives us instant micro-trend detection (10s, 15s, 30s windows)
@@ -127,26 +149,29 @@ def _get_micro_trend(seconds: int) -> Optional[float]:
     return None
 
 
-def _is_price_trending_up() -> Tuple[bool, str]:
+def _is_not_crashing() -> Tuple[bool, str]:
     """
-    Check if the real-time price buffer shows a genuine uptrend.
+    Safety check: ensure we're NOT in an active crash/selloff.
+
+    This is deliberately permissive -- data analysis showed that uptrend gates
+    provide zero selectivity (clean pumps start from flat, not rising prices).
+    We only block entry during genuine selloffs.
 
     Returns:
         (passed, description) where description shows the micro-trend values.
     """
-    trend_15s = _get_micro_trend(15)
     trend_30s = _get_micro_trend(30)
 
-    if trend_15s is None or trend_30s is None:
-        return False, f"insufficient data (buffer={len(_price_buffer)})"
+    if trend_30s is None:
+        # Not enough buffer data yet -- allow entry (filters will decide)
+        if len(_price_buffer) < 3:
+            return False, f"insufficient data (buffer={len(_price_buffer)})"
+        return True, f"buffer warming up ({len(_price_buffer)} samples)"
 
-    if trend_15s < MICRO_TREND_15S_MIN:
-        return False, f"15s={trend_15s:+.4f}% < {MICRO_TREND_15S_MIN}%"
+    if trend_30s < CRASH_GATE_MICRO_30S:
+        return False, f"30s={trend_30s:+.4f}% < {CRASH_GATE_MICRO_30S}% (active selloff)"
 
-    if trend_30s < MICRO_TREND_30S_MIN:
-        return False, f"30s={trend_30s:+.4f}% < {MICRO_TREND_30S_MIN}%"
-
-    return True, f"15s={trend_15s:+.4f}%, 30s={trend_30s:+.4f}%"
+    return True, f"30s={trend_30s:+.4f}%"
 
 
 # =============================================================================
@@ -233,6 +258,9 @@ def _load_and_label_data_duckdb() -> Optional[pd.DataFrame]:
 
         coalesce_parts = [f"COALESCE(fwd_return_{k}m, -9999)" for k in range(1, FORWARD_WINDOW + 1)]
         greatest_expr = f"GREATEST({', '.join(coalesce_parts)})"
+        # For min_fwd_return, use 9999 so missing values don't dominate LEAST
+        coalesce_parts_min = [f"COALESCE(fwd_return_{k}m, 9999)" for k in range(1, FORWARD_WINDOW + 1)]
+        least_expr = f"LEAST({', '.join(coalesce_parts_min)})"
         any_not_null = " OR ".join(
             [f"fwd_return_{k}m IS NOT NULL" for k in range(1, FORWARD_WINDOW + 1)]
         )
@@ -256,34 +284,48 @@ def _load_and_label_data_duckdb() -> Optional[pd.DataFrame]:
                 CASE WHEN {any_not_null}
                      THEN {greatest_expr}
                      ELSE NULL
-                END AS max_fwd_return
+                END AS max_fwd_return,
+                CASE WHEN {any_not_null}
+                     THEN {least_expr}
+                     ELSE NULL
+                END AS min_fwd_return
             FROM raw_fwd
             WHERE ({any_not_null})
         """)
 
         # 5) Label and pull to pandas
-        # IMPORTANT: Only label as pump_continuation/pump_reversal when there's
-        # a GENUINE uptrend. We use pm_price_velocity_30s > 0 (fastest trail
-        # signal, 30s window) PLUS pm_price_change_5m > 0 (broader trend).
-        # This matches the real-time signal check which uses our price buffer
-        # for fast detection + 5m trail data for broader confirmation.
+        # Label as pump_continuation/pump_reversal when 5m trend is positive.
+        #
+        # CRITICAL FIX: Drawdown-aware labeling.
+        # Previously, we only checked max_fwd_return (the PEAK in next 10 min).
+        # This caused look-ahead bias: the backtest said "price will reach +0.5%"
+        # but didn't check if price DIPPED below our stop-loss first.
+        #
+        # Now we ALSO check min_fwd_return (the worst dip in next 10 min).
+        # A moment is only labeled 'pump_continuation' if:
+        #   1. Peak return reaches MIN_PUMP_PCT (price goes up enough)
+        #   2. Worst dip stays above -MAX_DRAWDOWN_PCT (doesn't trigger stop-loss)
+        #
+        # NOTE: We do NOT require pm_price_change_5m > 0. Data analysis showed
+        # the 5m gate has NEGATIVE selectivity (passes 49% no-pumps vs 44%
+        # clean pumps). Clean pumps start from flat prices, not uptrends.
+        # We only exclude active crashes (< CRASH_GATE_5M = -0.3%).
         df = con.execute(f"""
             SELECT
                 t.*,
                 b.followed_at,
                 f.max_fwd_return,
+                f.min_fwd_return,
                 CASE
-                    WHEN t.pm_price_velocity_30s IS NOT NULL
-                         AND t.pm_price_velocity_30s > 0
-                         AND t.pm_price_change_5m IS NOT NULL
-                         AND t.pm_price_change_5m > {MIN_5M_CLIMB}
+                    WHEN (t.pm_price_change_5m IS NULL
+                          OR t.pm_price_change_5m > {CRASH_GATE_5M})
                          AND f.max_fwd_return > {MIN_PUMP_PCT}
+                         AND f.min_fwd_return > -{MAX_DRAWDOWN_PCT}
                         THEN 'pump_continuation'
-                    WHEN t.pm_price_velocity_30s IS NOT NULL
-                         AND t.pm_price_velocity_30s > 0
-                         AND t.pm_price_change_5m IS NOT NULL
-                         AND t.pm_price_change_5m > {MIN_5M_CLIMB}
-                         AND f.max_fwd_return <= {MIN_PUMP_PCT}
+                    WHEN (t.pm_price_change_5m IS NULL
+                          OR t.pm_price_change_5m > {CRASH_GATE_5M})
+                         AND (f.max_fwd_return <= {MIN_PUMP_PCT}
+                              OR f.min_fwd_return <= -{MAX_DRAWDOWN_PCT})
                         THEN 'pump_reversal'
                     ELSE 'no_pump'
                 END AS label
@@ -304,6 +346,15 @@ def _load_and_label_data_duckdb() -> Optional[pd.DataFrame]:
         for lbl in ['pump_continuation', 'pump_reversal', 'no_pump']:
             cnt = label_counts.get(lbl, 0)
             logger.info(f"    {lbl}: {cnt:,}")
+
+        # Log drawdown stats for pump_continuation (shows quality of labels)
+        cont_mask = df['label'] == 'pump_continuation'
+        if cont_mask.sum() > 0:
+            cont_df = df[cont_mask]
+            logger.info(f"    pump_continuation stats:")
+            logger.info(f"      avg max_fwd_return: {cont_df['max_fwd_return'].mean():.4f}%")
+            logger.info(f"      avg min_fwd_return: {cont_df['min_fwd_return'].mean():.4f}%")
+            logger.info(f"      worst dip (min of min_fwd): {cont_df['min_fwd_return'].min():.4f}%")
 
         return df
 
@@ -710,6 +761,32 @@ def maybe_refresh_rules():
 # SIGNAL CHECK & BUYIN INSERTION (every cycle)
 # =============================================================================
 
+def _log_gate_summary() -> None:
+    """Log a periodic summary of gate pass/fail stats (every 60s)."""
+    global _last_gate_summary_time
+    now = time.time()
+    if now - _last_gate_summary_time < 60:
+        return
+    _last_gate_summary_time = now
+
+    total = _gate_stats['total_checks']
+    if total == 0:
+        return
+
+    logger.info(
+        f"Pump gate summary (last 60s): {total} checks | "
+        f"no_rules={_gate_stats['no_rules']}, "
+        f"crash_30s={_gate_stats['crash_gate_fail']}, "
+        f"crash_5m={_gate_stats['crash_5m_fail']}, "
+        f"gates_ok={_gate_stats['gates_passed']}, "
+        f"filters_fail={_gate_stats['filters_fail']}, "
+        f"FIRED={_gate_stats['signal_fired']}"
+    )
+    # Reset counters
+    for k in _gate_stats:
+        _gate_stats[k] = 0
+
+
 def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     """
     Evaluate real-time price + trail data against uptrend gates and filter rules.
@@ -729,27 +806,35 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     Returns:
         True if all gates + filter rules pass (pump signal fires), False otherwise
     """
+    _gate_stats['total_checks'] += 1
+
     if not _active_rules:
+        _gate_stats['no_rules'] += 1
         return False
 
-    # ── Phase 1: Uptrend Gate ────────────────────────────────────────────
-    # ALL of these must pass. We only ride waves going UP.
+    # ── Phase 1: Safety Gates (crash protection only) ───────────────────
+    # Data analysis proved that uptrend gates provide ZERO selectivity
+    # between clean pumps and no-pumps (both pass at ~45-50% rate).
+    # Clean pumps start from FLAT prices, not rising ones.
+    #
+    # We only block entry during active crashes/selloffs.
+    # The STATISTICAL FILTERS (Phase 2) do all the real selection.
 
-    # Gate 1: Real-time micro-trend (15s + 30s from price buffer)
-    # This is the FASTEST possible trend detection -- no 30s trail lag.
-    uptrend_ok, uptrend_desc = _is_price_trending_up()
-    if not uptrend_ok:
+    # Gate 1: Not in active selloff (30s micro-trend)
+    crash_ok, crash_desc = _is_not_crashing()
+    if not crash_ok:
+        _gate_stats['crash_gate_fail'] += 1
+        logger.debug(f"Pump: crash gate FAILED ({crash_desc})")
         return False
 
-    # Gate 2: 5-minute trend from trail data (broader trend confirmation)
+    # Gate 2: Not in a broader crash (5m change)
     pm_5m = trail_row.get('pm_price_change_5m')
-    if pm_5m is None or float(pm_5m) <= MIN_5M_CLIMB:
+    if pm_5m is not None and float(pm_5m) < CRASH_GATE_5M:
+        _gate_stats['crash_5m_fail'] += 1
+        logger.debug(f"Pump: 5m crash gate FAILED (pm_price_change_5m={pm_5m} < {CRASH_GATE_5M}%)")
         return False
-    pm_5m_f = float(pm_5m)
 
-    # Log that we passed uptrend gates (this is relatively rare)
-    logger.info(f"Pump: uptrend gates PASSED (buffer: {uptrend_desc}, "
-                f"5m={pm_5m_f:+.4f}%)")
+    _gate_stats['gates_passed'] += 1
 
     # ── Phase 2: Statistical Filter Confirmation ─────────────────────────
     # Now check if the active filter rules confirm the uptrend will continue.
@@ -769,10 +854,12 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
             failed_filters.append(f"{col}={val_f:.4f} not in [{rule['from_val']:.4f}, {rule['to_val']:.4f}]")
 
     if failed_filters:
+        _gate_stats['filters_fail'] += 1
         logger.info(f"Pump: filters NOT met ({len(failed_filters)} failed: "
                     f"{', '.join(failed_filters[:3])})")
         return False
 
+    _gate_stats['signal_fired'] += 1
     logger.info(f"Pump: ALL CHECKS PASSED - uptrend confirmed + {len(_active_rules)} filters matched!")
     return True
 
@@ -828,6 +915,7 @@ def check_and_fire_pump_signal(
 
     # Evaluate signal
     signal_fires = check_pump_signal(trail_row, market_price)
+    _log_gate_summary()
 
     filter_summary = {r['column']: f"[{r['from_val']}, {r['to_val']}]" for r in _active_rules}
     if not signal_fires:

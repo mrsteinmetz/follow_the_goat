@@ -944,19 +944,6 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
             logger.warning("Trail generation failed - continuing with validation anyway")
             # Don't abort - trail generation failure shouldn't stop validation
         
-        # 4.5 Pump signal check (if enabled)
-        if PUMP_SIGNAL_PLAY_ID and trail_success:
-            try:
-                from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
-                maybe_refresh_rules()  # refreshes every 5 min, no-op otherwise
-                check_and_fire_pump_signal(
-                    buyin_id=buyin_id,
-                    market_price=market_price,
-                    price_cycle=price_cycle,
-                )
-            except Exception as pump_err:
-                logger.error(f"Pump signal check error (non-fatal): {pump_err}", exc_info=True)
-        
         # 5. Run validation
         validation_result = run_validation(buyin_id, play_config, step_logger)
         
@@ -968,6 +955,24 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         
         # 6. Update validation result
         update_success = update_validation_result(buyin_id, validation_result, step_logger)
+        
+        # 6.5 Pump signal check (if enabled)
+        # IMPORTANT: This must run AFTER validation completes (step 6), because
+        # the synthetic buyin is in 'validating' status until then. If pump signal
+        # runs before validation, its open-position guard will always find the
+        # current cycle's synthetic buyin and block pump entries permanently when
+        # TRAIN_VALIDATOR_PLAY_ID == PUMP_SIGNAL_PLAY_ID.
+        if PUMP_SIGNAL_PLAY_ID and trail_success:
+            try:
+                from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
+                maybe_refresh_rules()  # refreshes every 5 min, no-op otherwise
+                check_and_fire_pump_signal(
+                    buyin_id=buyin_id,
+                    market_price=market_price,
+                    price_cycle=price_cycle,
+                )
+            except Exception as pump_err:
+                logger.error(f"Pump signal check error (non-fatal): {pump_err}", exc_info=True)
         
         if not update_success:
             logger.error("Failed to update validation result")

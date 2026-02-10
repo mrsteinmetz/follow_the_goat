@@ -949,10 +949,14 @@ def check_and_fire_pump_signal(
         logger.error(f"Pump check: error checking DB cooldown: {e}")
 
     # Guard: no open positions for pump play
+    # IMPORTANT: Exclude TRAINING_TEST_ synthetic buyins -- they are always in
+    # 'validating' during the current train_validator cycle and would permanently
+    # block pump signals when TRAIN_VALIDATOR_PLAY_ID == PUMP_SIGNAL_PLAY_ID.
     try:
         open_pos = postgres_query_one("""
             SELECT id FROM follow_the_goat_buyins
             WHERE play_id = %s AND our_status IN ('pending', 'validating')
+              AND wallet_address NOT LIKE 'TRAINING_TEST_%%'
             LIMIT 1
         """, [pump_play_id])
         if open_pos:

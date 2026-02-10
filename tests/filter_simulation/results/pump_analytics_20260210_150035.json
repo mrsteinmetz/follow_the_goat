@@ -1,0 +1,522 @@
+{
+  "generated_at": "2026-02-10 15:00:39",
+  "analysis_type": "buyin_based_filter_discovery",
+  "section_stats": {
+    "n_climbing": 7938,
+    "base_precision": 15.558075081884606
+  },
+  "top_individual_filters": [
+    {
+      "column": "buyin_id_1",
+      "section": "other",
+      "from_val": 2.0260210124530464e+16,
+      "to_val": 2.026021013171932e+16,
+      "precision": 57.84,
+      "expected_profit": 0.2134,
+      "cohens_d": 0.0941,
+      "n_signals": 268
+    },
+    {
+      "column": "ob_cumulative_imbalance_5m",
+      "section": "ob",
+      "from_val": -1.22249276,
+      "to_val": -0.78874598,
+      "precision": 48.66,
+      "expected_profit": 0.1538,
+      "cohens_d": 0.5393,
+      "n_signals": 711
+    },
+    {
+      "column": "xa_eth_sol_corr_1m",
+      "section": "xa",
+      "from_val": 0.65483033,
+      "to_val": 0.85214115,
+      "precision": 30.75,
+      "expected_profit": 0.1411,
+      "cohens_d": 0.0302,
+      "n_signals": 348
+    },
+    {
+      "column": "mm_whale_alignment",
+      "section": "mm",
+      "from_val": 0.774,
+      "to_val": 0.777,
+      "precision": 40.0,
+      "expected_profit": 0.0615,
+      "cohens_d": 0.1372,
+      "n_signals": 240
+    },
+    {
+      "column": "pm_price_change_1m",
+      "section": "pm",
+      "from_val": 0.14723803,
+      "to_val": 0.29554448,
+      "precision": 24.33,
+      "expected_profit": 0.0497,
+      "cohens_d": 0.1613,
+      "n_signals": 526
+    },
+    {
+      "column": "pm_velocity_acceleration",
+      "section": "pm",
+      "from_val": -0.00015279,
+      "to_val": -0.00010185,
+      "precision": 25.43,
+      "expected_profit": 0.047,
+      "cohens_d": 0.0305,
+      "n_signals": 586
+    },
+    {
+      "column": "xa_sol_beta_eth",
+      "section": "xa",
+      "from_val": 0.35541433,
+      "to_val": 0.84421418,
+      "precision": 21.12,
+      "expected_profit": 0.0447,
+      "cohens_d": 0.0604,
+      "n_signals": 1070
+    },
+    {
+      "column": "pm_momentum_persistence",
+      "section": "pm",
+      "from_val": 0.21428571,
+      "to_val": 0.28571429,
+      "precision": 28.12,
+      "expected_profit": 0.0381,
+      "cohens_d": 0.0912,
+      "n_signals": 416
+    },
+    {
+      "column": "pm_candle_body_pct",
+      "section": "pm",
+      "from_val": 0.13331262,
+      "to_val": 0.29489186,
+      "precision": 22.55,
+      "expected_profit": 0.0368,
+      "cohens_d": 0.2013,
+      "n_signals": 705
+    },
+    {
+      "column": "ob_ask_liquidity_share_pct",
+      "section": "ob",
+      "from_val": 56.30279942,
+      "to_val": 65.60781974,
+      "precision": 26.09,
+      "expected_profit": 0.0366,
+      "cohens_d": 0.4112,
+      "n_signals": 1445
+    },
+    {
+      "column": "ob_bid_liquidity_share_pct",
+      "section": "ob",
+      "from_val": 34.39218026,
+      "to_val": 43.69720058,
+      "precision": 26.09,
+      "expected_profit": 0.0366,
+      "cohens_d": 0.4112,
+      "n_signals": 1445
+    },
+    {
+      "column": "ob_depth_imbalance_pct",
+      "section": "ob",
+      "from_val": -31.21563948,
+      "to_val": -12.60559929,
+      "precision": 26.09,
+      "expected_profit": 0.0366,
+      "cohens_d": 0.4112,
+      "n_signals": 1445
+    },
+    {
+      "column": "ob_depth_imbalance_ratio",
+      "section": "ob",
+      "from_val": 0.52420952,
+      "to_val": 0.77611087,
+      "precision": 26.09,
+      "expected_profit": 0.0366,
+      "cohens_d": 0.3667,
+      "n_signals": 1445
+    },
+    {
+      "column": "xa_eth_leads_sol_1",
+      "section": "xa",
+      "from_val": -0.69323413,
+      "to_val": -0.32253767,
+      "precision": 28.96,
+      "expected_profit": 0.0362,
+      "cohens_d": 0.2276,
+      "n_signals": 1091
+    },
+    {
+      "column": "ob_vwap_spread_bps",
+      "section": "ob",
+      "from_val": 13.90739775,
+      "to_val": 14.88879552,
+      "precision": 23.51,
+      "expected_profit": 0.0343,
+      "cohens_d": 0.4908,
+      "n_signals": 2675
+    },
+    {
+      "column": "mm_slippage_estimate",
+      "section": "mm",
+      "from_val": 3.18,
+      "to_val": 3.99,
+      "precision": 23.29,
+      "expected_profit": 0.0337,
+      "cohens_d": 0.3446,
+      "n_signals": 2108
+    },
+    {
+      "column": "ob_liquidity_score",
+      "section": "ob",
+      "from_val": 0.16024404,
+      "to_val": 0.24101941,
+      "precision": 22.78,
+      "expected_profit": 0.033,
+      "cohens_d": 0.3084,
+      "n_signals": 2006
+    },
+    {
+      "column": "ob_volume_imbalance",
+      "section": "ob",
+      "from_val": -0.30910742,
+      "to_val": -0.11314417,
+      "precision": 25.18,
+      "expected_profit": 0.0312,
+      "cohens_d": 0.4122,
+      "n_signals": 1628
+    },
+    {
+      "column": "wh_cumulative_flow_10m",
+      "section": "wh",
+      "from_val": -7.2433874,
+      "to_val": -5.78414568,
+      "precision": 23.26,
+      "expected_profit": 0.0306,
+      "cohens_d": 0.0636,
+      "n_signals": 2175
+    },
+    {
+      "column": "ob_aggression_ratio",
+      "section": "ob",
+      "from_val": 0.14607416,
+      "to_val": 0.604037,
+      "precision": 23.35,
+      "expected_profit": 0.0281,
+      "cohens_d": 0.0457,
+      "n_signals": 2642
+    },
+    {
+      "column": "xa_sol_beta_btc",
+      "section": "xa",
+      "from_val": -1.14060504,
+      "to_val": -0.41827871,
+      "precision": 28.54,
+      "expected_profit": 0.0278,
+      "cohens_d": 0.3587,
+      "n_signals": 1258
+    },
+    {
+      "column": "ob_net_flow_5m",
+      "section": "ob",
+      "from_val": 18521.67596154,
+      "to_val": 54334.9796,
+      "precision": 21.43,
+      "expected_profit": 0.0252,
+      "cohens_d": 0.0824,
+      "n_signals": 686
+    },
+    {
+      "column": "btc_price_change_10m",
+      "section": "btc",
+      "from_val": -0.591491,
+      "to_val": -0.268956,
+      "precision": 24.29,
+      "expected_profit": 0.0228,
+      "cohens_d": 0.1679,
+      "n_signals": 988
+    },
+    {
+      "column": "pm_realized_vol_1m",
+      "section": "pm",
+      "from_val": 0.08119426,
+      "to_val": 0.1668816,
+      "precision": 23.15,
+      "expected_profit": 0.0206,
+      "cohens_d": 0.3132,
+      "n_signals": 4578
+    },
+    {
+      "column": "pat_asc_tri_compression_ratio",
+      "section": "pat",
+      "from_val": 0.869,
+      "to_val": 2.22112,
+      "precision": 25.57,
+      "expected_profit": 0.0176,
+      "cohens_d": 0.0323,
+      "n_signals": 1537
+    }
+  ],
+  "top_combinations": [
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_vwap_spread_bps",
+        "ob_aggression_ratio"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_vwap_spread_bps:[13.90739775,14.88879552]|ob_aggression_ratio:[0.14607416,0.604037]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5927,
+      "test_n_signals": 16,
+      "overfit_delta": -0.0588,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "mm_slippage_estimate",
+        "ob_aggression_ratio"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|mm_slippage_estimate:[3.18,3.99]|ob_aggression_ratio:[0.14607416,0.604037]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5927,
+      "test_n_signals": 16,
+      "overfit_delta": -0.0862,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_liquidity_score",
+        "ob_aggression_ratio"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_liquidity_score:[0.16024404,0.24101941]|ob_aggression_ratio:[0.14607416,0.604037]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5927,
+      "test_n_signals": 16,
+      "overfit_delta": -0.005,
+      "is_stable": true
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_vwap_spread_bps",
+        "ob_volume_imbalance"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_vwap_spread_bps:[13.90739775,14.88879552]|ob_volume_imbalance:[-0.30910742,-0.11314417]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.592,
+      "test_n_signals": 15,
+      "overfit_delta": -0.425,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "mm_slippage_estimate",
+        "ob_volume_imbalance"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|mm_slippage_estimate:[3.18,3.99]|ob_volume_imbalance:[-0.30910742,-0.11314417]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.592,
+      "test_n_signals": 15,
+      "overfit_delta": -0.5066,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_liquidity_score",
+        "ob_volume_imbalance"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_liquidity_score:[0.16024404,0.24101941]|ob_volume_imbalance:[-0.30910742,-0.11314417]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.592,
+      "test_n_signals": 15,
+      "overfit_delta": -0.4418,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "xa_eth_leads_sol_1"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|xa_eth_leads_sol_1:[-0.69323413,-0.32253767]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5877,
+      "test_n_signals": 18,
+      "overfit_delta": -0.3009,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "xa_eth_leads_sol_1",
+        "ob_vwap_spread_bps"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|xa_eth_leads_sol_1:[-0.69323413,-0.32253767]|ob_vwap_spread_bps:[13.90739775,14.88879552]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5877,
+      "test_n_signals": 18,
+      "overfit_delta": 0.0675,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "xa_eth_leads_sol_1",
+        "ob_aggression_ratio"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|xa_eth_leads_sol_1:[-0.69323413,-0.32253767]|ob_aggression_ratio:[0.14607416,0.604037]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5839,
+      "test_n_signals": 15,
+      "overfit_delta": -0.1292,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_vwap_spread_bps"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_vwap_spread_bps:[13.90739775,14.88879552]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": -0.1508,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "mm_slippage_estimate"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|mm_slippage_estimate:[3.18,3.99]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": -0.15,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_liquidity_score"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_liquidity_score:[0.16024404,0.24101941]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": -0.0895,
+      "is_stable": true
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "pm_vol_of_vol"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|pm_vol_of_vol:[0.04621664,0.12153163]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": -0.463,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_vwap_spread_bps",
+        "mm_slippage_estimate"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_vwap_spread_bps:[13.90739775,14.88879552]|mm_slippage_estimate:[3.18,3.99]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": 0.0799,
+      "is_stable": true
+    },
+    {
+      "columns": [
+        "xa_eth_sol_corr_1m",
+        "ob_vwap_spread_bps",
+        "ob_liquidity_score"
+      ],
+      "filter_ranges": "xa_eth_sol_corr_1m:[0.65483033,0.85214115]|ob_vwap_spread_bps:[13.90739775,14.88879552]|ob_liquidity_score:[0.16024404,0.24101941]",
+      "test_precision": 100.0,
+      "test_expected_profit": 0.5807,
+      "test_n_signals": 22,
+      "overfit_delta": 0.0422,
+      "is_stable": true
+    }
+  ],
+  "force_behind_summary": {
+    "Order Book Pressure": {
+      "n_ranked": 8,
+      "n_profitable": 8,
+      "best_column": "ob_cumulative_imbalance_5m",
+      "best_precision": 48.66,
+      "best_expected_profit": 0.1538
+    },
+    "Transaction Buy Pressure": {
+      "n_ranked": 5,
+      "n_profitable": 0,
+      "best_column": "tx_whale_volume_pct",
+      "best_precision": 16.62,
+      "best_expected_profit": -0.0123
+    },
+    "Whale Accumulation": {
+      "n_ranked": 2,
+      "n_profitable": 1,
+      "best_column": "wh_cumulative_flow_10m",
+      "best_precision": 23.26,
+      "best_expected_profit": 0.0306
+    },
+    "Price Momentum": {
+      "n_ranked": 6,
+      "n_profitable": 3,
+      "best_column": "pm_price_change_1m",
+      "best_precision": 24.33,
+      "best_expected_profit": 0.0497
+    },
+    "Cross-Asset Alignment": {
+      "n_ranked": 6,
+      "n_profitable": 3,
+      "best_column": "xa_eth_leads_sol_1",
+      "best_precision": 28.96,
+      "best_expected_profit": 0.0362
+    },
+    "Composite Scores": {
+      "n_ranked": 7,
+      "n_profitable": 4,
+      "best_column": "mm_whale_alignment",
+      "best_precision": 40.0,
+      "best_expected_profit": 0.0615
+    }
+  },
+  "recommended_rules": [
+    {
+      "column": "xa_eth_sol_corr_1m",
+      "section": "xa",
+      "from_val": 0.65483033,
+      "to_val": 0.85214115
+    },
+    {
+      "column": "ob_liquidity_score",
+      "section": "ob",
+      "from_val": 0.16024404,
+      "to_val": 0.24101941
+    },
+    {
+      "column": "ob_aggression_ratio",
+      "section": "ob",
+      "from_val": 0.14607416,
+      "to_val": 0.604037
+    }
+  ],
+  "recommended_metadata": {
+    "test_precision": 100.0,
+    "test_expected_profit": 0.5927,
+    "test_n_signals": 16,
+    "is_stable": true
+  }
+}

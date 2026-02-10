@@ -174,6 +174,31 @@ def run_create_new_patterns():
         logger.error(f"[PATTERN GENERATOR] Exception in job wrapper: {e}", exc_info=True)
 
 
+@track_job("recalculate_pump_filters", "Recalculate pump continuation filters (every 5 min)")
+def run_recalculate_pump_filters():
+    """Discover best filter combo from recent buyins and write to pump_continuation_rules."""
+    try:
+        enabled = os.getenv("RECALCULATE_PUMP_FILTERS_ENABLED", "1") == "1"
+        if not enabled:
+            return
+
+        features_path = PROJECT_ROOT / "features" / "pump_continuation"
+        if str(features_path) not in sys.path:
+            sys.path.insert(0, str(features_path))
+        from features.pump_continuation.recalculate import recalculate
+
+        result = recalculate()
+        if result.get('status') == 'ok':
+            logger.info(f"Pump filters recalculated: prec={result['best_test_precision']:.1f}%, "
+                        f"cols={result['columns']}")
+        elif result.get('status') == 'no_combos':
+            logger.info("Pump filters: no profitable combos found, keeping existing rules")
+        else:
+            logger.info(f"Pump filters: {result.get('status', 'unknown')} - {result.get('reason', '')}")
+    except Exception as e:
+        logger.error(f"Recalculate pump filters job error: {e}", exc_info=True)
+
+
 @track_job("create_profiles", "Build wallet profiles (every 30s)")
 def run_create_profiles():
     """Build wallet profiles from trades and price cycles."""

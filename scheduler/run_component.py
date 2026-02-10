@@ -84,6 +84,7 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         run_archive_old_data,
         run_restart_quicknode_streams,
         export_job_status_to_file,
+        run_recalculate_pump_filters,
     )
 
     return {
@@ -98,6 +99,7 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         "create_profiles": IntervalJobSpec("create_profiles", 30.0, run_create_profiles),
         "archive_old_data": IntervalJobSpec("archive_old_data", 3600.0, run_archive_old_data),
         "restart_quicknode_streams": IntervalJobSpec("restart_quicknode_streams", 15.0, run_restart_quicknode_streams),
+        "recalculate_pump_filters": IntervalJobSpec("recalculate_pump_filters", 300.0, run_recalculate_pump_filters),
         "export_job_status": IntervalJobSpec("export_job_status", 5.0, export_job_status_to_file),
     }
 

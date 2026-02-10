@@ -1,0 +1,369 @@
+{
+  "generated_at": "2026-02-10 14:47:52",
+  "price_patterns": {
+    "n_climbing": 4489,
+    "base_precision": 23.011806638449546,
+    "best_multi_rules": [
+      {
+        "rule": "chg_5s>0.05% AND chg_30s>0.10%",
+        "count": 355,
+        "cont": 116,
+        "precision": 32.67605633802817,
+        "expected_profit": 0.07324120004549181
+      },
+      {
+        "rule": "chg_5s>0.03% AND chg_30s>0.10%",
+        "count": 542,
+        "cont": 174,
+        "precision": 32.10332103321033,
+        "expected_profit": 0.058628238300155316
+      },
+      {
+        "rule": "chg_5s>0.05% AND chg_30s>0.08%",
+        "count": 457,
+        "cont": 139,
+        "precision": 30.41575492341357,
+        "expected_profit": 0.05732142922337982
+      },
+      {
+        "rule": "chg_5s>0.02% AND chg_30s>0.10%",
+        "count": 670,
+        "cont": 212,
+        "precision": 31.64179104477612,
+        "expected_profit": 0.0533366511516746
+      },
+      {
+        "rule": "chg_5s>0.01% AND chg_30s>0.10%",
+        "count": 786,
+        "cont": 242,
+        "precision": 30.788804071246815,
+        "expected_profit": 0.04650037020327685
+      }
+    ]
+  },
+  "top_individual_filters": [
+    {
+      "column": "pre_entry_change_3m",
+      "from_val": 0.27937128,
+      "to_val": 0.71484773,
+      "precision": 37.06,
+      "expected_profit": 0.1175,
+      "cohens_d": 0.1689
+    },
+    {
+      "column": "pat_bull_flag_confidence",
+      "from_val": 0.677,
+      "to_val": 0.75802,
+      "precision": 39.47,
+      "expected_profit": 0.1112,
+      "cohens_d": 0.0778
+    },
+    {
+      "column": "mm_whale_alignment",
+      "from_val": 0.771,
+      "to_val": 0.78314,
+      "precision": 31.2,
+      "expected_profit": 0.0894,
+      "cohens_d": 0.059
+    },
+    {
+      "column": "xa_eth_leads_sol_1",
+      "from_val": -0.53557371,
+      "to_val": -0.33636124,
+      "precision": 38.5,
+      "expected_profit": 0.0883,
+      "cohens_d": 0.0762
+    },
+    {
+      "column": "mm_slippage_estimate",
+      "from_val": 3.56,
+      "to_val": 4.01,
+      "precision": 35.5,
+      "expected_profit": 0.0782,
+      "cohens_d": 0.0774
+    },
+    {
+      "column": "pre_entry_change_2m",
+      "from_val": 0.19394748,
+      "to_val": 0.5718972,
+      "precision": 31.45,
+      "expected_profit": 0.078,
+      "cohens_d": 0.1203
+    },
+    {
+      "column": "mp_microstructure_shift_confidence",
+      "from_val": 0.0,
+      "to_val": 0.133,
+      "precision": 36.48,
+      "expected_profit": 0.0779,
+      "cohens_d": 0.0506
+    },
+    {
+      "column": "ob_liquidity_score",
+      "from_val": 0.15665615,
+      "to_val": 0.20382719,
+      "precision": 35.24,
+      "expected_profit": 0.0764,
+      "cohens_d": 0.1328
+    },
+    {
+      "column": "pre_entry_change_1m",
+      "from_val": 0.15395716,
+      "to_val": 0.39568316,
+      "precision": 34.62,
+      "expected_profit": 0.0762,
+      "cohens_d": 0.1682
+    },
+    {
+      "column": "xa_btc_sol_divergence",
+      "from_val": 0.20593755,
+      "to_val": 0.59039451,
+      "precision": 32.22,
+      "expected_profit": 0.0758,
+      "cohens_d": 0.1496
+    },
+    {
+      "column": "ob_price_change_5m",
+      "from_val": 0.22440095,
+      "to_val": 0.971724,
+      "precision": 32.24,
+      "expected_profit": 0.0751,
+      "cohens_d": 0.2147
+    },
+    {
+      "column": "pm_trend_strength_ema",
+      "from_val": 0.05776705,
+      "to_val": 0.2121946,
+      "precision": 31.7,
+      "expected_profit": 0.0744,
+      "cohens_d": 0.1397
+    },
+    {
+      "column": "ob_vwap_spread_bps",
+      "from_val": 14.06454128,
+      "to_val": 14.76486532,
+      "precision": 33.79,
+      "expected_profit": 0.0736,
+      "cohens_d": 0.3467
+    },
+    {
+      "column": "xa_eth_sol_divergence",
+      "from_val": 0.2065564,
+      "to_val": 0.52449361,
+      "precision": 30.72,
+      "expected_profit": 0.073,
+      "cohens_d": 0.1089
+    },
+    {
+      "column": "pm_volatility_pct",
+      "from_val": 0.14101362,
+      "to_val": 0.3178008,
+      "precision": 36.55,
+      "expected_profit": 0.0727,
+      "cohens_d": 0.2932
+    },
+    {
+      "column": "chg_5m",
+      "from_val": 0.2633445,
+      "to_val": 0.82750253,
+      "precision": 32.93,
+      "expected_profit": 0.0705,
+      "cohens_d": 0.139
+    },
+    {
+      "column": "pat_asc_tri_compression_ratio",
+      "from_val": 1.51438462,
+      "to_val": 2.732,
+      "precision": 29.72,
+      "expected_profit": 0.0636,
+      "cohens_d": 0.0718
+    },
+    {
+      "column": "chg_30s",
+      "from_val": 0.11786232,
+      "to_val": 0.26756758,
+      "precision": 34.35,
+      "expected_profit": 0.0599,
+      "cohens_d": 0.2136
+    },
+    {
+      "column": "pm_price_change_1m",
+      "from_val": 0.10865257,
+      "to_val": 0.29184,
+      "precision": 32.65,
+      "expected_profit": 0.0524,
+      "cohens_d": 0.2057
+    },
+    {
+      "column": "chg_1m",
+      "from_val": 0.13566522,
+      "to_val": 0.35415472,
+      "precision": 33.53,
+      "expected_profit": 0.0515,
+      "cohens_d": 0.1876
+    }
+  ],
+  "top_combinations": [
+    {
+      "columns": [
+        "pm_volatility_pct",
+        "wh_cumulative_flow_10m"
+      ],
+      "filter_ranges": "pm_volatility_pct:[0.14101362,0.3178008]|wh_cumulative_flow_10m:[-7.15077043,-5.3541419]",
+      "test_precision": 61.11,
+      "test_expected_profit": 0.0876,
+      "test_n_signals": 18,
+      "overfit_delta": 0.0607,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "pre_entry_change_2m",
+        "ob_vwap_spread_bps",
+        "pm_volatility_pct"
+      ],
+      "filter_ranges": "pre_entry_change_2m:[0.19394748,0.5718972]|ob_vwap_spread_bps:[14.06454128,14.76486532]|pm_volatility_pct:[0.14101362,0.3178008]",
+      "test_precision": 63.64,
+      "test_expected_profit": 0.0845,
+      "test_n_signals": 11,
+      "overfit_delta": 0.0286,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "pre_entry_change_2m",
+        "xa_btc_sol_divergence",
+        "ob_vwap_spread_bps",
+        "pm_volatility_pct"
+      ],
+      "filter_ranges": "pre_entry_change_2m:[0.19394748,0.5718972]|xa_btc_sol_divergence:[0.20593755,0.59039451]|ob_vwap_spread_bps:[14.06454128,14.76486532]|pm_volatility_pct:[0.14101362,0.3178008]",
+      "test_precision": 60.0,
+      "test_expected_profit": 0.0762,
+      "test_n_signals": 10,
+      "overfit_delta": 0.0153,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "pre_entry_change_1m",
+        "xa_btc_sol_divergence",
+        "ob_vwap_spread_bps",
+        "xa_eth_sol_divergence"
+      ],
+      "filter_ranges": "pre_entry_change_1m:[0.15395716,0.39568316]|xa_btc_sol_divergence:[0.20593755,0.59039451]|ob_vwap_spread_bps:[14.06454128,14.76486532]|xa_eth_sol_divergence:[0.2065564,0.52449361]",
+      "test_precision": 60.0,
+      "test_expected_profit": 0.0728,
+      "test_n_signals": 15,
+      "overfit_delta": 0.0623,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "ob_vwap_spread_bps",
+        "pm_volatility_pct",
+        "chg_1m"
+      ],
+      "filter_ranges": "ob_vwap_spread_bps:[14.06454128,14.76486532]|pm_volatility_pct:[0.14101362,0.3178008]|chg_1m:[0.13566522,0.35415472]",
+      "test_precision": 58.33,
+      "test_expected_profit": 0.0698,
+      "test_n_signals": 12,
+      "overfit_delta": 0.0141,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "pre_entry_change_1m",
+        "ob_price_change_5m",
+        "ob_vwap_spread_bps",
+        "xa_eth_sol_divergence"
+      ],
+      "filter_ranges": "pre_entry_change_1m:[0.15395716,0.39568316]|ob_price_change_5m:[0.22440095,0.971724]|ob_vwap_spread_bps:[14.06454128,14.76486532]|xa_eth_sol_divergence:[0.2065564,0.52449361]",
+      "test_precision": 53.85,
+      "test_expected_profit": 0.0638,
+      "test_n_signals": 13,
+      "overfit_delta": 0.2028,
+      "is_stable": true
+    },
+    {
+      "columns": [
+        "pre_entry_change_2m",
+        "pre_entry_change_1m",
+        "xa_btc_sol_divergence",
+        "ob_vwap_spread_bps"
+      ],
+      "filter_ranges": "pre_entry_change_2m:[0.19394748,0.5718972]|pre_entry_change_1m:[0.15395716,0.39568316]|xa_btc_sol_divergence:[0.20593755,0.59039451]|ob_vwap_spread_bps:[14.06454128,14.76486532]",
+      "test_precision": 56.25,
+      "test_expected_profit": 0.062,
+      "test_n_signals": 16,
+      "overfit_delta": 0.1386,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "mm_slippage_estimate",
+        "xa_btc_sol_divergence",
+        "xa_eth_sol_divergence"
+      ],
+      "filter_ranges": "mm_slippage_estimate:[3.56,4.01]|xa_btc_sol_divergence:[0.20593755,0.59039451]|xa_eth_sol_divergence:[0.2065564,0.52449361]",
+      "test_precision": 70.0,
+      "test_expected_profit": 0.0615,
+      "test_n_signals": 10,
+      "overfit_delta": 0.0961,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "xa_btc_sol_divergence",
+        "ob_vwap_spread_bps",
+        "pm_volatility_pct"
+      ],
+      "filter_ranges": "xa_btc_sol_divergence:[0.20593755,0.59039451]|ob_vwap_spread_bps:[14.06454128,14.76486532]|pm_volatility_pct:[0.14101362,0.3178008]",
+      "test_precision": 54.55,
+      "test_expected_profit": 0.0602,
+      "test_n_signals": 11,
+      "overfit_delta": 0.0416,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "ob_vwap_spread_bps",
+        "xa_eth_sol_divergence",
+        "chg_1m"
+      ],
+      "filter_ranges": "ob_vwap_spread_bps:[14.06454128,14.76486532]|xa_eth_sol_divergence:[0.2065564,0.52449361]|chg_1m:[0.13566522,0.35415472]",
+      "test_precision": 53.33,
+      "test_expected_profit": 0.0533,
+      "test_n_signals": 15,
+      "overfit_delta": 0.122,
+      "is_stable": false
+    }
+  ],
+  "recommended_rules": [
+    {
+      "column": "pre_entry_change_1m",
+      "from_val": 0.15395716,
+      "to_val": 0.39568316
+    },
+    {
+      "column": "ob_price_change_5m",
+      "from_val": 0.22440095,
+      "to_val": 0.971724
+    },
+    {
+      "column": "ob_vwap_spread_bps",
+      "from_val": 14.06454128,
+      "to_val": 14.76486532
+    },
+    {
+      "column": "xa_eth_sol_divergence",
+      "from_val": 0.2065564,
+      "to_val": 0.52449361
+    }
+  ],
+  "recommended_metadata": {
+    "test_precision": 53.85,
+    "test_expected_profit": 0.0638,
+    "test_n_signals": 13,
+    "is_stable": true
+  }
+}

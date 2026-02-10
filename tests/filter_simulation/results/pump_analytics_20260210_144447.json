@@ -1,0 +1,250 @@
+{
+  "generated_at": "2026-02-10 14:44:55",
+  "price_patterns": {
+    "n_climbing": 4484,
+    "base_precision": 23.082069580731492,
+    "best_multi_rules": [
+      {
+        "rule": "chg_5s>0.05% AND chg_30s>0.10%",
+        "count": 356,
+        "cont": 110,
+        "precision": 30.89887640449438,
+        "expected_profit": 0.0634474223106147
+      },
+      {
+        "rule": "chg_5s>0.05% AND chg_30s>0.08%",
+        "count": 460,
+        "cont": 139,
+        "precision": 30.217391304347824,
+        "expected_profit": 0.05641189684712533
+      },
+      {
+        "rule": "chg_5s>0.03% AND chg_30s>0.10%",
+        "count": 548,
+        "cont": 167,
+        "precision": 30.474452554744524,
+        "expected_profit": 0.04988960713982271
+      },
+      {
+        "rule": "chg_5s>0.02% AND chg_30s>0.10%",
+        "count": 676,
+        "cont": 206,
+        "precision": 30.473372781065088,
+        "expected_profit": 0.047408124657480316
+      },
+      {
+        "rule": "chg_5s>0.01% AND chg_30s>0.10%",
+        "count": 796,
+        "cont": 236,
+        "precision": 29.64824120603015,
+        "expected_profit": 0.040345551610156044
+      }
+    ]
+  },
+  "top_individual_filters": [
+    {
+      "column": "mm_slippage_estimate",
+      "from_val": 3.56,
+      "to_val": 3.99,
+      "precision": 37.44,
+      "expected_profit": 0.0889,
+      "cohens_d": 0.0916
+    },
+    {
+      "column": "mm_whale_alignment",
+      "from_val": 0.771,
+      "to_val": 0.78342,
+      "precision": 30.28,
+      "expected_profit": 0.0873,
+      "cohens_d": 0.0418
+    },
+    {
+      "column": "chg_1m",
+      "from_val": 0.16502804,
+      "to_val": 0.35030238,
+      "precision": 37.5,
+      "expected_profit": 0.0831,
+      "cohens_d": 0.1783
+    },
+    {
+      "column": "ob_liquidity_score",
+      "from_val": 0.15508162,
+      "to_val": 0.20383578,
+      "precision": 34.44,
+      "expected_profit": 0.0712,
+      "cohens_d": 0.15
+    },
+    {
+      "column": "mp_microstructure_shift_confidence",
+      "from_val": 0.0,
+      "to_val": 0.13698462,
+      "precision": 35.02,
+      "expected_profit": 0.071,
+      "cohens_d": 0.0419
+    },
+    {
+      "column": "chg_5m",
+      "from_val": 0.26535368,
+      "to_val": 0.85367356,
+      "precision": 32.52,
+      "expected_profit": 0.0698,
+      "cohens_d": 0.1277
+    },
+    {
+      "column": "chg_30s",
+      "from_val": 0.11902553,
+      "to_val": 0.26426805,
+      "precision": 33.62,
+      "expected_profit": 0.0568,
+      "cohens_d": 0.2118
+    },
+    {
+      "column": "mp_volume_divergence_confidence",
+      "from_val": 0.0,
+      "to_val": 0.41429231,
+      "precision": 29.91,
+      "expected_profit": 0.0496,
+      "cohens_d": 0.1646
+    },
+    {
+      "column": "mp_momentum_acceleration_confidence",
+      "from_val": 0.115,
+      "to_val": 0.248,
+      "precision": 29.71,
+      "expected_profit": 0.0399,
+      "cohens_d": 0.121
+    },
+    {
+      "column": "mm_momentum_quality",
+      "from_val": 0.382,
+      "to_val": 0.612,
+      "precision": 32.52,
+      "expected_profit": 0.0381,
+      "cohens_d": 0.2384
+    },
+    {
+      "column": "eth_price_change_5m",
+      "from_val": 0.161383,
+      "to_val": 0.94588988,
+      "precision": 28.99,
+      "expected_profit": 0.0305,
+      "cohens_d": 0.0458
+    },
+    {
+      "column": "btc_price_change_5m",
+      "from_val": -0.68452568,
+      "to_val": -0.143193,
+      "precision": 31.28,
+      "expected_profit": 0.0254,
+      "cohens_d": 0.2208
+    },
+    {
+      "column": "mp_whale_stealth_accumulation_confidence",
+      "from_val": 0.309,
+      "to_val": 0.45906,
+      "precision": 27.42,
+      "expected_profit": 0.025,
+      "cohens_d": 0.1963
+    },
+    {
+      "column": "mm_expected_timeframe",
+      "from_val": 2.5,
+      "to_val": 3.4,
+      "precision": 28.02,
+      "expected_profit": 0.0217,
+      "cohens_d": 0.1732
+    },
+    {
+      "column": "btc_price_change_10m",
+      "from_val": -0.71561916,
+      "to_val": -0.19505314,
+      "precision": 28.08,
+      "expected_profit": 0.0206,
+      "cohens_d": 0.1133
+    },
+    {
+      "column": "mm_cross_asset_score",
+      "from_val": 0.331,
+      "to_val": 0.66984,
+      "precision": 26.13,
+      "expected_profit": 0.0193,
+      "cohens_d": 0.0524
+    },
+    {
+      "column": "eth_volatility_pct",
+      "from_val": 0.13763,
+      "to_val": 0.67773406,
+      "precision": 27.54,
+      "expected_profit": 0.0175,
+      "cohens_d": 0.1628
+    },
+    {
+      "column": "mm_probability",
+      "from_val": 0.518,
+      "to_val": 0.63106,
+      "precision": 27.63,
+      "expected_profit": 0.0173,
+      "cohens_d": 0.05
+    },
+    {
+      "column": "chg_15s",
+      "from_val": 0.06358389,
+      "to_val": 0.20189718,
+      "precision": 26.26,
+      "expected_profit": 0.015,
+      "cohens_d": 0.1316
+    },
+    {
+      "column": "ob_cumulative_imbalance_5m",
+      "from_val": -0.20664192,
+      "to_val": 0.64908838,
+      "precision": 25.33,
+      "expected_profit": 0.0123,
+      "cohens_d": 0.0344
+    }
+  ],
+  "top_combinations": [
+    {
+      "columns": [
+        "mp_microstructure_shift_confidence",
+        "btc_price_change_5m"
+      ],
+      "filter_ranges": "mp_microstructure_shift_confidence:[0.0,0.13698462]|btc_price_change_5m:[-0.68452568,-0.143193]",
+      "test_precision": 50.0,
+      "test_expected_profit": 0.1422,
+      "test_n_signals": 14,
+      "overfit_delta": -0.0582,
+      "is_stable": false
+    },
+    {
+      "columns": [
+        "eth_price_change_5m",
+        "btc_price_change_5m"
+      ],
+      "filter_ranges": "eth_price_change_5m:[0.161383,0.94588988]|btc_price_change_5m:[-0.68452568,-0.143193]",
+      "test_precision": 61.11,
+      "test_expected_profit": 0.1267,
+      "test_n_signals": 36,
+      "overfit_delta": -0.0355,
+      "is_stable": "True"
+    }
+  ],
+  "recommended_rules": [
+    {
+      "column": "eth_price_change_5m",
+      "from_val": 0.161383,
+      "to_val": 0.94588988
+    },
+    {
+      "column": "btc_price_change_5m",
+      "from_val": -0.68452568,
+      "to_val": -0.143193
+    }
+  ],
+  "recommended_metadata": {
+    "test_precision": 61.11,
+    "test_expected_profit": 0.1267,
+    "test_n_signals": 36,
+    "is_stable": true
+  }
+}

@@ -920,6 +920,41 @@ CREATE INDEX IF NOT EXISTS idx_job_metrics_started_at ON job_execution_metrics(s
 CREATE INDEX IF NOT EXISTS idx_job_metrics_job_started ON job_execution_metrics(job_id, started_at);
 
 -- =============================================================================
+-- PUMP CONTINUATION RULES
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS pump_continuation_rules (
+    id SERIAL PRIMARY KEY,
+    column_name VARCHAR(100) NOT NULL,
+    section VARCHAR(50),
+    from_value DOUBLE PRECISION,
+    to_value DOUBLE PRECISION,
+    precision_pct DOUBLE PRECISION,
+    expected_profit DOUBLE PRECISION,
+    test_n_signals INTEGER,
+    is_stable BOOLEAN DEFAULT FALSE,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =============================================================================
+-- PUMP CONTINUATION HISTORY (logs every check for monitoring)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS pump_continuation_history (
+    id BIGSERIAL PRIMARY KEY,
+    buyin_id BIGINT NOT NULL,
+    passed BOOLEAN NOT NULL,
+    reason VARCHAR(500),
+    rules_checked SMALLINT DEFAULT 0,
+    pre_entry_change_1m DOUBLE PRECISION,
+    rule_details JSONB,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pump_hist_created ON pump_continuation_history(created_at);
+CREATE INDEX IF NOT EXISTS idx_pump_hist_passed ON pump_continuation_history(passed, created_at);
+
+-- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================
 

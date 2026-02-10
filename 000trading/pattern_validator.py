@@ -57,6 +57,176 @@ logger = logging.getLogger(__name__)
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
+
+# =============================================================================
+# PUMP CONTINUATION RULES - Dynamic filter gate loaded from DB
+# =============================================================================
+
+import time as _time
+
+_pump_rules_cache: Optional[List[Dict[str, Any]]] = None
+_pump_rules_cache_ts: float = 0.0
+_PUMP_RULES_CACHE_TTL = 60.0  # seconds
+
+
+def _load_pump_continuation_rules() -> List[Dict[str, Any]]:
+    """Load active pump continuation rules from PostgreSQL, with 60s cache."""
+    global _pump_rules_cache, _pump_rules_cache_ts
+
+    now = _time.time()
+    if _pump_rules_cache is not None and (now - _pump_rules_cache_ts) < _PUMP_RULES_CACHE_TTL:
+        return _pump_rules_cache
+
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT column_name, section, from_value, to_value,
+                           precision_pct, is_stable
+                    FROM pump_continuation_rules
+                    ORDER BY id
+                """)
+                rows = cursor.fetchall()
+
+        _pump_rules_cache = rows if rows else []
+        _pump_rules_cache_ts = now
+        return _pump_rules_cache
+    except Exception as e:
+        logger.error(f"Failed to load pump continuation rules: {e}")
+        # On error, return cached version if available, otherwise empty
+        return _pump_rules_cache if _pump_rules_cache is not None else []
+
+
+def _log_pump_history(
+    buyin_id: int,
+    passed: bool,
+    reason: str,
+    rules_checked: int,
+    pre_entry_change_1m: Optional[float] = None,
+    rule_details: Optional[List[Dict]] = None,
+) -> None:
+    """Write a row to pump_continuation_history for monitoring."""
+    try:
+        from core.database import postgres_execute as _pe
+        _pe("""
+            INSERT INTO pump_continuation_history
+                (buyin_id, passed, reason, rules_checked, pre_entry_change_1m, rule_details, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+        """, [
+            buyin_id, passed, reason[:500], rules_checked,
+            pre_entry_change_1m,
+            json.dumps(rule_details) if rule_details else None,
+        ])
+    except Exception as e:
+        logger.error(f"Failed to log pump history for buyin #{buyin_id}: {e}")
+
+
+def check_pump_continuation_rules(
+    buyin_id: int,
+    trail_data: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Check if a buyin passes the pump continuation filter rules.
+
+    Loads the minute=0 trail row directly from buyin_trail_minutes (same column
+    names the analytics engine uses).  Only activates when pre_entry_change_1m > 0
+    (price was rising).  If the rules table is empty, passes by default.
+
+    Every check is logged to pump_continuation_history for monitoring.
+
+    Returns:
+        None if rules table is empty (no gate),
+        {'passed': True/False, 'reason': str, 'rules_checked': int}
+    """
+    rules = _load_pump_continuation_rules()
+    if not rules:
+        return None  # No rules = no gate, pass through
+
+    # Load minute=0 trail row directly from DB (same column names as analytics)
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                # Get all columns needed: pre_entry_change_1m + rule columns
+                needed_cols = ['pre_entry_change_1m'] + [r['column_name'] for r in rules]
+                col_list = ', '.join(needed_cols)
+                cursor.execute(f"""
+                    SELECT {col_list}
+                    FROM buyin_trail_minutes
+                    WHERE buyin_id = %s AND minute = 0 AND COALESCE(sub_minute, 0) = 0
+                    LIMIT 1
+                """, [buyin_id])
+                row = cursor.fetchone()
+    except Exception as e:
+        logger.error(f"Failed to load trail row for pump check (buyin #{buyin_id}): {e}")
+        result = {'passed': True, 'reason': f'trail load error: {e}', 'rules_checked': 0}
+        _log_pump_history(buyin_id, True, result['reason'], 0)
+        return result
+
+    if not row:
+        result = {'passed': True, 'reason': 'no trail row at minute=0', 'rules_checked': 0}
+        _log_pump_history(buyin_id, True, result['reason'], 0)
+        return result
+
+    # Only apply pump continuation check when price is rising
+    pre_entry_chg = row.get('pre_entry_change_1m')
+    pre_entry_float = float(pre_entry_chg) if pre_entry_chg is not None else None
+    if pre_entry_float is None or pre_entry_float <= 0:
+        result = {'passed': True, 'reason': 'price not rising, pump check skipped', 'rules_checked': 0}
+        _log_pump_history(buyin_id, True, result['reason'], 0, pre_entry_float)
+        return result
+
+    # Apply each filter rule against the trail data
+    failed_rules = []
+    passed_count = 0
+    rule_details = []
+
+    for rule in rules:
+        col_name = rule['column_name']
+        from_val = rule['from_value']
+        to_val = rule['to_value']
+
+        value = row.get(col_name)
+        if value is None:
+            rule_details.append({'col': col_name, 'val': None, 'range': [from_val, to_val], 'ok': None})
+            continue  # Column missing -- skip rule
+
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            rule_details.append({'col': col_name, 'val': str(value), 'range': [from_val, to_val], 'ok': None})
+            continue
+
+        in_range = from_val <= val <= to_val
+        rule_details.append({
+            'col': col_name,
+            'val': round(val, 6),
+            'range': [round(from_val, 6), round(to_val, 6)],
+            'ok': in_range,
+        })
+        if in_range:
+            passed_count += 1
+        else:
+            failed_rules.append(f"{col_name}={val:.4f} not in [{from_val:.4f},{to_val:.4f}]")
+
+    total_rules = len(rules)
+    if failed_rules:
+        reason = f"{len(failed_rules)}/{total_rules} rules failed: {'; '.join(failed_rules[:3])}"
+        _log_pump_history(buyin_id, False, reason, total_rules, pre_entry_float, rule_details)
+        return {
+            'passed': False,
+            'reason': reason,
+            'rules_checked': total_rules,
+        }
+
+    reason = f"All {passed_count}/{total_rules} pump continuation rules passed"
+    _log_pump_history(buyin_id, True, reason, total_rules, pre_entry_float, rule_details)
+    return {
+        'passed': True,
+        'reason': reason,
+        'rules_checked': total_rules,
+    }
+
+
 # Default pattern schema - Staged evaluation approach
 DEFAULT_PATTERN_SCHEMA = {
     "window": {"minutes": 15},
@@ -1279,6 +1449,37 @@ def validate_buyin_signal(
     
     schema_source = 'default'
     validator_version = "v1_schema_based"
+
+    # =========================================================================
+    # PUMP CONTINUATION FILTER CHECK
+    # Loads dynamic rules from pump_continuation_rules table (refreshed every 5 min).
+    # Acts as an AND gate: if price is rising but pump rules fail → NO_GO.
+    # =========================================================================
+    try:
+        pump_result = check_pump_continuation_rules(buyin_id)
+        if pump_result and not pump_result['passed']:
+            logger.info(
+                f"✗ Buyin #{buyin_id} REJECTED by pump continuation filter: {pump_result['reason']}"
+            )
+            return {
+                "buyin_id": buyin_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "decision": "NO_GO",
+                "reason": f"Pump continuation filter: {pump_result['reason']}",
+                "schema_source": "pump_continuation_filter",
+                "schema_play_id": play_id,
+                "project_ids": projects_to_validate,
+                "validator_version": "v5_pump_continuation",
+                "filter_stage": "pump_continuation",
+                "pump_rules_checked": pump_result.get('rules_checked', 0),
+            }
+        elif pump_result and pump_result['passed']:
+            logger.info(
+                f"✓ Buyin #{buyin_id} passes pump continuation: {pump_result['reason']}"
+            )
+    except Exception as e:
+        logger.error(f"Pump continuation check error for buyin #{buyin_id}: {e}", exc_info=True)
+        # Non-fatal: continue with existing validation on error
 
     # If project_ids provided, use multi-project validation
     if projects_to_validate:

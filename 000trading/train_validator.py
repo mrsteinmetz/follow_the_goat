@@ -957,20 +957,25 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         update_success = update_validation_result(buyin_id, validation_result, step_logger)
         
         # 6.5 Pump signal check (if enabled)
+        # Uses best-known rules: loads overnight_pump_best_latest.json on first use,
+        # then refreshes every 5 min but only replaces rules when new combo is as good or better.
         # IMPORTANT: This must run AFTER validation completes (step 6), because
-        # the synthetic buyin is in 'validating' status until then. If pump signal
-        # runs before validation, its open-position guard will always find the
-        # current cycle's synthetic buyin and block pump entries permanently when
-        # TRAIN_VALIDATOR_PLAY_ID == PUMP_SIGNAL_PLAY_ID.
-        if PUMP_SIGNAL_PLAY_ID and trail_success:
+        # the synthetic buyin is in 'validating' status until then.
+        if not PUMP_SIGNAL_PLAY_ID:
+            logger.debug("Pump signal skipped: PUMP_SIGNAL_PLAY_ID not set")
+        elif not trail_success:
+            logger.debug("Pump signal skipped: trail not persisted for this buyin")
+        else:
             try:
                 from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
-                maybe_refresh_rules()  # refreshes every 5 min, no-op otherwise
-                check_and_fire_pump_signal(
+                maybe_refresh_rules()  # load overnight best if empty; refresh every 5 min
+                fired = check_and_fire_pump_signal(
                     buyin_id=buyin_id,
                     market_price=market_price,
                     price_cycle=price_cycle,
                 )
+                if fired:
+                    logger.info(f"Pump signal fired for play #{PUMP_SIGNAL_PLAY_ID} (source buyin #{buyin_id})")
             except Exception as pump_err:
                 logger.error(f"Pump signal check error (non-fatal): {pump_err}", exc_info=True)
         

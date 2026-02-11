@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-02-10T19:29:51.651604+00:00",
+  "lookback_hours": 24,
+  "min_precision": 50.0,
+  "train_size": 76814,
+  "test_size": 32695,
+  "rules": [
+    {
+      "column": "ob_price_change_10m",
+      "from_val": -0.607654,
+      "to_val": -0.184088
+    },
+    {
+      "column": "ob_liquidity_change_3m",
+      "from_val": 15.765929,
+      "to_val": 54.327703
+    },
+    {
+      "column": "ts_price_change_30s",
+      "from_val": -0.186504,
+      "to_val": -0.080445
+    }
+  ],
+  "test_precision": 100.0,
+  "test_expected_profit": 0.4671,
+  "test_n_signals": 14,
+  "test_avg_gain": 0.5671,
+  "train_precision": 78.95,
+  "train_expected_profit": 0.1947
+}

@@ -76,10 +76,8 @@ def _get_engine_if_running():
 def _execute_query(query: str, params: list = None, as_dict: bool = True, graceful: bool = True):
     """Execute a query directly against PostgreSQL.
     
-    PostgreSQL-only architecture - no DuckDB fallback needed.
-    
     Args:
-        query: SQL query (use ? for placeholders - will be converted to %s)
+        query: SQL query (use ? or %s for placeholders)
         params: Query parameters
         as_dict: If True, return list of dicts; if False, return list of tuples
         graceful: If True, return empty list on errors instead of raising
@@ -90,7 +88,7 @@ def _execute_query(query: str, params: list = None, as_dict: bool = True, gracef
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Convert DuckDB-style ? placeholders to PostgreSQL %s
+                # Convert ? placeholders to PostgreSQL %s
                 pg_query = query.replace('?', '%s')
                 cursor.execute(pg_query, params or [])
                 
@@ -118,7 +116,7 @@ if not logger.handlers:
 
 DEFAULT_SYMBOL = os.getenv("DEFAULT_SYMBOL", "SOLUSDT")
 DEFAULT_LOOKBACK_MINUTES = int(os.getenv("TRAIL_LOOKBACK_MINUTES", "15"))
-TRAIL_COLUMN_NAME = "fifteen_min_trail"  # DuckDB uses this name (no numeric prefix)
+TRAIL_COLUMN_NAME = "fifteen_min_trail"
 
 
 # =============================================================================
@@ -352,7 +350,11 @@ def fetch_order_book_signals(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch order book signals from PostgreSQL with computed metrics."""
+    """Fetch order book signals from PostgreSQL with computed metrics.
+    
+    Uses timestamp-based JOINs so Xm changes are accurate even with gaps.
+    Missing lookback periods return NULL (not zero).
+    """
     # PostgreSQL query for order book data with minute aggregation
     query = """
         WITH minute_aggregates AS (
@@ -380,33 +382,28 @@ def fetch_order_book_signals(
             WHERE timestamp >= ?
                 AND timestamp <= ?
             GROUP BY DATE_TRUNC('minute', timestamp)
-        ),
-        numbered_minutes AS (
-            SELECT *,
-                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-            FROM minute_aggregates
         )
         SELECT 
             m0.minute_timestamp,
             m0.mid_price,
-            m0.row_num AS minute_number,
-            ROUND(((m0.mid_price - COALESCE(m1.mid_price, m0.mid_price)) / 
-                COALESCE(m1.mid_price, m0.mid_price) * 100), 6) AS price_change_1m,
-            ROUND(((m0.mid_price - COALESCE(m5.mid_price, m0.mid_price)) / 
-                COALESCE(m5.mid_price, m0.mid_price) * 100), 6) AS price_change_5m,
-            ROUND(((m0.mid_price - COALESCE(m10.mid_price, m0.mid_price)) / 
-                COALESCE(m10.mid_price, m0.mid_price) * 100), 6) AS price_change_10m,
+            ROW_NUMBER() OVER (ORDER BY m0.minute_timestamp) AS minute_number,
+            ROUND(((m0.mid_price - m1.mid_price) / 
+                NULLIF(m1.mid_price, 0) * 100), 6) AS price_change_1m,
+            ROUND(((m0.mid_price - m5.mid_price) / 
+                NULLIF(m5.mid_price, 0) * 100), 6) AS price_change_5m,
+            ROUND(((m0.mid_price - m10.mid_price) / 
+                NULLIF(m10.mid_price, 0) * 100), 6) AS price_change_10m,
             ROUND(m0.volume_imbalance, 6) AS volume_imbalance,
-            ROUND((m0.volume_imbalance - COALESCE(m1.volume_imbalance, m0.volume_imbalance)), 6) AS imbalance_shift_1m,
+            ROUND((m0.volume_imbalance - m1.volume_imbalance), 6) AS imbalance_shift_1m,
             ROUND((m0.bid_depth_10 / NULLIF(m0.ask_depth_10, 0)), 6) AS depth_imbalance_ratio,
             ROUND((m0.bid_depth_10 / NULLIF(m0.total_depth_10, 0) * 100), 6) AS bid_liquidity_share_pct,
             ROUND((m0.ask_depth_10 / NULLIF(m0.total_depth_10, 0) * 100), 6) AS ask_liquidity_share_pct,
             ROUND(((m0.bid_depth_10 - m0.ask_depth_10) / NULLIF(m0.total_depth_10, 0) * 100), 6) AS depth_imbalance_pct,
             ROUND(m0.total_depth_10, 2) AS total_liquidity,
-            ROUND(((m0.total_depth_10 - COALESCE(m3.total_depth_10, m0.total_depth_10)) / 
-                NULLIF(COALESCE(m3.total_depth_10, m0.total_depth_10), 0) * 100), 6) AS liquidity_change_3m,
+            ROUND(((m0.total_depth_10 - m3.total_depth_10) / 
+                NULLIF(m3.total_depth_10, 0) * 100), 6) AS liquidity_change_3m,
             ROUND(m0.microprice_dev_bps, 6) AS microprice_deviation,
-            ROUND((m0.microprice_dev_bps - COALESCE(m2.microprice_dev_bps, m0.microprice_dev_bps)), 6) AS microprice_acceleration_2m,
+            ROUND((m0.microprice_dev_bps - m2.microprice_dev_bps), 6) AS microprice_acceleration_2m,
             ROUND(m0.relative_spread_bps, 6) AS spread_bps,
             ROUND((ABS(m0.bid_slope) / NULLIF(ABS(m0.ask_slope), 0)), 6) AS aggression_ratio,
             ROUND(((m0.ask_vwap_10 - m0.bid_vwap_10) / NULLIF(m0.bid_vwap_10, 0) * 10000), 6) AS vwap_spread_bps,
@@ -414,22 +411,17 @@ def fetch_order_book_signals(
             ROUND(m0.net_liquidity_change_sum / NULLIF(m0.total_depth_10, 0), 6) AS net_flow_to_liquidity_ratio,
             m0.sample_count,
             EXTRACT(EPOCH FROM (m0.period_end - m0.period_start)) AS coverage_seconds
-        FROM numbered_minutes m0
-        LEFT JOIN numbered_minutes m1 
-            ON m0.row_num > 1
-            AND m1.row_num = m0.row_num - 1
-        LEFT JOIN numbered_minutes m2
-            ON m0.row_num > 2
-            AND m2.row_num = m0.row_num - 2
-        LEFT JOIN numbered_minutes m3
-            ON m0.row_num > 3
-            AND m3.row_num = m0.row_num - 3
-        LEFT JOIN numbered_minutes m5
-            ON m0.row_num > 5
-            AND m5.row_num = m0.row_num - 5
-        LEFT JOIN numbered_minutes m10
-            ON m0.row_num > 10
-            AND m10.row_num = m0.row_num - 10
+        FROM minute_aggregates m0
+        LEFT JOIN minute_aggregates m1 
+            ON m1.minute_timestamp = m0.minute_timestamp - INTERVAL '1 minute'
+        LEFT JOIN minute_aggregates m2
+            ON m2.minute_timestamp = m0.minute_timestamp - INTERVAL '2 minutes'
+        LEFT JOIN minute_aggregates m3
+            ON m3.minute_timestamp = m0.minute_timestamp - INTERVAL '3 minutes'
+        LEFT JOIN minute_aggregates m5
+            ON m5.minute_timestamp = m0.minute_timestamp - INTERVAL '5 minutes'
+        LEFT JOIN minute_aggregates m10
+            ON m10.minute_timestamp = m0.minute_timestamp - INTERVAL '10 minutes'
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
         """
@@ -440,14 +432,13 @@ def fetch_transactions(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch transaction data from local DuckDB and compute per-minute metrics.
+    """Fetch transaction data from PostgreSQL and compute per-minute metrics.
     
-    Data source: master2's local DuckDB (sol_stablecoin_trades table)
-    Priority: master2 local DB > TradingDataEngine > file-based DuckDB
+    Data source: PostgreSQL sol_stablecoin_trades table.
     
     Note: All timestamps are in UTC (server time).
     """
-    # Query sol_stablecoin_trades from local DuckDB
+    # Query sol_stablecoin_trades from PostgreSQL
     query = """
         SELECT 
             trade_timestamp,
@@ -579,14 +570,13 @@ def fetch_whale_activity(
     start_time: datetime,
     end_time: datetime
 ) -> List[Dict[str, Any]]:
-    """Fetch whale movement data from local DuckDB and compute per-minute metrics.
+    """Fetch whale movement data from PostgreSQL and compute per-minute metrics.
     
-    Data source: master2's local DuckDB or TradingDataEngine (whale_movements table)
-    Priority: master2 local DB > TradingDataEngine > file-based DuckDB
+    Data source: PostgreSQL whale_movements table.
     
     Note: All timestamps are in UTC (server time).
     """
-    # Query whale_movements from local DuckDB
+    # Query whale_movements from PostgreSQL
     query = """
         SELECT 
             timestamp,
@@ -784,18 +774,17 @@ def fetch_price_movements(
     token: str = "SOL",
     coin_id: int = 5
 ) -> List[Dict[str, Any]]:
-    """Fetch price movement data with legacy-equivalent calculations.
+    """Fetch price movement data with per-minute calculations.
     
-    Priority order:
-    1. master2's local DuckDB (prices table with token column)
-    2. TradingDataEngine (master.py's in-memory prices table)
-    3. File-based DuckDB price_points table (legacy fallback)
+    Uses PostgreSQL prices table (primary) with price_points fallback.
+    Timestamp-based JOINs ensure correct Xm changes even with gaps.
+    Missing lookback periods return NULL (not zero).
     
     Args:
         start_time: Start of the time window
         end_time: End of the time window
-        token: Token symbol for DuckDB (SOL, BTC, ETH)
-        coin_id: Coin ID for legacy price_points (1=BTC, 2=ETH, 5=SOL)
+        token: Token symbol (SOL, BTC, ETH)
+        coin_id: Coin ID for legacy price_points fallback (1=BTC, 2=ETH, 5=SOL)
     """
     # Query for prices table (modern format: timestamp, token, price)
     query_prices = """
@@ -815,15 +804,10 @@ def fetch_price_movements(
                 AND timestamp <= ?
                 AND token = ?
             GROUP BY DATE_TRUNC('minute', timestamp)
-        ),
-        numbered_minutes AS (
-            SELECT *,
-                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-            FROM minute_aggregates
         )
         SELECT 
             m0.minute_timestamp,
-            m0.row_num AS minute_number,
+            ROW_NUMBER() OVER (ORDER BY m0.minute_timestamp) AS minute_number,
             ROUND((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100, 6) AS price_change_1m,
             ROUND(
                 ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100) /
@@ -831,16 +815,16 @@ def fetch_price_movements(
             6) AS momentum_volatility_ratio,
             ROUND(
                 CASE WHEN m1.true_close > 0 AND m1.true_open > 0 THEN
-                    ((m0.true_close - m0.true_open) / m0.true_open) -
-                    ((m1.true_close - m1.true_open) / m1.true_open)
-                ELSE 0 END * 100,
+                    ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0)) -
+                    ((m1.true_close - m1.true_open) / NULLIF(m1.true_open, 0))
+                ELSE NULL END * 100,
             6) AS momentum_acceleration_1m,
-            ROUND(CASE WHEN m5.true_close > 0 THEN
+            ROUND(CASE WHEN m5.true_close IS NOT NULL AND m5.true_close > 0 THEN
                 (m0.true_close - m5.true_close) / m5.true_close * 100
-            ELSE 0 END, 6) AS price_change_5m,
-            ROUND(CASE WHEN m10.true_close > 0 THEN
+            ELSE NULL END, 6) AS price_change_5m,
+            ROUND(CASE WHEN m10.true_close IS NOT NULL AND m10.true_close > 0 THEN
                 (m0.true_close - m10.true_close) / m10.true_close * 100
-            ELSE 0 END, 6) AS price_change_10m,
+            ELSE NULL END, 6) AS price_change_10m,
             ROUND(m0.price_range / NULLIF(m0.avg_price, 0) * 100, 6) AS volatility_pct,
             ROUND(
                 (ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100) /
@@ -858,16 +842,13 @@ def fetch_price_movements(
             ROUND(m0.true_close, 4) AS close_price,
             ROUND(m0.avg_price, 4) AS avg_price,
             m0.price_updates
-        FROM numbered_minutes m0
-        LEFT JOIN numbered_minutes m1 
-            ON m0.row_num > 1
-            AND m1.row_num = m0.row_num - 1
-        LEFT JOIN numbered_minutes m5
-            ON m0.row_num > 5
-            AND m5.row_num = m0.row_num - 5
-        LEFT JOIN numbered_minutes m10
-            ON m0.row_num > 10
-            AND m10.row_num = m0.row_num - 10
+        FROM minute_aggregates m0
+        LEFT JOIN minute_aggregates m1 
+            ON m1.minute_timestamp = m0.minute_timestamp - INTERVAL '1 minute'
+        LEFT JOIN minute_aggregates m5
+            ON m5.minute_timestamp = m0.minute_timestamp - INTERVAL '5 minutes'
+        LEFT JOIN minute_aggregates m10
+            ON m10.minute_timestamp = m0.minute_timestamp - INTERVAL '10 minutes'
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
     """
@@ -882,7 +863,7 @@ def fetch_price_movements(
     query_duckdb = """
         WITH minute_aggregates AS (
             SELECT 
-                TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:00') AS minute_timestamp,
+                DATE_TRUNC('minute', created_at) AS minute_timestamp,
                 CAST(MIN(value) AS NUMERIC) AS low_price,
                 CAST(MAX(value) AS NUMERIC) AS high_price,
                 CAST(AVG(value) AS NUMERIC) AS avg_price,
@@ -895,16 +876,11 @@ def fetch_price_movements(
             WHERE created_at >= %s
                 AND created_at <= %s
                 AND coin_id = %s
-            GROUP BY TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:00')
-        ),
-        numbered_minutes AS (
-            SELECT *,
-                ROW_NUMBER() OVER (ORDER BY minute_timestamp) AS row_num
-            FROM minute_aggregates
+            GROUP BY DATE_TRUNC('minute', created_at)
         )
         SELECT 
             m0.minute_timestamp,
-            m0.row_num AS minute_number,
+            ROW_NUMBER() OVER (ORDER BY m0.minute_timestamp) AS minute_number,
             ROUND((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100, 6) AS price_change_1m,
             ROUND(
                 ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0) * 100) /
@@ -912,16 +888,16 @@ def fetch_price_movements(
             6) AS momentum_volatility_ratio,
             ROUND(
                 CASE WHEN m1.true_close > 0 AND m1.true_open > 0 THEN
-                    ((m0.true_close - m0.true_open) / m0.true_open) -
-                    ((m1.true_close - m1.true_open) / m1.true_open)
-                ELSE 0 END * 100,
+                    ((m0.true_close - m0.true_open) / NULLIF(m0.true_open, 0)) -
+                    ((m1.true_close - m1.true_open) / NULLIF(m1.true_open, 0))
+                ELSE NULL END * 100,
             6) AS momentum_acceleration_1m,
-            ROUND(CASE WHEN m5.true_close > 0 THEN
+            ROUND(CASE WHEN m5.true_close IS NOT NULL AND m5.true_close > 0 THEN
                 (m0.true_close - m5.true_close) / m5.true_close * 100
-            ELSE 0 END, 6) AS price_change_5m,
-            ROUND(CASE WHEN m10.true_close > 0 THEN
+            ELSE NULL END, 6) AS price_change_5m,
+            ROUND(CASE WHEN m10.true_close IS NOT NULL AND m10.true_close > 0 THEN
                 (m0.true_close - m10.true_close) / m10.true_close * 100
-            ELSE 0 END, 6) AS price_change_10m,
+            ELSE NULL END, 6) AS price_change_10m,
             ROUND(m0.price_range / NULLIF(m0.avg_price, 0) * 100, 6) AS volatility_pct,
             ROUND(
                 (ABS(m0.true_close - m0.true_open) / NULLIF(m0.avg_price, 0) * 100) /
@@ -939,16 +915,13 @@ def fetch_price_movements(
             ROUND(m0.true_close, 4) AS close_price,
             ROUND(m0.avg_price, 4) AS avg_price,
             m0.price_updates
-        FROM numbered_minutes m0
-        LEFT JOIN numbered_minutes m1 
-            ON m0.row_num > 1
-            AND m1.row_num = m0.row_num - 1
-        LEFT JOIN numbered_minutes m5
-            ON m0.row_num > 5
-            AND m5.row_num = m0.row_num - 5
-        LEFT JOIN numbered_minutes m10
-            ON m0.row_num > 10
-            AND m10.row_num = m0.row_num - 10
+        FROM minute_aggregates m0
+        LEFT JOIN minute_aggregates m1 
+            ON m1.minute_timestamp = m0.minute_timestamp - INTERVAL '1 minute'
+        LEFT JOIN minute_aggregates m5
+            ON m5.minute_timestamp = m0.minute_timestamp - INTERVAL '5 minutes'
+        LEFT JOIN minute_aggregates m10
+            ON m10.minute_timestamp = m0.minute_timestamp - INTERVAL '10 minutes'
         ORDER BY m0.minute_timestamp DESC
         LIMIT 15
     """
@@ -1562,6 +1535,42 @@ def detect_microstructure_shift(
 # VELOCITY AND ACCELERATION CALCULATIONS FOR MICRO-MOVEMENT DETECTION
 # =============================================================================
 
+def _extract_timestamps_from_rows(sorted_rows: List[Dict[str, Any]]) -> List[datetime]:
+    """Extract real timestamps from data rows, falling back to evenly-spaced if missing.
+    
+    Uses actual minute_timestamp from the data so velocity/acceleration 
+    calculations correctly account for gaps in the data.
+    """
+    timestamps = []
+    for r in sorted_rows:
+        ts = r.get('minute_timestamp')
+        if ts is not None:
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except (ValueError, AttributeError):
+                    ts = None
+            if isinstance(ts, datetime):
+                timestamps.append(ts)
+                continue
+        # Fallback: use minute_number offset from first known timestamp
+        timestamps.append(None)
+    
+    # If we got at least one real timestamp, fill gaps relative to it
+    first_real = next((i for i, t in enumerate(timestamps) if t is not None), None)
+    if first_real is not None:
+        base = timestamps[first_real]
+        for i in range(len(timestamps)):
+            if timestamps[i] is None:
+                timestamps[i] = base + timedelta(minutes=(i - first_real))
+    else:
+        # No real timestamps at all - fall back to evenly-spaced
+        base = datetime.now()
+        timestamps = [base + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    
+    return timestamps
+
+
 def calculate_velocity_metrics(
     current_values: List[float],
     timestamps: List[datetime],
@@ -1667,9 +1676,8 @@ def calculate_order_book_velocities(
     bid_depths = [float(r.get('bid_depth_10', 0) or 0) for r in sorted_rows]
     ask_depths = [float(r.get('ask_depth_10', 0) or 0) for r in sorted_rows]
     
-    # Create dummy timestamps (1 minute apart)
-    base_time = datetime.now()
-    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    # Use real timestamps from data (handles gaps correctly)
+    timestamps = _extract_timestamps_from_rows(sorted_rows)
     
     # Calculate velocities
     imbalance_vel = calculate_velocity_metrics(imbalances, timestamps)
@@ -1703,7 +1711,7 @@ def calculate_order_book_velocities(
     
     return {
         "imbalance_velocity_1m": imbalance_vel["velocity"],
-        "imbalance_velocity_30s": imbalance_vel["velocity"] / 2,  # Estimate 30s
+        "imbalance_velocity_30s": None,  # Removed: was fabricated (1m / 2). Need real 30s data.
         "imbalance_acceleration": imbalance_vel["acceleration"],
         "depth_ratio_velocity": depth_ratio_vel["velocity"],
         "spread_velocity": spread_vel["velocity"],
@@ -1713,8 +1721,8 @@ def calculate_order_book_velocities(
         "imbalance_consistency_5m": consistency,
         "liquidity_gap_score": liquidity_gap,
         "liquidity_score": liquidity_score,
-        "liquidity_concentration": 0.5,  # Default - would need more detailed order book data
-        "spread_percentile_1h": 0.5,  # Default - would need historical spread data
+        "liquidity_concentration": None,  # Removed: was hardcoded 0.5
+        "spread_percentile_1h": None,  # Removed: was hardcoded 0.5
         "imbalance_momentum_persistence": imbalance_vel["momentum_persistence"],
     }
 
@@ -1742,8 +1750,8 @@ def calculate_transaction_velocities(
     buy_volumes = [buy_vol_pcts[i] / 100 * volumes[i] for i in range(len(volumes))]
     sell_volumes = [sell_vol_pcts[i] / 100 * volumes[i] for i in range(len(volumes))]
     
-    base_time = datetime.now()
-    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    # Use real timestamps from data (handles gaps correctly)
+    timestamps = _extract_timestamps_from_rows(sorted_rows)
     
     volume_vel = calculate_velocity_metrics(volumes, timestamps)
     pressure_vel = calculate_velocity_metrics(buy_pressures, timestamps)
@@ -1810,8 +1818,8 @@ def calculate_whale_velocities(
     net_flows = [float(r.get('net_flow_ratio', 0) or 0) for r in sorted_rows]
     total_moved = [float(r.get('total_sol_moved', 0) or 0) for r in sorted_rows]
     
-    base_time = datetime.now()
-    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    # Use real timestamps from data (handles gaps correctly)
+    timestamps = _extract_timestamps_from_rows(sorted_rows)
     
     flow_vel = calculate_velocity_metrics(net_flows, timestamps)
     
@@ -1851,7 +1859,7 @@ def calculate_whale_velocities(
         "stealth_accumulation_score": stealth_score,
         "distribution_urgency": distribution_urgency,
         "whale_activity_regime": activity_regime,
-        "time_since_last_large_move": 60.0,  # Default - would need timestamp tracking
+        "time_since_last_large_move": None,  # Removed: was hardcoded 60.0
         "large_move_frequency_5m": massive_count / 5.0 if massive_count else 0,
     }
 
@@ -1874,8 +1882,8 @@ def calculate_price_velocities(
     high_prices = [float(r.get('high_price', 0) or 0) for r in sorted_rows]
     low_prices = [float(r.get('low_price', 0) or 0) for r in sorted_rows]
     
-    base_time = datetime.now()
-    timestamps = [base_time + timedelta(minutes=i) for i in range(len(sorted_rows))]
+    # Use real timestamps from data (handles gaps correctly)
+    timestamps = _extract_timestamps_from_rows(sorted_rows)
     
     price_vel = calculate_velocity_metrics(price_changes, timestamps)
     vol_vel = calculate_velocity_metrics(volatilities, timestamps)
@@ -1931,15 +1939,15 @@ def calculate_price_velocities(
     
     return {
         "price_velocity_1m": price_vel["velocity"],
-        "price_velocity_30s": price_vel["velocity"] / 2,  # Estimate
+        "price_velocity_30s": None,  # Removed: was fabricated (1m / 2). Need real 30s data.
         "velocity_acceleration": price_vel["acceleration"],
         "momentum_persistence": price_vel["momentum_persistence"],
         "realized_volatility_1m": realized_vol,
         "volatility_of_volatility": vol_of_vol,
         "volatility_regime": vol_regime,
         "trend_strength_ema": trend_strength,
-        "price_vs_vwap_pct": 0,  # Would need VWAP calculation
-        "price_vs_twap_pct": 0,  # Would need TWAP calculation
+        "price_vs_vwap_pct": None,  # Removed: was hardcoded 0
+        "price_vs_twap_pct": None,  # Removed: was hardcoded 0
         "higher_highs_count_5m": higher_highs,
         "higher_lows_count_5m": higher_lows,
         "distance_to_resistance_pct": dist_resistance,
@@ -2374,13 +2382,15 @@ def calculate_30_second_metrics(
         result["price_change_30s"] = float(current.get("price_change_30s", 0) or 0)
         result["volatility_30s"] = float(current.get("volatility_30s", 0) or 0)
     
-    # Aggregate volume for 30-second window (from transactions)
+    # Transaction-derived 30s metrics
+    # NOTE: We no longer fabricate 30s values by halving 1m data.
+    # These remain at their 1-minute resolution values (latest minute snapshot).
+    # True 30s resolution would require sub-minute transaction aggregation.
     if transaction_rows:
-        # Estimate 30-second volume as half of 1-minute volume
         latest_tx = transaction_rows[0] if transaction_rows else {}
-        result["volume_30s"] = float(latest_tx.get("total_volume_usd", 0) or 0) / 2
+        result["volume_30s"] = None  # Removed: was fabricated (1m / 2)
         result["buy_sell_pressure_30s"] = float(latest_tx.get("buy_sell_pressure", 0) or 0)
-        result["trade_count_30s"] = int(latest_tx.get("trade_count", 0) or 0) // 2
+        result["trade_count_30s"] = None  # Removed: was fabricated (1m // 2)
     
     # Order book at 30s
     if order_book_rows:

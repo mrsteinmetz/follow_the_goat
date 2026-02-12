@@ -31,9 +31,12 @@ DEFAULT_COMPONENT_DEFS = [
     ComponentDef("archive_old_data", "job", "master2", "Archive Old Data (hourly)", expected_interval_ms=3600000),
     ComponentDef("restart_quicknode_streams", "job", "master2", "Monitor QuickNode Stream Latency (every 15s)", expected_interval_ms=15000),
     ComponentDef("recalculate_pump_filters", "job", "master2", "Recalculate pump continuation filters (every 5 min)", expected_interval_ms=300000),
+    ComponentDef("refresh_pump_model", "job", "master2", "Refresh Pump Signal V2 Model (every 5 min)", expected_interval_ms=300000),
     ComponentDef("export_job_status", "job", "master2", "Export Job Status (every 5s)", expected_interval_ms=5000),
     # master2.py service
     ComponentDef("local_api_5052", "service", "master2", "FastAPI Local API (port 5052)", expected_interval_ms=5000),
+    # standalone jobs
+    ComponentDef("sde_overnight_sweep", "job", "standalone", "Signal Discovery Engine - Overnight Sweep (every 12h)", expected_interval_ms=43200000),
 ]
 
 

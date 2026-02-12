@@ -524,3 +524,76 @@ def stop_local_api():
             logger.info("✓ Local API server stopped")
         except Exception as e:
             logger.error(f"Error stopping Local API server: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Pump Signal V2 Model Refresh (separate process from train_validator)
+# ---------------------------------------------------------------------------
+
+def run_refresh_pump_model():
+    """Retrain the pump signal V2 model and write to disk cache.
+
+    Runs in its own process so the heavy GBM training (2-4 min) doesn't
+    compete with train_validator's 5-second cycle.  train_validator reads
+    the updated model from the cache file.
+    """
+    try:
+        import logging as _logging
+        _logging.basicConfig(level=_logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+        trading_path = str(PROJECT_ROOT / "000trading")
+        if trading_path not in sys.path:
+            sys.path.insert(0, trading_path)
+
+        from pump_signal_logic import refresh_pump_rules
+        refresh_pump_rules()
+        logger.info("Pump model refresh cycle complete.")
+
+    except Exception as e:
+        logger.error(f"Pump model refresh error: {e}", exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Signal Discovery Engine (SDE) — Overnight Sweep
+# ---------------------------------------------------------------------------
+
+def run_sde_overnight_sweep():
+    """Run the Signal Discovery Engine sweep and auto-apply better filters.
+
+    This is CPU-heavy (can take 2-3 hours with 24h of data) and runs as its
+    own isolated component process so it doesn't block train_validator or
+    other real-time components.
+    """
+    try:
+        trading_path = str(PROJECT_ROOT / "000trading")
+        if trading_path not in sys.path:
+            sys.path.insert(0, trading_path)
+
+        from signal_discovery_engine import run_sweep, apply_best_filters, setup_logging
+        from datetime import datetime
+
+        hours = int(os.getenv("SDE_HOURS", "24"))
+        date_str = datetime.now().strftime("%Y%m%d")
+        output_path = f"/tmp/sde_overnight_{date_str}.json"
+        log_path = f"/tmp/sde_overnight_{date_str}.log"
+
+        setup_logging(log_path)
+        logger.info(f"SDE sweep starting: hours={hours}, output={output_path}")
+
+        results = run_sweep(hours, output_path)
+
+        if results:
+            applied = apply_best_filters(results)
+            if applied:
+                logger.info("SDE: New pump continuation rules applied.")
+            else:
+                logger.info("SDE: Current rules kept (no improvement found).")
+        else:
+            logger.info("SDE: No profitable results found.")
+
+        logger.info("SDE sweep finished.")
+
+    except Exception as e:
+        logger.error(f"SDE overnight sweep error: {e}", exc_info=True)
+        raise

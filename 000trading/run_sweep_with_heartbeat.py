@@ -101,6 +101,8 @@ def main():
                         help="Heartbeat file path")
     parser.add_argument("--heartbeat-interval", type=int, default=HEARTBEAT_INTERVAL_SEC,
                         help="Seconds between heartbeat updates")
+    parser.add_argument("--apply", action="store_true",
+                        help="Auto-apply best filters to pump_continuation_rules if better than current")
     parser.add_argument("--watch", action="store_true",
                         help="Only watch checkpoint and write heartbeat (sweep runs elsewhere)")
     parser.add_argument("--engine", type=str, default=None,
@@ -138,6 +140,8 @@ def main():
     cmd = [sys.executable, str(engine)]
     if args.sweep:
         cmd.append("--sweep")
+    if args.apply:
+        cmd.append("--apply")
     cmd.extend(["--hours", str(args.hours)])
     if args.output:
         cmd.extend(["--output", args.output])

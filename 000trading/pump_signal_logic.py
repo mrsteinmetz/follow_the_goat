@@ -610,6 +610,12 @@ def _compute_feat(name: str, row: dict) -> float:
 # =============================================================================
 
 def refresh_pump_rules():
+    """Train a new pump model and write to disk cache.
+
+    This is CPU-heavy (2-4 minutes) and should be called from the
+    dedicated refresh_pump_model component process — NOT from train_validator.
+    train_validator only reads the cached model via maybe_refresh_rules().
+    """
     global _model, _feature_columns, _model_metadata
 
     logger.info("=== V2: Refreshing pump model ===")
@@ -642,9 +648,12 @@ def refresh_pump_rules():
 
     try:
         MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(MODEL_CACHE_PATH, 'wb') as f:
+        tmp_path = MODEL_CACHE_PATH.with_suffix('.pkl.tmp')
+        with open(tmp_path, 'wb') as f:
             pickle.dump({'model': _model, 'feature_columns': _feature_columns,
                          'metadata': _model_metadata}, f)
+        tmp_path.replace(MODEL_CACHE_PATH)  # atomic rename
+        logger.info(f"  Cache written to {MODEL_CACHE_PATH}")
     except Exception as e:
         logger.warning(f"Cache write failed: {e}")
 
@@ -665,15 +674,16 @@ def _load_cached_model() -> bool:
 
 
 def maybe_refresh_rules():
+    """Reload the pump model from disk cache if stale.
+
+    Called by train_validator every cycle. This is lightweight (just a file
+    read) — the heavy model training runs in the separate refresh_pump_model
+    component which writes to the same cache file.
+    """
     global _last_rules_refresh
     now = time.time()
-    if _model is None:
+    if _model is None or (now - _last_rules_refresh >= RULES_REFRESH_INTERVAL):
         _load_cached_model()
-    if now - _last_rules_refresh >= RULES_REFRESH_INTERVAL:
-        try:
-            refresh_pump_rules()
-        except Exception as e:
-            logger.error(f"Refresh error: {e}", exc_info=True)
         _last_rules_refresh = now
 
 

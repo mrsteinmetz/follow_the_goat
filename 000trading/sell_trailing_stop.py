@@ -574,6 +574,11 @@ class TrailingStopSeller:
         - Trailing stop: If drop from HIGHEST exceeds 'increases' tolerance, sell
         - BOTH conditions are checked every cycle - whichever triggers first wins
         
+        MINIMUM HOLD TIME:
+        - If sell_logic contains "min_hold_seconds", selling is suppressed until
+          the position has been held for at least that many seconds.
+          Price tracking (highest price, etc.) still updates normally.
+        
         Returns:
             Dictionary with check results including should_sell flag.
         """
@@ -643,6 +648,26 @@ class TrailingStopSeller:
                 tracking['current_tolerance'] = effective_trailing_tolerance
                 logger.debug(f"Position {position_id}: Using locked tolerance {effective_trailing_tolerance*100:.4f}% (rule would be {trailing_tolerance*100:.4f}%)")
         
+        # Step 4b: MINIMUM HOLD TIME - suppress sell signals until position held long enough
+        # This prevents premature exits from entry noise, bid-ask spread, etc.
+        min_hold_seconds = (logic or {}).get('min_hold_seconds', 0)
+        hold_time_satisfied = True
+        hold_elapsed_seconds = None
+        
+        if min_hold_seconds > 0:
+            followed_at = position.get('followed_at')
+            if followed_at is not None:
+                now_utc = datetime.now(timezone.utc)
+                # Handle timezone-naive timestamps (assume UTC)
+                if followed_at.tzinfo is None:
+                    followed_at_utc = followed_at.replace(tzinfo=timezone.utc)
+                else:
+                    followed_at_utc = followed_at
+                hold_elapsed_seconds = (now_utc - followed_at_utc).total_seconds()
+                if hold_elapsed_seconds < min_hold_seconds:
+                    hold_time_satisfied = False
+                    logger.debug(f"Position {position_id}: Hold time {hold_elapsed_seconds:.1f}s < {min_hold_seconds}s minimum - sell suppressed")
+        
         # Step 5: DUAL SELL CHECK - check BOTH conditions
         should_sell = False
         sell_reason = None
@@ -650,21 +675,27 @@ class TrailingStopSeller:
         # Check 1: Stop-loss from entry (only if price is below entry)
         # If drop from entry exceeds the 'decreases' tolerance, trigger immediate sell
         if drop_from_entry_decimal < -stop_loss_tolerance:
-            should_sell = True
-            sell_reason = 'stop_loss'
-            logger.info(f"SELL SIGNAL - Position {position_id} (STOP-LOSS from entry, tolerance {stop_loss_tolerance*100:.2f}%):")
-            logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
-            logger.info(f"   Drop from entry: {drop_from_entry_decimal*100:.4f}% - EXCEEDED STOP-LOSS TOLERANCE")
+            if hold_time_satisfied:
+                should_sell = True
+                sell_reason = 'stop_loss'
+                logger.info(f"SELL SIGNAL - Position {position_id} (STOP-LOSS from entry, tolerance {stop_loss_tolerance*100:.2f}%):")
+                logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
+                logger.info(f"   Drop from entry: {drop_from_entry_decimal*100:.4f}% - EXCEEDED STOP-LOSS TOLERANCE")
+            else:
+                logger.debug(f"Position {position_id}: Stop-loss would fire but hold time not met ({hold_elapsed_seconds:.1f}s / {min_hold_seconds}s)")
         
         # Check 2: Trailing stop from highest (always checked if we had any gain)
         # CRITICAL: This check runs even if current price is below entry!
         # If we achieved a gain and then dropped too far from highest, sell
         if not should_sell and highest_gain_decimal > 0 and drop_from_high_decimal < -effective_trailing_tolerance:
-            should_sell = True
-            sell_reason = 'trailing_stop'
-            logger.info(f"SELL SIGNAL - Position {position_id} (TRAILING STOP from highest, tolerance {effective_trailing_tolerance*100:.2f}%):")
-            logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
-            logger.info(f"   Highest gain was: {highest_gain_decimal*100:.4f}%, Drop from high: {drop_from_high_decimal*100:.4f}% - EXCEEDED TRAILING TOLERANCE")
+            if hold_time_satisfied:
+                should_sell = True
+                sell_reason = 'trailing_stop'
+                logger.info(f"SELL SIGNAL - Position {position_id} (TRAILING STOP from highest, tolerance {effective_trailing_tolerance*100:.2f}%):")
+                logger.info(f"   Entry: ${entry_price:.6f}, Current: ${current_price:.6f}, Highest: ${highest_price:.6f}")
+                logger.info(f"   Highest gain was: {highest_gain_decimal*100:.4f}%, Drop from high: {drop_from_high_decimal*100:.4f}% - EXCEEDED TRAILING TOLERANCE")
+            else:
+                logger.debug(f"Position {position_id}: Trailing stop would fire but hold time not met ({hold_elapsed_seconds:.1f}s / {min_hold_seconds}s)")
         
         # Step 6: Determine which bucket we're currently in (for logging/display)
         rules_bucket = 'increases' if current_price > entry_price else 'decreases'
@@ -913,6 +944,18 @@ class TrailingStopSeller:
                 if position_id in self.position_tracking:
                     del self.position_tracking[position_id]
             
+            # Feed outcome to pump signal circuit breaker (Play #3 trades)
+            play_id = position.get('play_id')
+            if play_id == 3:
+                try:
+                    from pump_signal_logic import record_signal_outcome
+                    # "hit target" = highest price reached >= 0.2% above entry
+                    hit_target = (highest_price - entry_price_value) / entry_price_value * 100 >= 0.2 if entry_price_value else False
+                    record_signal_outcome(hit_target)
+                    logger.info(f"  Pump circuit breaker: recorded {'HIT' if hit_target else 'MISS'} for #{position_id}")
+                except Exception as e:
+                    logger.debug(f"  Pump circuit breaker feedback skipped: {e}")
+
             logger.info(f"SOLD Position {position_id} - {result_icon}")
             logger.info(f"  Entry: ${entry_price_value:.4f}")
             logger.info(f"  Exit: ${actual_exit_price:.4f}")

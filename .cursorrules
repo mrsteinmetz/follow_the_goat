@@ -5,17 +5,18 @@ This project uses a **PostgreSQL-only architecture** for all data storage and re
 
 ---
 
-### DuckDB Exception for Filter Analysis
+### DuckDB Exceptions for Read-Only Caching
 
-**IMPORTANT:** There is ONE exception to the PostgreSQL-only rule:
+**IMPORTANT:** There are TWO exceptions to the PostgreSQL-only rule:
 
-**`core/filter_cache.py`** is permitted to use DuckDB for read-only caching of filter analysis data.
+1. **`core/filter_cache.py`** — DuckDB read-only cache for filter analysis data.
+2. **`000trading/pump_signal_logic.py`** — DuckDB read-only cache for pump model trail data.
 
-This is a performance optimization that:
-- Speeds up filter pattern generation by 10-50x
-- Uses DuckDB purely as a read-only cache (7-day rolling window)
+Both follow the same approved pattern:
+- Speeds up analysis by 10-50x vs raw PostgreSQL queries
+- Uses DuckDB purely as a read-only cache (rolling window)
 - PostgreSQL remains the source of truth
-- Cache is automatically synced incrementally from PostgreSQL
+- Cache is automatically synced incrementally from PostgreSQL (watermark-based)
 - NO other modules should use DuckDB
 
 

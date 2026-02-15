@@ -129,15 +129,26 @@ def check_pump_continuation_rules(
     Check if a buyin passes the pump continuation filter rules.
 
     Loads the minute=0 trail row directly from buyin_trail_minutes (same column
-    names the analytics engine uses).  Only activates when pre_entry_change_1m > 0
-    (price was rising).  If the rules table is empty, passes by default.
+    names the analytics engine uses).
 
+    Two-stage check:
+      1. **Downtrend guard**: REJECT if price is falling significantly
+         (pre_entry_change_1m < -0.10% or pre_entry_change_3m < -0.20%).
+         This prevents buying into crashes regardless of other filters.
+      2. **Pump quality check**: When price IS rising (pre_entry_change_1m > 0),
+         apply pump continuation rules to verify the pump is high-quality.
+
+    If the rules table is empty, passes by default.
     Every check is logged to pump_continuation_history for monitoring.
 
     Returns:
         None if rules table is empty (no gate),
         {'passed': True/False, 'reason': str, 'rules_checked': int}
     """
+    # ── Downtrend guard thresholds (in %) ──
+    DOWNTREND_1M_THRESHOLD = -0.10   # Reject if 1-min price change below this
+    DOWNTREND_3M_THRESHOLD = -0.20   # Reject if 3-min price change below this
+
     rules = _load_pump_continuation_rules()
     if not rules:
         return None  # No rules = no gate, pass through
@@ -146,8 +157,12 @@ def check_pump_continuation_rules(
     try:
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Get all columns needed: pre_entry_change_1m + rule columns
-                needed_cols = ['pre_entry_change_1m'] + [r['column_name'] for r in rules]
+                # Get all columns needed: pre_entry changes + rule columns
+                needed_cols = ['pre_entry_change_1m', 'pre_entry_change_3m'] + [
+                    r['column_name'] for r in rules
+                ]
+                # Deduplicate in case a rule column overlaps
+                needed_cols = list(dict.fromkeys(needed_cols))
                 col_list = ', '.join(needed_cols)
                 cursor.execute(f"""
                     SELECT {col_list}
@@ -167,12 +182,31 @@ def check_pump_continuation_rules(
         _log_pump_history(buyin_id, True, result['reason'], 0)
         return result
 
-    # Only apply pump continuation check when price is rising
-    pre_entry_chg = row.get('pre_entry_change_1m')
-    pre_entry_float = float(pre_entry_chg) if pre_entry_chg is not None else None
-    if pre_entry_float is None or pre_entry_float <= 0:
-        result = {'passed': True, 'reason': 'price not rising, pump check skipped', 'rules_checked': 0}
-        _log_pump_history(buyin_id, True, result['reason'], 0, pre_entry_float)
+    # ── Stage 1: Downtrend guard ──
+    # REJECT trades when price is clearly falling — prevents buying into crashes.
+    pre_entry_chg_1m_raw = row.get('pre_entry_change_1m')
+    pre_entry_chg_3m_raw = row.get('pre_entry_change_3m')
+    pre_entry_1m = float(pre_entry_chg_1m_raw) if pre_entry_chg_1m_raw is not None else None
+    pre_entry_3m = float(pre_entry_chg_3m_raw) if pre_entry_chg_3m_raw is not None else None
+
+    if pre_entry_1m is not None and pre_entry_1m < DOWNTREND_1M_THRESHOLD:
+        reason = (f"DOWNTREND GUARD: 1m price change {pre_entry_1m:+.4f}% "
+                  f"below threshold {DOWNTREND_1M_THRESHOLD}%")
+        logger.info(f"✗ Buyin #{buyin_id} REJECTED by downtrend guard: {reason}")
+        _log_pump_history(buyin_id, False, reason, 0, pre_entry_1m)
+        return {'passed': False, 'reason': reason, 'rules_checked': 0}
+
+    if pre_entry_3m is not None and pre_entry_3m < DOWNTREND_3M_THRESHOLD:
+        reason = (f"DOWNTREND GUARD: 3m price change {pre_entry_3m:+.4f}% "
+                  f"below threshold {DOWNTREND_3M_THRESHOLD}%")
+        logger.info(f"✗ Buyin #{buyin_id} REJECTED by downtrend guard: {reason}")
+        _log_pump_history(buyin_id, False, reason, 0, pre_entry_1m)
+        return {'passed': False, 'reason': reason, 'rules_checked': 0}
+
+    # ── Stage 2: Pump quality check (only when price is rising) ──
+    if pre_entry_1m is None or pre_entry_1m <= 0:
+        result = {'passed': True, 'reason': 'price flat/not rising, pump quality check skipped', 'rules_checked': 0}
+        _log_pump_history(buyin_id, True, result['reason'], 0, pre_entry_1m)
         return result
 
     # Apply each filter rule against the trail data

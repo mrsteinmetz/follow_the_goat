@@ -38,11 +38,12 @@ MIN_PRECISION = 40.0
 MIN_SIGNALS = 15
 
 SKIP_COLUMNS = frozenset([
-    'buyin_id', 'trade_id', 'play_id', 'wallet_address', 'followed_at',
+    'buyin_id', 'buyin_id_1', 'trade_id', 'play_id', 'wallet_address', 'followed_at',
     'our_status', 'minute', 'sub_minute', 'interval_idx',
     'potential_gains', 'pat_detected_list', 'pat_swing_trend',
     'is_good', 'label', 'created_at', 'pre_entry_trend',
     'max_fwd_return', 'min_fwd_return',
+    'our_entry_price', 'price_cycle', 'id',  # metadata, not features
 ])
 
 ABSOLUTE_PRICE_COLUMNS = frozenset([
@@ -124,9 +125,12 @@ def _load_data(con: duckdb.DuckDBPyConnection, hours: int) -> int:
           AND minute = 0 AND COALESCE(sub_minute, 0) = 0
     """)
 
-    con.execute("""
+    # Exclude t.buyin_id to avoid DuckDB renaming it to buyin_id_1
+    trail_cols = con.execute("SELECT column_name FROM information_schema.columns WHERE table_name='trail'").fetchall()
+    t_cols = ", ".join(f"t.{r[0]}" for r in trail_cols if r[0] != 'buyin_id')
+    con.execute(f"""
         CREATE TABLE merged AS
-        SELECT b.buyin_id, b.followed_at, b.our_entry_price, b.potential_gains, b.our_status, b.price_cycle, t.*
+        SELECT b.buyin_id, b.followed_at, b.our_entry_price, b.potential_gains, b.our_status, b.price_cycle, {t_cols}
         FROM buyins b INNER JOIN trail t ON t.buyin_id = b.buyin_id
     """)
 

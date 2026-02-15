@@ -17,23 +17,31 @@ Drop-in replacement for pump_signal_logic V1 — same external API:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import pickle
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import duckdb
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 
 from core.database import get_postgres, postgres_execute, postgres_query, postgres_query_one
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_CACHE_PATH = _PROJECT_ROOT / "tests" / "filter_simulation" / "results" / "pump_model_v2_cache.pkl"
+
+# ── DuckDB trail cache ───────────────────────────────────────────────────────
+_CACHE_DIR = _PROJECT_ROOT / "cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+_TRAIL_CACHE_FILE = _CACHE_DIR / "pump_model_trail.duckdb"
 
 logger = logging.getLogger("train_validator.pump_signal_v2")
 
@@ -113,6 +121,55 @@ _gate_stats: Dict[str, int] = {
 
 _price_buffer: deque = deque(maxlen=200)
 
+# ── Volatility regime tracking ───────────────────────────────────────────────
+_vol_buffer: deque = deque(maxlen=720)     # ~12 hours at 1 sample per ~minute
+
+# ── Circuit breaker: rolling accuracy tracker ────────────────────────────────
+_recent_outcomes: deque = deque(maxlen=50)  # last 50 signal outcomes
+_circuit_breaker_paused: bool = False
+
+
+def record_signal_outcome(hit_target: bool) -> None:
+    """Record whether a fired signal hit the +0.2% target.
+
+    Called by the trailing_stop_seller / update_potential_gains component
+    when a Play #3 trade resolves.
+    """
+    _recent_outcomes.append(1 if hit_target else 0)
+
+
+def _check_circuit_breaker() -> bool:
+    """Return True if the circuit breaker is tripped (live precision too low)."""
+    global _circuit_breaker_paused
+    if len(_recent_outcomes) < 20:
+        return False  # not enough data to judge
+    live_prec = sum(_recent_outcomes) / len(_recent_outcomes)
+    if live_prec < 0.40:
+        if not _circuit_breaker_paused:
+            logger.warning(f"Circuit breaker TRIPPED: live precision {live_prec:.1%} "
+                           f"({sum(_recent_outcomes)}/{len(_recent_outcomes)}) — pausing signals")
+            _circuit_breaker_paused = True
+        return True
+    if _circuit_breaker_paused:
+        logger.info(f"Circuit breaker RESET: live precision recovered to {live_prec:.1%}")
+        _circuit_breaker_paused = False
+    return False
+
+
+def _update_vol_buffer(vol_1m: Optional[float]) -> None:
+    if vol_1m is not None:
+        _vol_buffer.append(float(vol_1m))
+
+
+def _get_vol_percentile() -> Optional[float]:
+    """Return the percentile rank of the most recent volatility reading."""
+    if len(_vol_buffer) < 60:
+        return None  # need ~1 hour of data
+    current = _vol_buffer[-1]
+    rank = sum(1 for v in _vol_buffer if v <= current)
+    return rank / len(_vol_buffer) * 100
+
+
 # =============================================================================
 # PRICE BUFFER & SAFETY GATES
 # =============================================================================
@@ -150,12 +207,19 @@ def _is_not_crashing() -> Tuple[bool, str]:
 
 def _check_multi_timeframe_trend(trail_row: dict) -> Tuple[bool, str]:
     """
-    Require at least 2 of 3 timeframes showing positive momentum.
+    Require at least 1 of 3 timeframes showing positive momentum.
 
-    THIS IS THE KEY FIX for downtrend bounces: V1 passed if ANY single
-    timeframe was positive. A brief 1-minute bounce during a 5-minute
-    downtrend passed the gate. With V2, we also need 5m > 0 (which would
-    have been deeply negative during that downtrend), so it gets rejected.
+    Backtest shows the GBM model is fundamentally a dip-buyer: it fires
+    highest confidence when 5m trend is negative (pullback before pump).
+    Requiring 2/3 positive blocked 100% of high-confidence signals.
+
+    With 1/3 positive we still block total freefall (0/3 positive = all
+    timeframes falling) but allow the model to catch pullback-pump patterns
+    where at least one timeframe has started recovering.
+
+    Backtest results (48h, light trend gate):
+      thresh=0.50: 146 signals, 33.6% prec, +0.13% E[profit]
+      thresh=0.70:  51 signals, 41.2% prec, +0.12% E[profit]
     """
     scores = 0
     available = 0
@@ -179,129 +243,367 @@ def _check_multi_timeframe_trend(trail_row: dict) -> Tuple[bool, str]:
     if available == 0:
         return False, "no momentum data"
 
-    # Need 2+ positive if we have 2+ timeframes, else need all
-    required = min(2, available)
-    return scores >= required, desc
+    # Need at least 1 positive — blocks total freefall but allows dip-buying
+    return scores >= 1, desc
 
 
 # =============================================================================
-# DATA LOADING WITH PATH-AWARE LABELING
+# DUCKDB TRAIL CACHE — Incremental Sync + Vectorised Forward Returns
 # =============================================================================
 
-def _get_pg_connection_string() -> str:
-    from core.config import settings
-    pg = settings.postgres
-    return f"host={pg.host} port={pg.port} dbname={pg.database} user={pg.user} password={pg.password}"
+def _get_trail_cache_conn() -> duckdb.DuckDBPyConnection:
+    """Open (or create) the DuckDB trail cache."""
+    return duckdb.connect(str(_TRAIL_CACHE_FILE))
 
+
+def _init_trail_cache(con: duckdb.DuckDBPyConnection) -> None:
+    """Ensure the DuckDB cache tables exist."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS cached_trail (
+            buyin_id   BIGINT,
+            minute     INTEGER,
+            followed_at TIMESTAMP,
+            -- forward-return source
+            pm_close_price DOUBLE,
+            -- all feature columns we actually use (ratio / pct columns)
+            pm_price_change_1m DOUBLE, pm_momentum_volatility_ratio DOUBLE,
+            pm_momentum_acceleration_1m DOUBLE, pm_price_change_5m DOUBLE,
+            pm_price_change_10m DOUBLE, pm_volatility_pct DOUBLE,
+            pm_body_range_ratio DOUBLE, pm_volatility_surge_ratio DOUBLE,
+            pm_price_stddev_pct DOUBLE, pm_trend_consistency_3m DOUBLE,
+            pm_cumulative_return_5m DOUBLE, pm_candle_body_pct DOUBLE,
+            pm_upper_wick_pct DOUBLE, pm_lower_wick_pct DOUBLE,
+            pm_wick_balance_ratio DOUBLE, pm_price_vs_ma5_pct DOUBLE,
+            pm_breakout_strength_10m DOUBLE,
+            pm_price_velocity_1m DOUBLE, pm_price_velocity_30s DOUBLE,
+            pm_velocity_acceleration DOUBLE, pm_momentum_persistence DOUBLE,
+            pm_realized_vol_1m DOUBLE, pm_vol_of_vol DOUBLE,
+            pm_volatility_regime DOUBLE, pm_trend_strength_ema DOUBLE,
+            pm_price_vs_vwap_pct DOUBLE, pm_price_vs_twap_pct DOUBLE,
+            pm_higher_highs_5m DOUBLE, pm_higher_lows_5m DOUBLE,
+            pm_dist_resistance_pct DOUBLE, pm_dist_support_pct DOUBLE,
+            pm_breakout_imminence DOUBLE,
+            ob_price_change_1m DOUBLE, ob_price_change_5m DOUBLE,
+            ob_price_change_10m DOUBLE, ob_volume_imbalance DOUBLE,
+            ob_imbalance_shift_1m DOUBLE, ob_imbalance_trend_3m DOUBLE,
+            ob_depth_imbalance_ratio DOUBLE, ob_bid_liquidity_share_pct DOUBLE,
+            ob_ask_liquidity_share_pct DOUBLE, ob_depth_imbalance_pct DOUBLE,
+            ob_liquidity_change_3m DOUBLE, ob_microprice_deviation DOUBLE,
+            ob_microprice_acceleration_2m DOUBLE, ob_spread_bps DOUBLE,
+            ob_aggression_ratio DOUBLE, ob_vwap_spread_bps DOUBLE,
+            ob_net_flow_5m DOUBLE, ob_net_flow_to_liquidity_ratio DOUBLE,
+            ob_imbalance_velocity_1m DOUBLE, ob_imbalance_velocity_30s DOUBLE,
+            ob_imbalance_acceleration DOUBLE, ob_bid_depth_velocity DOUBLE,
+            ob_ask_depth_velocity DOUBLE, ob_depth_ratio_velocity DOUBLE,
+            ob_spread_velocity DOUBLE, ob_spread_percentile_1h DOUBLE,
+            ob_liquidity_score DOUBLE, ob_liquidity_gap_score DOUBLE,
+            ob_liquidity_concentration DOUBLE,
+            ob_cumulative_imbalance_5m DOUBLE, ob_imbalance_consistency_5m DOUBLE,
+            tx_buy_sell_pressure DOUBLE, tx_buy_volume_pct DOUBLE,
+            tx_sell_volume_pct DOUBLE, tx_pressure_shift_1m DOUBLE,
+            tx_pressure_trend_3m DOUBLE, tx_long_short_ratio DOUBLE,
+            tx_long_volume_pct DOUBLE, tx_short_volume_pct DOUBLE,
+            tx_perp_position_skew_pct DOUBLE, tx_long_ratio_shift_1m DOUBLE,
+            tx_perp_dominance_pct DOUBLE, tx_volume_acceleration_ratio DOUBLE,
+            tx_volume_surge_ratio DOUBLE, tx_whale_volume_pct DOUBLE,
+            tx_avg_trade_size DOUBLE, tx_trades_per_second DOUBLE,
+            tx_buy_trade_pct DOUBLE, tx_price_change_1m DOUBLE,
+            tx_price_volatility_pct DOUBLE, tx_cumulative_buy_flow_5m DOUBLE,
+            tx_trade_count DOUBLE, tx_large_trade_count DOUBLE,
+            tx_volume_velocity DOUBLE, tx_volume_acceleration DOUBLE,
+            tx_volume_percentile_1h DOUBLE, tx_cumulative_delta DOUBLE,
+            tx_cumulative_delta_5m DOUBLE, tx_delta_divergence DOUBLE,
+            tx_trade_intensity DOUBLE, tx_intensity_velocity DOUBLE,
+            tx_large_trade_intensity DOUBLE, tx_vpin_estimate DOUBLE,
+            tx_order_flow_toxicity DOUBLE, tx_kyle_lambda DOUBLE,
+            tx_aggressive_buy_ratio DOUBLE, tx_aggressive_sell_ratio DOUBLE,
+            tx_aggression_imbalance DOUBLE,
+            wh_net_flow_ratio DOUBLE, wh_flow_shift_1m DOUBLE,
+            wh_flow_trend_3m DOUBLE, wh_accumulation_ratio DOUBLE,
+            wh_strong_accumulation DOUBLE, wh_cumulative_flow_5m DOUBLE,
+            wh_inflow_share_pct DOUBLE, wh_outflow_share_pct DOUBLE,
+            wh_net_flow_strength_pct DOUBLE,
+            wh_strong_accumulation_pct DOUBLE, wh_strong_distribution_pct DOUBLE,
+            wh_activity_surge_ratio DOUBLE, wh_movement_count DOUBLE,
+            wh_massive_move_pct DOUBLE, wh_avg_wallet_pct_moved DOUBLE,
+            wh_largest_move_dominance DOUBLE,
+            wh_distribution_pressure_pct DOUBLE, wh_outflow_surge_pct DOUBLE,
+            wh_movement_imbalance_pct DOUBLE, wh_net_flow_sol DOUBLE,
+            wh_flow_velocity DOUBLE, wh_flow_acceleration DOUBLE,
+            wh_cumulative_flow_10m DOUBLE, wh_stealth_acc_score DOUBLE,
+            wh_distribution_urgency DOUBLE, wh_activity_regime DOUBLE,
+            wh_time_since_large DOUBLE, wh_large_freq_5m DOUBLE,
+            sp_price_range_pct DOUBLE, sp_total_change_pct DOUBLE,
+            sp_volatility_pct DOUBLE,
+            btc_price_change_1m DOUBLE, btc_price_change_5m DOUBLE,
+            btc_price_change_10m DOUBLE, btc_volatility_pct DOUBLE,
+            eth_price_change_1m DOUBLE, eth_price_change_5m DOUBLE,
+            eth_price_change_10m DOUBLE, eth_volatility_pct DOUBLE,
+            mp_volume_divergence_confidence DOUBLE,
+            mp_order_book_squeeze_confidence DOUBLE,
+            mp_whale_stealth_accumulation_confidence DOUBLE,
+            mp_momentum_acceleration_confidence DOUBLE,
+            mp_microstructure_shift_confidence DOUBLE,
+            xa_btc_sol_corr_1m DOUBLE, xa_btc_sol_corr_5m DOUBLE,
+            xa_btc_leads_sol_1 DOUBLE, xa_btc_leads_sol_2 DOUBLE,
+            xa_sol_beta_btc DOUBLE, xa_eth_sol_corr_1m DOUBLE,
+            xa_eth_leads_sol_1 DOUBLE, xa_sol_beta_eth DOUBLE,
+            xa_btc_sol_divergence DOUBLE, xa_eth_sol_divergence DOUBLE,
+            xa_momentum_alignment DOUBLE,
+            ts_price_change_30s DOUBLE, ts_volume_30s DOUBLE,
+            ts_buy_sell_pressure_30s DOUBLE, ts_imbalance_30s DOUBLE,
+            ts_trade_count_30s DOUBLE, ts_momentum_30s DOUBLE,
+            ts_volatility_30s DOUBLE,
+            mm_probability DOUBLE, mm_direction DOUBLE,
+            mm_confidence DOUBLE, mm_order_flow_score DOUBLE,
+            mm_whale_alignment DOUBLE, mm_momentum_quality DOUBLE,
+            mm_volatility_regime DOUBLE, mm_cross_asset_score DOUBLE,
+            mm_false_signal_risk DOUBLE, mm_adverse_selection DOUBLE,
+            pre_entry_change_1m DOUBLE, pre_entry_change_2m DOUBLE,
+            pre_entry_change_3m DOUBLE, pre_entry_change_5m DOUBLE,
+            pre_entry_change_10m DOUBLE,
+            PRIMARY KEY (buyin_id, minute)
+        )
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ct_followed
+        ON cached_trail(followed_at)
+    """)
+
+
+# Column list used in SELECT from PostgreSQL (must match cached_trail schema)
+_TRAIL_CACHE_COLUMNS: List[str] = []  # populated lazily
+
+
+def _trail_cache_columns() -> List[str]:
+    """Return the explicit column list to SELECT from buyin_trail_minutes."""
+    global _TRAIL_CACHE_COLUMNS
+    if _TRAIL_CACHE_COLUMNS:
+        return _TRAIL_CACHE_COLUMNS
+
+    # Open a throwaway DuckDB connection to read column names from schema
+    con = _get_trail_cache_conn()
+    try:
+        _init_trail_cache(con)
+        info = con.execute("PRAGMA table_info('cached_trail')").fetchall()
+        # info rows: (cid, name, type, notnull, dflt_value, pk)
+        cols = [row[1] for row in info if row[1] != 'followed_at']
+        _TRAIL_CACHE_COLUMNS = cols
+    finally:
+        con.close()
+    return _TRAIL_CACHE_COLUMNS
+
+
+def _sync_trail_cache(hours: int) -> duckdb.DuckDBPyConnection:
+    """Incrementally sync trail data from PostgreSQL into DuckDB.
+
+    Returns an open DuckDB connection ready for queries.
+    """
+    con = _get_trail_cache_conn()
+    _init_trail_cache(con)
+
+    t0 = time.time()
+
+    # Watermark: latest followed_at already in cache
+    row = con.execute("SELECT MAX(followed_at) FROM cached_trail").fetchone()
+    max_ts = row[0] if row and row[0] else None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    # ── Cleanup old data ────────────────────────────────────────────────
+    con.execute("DELETE FROM cached_trail WHERE followed_at < ?", [cutoff])
+
+    # ── Determine which buyins to fetch ─────────────────────────────────
+    if max_ts is not None:
+        fetch_since = max_ts
+        logger.info(f"  Incremental sync (since {max_ts})")
+    else:
+        fetch_since = cutoff
+        logger.info(f"  Full sync (last {hours}h)")
+
+    with get_postgres() as pg:
+        with pg.cursor() as cur:
+            cur.execute("""
+                SELECT id AS buyin_id, followed_at
+                FROM follow_the_goat_buyins
+                WHERE potential_gains IS NOT NULL
+                  AND followed_at > %s
+            """, [fetch_since])
+            new_buyins = cur.fetchall()
+
+    if not new_buyins:
+        cached_count = con.execute("SELECT COUNT(DISTINCT buyin_id) FROM cached_trail").fetchone()[0]
+        logger.info(f"  No new buyins (cache has {cached_count:,} buyins)")
+        return con
+
+    new_buyin_ids = [r['buyin_id'] for r in new_buyins]
+    followed_map = {r['buyin_id']: r['followed_at'] for r in new_buyins}
+    logger.info(f"  {len(new_buyin_ids):,} new buyins to sync")
+
+    # ── Fetch trail rows (only needed columns) ──────────────────────────
+    trail_cols = _trail_cache_columns()
+    col_list = ', '.join(trail_cols)
+
+    all_trail_rows = []
+    chunk_size = 500
+    for i in range(0, len(new_buyin_ids), chunk_size):
+        chunk = new_buyin_ids[i:i + chunk_size]
+        placeholders = ','.join(['%s'] * len(chunk))
+        with get_postgres() as pg:
+            with pg.cursor() as cur:
+                cur.execute(f"""
+                    SELECT {col_list}
+                    FROM buyin_trail_minutes
+                    WHERE buyin_id IN ({placeholders})
+                      AND (sub_minute = 0 OR sub_minute IS NULL)
+                """, chunk)
+                all_trail_rows.extend(cur.fetchall())
+
+    if not all_trail_rows:
+        logger.warning("  No trail rows for new buyins")
+        return con
+
+    # ── Build PyArrow table (avoids pandas type-inference entirely) ──────
+    # Get the DuckDB schema column order so Arrow table matches exactly
+    schema_info = con.execute("PRAGMA table_info('cached_trail')").fetchall()
+    schema_cols = [row[1] for row in schema_info]  # ordered by position
+
+    pg_col_names = list(all_trail_rows[0].keys())  # from PostgreSQL result
+    arrays = {}
+
+    for cname in schema_cols:
+        if cname == 'buyin_id':
+            arrays[cname] = pa.array(
+                [r['buyin_id'] for r in all_trail_rows], type=pa.int64())
+        elif cname == 'minute':
+            arrays[cname] = pa.array(
+                [r['minute'] for r in all_trail_rows], type=pa.int32())
+        elif cname == 'followed_at':
+            arrays[cname] = pa.array(
+                [followed_map.get(r['buyin_id']) for r in all_trail_rows],
+                type=pa.timestamp('us'))
+        elif cname in pg_col_names:
+            # Feature column → float64 (handles None natively)
+            arrays[cname] = pa.array(
+                [float(r[cname]) if r[cname] is not None else None
+                 for r in all_trail_rows],
+                type=pa.float64())
+        else:
+            # Column exists in DuckDB schema but not in PostgreSQL result → fill NULLs
+            arrays[cname] = pa.array(
+                [None] * len(all_trail_rows), type=pa.float64())
+
+    # Build table with columns in schema order
+    trail_arrow = pa.table(
+        [arrays[c] for c in schema_cols],
+        names=schema_cols,
+    )
+
+    # Register the Arrow table with DuckDB and INSERT OR REPLACE
+    con.register('_trail_arrow', trail_arrow)
+    con.execute("INSERT OR REPLACE INTO cached_trail SELECT * FROM _trail_arrow")
+    con.unregister('_trail_arrow')
+
+    total = con.execute("SELECT COUNT(DISTINCT buyin_id) FROM cached_trail").fetchone()[0]
+    n_synced = len(all_trail_rows)
+    logger.info(f"  Synced {n_synced:,} trail rows ({len(new_buyin_ids):,} buyins) "
+                f"in {time.time()-t0:.1f}s  [cache total: {total:,} buyins]")
+    return con
+
+
+# =============================================================================
+# DATA LOADING WITH PATH-AWARE LABELING (DuckDB + vectorised forward returns)
+# =============================================================================
 
 def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.DataFrame]:
     """
-    Load trail data with PATH-AWARE labeling.
+    Load trail data with PATH-AWARE labeling using DuckDB for speed.
 
-    V1 problem: labeled as 'pump_continuation' if max return in 10 min >= 0.3%,
-    even if price dropped first and only recovered in minute 9. You can't actually
-    capture that gain because you'd hit your stop loss.
-
-    V2 fix: label as 'clean_pump' ONLY if:
-      a) Price reaches +0.2% within first 4 minutes (EARLY_WINDOW)
-      b) Price never dips below -0.10% at ANY point (MAX_DRAWDOWN_PCT)
-      c) Price doesn't immediately drop > -0.08% in first 2 min
+    Pipeline:
+      1. Incremental sync from PostgreSQL → DuckDB cache
+      2. LEAD() window functions for forward returns (vectorised, ~2-5s)
+      3. Path-aware labeling (clean_pump / no_pump / crash)
     """
-    import duckdb
-
     hours = lookback_hours if lookback_hours is not None else LOOKBACK_HOURS
     logger.info(f"V2: Loading data (last {hours}h)...")
     t0 = time.time()
 
-    con = duckdb.connect(":memory:")
+    con: Optional[duckdb.DuckDBPyConnection] = None
     try:
-        con.execute("INSTALL postgres; LOAD postgres;")
-        pg_conn = _get_pg_connection_string()
-        con.execute(f"ATTACH '{pg_conn}' AS pg (TYPE POSTGRES, READ_ONLY)")
+        # ── Step 1: Sync cache ───────────────────────────────────────────
+        con = _sync_trail_cache(hours)
 
-        con.execute(f"""
-            CREATE TABLE buyins AS
-            SELECT id AS buyin_id, followed_at, potential_gains
-            FROM pg.follow_the_goat_buyins
-            WHERE potential_gains IS NOT NULL
-              AND followed_at >= NOW() - INTERVAL '{hours} hours'
-        """)
-        n_buyins = con.execute("SELECT COUNT(*) FROM buyins").fetchone()[0]
-        if n_buyins == 0:
-            con.execute("DETACH pg")
+        n_rows = con.execute("SELECT COUNT(*) FROM cached_trail").fetchone()[0]
+        n_buyins = con.execute("SELECT COUNT(DISTINCT buyin_id) FROM cached_trail").fetchone()[0]
+        if n_rows == 0:
+            logger.warning("Cache is empty after sync")
             return None
+        logger.info(f"  Cache: {n_rows:,} trail rows, {n_buyins:,} buyins")
 
-        con.execute("""
-            CREATE TABLE trail AS
-            SELECT * FROM pg.buyin_trail_minutes
-            WHERE buyin_id IN (SELECT buyin_id FROM buyins)
-              AND COALESCE(sub_minute, 0) = 0
-        """)
-        n_trail = con.execute("SELECT COUNT(*) FROM trail").fetchone()[0]
-        logger.info(f"  {n_trail:,} trail rows ({n_buyins:,} buyins)")
-        con.execute("DETACH pg")
-
-        if n_trail == 0:
-            return None
-
-        con.execute("CREATE INDEX idx_bid_min ON trail(buyin_id, minute)")
-
-        # Forward returns at each minute
-        joins, selects = [], []
+        # ── Step 2: Vectorised forward returns with LEAD() ───────────────
+        # Build LEAD expressions for 1..FORWARD_WINDOW minutes
+        lead_cols = []
         for k in range(1, FORWARD_WINDOW + 1):
-            a = f"t{k}"
-            joins.append(f"LEFT JOIN trail {a} ON {a}.buyin_id=t.buyin_id AND {a}.minute=t.minute+{k}")
-            selects.append(f"({a}.pm_close_price-t.pm_close_price)/NULLIF(t.pm_close_price,0)*100 AS fwd_{k}m")
+            lead_cols.append(
+                f"(LEAD(pm_close_price, {k}) OVER w - pm_close_price) "
+                f"/ NULLIF(pm_close_price, 0) * 100 AS fwd_{k}m"
+            )
+        lead_sql = ",\n            ".join(lead_cols)
 
-        joins_sql = "\n".join(joins)
-        selects_sql = ",\n".join(selects)
+        # Aggregate expressions
+        fwd_all = [f"fwd_{k}m" for k in range(1, FORWARD_WINDOW + 1)]
+        fwd_early = [f"fwd_{k}m" for k in range(1, EARLY_WINDOW + 1)]
+        fwd_imm = [f"fwd_{k}m" for k in range(1, min(3, FORWARD_WINDOW + 1))]
 
-        # Aggregates over different windows
-        early = [f"COALESCE(fwd_{k}m,-9999)" for k in range(1, EARLY_WINDOW + 1)]
-        all_max = [f"COALESCE(fwd_{k}m,-9999)" for k in range(1, FORWARD_WINDOW + 1)]
-        all_min = [f"COALESCE(fwd_{k}m,9999)" for k in range(1, FORWARD_WINDOW + 1)]
-        imm = [f"COALESCE(fwd_{k}m,9999)" for k in range(1, min(3, FORWARD_WINDOW + 1))]
-        any_nn = " OR ".join([f"fwd_{k}m IS NOT NULL" for k in range(1, FORWARD_WINDOW + 1)])
+        greatest_all = f"GREATEST({', '.join(fwd_all)})"
+        least_all = f"LEAST({', '.join(fwd_all)})"
+        greatest_early = f"GREATEST({', '.join(fwd_early)})"
+        least_imm = f"LEAST({', '.join(fwd_imm)})"
+        any_not_null = " OR ".join([f"{c} IS NOT NULL" for c in fwd_all])
 
-        # Time to peak
-        ttp = "CASE " + " ".join([f"WHEN fwd_{k}m>={MIN_PUMP_PCT} THEN {k}" for k in range(1, FORWARD_WINDOW + 1)]) + " ELSE NULL END"
+        # Time-to-peak CASE
+        ttp_cases = " ".join(
+            [f"WHEN fwd_{k}m >= {MIN_PUMP_PCT} THEN {k}" for k in range(1, FORWARD_WINDOW + 1)]
+        )
+        ttp_sql = f"CASE {ttp_cases} ELSE NULL END"
 
         con.execute(f"""
-            CREATE TABLE fwd AS
-            WITH raw AS (
-                SELECT t.buyin_id, t.minute, {selects_sql}
-                FROM trail t {joins_sql}
-                WHERE t.pm_close_price IS NOT NULL AND t.pm_close_price > 0
+            CREATE OR REPLACE TEMP TABLE fwd_returns AS
+            WITH base AS (
+                SELECT *,
+                    {lead_sql}
+                FROM cached_trail
+                WHERE pm_close_price IS NOT NULL AND pm_close_price > 0
+                WINDOW w AS (PARTITION BY buyin_id ORDER BY minute)
             )
             SELECT *,
-                CASE WHEN {any_nn} THEN GREATEST({','.join(all_max)}) ELSE NULL END AS max_fwd,
-                CASE WHEN {any_nn} THEN LEAST({','.join(all_min)}) ELSE NULL END AS min_fwd,
-                CASE WHEN {any_nn} THEN GREATEST({','.join(early)}) ELSE NULL END AS max_fwd_early,
-                CASE WHEN {any_nn} THEN LEAST({','.join(imm)}) ELSE NULL END AS min_fwd_imm,
-                {ttp} AS time_to_peak
-            FROM raw WHERE ({any_nn})
+                CASE WHEN {any_not_null} THEN {greatest_all} ELSE NULL END AS max_fwd,
+                CASE WHEN {any_not_null} THEN {least_all}    ELSE NULL END AS min_fwd,
+                CASE WHEN {any_not_null} THEN {greatest_early} ELSE NULL END AS max_fwd_early,
+                CASE WHEN {any_not_null} THEN {least_imm}    ELSE NULL END AS min_fwd_imm,
+                {ttp_sql} AS time_to_peak
+            FROM base
+            WHERE ({any_not_null})
         """)
 
-        # Path-aware labels
-        df = con.execute(f"""
-            SELECT t.*, b.followed_at,
-                f.max_fwd, f.min_fwd, f.max_fwd_early, f.min_fwd_imm, f.time_to_peak,
+        # ── Step 3: Path-aware labeling (zero-copy Arrow → pandas) ────────
+        arrow_result = con.execute(f"""
+            SELECT *,
                 CASE
-                    WHEN f.max_fwd_early >= {MIN_PUMP_PCT}
-                         AND f.min_fwd > -{MAX_DRAWDOWN_PCT}
-                         AND f.min_fwd_imm > {IMMEDIATE_DIP_MAX}
-                         AND (t.pm_price_change_5m IS NULL OR t.pm_price_change_5m > {CRASH_GATE_5M})
+                    WHEN max_fwd_early >= {MIN_PUMP_PCT}
+                         AND min_fwd > -{MAX_DRAWDOWN_PCT}
+                         AND min_fwd_imm > {IMMEDIATE_DIP_MAX}
+                         AND (pm_price_change_5m IS NULL OR pm_price_change_5m > {CRASH_GATE_5M})
                         THEN 'clean_pump'
-                    WHEN (t.pm_price_change_5m IS NULL OR t.pm_price_change_5m > {CRASH_GATE_5M})
+                    WHEN (pm_price_change_5m IS NULL OR pm_price_change_5m > {CRASH_GATE_5M})
                         THEN 'no_pump'
                     ELSE 'crash'
                 END AS label
-            FROM trail t
-            JOIN fwd f ON f.buyin_id=t.buyin_id AND f.minute=t.minute
-            JOIN buyins b ON b.buyin_id=t.buyin_id
-            WHERE f.max_fwd IS NOT NULL AND f.max_fwd > -9000
-            ORDER BY b.followed_at, t.buyin_id, t.minute
-        """).fetchdf()
+            FROM fwd_returns
+            WHERE max_fwd IS NOT NULL
+            ORDER BY followed_at, buyin_id, minute
+        """).arrow()
+        df = arrow_result.read_all().to_pandas()
 
         elapsed = time.time() - t0
         logger.info(f"  {len(df):,} labeled rows in {elapsed:.1f}s")
@@ -315,14 +617,24 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
                         f"time_to_peak={cp['time_to_peak'].mean():.1f}m")
         return df
 
+    except duckdb.Error as e:
+        logger.error(f"DuckDB error (will rebuild cache): {e}", exc_info=True)
+        if _TRAIL_CACHE_FILE.exists():
+            try:
+                _TRAIL_CACHE_FILE.unlink()
+                logger.info("Deleted corrupted trail cache — will rebuild next run")
+            except OSError:
+                pass
+        return None
     except Exception as e:
         logger.error(f"Data load error: {e}", exc_info=True)
         return None
     finally:
-        try:
-            con.close()
-        except Exception:
-            pass
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -377,36 +689,25 @@ def _engineer_features(df: pd.DataFrame, base_cols: List[str]) -> Tuple[pd.DataF
     # ── Cross-asset divergence (SOL strength vs BTC/ETH) ──────────────────
     if 'pm_price_change_1m' in df.columns:
         sol = df['pm_price_change_1m'].fillna(0)
-        if 'btc_price_change_pct' in df.columns:
-            df['feat_sol_btc_div'] = sol - df['btc_price_change_pct'].fillna(0)
+        if 'btc_price_change_1m' in df.columns:
+            df['feat_sol_btc_div'] = sol - df['btc_price_change_1m'].fillna(0)
             new_cols.append('feat_sol_btc_div')
-        if 'eth_price_change_pct' in df.columns:
-            df['feat_sol_eth_div'] = sol - df['eth_price_change_pct'].fillna(0)
+        if 'eth_price_change_1m' in df.columns:
+            df['feat_sol_eth_div'] = sol - df['eth_price_change_1m'].fillna(0)
             new_cols.append('feat_sol_eth_div')
 
-    # ── Order book z-score (is current imbalance unusual?) ────────────────
-    if 'ob_bid_ask_ratio' in df.columns:
-        r_mean = df['ob_bid_ask_ratio'].rolling(50, min_periods=5).mean()
-        r_std = df['ob_bid_ask_ratio'].rolling(50, min_periods=5).std().clip(lower=1e-8)
-        df['feat_ob_zscore'] = (df['ob_bid_ask_ratio'] - r_mean) / r_std
-        new_cols.append('feat_ob_zscore')
+    # NOTE: feat_ob_zscore and feat_vol_price_div were removed because they
+    # used rolling(50) during training but raw values at prediction time
+    # (train/serve skew). Neither appeared in the top 15 feature importances.
 
-    # ── Volume-price divergence (accumulation detection) ──────────────────
-    if 'tx_trade_count' in df.columns and 'pm_price_change_1m' in df.columns:
-        v_mean = df['tx_trade_count'].rolling(50, min_periods=5).mean()
-        v_std = df['tx_trade_count'].rolling(50, min_periods=5).std().clip(lower=1e-8)
-        vol_z = (df['tx_trade_count'] - v_mean) / v_std
-        df['feat_vol_price_div'] = vol_z - df['pm_price_change_1m'].fillna(0)
-        new_cols.append('feat_vol_price_div')
-
-    # ── Whale intensity (net flow per active wallet) ──────────────────────
-    if 'wh_net_flow' in df.columns and 'wh_active_wallets' in df.columns:
-        df['feat_whale_intensity'] = df['wh_net_flow'] / df['wh_active_wallets'].clip(lower=1)
+    # ── Whale flow intensity (net flow scaled by total movement) ──────────
+    if 'wh_net_flow_sol' in df.columns and 'wh_total_sol_moved' in df.columns:
+        df['feat_whale_intensity'] = df['wh_net_flow_sol'] / df['wh_total_sol_moved'].clip(lower=1)
         new_cols.append('feat_whale_intensity')
 
     # ── Volatility compression (squeeze = breakout imminent) ──────────────
-    if 'pm_volatility_1m' in df.columns and 'pm_volatility_5m' in df.columns:
-        df['feat_vol_compress'] = df['pm_volatility_5m'] / df['pm_volatility_1m'].clip(lower=1e-8)
+    if 'pm_realized_vol_1m' in df.columns and 'pm_volatility_pct' in df.columns:
+        df['feat_vol_compress'] = df['pm_volatility_pct'] / df['pm_realized_vol_1m'].clip(lower=1e-8)
         new_cols.append('feat_vol_compress')
 
     all_cols = base_cols + new_cols
@@ -454,8 +755,21 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     df = df.sort_values('followed_at').reset_index(drop=True)
     n = len(df)
 
+    # ── Exponential decay weights (half-life ~72h / 3 days) ────────────
+    # Recent data gets more weight, but gentle enough to avoid overfitting
+    # to noise in the most recent hours. 14h half-life was too aggressive.
+    # ln(2)/72 ≈ 0.00963
+    now_ts = pd.Timestamp.now(tz='UTC')
+    if df['followed_at'].dt.tz is None:
+        followed_utc = df['followed_at'].dt.tz_localize('UTC')
+    else:
+        followed_utc = df['followed_at'].dt.tz_convert('UTC')
+    hours_ago = (now_ts - followed_utc).dt.total_seconds() / 3600
+    decay_weights = np.exp(-0.00963 * hours_ago.values)  # half-life ~72h
+
     # Walk-forward: 3 sequential test windows
     split_results = []
+    split_thresholds = []
     for i in range(N_WALK_FORWARD_SPLITS):
         test_start_frac = 1.0 - (N_WALK_FORWARD_SPLITS - i) * WALK_FORWARD_TEST_FRAC
         train_end = int(n * test_start_frac)
@@ -466,6 +780,7 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
         X_tr = df.iloc[:train_end][feature_cols].fillna(0)
         y_tr = df.iloc[:train_end]['target']
+        w_tr = decay_weights[:train_end]
         X_te = df.iloc[train_end:test_end][feature_cols].fillna(0)
         y_te = df.iloc[train_end:test_end]['target']
 
@@ -478,11 +793,31 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             min_samples_leaf=10, min_samples_split=20,
             random_state=42,
         )
-        mdl.fit(X_tr, y_tr)
+        mdl.fit(X_tr, y_tr, sample_weight=w_tr)
 
         proba = mdl.predict_proba(X_te)[:, 1]
-        pred = (proba >= MIN_CONFIDENCE).astype(int)
 
+        # ── Calibrate optimal threshold for this split ───────────────
+        best_thresh = MIN_CONFIDENCE
+        best_ep = -999.0
+        for thresh in np.arange(0.50, 0.91, 0.05):
+            pred_t = (proba >= thresh).astype(int)
+            if pred_t.sum() == 0:
+                continue
+            prec_t = float(precision_score(y_te, pred_t, zero_division=0)) * 100
+            sig_mask_t = pred_t.astype(bool)
+            tp_mask_t = sig_mask_t & (y_te.values == 1)
+            tp_t = int(tp_mask_t.sum())
+            avg_g_t = float(df.iloc[train_end:test_end][tp_mask_t]['max_fwd'].mean()) if tp_t > 0 else 0.0
+            ep_t = (prec_t / 100) * avg_g_t - TRADE_COST_PCT
+            if ep_t > best_ep:
+                best_ep = ep_t
+                best_thresh = float(thresh)
+
+        split_thresholds.append(best_thresh)
+
+        # Evaluate at the calibrated threshold for reporting
+        pred = (proba >= best_thresh).astype(int)
         if pred.sum() == 0:
             prec, n_sig, tp, avg_g, ep = 0.0, 0, 0, 0.0, -TRADE_COST_PCT
         else:
@@ -498,8 +833,10 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             'split': i, 'train': train_end, 'test': test_end - train_end,
             'precision': prec, 'n_signals': n_sig, 'tp': tp,
             'avg_gain': avg_g, 'expected_profit': ep,
+            'optimal_threshold': best_thresh,
         })
-        logger.info(f"  Split {i}: prec={prec:.1f}%, signals={n_sig}, E[profit]={ep:+.4f}%")
+        logger.info(f"  Split {i}: prec={prec:.1f}%, signals={n_sig}, "
+                    f"E[profit]={ep:+.4f}%, thresh={best_thresh:.2f}")
 
     if len(split_results) < 2:
         logger.warning("Not enough walk-forward splits")
@@ -526,14 +863,19 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
         logger.warning(f"Avg profit {avg_profit:+.4f}% <= 0")
         return None
 
-    # Final model on all data
+    # Most conservative (highest) threshold across splits
+    optimal_threshold = max(split_thresholds) if split_thresholds else MIN_CONFIDENCE
+    logger.info(f"  Optimal threshold: {optimal_threshold:.2f} "
+                f"(per-split: {[f'{t:.2f}' for t in split_thresholds]})")
+
+    # Final model on all data (with decay weights)
     final = GradientBoostingClassifier(
         n_estimators=150, max_depth=3, learning_rate=0.05,
         subsample=0.7, max_features=0.7,
         min_samples_leaf=10, min_samples_split=20,
         random_state=42,
     )
-    final.fit(df[feature_cols].fillna(0), df['target'])
+    final.fit(df[feature_cols].fillna(0), df['target'], sample_weight=decay_weights)
 
     importances = pd.Series(final.feature_importances_, index=feature_cols).nlargest(15)
     logger.info("  Top features:")
@@ -547,6 +889,7 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             'avg_precision': round(avg_prec, 2),
             'min_precision': round(min_prec, 2),
             'avg_expected_profit': round(avg_profit, 4),
+            'optimal_threshold': round(optimal_threshold, 4),
             'splits': split_results,
             'n_features': len(feature_cols),
             'n_samples': len(df),
@@ -574,31 +917,22 @@ def _compute_feat(name: str, row: dict) -> float:
             return float(a) - float(b) / 5 if a is not None and b is not None else 0.0
 
         if name == 'feat_sol_btc_div':
-            a, b = row.get('pm_price_change_1m'), row.get('btc_price_change_pct')
+            a, b = row.get('pm_price_change_1m'), row.get('btc_price_change_1m')
             return float(a) - float(b) if a is not None and b is not None else 0.0
 
         if name == 'feat_sol_eth_div':
-            a, b = row.get('pm_price_change_1m'), row.get('eth_price_change_pct')
+            a, b = row.get('pm_price_change_1m'), row.get('eth_price_change_1m')
             return float(a) - float(b) if a is not None and b is not None else 0.0
 
         if name == 'feat_whale_intensity':
-            a, b = row.get('wh_net_flow'), row.get('wh_active_wallets')
+            a, b = row.get('wh_net_flow_sol'), row.get('wh_total_sol_moved')
             return float(a) / max(float(b), 1) if a is not None and b is not None else 0.0
 
         if name == 'feat_vol_compress':
-            a, b = row.get('pm_volatility_1m'), row.get('pm_volatility_5m')
+            a, b = row.get('pm_realized_vol_1m'), row.get('pm_volatility_pct')
             return float(b) / max(float(a), 1e-8) if a is not None and b is not None else 1.0
 
-        # These use rolling stats which aren't available for a single row —
-        # use raw values as approximation
-        if name == 'feat_ob_zscore':
-            v = row.get('ob_bid_ask_ratio')
-            return float(v) if v is not None else 0.0
-
-        if name == 'feat_vol_price_div':
-            tc = row.get('tx_trade_count')
-            pm = row.get('pm_price_change_1m')
-            return (float(tc) / 100 - float(pm)) if tc is not None and pm is not None else 0.0
+        # feat_ob_zscore and feat_vol_price_div removed (train/serve skew)
 
     except (ValueError, TypeError):
         pass
@@ -634,17 +968,28 @@ def refresh_pump_rules():
     new_profit = result['metadata']['avg_expected_profit']
     cur_profit = _model_metadata.get('avg_expected_profit')
 
-    if cur_profit is not None and new_profit < cur_profit:
-        logger.info(f"Keeping current model (new {new_profit:+.4f}% < current {cur_profit:+.4f}%)")
+    # Always replace — crypto patterns shift fast.
+    # Only skip if new model has *negative* expected profit.
+    if new_profit <= 0:
+        logger.warning(f"New model unprofitable ({new_profit:+.4f}%), keeping current")
         return
+
+    logger.info(f"  Replacing model: cur={cur_profit}  →  new={new_profit:+.4f}%")
 
     _model = result['model']
     _feature_columns = result['feature_columns']
     _model_metadata = result['metadata']
 
+    # Reset circuit breaker on model refresh — new model gets a clean slate
+    global _circuit_breaker_paused
+    _recent_outcomes.clear()
+    _circuit_breaker_paused = False
+
+    opt_t = result['metadata'].get('optimal_threshold', MIN_CONFIDENCE)
     logger.info(f"  NEW MODEL: {len(_feature_columns)} features, "
                 f"prec={result['metadata']['avg_precision']:.1f}%, "
-                f"E[profit]={new_profit:+.4f}% ({time.time()-t0:.1f}s)")
+                f"E[profit]={new_profit:+.4f}%, thresh={opt_t:.2f} "
+                f"({time.time()-t0:.1f}s)")
 
     try:
         MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -700,11 +1045,13 @@ def _log_gate_summary() -> None:
     total = _gate_stats['total_checks']
     if total == 0:
         return
+    cb = _gate_stats.get('circuit_breaker', 0)
     logger.info(
         f"V2 gates (60s): {total} chk | no_mdl={_gate_stats['no_model']} "
-        f"tf_fail={_gate_stats['multi_tf_fail']} crash={_gate_stats['crash_gate_fail']} "
-        f"5m={_gate_stats['crash_5m_fail']} ok={_gate_stats['gates_passed']} "
-        f"low_conf={_gate_stats['low_confidence']} FIRED={_gate_stats['signal_fired']}"
+        f"cb={cb} tf_fail={_gate_stats['multi_tf_fail']} "
+        f"crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
+        f"ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
+        f"FIRED={_gate_stats['signal_fired']}"
     )
     for k in _gate_stats:
         _gate_stats[k] = 0
@@ -715,6 +1062,12 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
 
     if _model is None:
         _gate_stats['no_model'] += 1
+        return False
+
+    # Gate 0: Circuit breaker — auto-pause if live precision is too low
+    if _check_circuit_breaker():
+        _gate_stats.setdefault('circuit_breaker', 0)
+        _gate_stats['circuit_breaker'] += 1
         return False
 
     # Gate 1: Multi-timeframe trend
@@ -737,7 +1090,18 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
 
     _gate_stats['gates_passed'] += 1
 
-    # Gate 3: Model confidence
+    # Gate 3: Volatility regime — raise confidence in unusual regimes
+    _update_vol_buffer(trail_row.get('pm_realized_vol_1m'))
+    vol_pct = _get_vol_percentile()
+    base_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
+    if vol_pct is not None and (vol_pct > 90 or vol_pct < 10):
+        required_confidence = min(base_threshold + 0.10, 0.90)
+        regime_tag = f"vol_p{vol_pct:.0f}→{required_confidence:.2f}"
+    else:
+        required_confidence = base_threshold
+        regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
+
+    # Gate 4: Model confidence (using calibrated + regime-adjusted threshold)
     try:
         features = {}
         for col in _feature_columns:
@@ -750,13 +1114,15 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         X = pd.DataFrame([features])[_feature_columns].fillna(0)
         proba = float(_model.predict_proba(X)[0, 1])
 
-        if proba < MIN_CONFIDENCE:
+        if proba < required_confidence:
             _gate_stats['low_confidence'] += 1
-            logger.info(f"V2: conf={proba:.3f} < {MIN_CONFIDENCE} ({trend_desc})")
+            logger.info(f"V2: conf={proba:.3f} < {required_confidence:.2f} "
+                        f"({trend_desc}, {regime_tag})")
             return False
 
         _gate_stats['signal_fired'] += 1
-        logger.info(f"V2: SIGNAL! conf={proba:.3f} ({trend_desc})")
+        logger.info(f"V2: SIGNAL! conf={proba:.3f} >= {required_confidence:.2f} "
+                    f"({trend_desc}, {regime_tag})")
         return True
 
     except Exception as e:
@@ -775,7 +1141,7 @@ def check_and_fire_pump_signal(
 ) -> bool:
     global _last_entry_time
 
-    pump_play_id = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "0"))
+    pump_play_id = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
     if not pump_play_id:
         return False
 
@@ -786,7 +1152,7 @@ def check_and_fire_pump_signal(
 
     try:
         trail_row = postgres_query_one(
-            "SELECT * FROM buyin_trail_minutes WHERE buyin_id=%s AND minute=0 AND COALESCE(sub_minute,0)=0",
+            "SELECT * FROM buyin_trail_minutes WHERE buyin_id=%s AND minute=0 AND (sub_minute=0 OR sub_minute IS NULL)",
             [buyin_id])
     except Exception as e:
         logger.error(f"V2 trail read error: {e}")
@@ -878,6 +1244,7 @@ def check_and_fire_pump_signal(
 
 
 def get_pump_status() -> Dict[str, Any]:
+    live_prec = (sum(_recent_outcomes) / len(_recent_outcomes)) if len(_recent_outcomes) > 0 else None
     return {
         'version': 'v2',
         'has_model': _model is not None,
@@ -885,6 +1252,11 @@ def get_pump_status() -> Dict[str, Any]:
         'metadata': _model_metadata,
         'last_refresh': _last_rules_refresh,
         'last_entry': _last_entry_time,
+        'circuit_breaker_paused': _circuit_breaker_paused,
+        'live_precision': round(live_prec, 4) if live_prec is not None else None,
+        'live_outcomes_count': len(_recent_outcomes),
+        'vol_buffer_size': len(_vol_buffer),
+        'vol_percentile': round(_get_vol_percentile(), 1) if _get_vol_percentile() is not None else None,
     }
 
 

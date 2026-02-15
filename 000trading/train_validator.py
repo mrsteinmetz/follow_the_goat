@@ -68,7 +68,7 @@ from pre_entry_price_movement import (
 PLAY_ID = int(os.getenv("TRAIN_VALIDATOR_PLAY_ID", "46"))
 TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "15"))
 TRAINING_ENABLED = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
-PUMP_SIGNAL_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "0"))
+PUMP_SIGNAL_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
 
 # Setup logging
 LOGS_DIR = Path(__file__).parent / "logs"

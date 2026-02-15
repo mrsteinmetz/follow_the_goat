@@ -1211,7 +1211,11 @@ def run() -> Dict[str, Any]:
         best_minute = 0
         minute_results = {}
         
-        for minute in range(15):
+        # Only analyze minute 0 — the pump signal fires at entry time,
+        # so only minute-0 features are available for the GO/NO_GO decision.
+        # Analyzing later minutes (1-14) caused overfitting to narrow ranges
+        # at minute 6+ where data is often unavailable.
+        for minute in [0]:
             # Filter to this minute
             if 'minute' in df_train_all.columns:
                 df_train_min = df_train_all[df_train_all['minute'] == minute]

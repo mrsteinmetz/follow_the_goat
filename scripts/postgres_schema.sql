@@ -955,6 +955,24 @@ CREATE INDEX IF NOT EXISTS idx_pump_hist_created ON pump_continuation_history(cr
 CREATE INDEX IF NOT EXISTS idx_pump_hist_passed ON pump_continuation_history(passed, created_at);
 
 -- =============================================================================
+-- PUMP TRAINING LABELS (analytics points: clean_pump entry points from V2 labeling)
+-- Written by pump_signal_logic when it loads/labels data; used by pumps.php chart.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS pump_training_labels (
+    id BIGSERIAL PRIMARY KEY,
+    followed_at TIMESTAMP NOT NULL,
+    buyin_id BIGINT NOT NULL,
+    entry_price DOUBLE PRECISION NOT NULL,
+    max_fwd_pct DOUBLE PRECISION,
+    time_to_peak_min DOUBLE PRECISION,
+    label VARCHAR(20) NOT NULL DEFAULT 'clean_pump',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pump_training_followed ON pump_training_labels(followed_at);
+
+-- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================
 

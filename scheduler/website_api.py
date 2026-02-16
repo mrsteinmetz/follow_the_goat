@@ -231,6 +231,50 @@ def get_price_points():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/pump_training_entries', methods=['GET'])
+def get_pump_training_entries():
+    """Get clean_pump entry points (analytics) for the pumps chart.
+
+    Returns rows from pump_training_labels: timestamps and prices where the
+    pump model's path-aware labeling marked a minute-0 entry as 'clean_pump'
+    (price rose >= 0.2% within 4 min without crashing). Used by pumps.php.
+    """
+    try:
+        hours = request.args.get('hours', 48, type=int)
+        hours = max(1, min(168, hours))
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT followed_at, buyin_id, entry_price, max_fwd_pct, time_to_peak_min, label
+                    FROM pump_training_labels
+                    WHERE followed_at >= NOW() - INTERVAL '1 hour' * %s
+                    ORDER BY followed_at ASC
+                """, [hours])
+                rows = cursor.fetchall()
+        # Serialize for JSON (timestamps to ISO string)
+        entries = []
+        for row in rows:
+            followed = row.get('followed_at')
+            if hasattr(followed, 'isoformat'):
+                followed = followed.isoformat()
+            elif followed is not None:
+                followed = str(followed)
+            entries.append({
+                'followed_at': followed,
+                'buyin_id': row.get('buyin_id'),
+                'entry_price': float(row['entry_price']) if row.get('entry_price') is not None else None,
+                'max_fwd_pct': float(row['max_fwd_pct']) if row.get('max_fwd_pct') is not None else None,
+                'time_to_peak_min': float(row['time_to_peak_min']) if row.get('time_to_peak_min') is not None else None,
+                'label': row.get('label', 'clean_pump'),
+            })
+        return jsonify({'entries': entries, 'count': len(entries)})
+    except Exception as e:
+        if 'pump_training_labels' in str(e) and ('does not exist' in str(e) or 'relation' in str(e).lower()):
+            return jsonify({'entries': [], 'count': 0})  # Table not created yet (no refresh run)
+        logger.error(f"Get pump training entries failed: {e}", exc_info=True)
+        return jsonify({'error': str(e), 'entries': [], 'count': 0}), 500
+
+
 # =============================================================================
 # TRADING ENDPOINTS
 # =============================================================================

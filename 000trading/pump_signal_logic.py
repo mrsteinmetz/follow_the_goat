@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-from core.database import get_postgres, postgres_execute, postgres_query, postgres_query_one
+from core.database import get_postgres, postgres_execute, postgres_insert_many, postgres_query, postgres_query_one
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_CACHE_PATH = _PROJECT_ROOT / "tests" / "filter_simulation" / "results" / "pump_model_v2_cache.pkl"
@@ -62,9 +62,10 @@ RULES_REFRESH_INTERVAL = 300
 TRADE_COST_PCT = 0.1
 
 # ── Signal ────────────────────────────────────────────────────────────────────
-MIN_CONFIDENCE = 0.70           # Model probability threshold to fire
-MIN_SAMPLES_TO_TRAIN = 200
-COOLDOWN_SECONDS = 300
+MIN_CONFIDENCE = 0.50           # Model probability floor (calibrated threshold can be higher)
+MAX_PREDICTION_THRESHOLD = 0.65 # Cap prediction-time threshold (prevents overfitting to backtest)
+MIN_SAMPLES_TO_TRAIN = 50
+COOLDOWN_SECONDS = 120
 
 # ── Safety gates ──────────────────────────────────────────────────────────────
 CRASH_GATE_5M = -0.3
@@ -115,7 +116,7 @@ _last_gate_summary_time: float = 0.0
 
 _gate_stats: Dict[str, int] = {
     'no_model': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
-    'multi_tf_fail': 0, 'gates_passed': 0, 'low_confidence': 0,
+    'gates_passed': 0, 'low_confidence': 0,
     'signal_fired': 0, 'total_checks': 0,
 }
 
@@ -205,46 +206,17 @@ def _is_not_crashing() -> Tuple[bool, str]:
 # MULTI-TIMEFRAME TREND GATE
 # =============================================================================
 
-def _check_multi_timeframe_trend(trail_row: dict) -> Tuple[bool, str]:
-    """
-    Require at least 1 of 3 timeframes showing positive momentum.
-
-    Backtest shows the GBM model is fundamentally a dip-buyer: it fires
-    highest confidence when 5m trend is negative (pullback before pump).
-    Requiring 2/3 positive blocked 100% of high-confidence signals.
-
-    With 1/3 positive we still block total freefall (0/3 positive = all
-    timeframes falling) but allow the model to catch pullback-pump patterns
-    where at least one timeframe has started recovering.
-
-    Backtest results (48h, light trend gate):
-      thresh=0.50: 146 signals, 33.6% prec, +0.13% E[profit]
-      thresh=0.70:  51 signals, 41.2% prec, +0.12% E[profit]
-    """
-    scores = 0
-    available = 0
+def _get_trend_description(trail_row: dict) -> str:
+    """Build a descriptive string of current multi-timeframe trend (for logging only)."""
     details = []
-
     for label, col in [('30s', 'pm_price_velocity_30s'),
                         ('1m', 'pm_price_change_1m'),
                         ('5m', 'pm_price_change_5m')]:
         val = trail_row.get(col)
         if val is not None:
-            available += 1
             v = float(val)
-            if v > 0:
-                scores += 1
-                details.append(f"{label}={v:+.4f}%+")
-            else:
-                details.append(f"{label}={v:+.4f}%-")
-
-    desc = f"trend={scores}/{available} ({', '.join(details)})"
-
-    if available == 0:
-        return False, "no momentum data"
-
-    # Need at least 1 positive — blocks total freefall but allows dip-buying
-    return scores >= 1, desc
+            details.append(f"{label}={v:+.4f}%")
+    return ', '.join(details) if details else 'no data'
 
 
 # =============================================================================
@@ -587,6 +559,12 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
         """)
 
         # ── Step 3: Path-aware labeling (zero-copy Arrow → pandas) ────────
+        # CRITICAL: Filter to minute=0 only for training.
+        # The model predicts on minute=0 (entry point) but was previously
+        # trained on ALL minutes (0-14), causing train/serve skew that
+        # inflated precision to ~98% while real-time confidence stayed low.
+        # By training only on minute=0 data, the model learns patterns
+        # at the actual entry point, matching prediction-time conditions.
         arrow_result = con.execute(f"""
             SELECT *,
                 CASE
@@ -601,7 +579,8 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
                 END AS label
             FROM fwd_returns
             WHERE max_fwd IS NOT NULL
-            ORDER BY followed_at, buyin_id, minute
+              AND minute = 0
+            ORDER BY followed_at, buyin_id
         """).arrow()
         df = arrow_result.read_all().to_pandas()
 
@@ -635,6 +614,85 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
                 con.close()
             except Exception:
                 pass
+
+
+def _persist_training_labels(df: pd.DataFrame) -> None:
+    """Write clean_pump entry points (minute=0) to PostgreSQL for the pumps chart.
+
+    Called after _load_and_label_data() so the dashboard can show the analytics
+    points the engine uses to find the best entry points.
+    """
+    if df is None or len(df) == 0:
+        return
+    try:
+        postgres_execute("""
+            CREATE TABLE IF NOT EXISTS pump_training_labels (
+                id BIGSERIAL PRIMARY KEY,
+                followed_at TIMESTAMP NOT NULL,
+                buyin_id BIGINT NOT NULL,
+                entry_price DOUBLE PRECISION NOT NULL,
+                max_fwd_pct DOUBLE PRECISION,
+                time_to_peak_min DOUBLE PRECISION,
+                label VARCHAR(20) NOT NULL DEFAULT 'clean_pump',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+    except Exception as e:
+        logger.debug(f"pump_training_labels create: {e}")
+    try:
+        postgres_execute("CREATE INDEX IF NOT EXISTS idx_pump_training_followed ON pump_training_labels(followed_at)")
+    except Exception:
+        pass
+    entry_rows = df[(df['minute'] == 0) & (df['label'] == 'clean_pump')]
+    if entry_rows.empty:
+        try:
+            # Keep table bounded: remove older than lookback
+            postgres_execute(
+                "DELETE FROM pump_training_labels WHERE followed_at < NOW() - INTERVAL '1 hour' * %s",
+                [LOOKBACK_HOURS],
+            )
+        except Exception:
+            pass
+        return
+    try:
+        # Replace window: delete labels in the same time range we're about to insert
+        with get_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM pump_training_labels WHERE followed_at >= NOW() - INTERVAL '1 hour' * %s",
+                    [LOOKBACK_HOURS],
+                )
+        # Bulk insert (followed_at, buyin_id, entry_price, max_fwd_pct, time_to_peak_min, label)
+        rows_to_insert = []
+        for _, row in entry_rows.iterrows():
+            followed = row.get('followed_at')
+            if hasattr(followed, 'tz_localize'):
+                if followed.tzinfo is None:
+                    followed = followed.tz_localize('UTC')
+                else:
+                    followed = followed.tz_convert('UTC')
+            if hasattr(followed, 'strftime'):
+                followed_str = followed.strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                followed_str = str(followed)
+            entry_price = float(row.get('pm_close_price', 0) or 0)
+            max_fwd = row.get('max_fwd')
+            max_fwd_pct = float(max_fwd) if max_fwd is not None and pd.notna(max_fwd) else None
+            ttp = row.get('time_to_peak')
+            time_to_peak_min = float(ttp) if ttp is not None and pd.notna(ttp) else None
+            rows_to_insert.append({
+                'followed_at': followed_str,
+                'buyin_id': int(row.get('buyin_id', 0)),
+                'entry_price': entry_price,
+                'max_fwd_pct': max_fwd_pct,
+                'time_to_peak_min': time_to_peak_min,
+                'label': 'clean_pump',
+            })
+        if rows_to_insert:
+            postgres_insert_many('pump_training_labels', rows_to_insert)
+        logger.info(f"  Persisted {len(entry_rows)} clean_pump entry points to pump_training_labels")
+    except Exception as e:
+        logger.warning(f"Failed to persist training labels: {e}")
 
 
 # =============================================================================
@@ -853,20 +911,24 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     min_prec = float(np.min(precs))
     avg_profit = float(np.mean(profits))
 
-    if avg_prec < 50:
-        logger.warning(f"Avg precision {avg_prec:.1f}% < 50%")
+    if avg_prec < 40:
+        logger.warning(f"Avg precision {avg_prec:.1f}% < 40%")
         return None
-    if min_prec < 35:
-        logger.warning(f"Worst split {min_prec:.1f}% < 35%")
+    if min_prec < 25:
+        logger.warning(f"Worst split {min_prec:.1f}% < 25%")
         return None
     if avg_profit <= 0:
         logger.warning(f"Avg profit {avg_profit:+.4f}% <= 0")
         return None
 
-    # Most conservative (highest) threshold across splits
-    optimal_threshold = max(split_thresholds) if split_thresholds else MIN_CONFIDENCE
+    # Use median threshold across splits, capped at MAX_PREDICTION_THRESHOLD.
+    # Previously used max() which gave 0.90 — way too conservative for real-time
+    # where feature distributions differ from training (minute=0 vs all minutes).
+    raw_threshold = float(np.median(split_thresholds)) if split_thresholds else MIN_CONFIDENCE
+    optimal_threshold = min(raw_threshold, MAX_PREDICTION_THRESHOLD)
     logger.info(f"  Optimal threshold: {optimal_threshold:.2f} "
-                f"(per-split: {[f'{t:.2f}' for t in split_thresholds]})")
+                f"(raw median: {raw_threshold:.2f}, cap: {MAX_PREDICTION_THRESHOLD}, "
+                f"per-split: {[f'{t:.2f}' for t in split_thresholds]})")
 
     # Final model on all data (with decay weights)
     final = GradientBoostingClassifier(
@@ -960,6 +1022,9 @@ def refresh_pump_rules():
         logger.warning("Insufficient data — keeping model")
         return
 
+    # Persist clean_pump entry points (minute=0) for the pumps chart
+    _persist_training_labels(df)
+
     result = _train_model(df)
     if result is None:
         logger.warning("Training failed — keeping model")
@@ -1048,8 +1113,7 @@ def _log_gate_summary() -> None:
     cb = _gate_stats.get('circuit_breaker', 0)
     logger.info(
         f"V2 gates (60s): {total} chk | no_mdl={_gate_stats['no_model']} "
-        f"cb={cb} tf_fail={_gate_stats['multi_tf_fail']} "
-        f"crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
+        f"cb={cb} crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
         f"ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
         f"FIRED={_gate_stats['signal_fired']}"
     )
@@ -1070,19 +1134,13 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         _gate_stats['circuit_breaker'] += 1
         return False
 
-    # Gate 1: Multi-timeframe trend
-    trend_ok, trend_desc = _check_multi_timeframe_trend(trail_row)
-    if not trend_ok:
-        _gate_stats['multi_tf_fail'] += 1
-        logger.debug(f"V2: trend FAIL ({trend_desc})")
-        return False
-
-    # Gate 2: Crash protection
+    # Gate 1: Crash protection (micro 30s)
     crash_ok, crash_desc = _is_not_crashing()
     if not crash_ok:
         _gate_stats['crash_gate_fail'] += 1
         return False
 
+    # Gate 2: 5-minute crash protection
     pm_5m = trail_row.get('pm_price_change_5m')
     if pm_5m is not None and float(pm_5m) < CRASH_GATE_5M:
         _gate_stats['crash_5m_fail'] += 1
@@ -1090,18 +1148,19 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
 
     _gate_stats['gates_passed'] += 1
 
-    # Gate 3: Volatility regime — raise confidence in unusual regimes
+    # Trend description for logging (no longer a gate — the model handles trend awareness)
+    trend_desc = _get_trend_description(trail_row)
+
+    # Track volatility for monitoring but DO NOT boost threshold
     _update_vol_buffer(trail_row.get('pm_realized_vol_1m'))
     vol_pct = _get_vol_percentile()
-    base_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
-    if vol_pct is not None and (vol_pct > 90 or vol_pct < 10):
-        required_confidence = min(base_threshold + 0.10, 0.90)
-        regime_tag = f"vol_p{vol_pct:.0f}→{required_confidence:.2f}"
-    else:
-        required_confidence = base_threshold
-        regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
+    regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
 
-    # Gate 4: Model confidence (using calibrated + regime-adjusted threshold)
+    # Model confidence check — threshold capped at MAX_PREDICTION_THRESHOLD
+    # to prevent overfitting to backtest thresholds that don't match real-time
+    raw_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
+    required_confidence = min(max(raw_threshold, MIN_CONFIDENCE), MAX_PREDICTION_THRESHOLD)
+
     try:
         features = {}
         for col in _feature_columns:

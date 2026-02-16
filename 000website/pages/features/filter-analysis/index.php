@@ -1024,7 +1024,7 @@ ob_start();
         settings['is_ratio'] = isRatioToggle && isRatioToggle.checked ? 'true' : 'false';
         
         try {
-            const response = await fetch('<?php echo DATABASE_API_URL; ?>/filter-analysis/settings', {
+            const response = await fetch('<?php echo defined("DATABASE_API_PUBLIC_URL") ? DATABASE_API_PUBLIC_URL : DATABASE_API_URL; ?>/filter-analysis/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ settings })

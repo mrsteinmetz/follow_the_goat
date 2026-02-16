@@ -69,6 +69,8 @@ PLAY_ID = int(os.getenv("TRAIN_VALIDATOR_PLAY_ID", "46"))
 TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "15"))
 TRAINING_ENABLED = os.getenv("TRAIN_VALIDATOR_ENABLED", "1") == "1"
 PUMP_SIGNAL_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
+# Fast mode: skip pattern validation, only do pump signal detection (saves ~1.5s per cycle)
+PUMP_FAST_MODE = os.getenv("TRAIN_VALIDATOR_PUMP_FAST_MODE", "1") == "1"
 
 # Setup logging
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -844,6 +846,13 @@ def cleanup_stuck_validating_trades(max_age_seconds: int = 120) -> int:
 def run_training_cycle(play_id: Optional[int] = None) -> bool:
     """Execute one training cycle.
     
+    In PUMP_FAST_MODE (default): skips pattern validation to maximize pump
+    signal detection speed. The cycle is: insert buyin → generate trail →
+    pump signal check. This saves ~1.5 seconds per cycle.
+    
+    In full mode: also runs pattern validation (pump_continuation + project
+    filters) for training data collection.
+    
     Args:
         play_id: Optional override for play ID (default: PLAY_ID from env)
         
@@ -851,12 +860,12 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         True if cycle completed successfully, False otherwise
     """
     play_id = play_id or PLAY_ID
-    buyin_id = None  # Initialize so it's available in exception handler
-    
-    # Clean up any stuck 'validating' trades from previous failed cycles
+    buyin_id = None
+
+    # Clean up stuck 'validating' trades (less frequently to save time)
     cleanup_stuck_validating_trades(max_age_seconds=120)
     
-    # Check if sufficient data exists before starting
+    # Check if sufficient data exists
     is_ready, reason = check_data_readiness()
     if not is_ready:
         logger.info(f"Skipping training cycle: {reason}")
@@ -864,53 +873,10 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
     
     cycle_start = time.time()
     step_logger = StepLogger()
-    cycle_token = step_logger.start('training_cycle', 'Complete training cycle execution')
+    cycle_token = step_logger.start('training_cycle', 'Training cycle')
     
     try:
-        # Clear schema cache to get latest
-        cache_result = clear_schema_cache(play_id=play_id)
-        step_logger.add('clear_schema_cache', 'Cleared validator schema cache', cache_result)
-        
-        # 1. Get play config (from DuckDB - fast)
-        play_config = get_play_config(play_id)
-        
-        if not play_config:
-            logger.error("Failed to load play configuration - aborting cycle")
-            _stats.errors += 1
-            return False
-        
-        # Check if pattern validator is enabled
-        enable_flag = play_config.get('pattern_validator_enable')
-        pattern_validator_enabled = (enable_flag == 1 or enable_flag is True)
-        
-        if not pattern_validator_enabled:
-            logger.warning("Pattern validator not enabled for this play - aborting cycle")
-            _stats.errors += 1
-            return False
-        
-        # Allow validation if either schema OR project_ids is available
-        project_ids = play_config.get('project_ids', [])
-        if not play_config.get('pattern_validator_config') and not project_ids:
-            logger.warning("Pattern validator schema missing and no project_ids configured - aborting cycle")
-            _stats.errors += 1
-            return False
-        
-        validation_mode = 'multi_project_filters' if len(project_ids) > 1 else \
-                         'project_filters' if project_ids else 'schema_based'
-        
-        step_logger.add(
-            'load_play_config',
-            'Play configuration loaded',
-            make_json_safe({
-                'play_id': play_config.get('id'),
-                'play_name': play_config.get('name'),
-                'validator_enabled': pattern_validator_enabled,
-                'project_ids': project_ids,
-                'validation_mode': validation_mode,
-            })
-        )
-        
-        # 2. Get market price and price cycle (from DuckDB - fast)
+        # 1. Get market price (fast — essential for pump detection)
         market_price = get_current_market_price()
         price_cycle = get_current_price_cycle()
         
@@ -925,7 +891,7 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
             {'market_price': market_price, 'price_cycle': price_cycle}
         )
         
-        # 3. Insert synthetic buyin
+        # 2. Insert synthetic buyin
         buyin_id = insert_synthetic_buyin(play_id, market_price, price_cycle, step_logger)
         
         if not buyin_id:
@@ -935,72 +901,70 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         
         _stats.trades_inserted += 1
         
-        # 4. Generate trail
-        # Trail data includes pre-entry metrics which flow through the auto-filter pipeline
-        logger.info(f"Generating trail for synthetic buyin #{buyin_id}")
+        # 3. Generate trail (the most time-consuming step ~2s)
         trail_success = generate_trail(buyin_id, step_logger)
         
         if not trail_success:
-            logger.warning("Trail generation failed - continuing with validation anyway")
-            # Don't abort - trail generation failure shouldn't stop validation
-        
-        # 5. Run validation
-        validation_result = run_validation(buyin_id, play_config, step_logger)
-        
-        if not validation_result:
-            logger.error("Validation failed - aborting cycle")
-            mark_buyin_as_error(buyin_id, "Validation returned no result", step_logger)
+            logger.warning("Trail generation failed")
+            mark_buyin_as_error(buyin_id, "Trail generation failed", step_logger)
             _stats.errors += 1
             return False
         
-        # 6. Update validation result
-        update_success = update_validation_result(buyin_id, validation_result, step_logger)
-        
-        # 6.5 Pump signal check (if enabled)
-        # Uses best-known rules: loads overnight_pump_best_latest.json on first use,
-        # then refreshes every 5 min but only replaces rules when new combo is as good or better.
-        # IMPORTANT: This must run AFTER validation completes (step 6), because
-        # the synthetic buyin is in 'validating' status until then.
-        if not PUMP_SIGNAL_PLAY_ID:
-            logger.debug("Pump signal skipped: PUMP_SIGNAL_PLAY_ID not set")
-        elif not trail_success:
-            logger.debug("Pump signal skipped: trail not persisted for this buyin")
-        else:
+        # 4. PUMP SIGNAL CHECK — the primary purpose of this cycle
+        # Run BEFORE validation so pump detection is as fast as possible
+        pump_fired = False
+        if PUMP_SIGNAL_PLAY_ID:
             try:
                 from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
-                maybe_refresh_rules()  # load overnight best if empty; refresh every 5 min
-                fired = check_and_fire_pump_signal(
+                maybe_refresh_rules()
+                pump_fired = check_and_fire_pump_signal(
                     buyin_id=buyin_id,
                     market_price=market_price,
                     price_cycle=price_cycle,
                 )
-                if fired:
-                    logger.info(f"Pump signal fired for play #{PUMP_SIGNAL_PLAY_ID} (source buyin #{buyin_id})")
+                if pump_fired:
+                    logger.info(f"PUMP SIGNAL FIRED for play #{PUMP_SIGNAL_PLAY_ID} (source buyin #{buyin_id})")
             except Exception as pump_err:
-                logger.error(f"Pump signal check error (non-fatal): {pump_err}", exc_info=True)
+                logger.error(f"Pump signal check error: {pump_err}", exc_info=True)
         
-        if not update_success:
-            logger.error("Failed to update validation result")
-            mark_buyin_as_error(buyin_id, "Failed to update validation result", step_logger)
-            _stats.errors += 1
-            return False
+        # 5. Pattern validation (skip in fast mode to save ~1.5s)
+        validation_result = None
+        if not PUMP_FAST_MODE:
+            # Full mode: also run pattern validation
+            cache_result = clear_schema_cache(play_id=play_id)
+            step_logger.add('clear_schema_cache', 'Cleared cache', cache_result)
+            
+            play_config = get_play_config(play_id)
+            if play_config:
+                enable_flag = play_config.get('pattern_validator_enable')
+                pattern_validator_enabled = (enable_flag == 1 or enable_flag is True)
+                
+                if pattern_validator_enabled:
+                    validation_result = run_validation(buyin_id, play_config, step_logger)
+                    if validation_result:
+                        update_validation_result(buyin_id, validation_result, step_logger)
         
-        # 7. Update entry log
+        # If no validation ran, mark the synthetic buyin as no_go
+        if validation_result is None:
+            _pg_update_buyin(buyin_id, {'our_status': 'no_go'})
+            decision = 'PUMP_CHECK'
+        else:
+            decision = validation_result.get('decision', 'UNKNOWN')
+        
+        # Update entry log
         update_entry_log(buyin_id, step_logger)
-        
         step_logger.end(cycle_token, {'buyin_id': buyin_id, 'success': True})
         
-        # Update stats
         _stats.validations_run += 1
-        decision = validation_result.get('decision', 'UNKNOWN')
         if decision == 'GO':
             _stats.validations_passed += 1
         else:
             _stats.validations_failed += 1
         
-        # Single-line summary (less verbose for 15s interval)
         cycle_ms = round((time.time() - cycle_start) * 1000)
-        logger.info(f"✓ Training #{buyin_id}: {decision} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms]")
+        pump_tag = " PUMP!" if pump_fired else ""
+        mode_tag = "fast" if PUMP_FAST_MODE else "full"
+        logger.info(f"✓ #{buyin_id}: {decision}{pump_tag} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms] [{mode_tag}]")
         
         return True
         
@@ -1008,7 +972,6 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         logger.error(f"Unexpected error in training cycle: {e}", exc_info=True)
         _stats.errors += 1
         step_logger.fail(cycle_token, str(e))
-        # Mark buyin as error if we have a buyin_id (insert succeeded but something else failed)
         if buyin_id:
             mark_buyin_as_error(buyin_id, f"Unexpected error: {str(e)}", step_logger)
         return False

@@ -1325,7 +1325,7 @@ if ($scheduler_started_raw && is_string($scheduler_started_raw) && preg_match('/
              */
             async function refreshSchedulerStatus() {
                 try {
-                    const response = await fetch('<?php echo DATABASE_API_URL; ?>/scheduler_status');
+                    const response = await fetch('<?php echo defined("DATABASE_API_PUBLIC_URL") ? DATABASE_API_PUBLIC_URL : DATABASE_API_URL; ?>/scheduler_status');
                     if (!response.ok) {
                         console.error('Scheduler status API returned:', response.status, response.statusText);
                         return;

@@ -385,6 +385,16 @@ class DatabaseClient {
         }
         return $this->post('/price_points', $data);
     }
+
+    /**
+     * Get pump training entries (clean_pump analytics points for pumps chart)
+     *
+     * @param int $hours Last N hours (default 48)
+     * @return array|null Array with 'entries' and 'count' or null on error
+     */
+    public function getPumpTrainingEntries(int $hours = 48): ?array {
+        return $this->get('/pump_training_entries', ['hours' => $hours]);
+    }
     
     /**
      * Get latest prices for all tokens

@@ -113,10 +113,11 @@ _model_metadata: Dict[str, Any] = {}
 _last_rules_refresh: float = 0.0
 _last_entry_time: float = 0.0
 _last_gate_summary_time: float = 0.0
+_last_train_data_hash: str = ""  # hash of training data to skip identical retrains
 
 _gate_stats: Dict[str, int] = {
     'no_model': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
-    'gates_passed': 0, 'low_confidence': 0,
+    'micro_fail': 0, 'gates_passed': 0, 'low_confidence': 0,
     'signal_fired': 0, 'total_checks': 0,
 }
 
@@ -1008,11 +1009,14 @@ def _compute_feat(name: str, row: dict) -> float:
 def refresh_pump_rules():
     """Train a new pump model and write to disk cache.
 
-    This is CPU-heavy (2-4 minutes) and should be called from the
+    This is CPU-heavy (~4 minutes) and should be called from the
     dedicated refresh_pump_model component process — NOT from train_validator.
     train_validator only reads the cached model via maybe_refresh_rules().
+    
+    Smart skip: if the training data hasn't changed since last run, we skip
+    the expensive GBM training and only refresh the training labels chart.
     """
-    global _model, _feature_columns, _model_metadata
+    global _model, _feature_columns, _model_metadata, _last_train_data_hash
 
     logger.info("=== V2: Refreshing pump model ===")
     t0 = time.time()
@@ -1024,6 +1028,17 @@ def refresh_pump_rules():
 
     # Persist clean_pump entry points (minute=0) for the pumps chart
     _persist_training_labels(df)
+
+    # Smart skip: hash the data shape + label distribution to detect changes.
+    # If the data is identical to the last training run, skip the expensive
+    # GBM training (~4 min) since it would produce the same model.
+    n_pump = int(df['label'].eq('clean_pump').sum())
+    n_total = len(df)
+    data_hash = hashlib.md5(f"{n_total}:{n_pump}:{df.iloc[-1].get('buyin_id', 0)}".encode()).hexdigest()[:12]
+    if data_hash == _last_train_data_hash and _model is not None:
+        logger.info(f"  Data unchanged ({n_total} rows, {n_pump} pumps, hash={data_hash}) — skipping retrain")
+        return
+    logger.info(f"  Data changed: {n_total} rows, {n_pump} pumps (hash {_last_train_data_hash or 'none'} → {data_hash})")
 
     result = _train_model(df)
     if result is None:
@@ -1063,6 +1078,7 @@ def refresh_pump_rules():
             pickle.dump({'model': _model, 'feature_columns': _feature_columns,
                          'metadata': _model_metadata}, f)
         tmp_path.replace(MODEL_CACHE_PATH)  # atomic rename
+        _last_train_data_hash = data_hash  # remember so we skip identical data next time
         logger.info(f"  Cache written to {MODEL_CACHE_PATH}")
     except Exception as e:
         logger.warning(f"Cache write failed: {e}")
@@ -1111,14 +1127,77 @@ def _log_gate_summary() -> None:
     if total == 0:
         return
     cb = _gate_stats.get('circuit_breaker', 0)
+    micro = _gate_stats.get('micro_fail', 0)
     logger.info(
         f"V2 gates (60s): {total} chk | no_mdl={_gate_stats['no_model']} "
         f"cb={cb} crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
-        f"ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
+        f"micro={micro} ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
         f"FIRED={_gate_stats['signal_fired']}"
     )
     for k in _gate_stats:
         _gate_stats[k] = 0
+
+
+def _check_microstructure_confirmation(trail_row: dict) -> Tuple[bool, str]:
+    """Verify that market microstructure supports the dip-buy signal.
+
+    The GBM model is heavily driven by pre_entry_change_3m (41% weight).
+    It sees ANY dip as a pump opportunity — but dips where whales are selling,
+    order book is bearish, and transactions show net selling are NOT bounces,
+    they're real selloffs.
+
+    This gate requires at least ONE bullish confirmation from the microstructure
+    (order book, transactions, or whale activity). If ALL three are bearish,
+    the dip is real and we should NOT buy.
+    """
+    bearish_count = 0
+    checks = 0
+    details = []
+
+    # Order book: is there buying pressure?
+    ob_imbalance = trail_row.get('ob_volume_imbalance')
+    if ob_imbalance is not None:
+        checks += 1
+        v = float(ob_imbalance)
+        if v < -0.05:  # net selling in order book
+            bearish_count += 1
+            details.append(f"ob_imb={v:+.3f}(sell)")
+        else:
+            details.append(f"ob_imb={v:+.3f}(ok)")
+
+    # Transaction flow: are buyers or sellers dominant?
+    tx_pressure = trail_row.get('tx_buy_sell_pressure')
+    if tx_pressure is not None:
+        checks += 1
+        v = float(tx_pressure)
+        if v < -0.02:  # net selling in transactions
+            bearish_count += 1
+            details.append(f"tx_press={v:+.3f}(sell)")
+        else:
+            details.append(f"tx_press={v:+.3f}(ok)")
+
+    # Whale activity: are whales accumulating or dumping?
+    wh_flow = trail_row.get('wh_net_flow_ratio')
+    if wh_flow is not None:
+        checks += 1
+        v = float(wh_flow)
+        if v < -0.3:  # whales are net sellers
+            bearish_count += 1
+            details.append(f"wh_flow={v:+.3f}(dump)")
+        else:
+            details.append(f"wh_flow={v:+.3f}(ok)")
+
+    desc = f"micro={checks-bearish_count}/{checks} bullish ({', '.join(details)})"
+
+    if checks == 0:
+        return True, "no microstructure data"
+
+    # Block if ALL available microstructure signals are bearish
+    # (i.e., zero bullish confirmations = pure selloff, not a bounce)
+    if bearish_count == checks:
+        return False, desc
+
+    return True, desc
 
 
 def check_pump_signal(trail_row: dict, market_price: float) -> bool:
@@ -1146,9 +1225,19 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         _gate_stats['crash_5m_fail'] += 1
         return False
 
+    # Gate 3: Microstructure confirmation — prevent buying into pure selloffs.
+    # The model sees any dip as a bounce opportunity, but if order book, whales,
+    # AND transactions ALL show selling, the dip is real, not a bounce.
+    micro_ok, micro_desc = _check_microstructure_confirmation(trail_row)
+    if not micro_ok:
+        _gate_stats.setdefault('micro_fail', 0)
+        _gate_stats['micro_fail'] += 1
+        logger.info(f"V2: microstructure REJECT ({micro_desc})")
+        return False
+
     _gate_stats['gates_passed'] += 1
 
-    # Trend description for logging (no longer a gate — the model handles trend awareness)
+    # Trend description for logging
     trend_desc = _get_trend_description(trail_row)
 
     # Track volatility for monitoring but DO NOT boost threshold
@@ -1157,7 +1246,6 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
 
     # Model confidence check — threshold capped at MAX_PREDICTION_THRESHOLD
-    # to prevent overfitting to backtest thresholds that don't match real-time
     raw_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
     required_confidence = min(max(raw_threshold, MIN_CONFIDENCE), MAX_PREDICTION_THRESHOLD)
 
@@ -1176,12 +1264,12 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         if proba < required_confidence:
             _gate_stats['low_confidence'] += 1
             logger.info(f"V2: conf={proba:.3f} < {required_confidence:.2f} "
-                        f"({trend_desc}, {regime_tag})")
+                        f"({trend_desc}, {micro_desc}, {regime_tag})")
             return False
 
         _gate_stats['signal_fired'] += 1
         logger.info(f"V2: SIGNAL! conf={proba:.3f} >= {required_confidence:.2f} "
-                    f"({trend_desc}, {regime_tag})")
+                    f"({trend_desc}, {micro_desc}, {regime_tag})")
         return True
 
     except Exception as e:

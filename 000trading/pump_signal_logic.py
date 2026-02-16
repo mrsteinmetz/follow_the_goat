@@ -1,18 +1,29 @@
 """
-Pump Signal Logic V2 — Improved Signal Detection
-=================================================
-Key changes from V1:
-  1. PATH-AWARE labeling: price must rise within 4 min, not just "eventually"
-  2. Multi-timeframe trend gate: need 2/3 timeframes positive (catches downtrend bounces)
-  3. Gradient-boosted model instead of manual threshold combos (captures interactions)
-  4. Walk-forward validation: model must work on 3 sequential test windows, not just one
-  5. Engineered features: momentum agreement, cross-asset divergence, volume-price divergence
-  6. Confidence threshold: only fires when model is 70%+ confident
+Pump Signal Logic V3 — Precision Signal Detection
+===================================================
+Key changes from V2:
+  1. SUSTAINED MOVE labeling: price must still be >= +0.10% at minute 4
+  2. Six new microstructure features: ask_pull_bid_stack, volume_confirmed_momentum,
+     whale_retail_divergence, spread_squeeze, delta_acceleration, trade_burstiness
+  3. Pre-entry slope composite: replaces 5 correlated pre_entry_change_* with
+     feat_pre_entry_slope (OLS) + feat_pre_entry_level (mean)
+  4. Whale acceleration ratio: whale net inflow 60s vs 5m average
+  5. Readiness score fast path: volatility-event detector triggers immediate
+     trail gen + full GBM check when threshold crossed (every 5-10s)
+  6. Feature drift monitoring: dual-window (12 min fast, 1h slow) percentile check
+  7. Outcome attribution: top features + gate details logged per signal
 
-Drop-in replacement for pump_signal_logic V1 — same external API:
+Retained from V2:
+  - PATH-AWARE labeling, walk-forward validation, gradient-boosted model
+  - Safety gates: crash, microstructure, cross-asset
+  - Circuit breaker with PostgreSQL-based win rate tracking
+
+External API (unchanged):
   - maybe_refresh_rules()
   - check_and_fire_pump_signal(buyin_id, market_price, price_cycle)
   - get_pump_status()
+  - compute_readiness_score() — NEW: fast path readiness
+  - should_trigger_fast_path() — NEW: check if immediate trail gen needed
 """
 
 from __future__ import annotations
@@ -55,6 +66,8 @@ MAX_DRAWDOWN_PCT = 0.10         # Max dip before reaching target (tighter than v
 FORWARD_WINDOW = 10             # Look 10 min ahead
 EARLY_WINDOW = 4                # Must reach target within first 4 minutes
 IMMEDIATE_DIP_MAX = -0.08       # Max allowed dip in first 2 min after entry
+SUSTAINED_PCT = 0.10            # Price must still be >= +0.10% at minute 4 (sustained move)
+MAX_RETRACEMENT_RATIO = 0.50    # Retracement filter (defined but NOT in label CASE yet — measurement first)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 LOOKBACK_HOURS = 48
@@ -70,6 +83,11 @@ COOLDOWN_SECONDS = 120
 # ── Safety gates ──────────────────────────────────────────────────────────────
 CRASH_GATE_5M = -0.3
 CRASH_GATE_MICRO_30S = -0.05
+
+# ── Readiness score (fast path) ──────────────────────────────────────────────
+READINESS_THRESHOLD = float(os.getenv("READINESS_THRESHOLD", "0.60"))
+READINESS_COOLDOWN_SEC = 30        # min seconds between fast-path triggers
+READINESS_PERCENTILE_WINDOW_SEC = 600  # 10-min window for percentile ranks
 
 # ── Walk-forward ──────────────────────────────────────────────────────────────
 N_WALK_FORWARD_SPLITS = 3
@@ -126,34 +144,109 @@ _price_buffer: deque = deque(maxlen=200)
 # ── Volatility regime tracking ───────────────────────────────────────────────
 _vol_buffer: deque = deque(maxlen=720)     # ~12 hours at 1 sample per ~minute
 
-# ── Circuit breaker: rolling accuracy tracker ────────────────────────────────
-_recent_outcomes: deque = deque(maxlen=50)  # last 50 signal outcomes
+# ── Outcome attribution: capture signal context at fire time ─────────────────
+# Keyed by buyin_id, consumed by record_signal_outcome when trade resolves.
+_signal_context: Dict[int, Dict[str, Any]] = {}
+
+# ── Readiness score: rolling buffers for percentile calculation ──────────────
+_readiness_buffers: Dict[str, deque] = {
+    'delta_accel': deque(maxlen=600),
+    'ask_pull_bid_stack': deque(maxlen=600),
+    'spread_squeeze': deque(maxlen=600),
+    'vol_confirmed_mom': deque(maxlen=600),
+    'whale_accel': deque(maxlen=600),
+    'price_volatility': deque(maxlen=600),
+}
+_last_readiness_trigger: float = 0.0
+_last_readiness_score: float = 0.0
+
+# ── Feature drift monitoring ────────────────────────────────────────────────
+# Dual-window: fast (12 min) for OB/tx features, slow (60 min) for whale/pre_entry
+_DRIFT_FAST_WINDOW_SEC = 720     # 12 minutes
+_DRIFT_SLOW_WINDOW_SEC = 3600    # 1 hour
+_drift_buffers: Dict[str, deque] = {}  # populated after first model train
+_drift_last_check: float = 0.0
+_DRIFT_CHECK_INTERVAL: float = 60.0  # check every 60s
+_drift_warnings: List[str] = []
+
+# Prefixes that use fast vs slow drift window
+_FAST_DRIFT_PREFIXES = ('ob_', 'tx_', 'feat_ask_pull', 'feat_spread_squeeze',
+                        'feat_delta_acceleration', 'feat_trade_burstiness',
+                        'feat_volume_confirmed')
+_SLOW_DRIFT_PREFIXES = ('wh_', 'feat_whale', 'feat_pre_entry', 'xa_', 'pre_entry_')
+
+# ── Circuit breaker: PostgreSQL-based rolling accuracy tracker ────────────────
+# Outcomes are stored in pump_signal_outcomes table (shared across processes).
+# The trailing_stop_seller writes outcomes; train_validator reads them.
 _circuit_breaker_paused: bool = False
+_cb_cache: Optional[Dict[str, Any]] = None  # cached query result
+_cb_cache_time: float = 0.0
+_CB_CACHE_TTL: float = 30.0  # seconds between DB queries
 
 
-def record_signal_outcome(hit_target: bool) -> None:
-    """Record whether a fired signal hit the +0.2% target.
+def record_signal_outcome(buyin_id: int, hit_target: bool,
+                          gain_pct: float = 0.0, confidence: float = 0.0) -> None:
+    """Record whether a fired signal hit the target. Writes to PostgreSQL.
 
-    Called by the trailing_stop_seller / update_potential_gains component
-    when a Play #3 trade resolves.
+    Called by trailing_stop_seller when a Play #3 trade resolves.
+    Both processes share the same DB table, so the train_validator
+    (which runs check_pump_signal) can read the outcomes.
+
+    Includes outcome attribution: top feature values and gate details
+    captured at signal-fire time (stored in _signal_context).
     """
-    _recent_outcomes.append(1 if hit_target else 0)
+    # Retrieve signal context captured at fire time
+    ctx = _signal_context.pop(buyin_id, {})
+    top_features_json = json.dumps(ctx.get('top_features', {})) if ctx.get('top_features') else None
+    gates_passed_json = json.dumps(ctx.get('gates_passed', {})) if ctx.get('gates_passed') else None
+
+    try:
+        postgres_execute(
+            """INSERT INTO pump_signal_outcomes
+               (buyin_id, hit_target, gain_pct, confidence, top_features_json, gates_passed_json)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            [buyin_id, hit_target, gain_pct, confidence, top_features_json, gates_passed_json])
+    except Exception as e:
+        logger.warning(f"Failed to record signal outcome: {e}")
+
+
+def _get_live_outcomes() -> Dict[str, Any]:
+    """Get recent outcomes from PostgreSQL, cached for _CB_CACHE_TTL seconds."""
+    global _cb_cache, _cb_cache_time
+    now = time.time()
+    if _cb_cache is not None and (now - _cb_cache_time) < _CB_CACHE_TTL:
+        return _cb_cache
+
+    try:
+        rows = postgres_query(
+            """SELECT hit_target, gain_pct FROM pump_signal_outcomes
+               ORDER BY created_at DESC LIMIT 50""")
+        n = len(rows)
+        hits = sum(1 for r in rows if r['hit_target']) if n else 0
+        win_rate = hits / n if n else None
+        _cb_cache = {'n': n, 'hits': hits, 'win_rate': win_rate}
+    except Exception as e:
+        logger.debug(f"Circuit breaker DB read error: {e}")
+        _cb_cache = {'n': 0, 'hits': 0, 'win_rate': None}
+    _cb_cache_time = now
+    return _cb_cache
 
 
 def _check_circuit_breaker() -> bool:
-    """Return True if the circuit breaker is tripped (live precision too low)."""
+    """Return True if the circuit breaker is tripped (live win rate too low)."""
     global _circuit_breaker_paused
-    if len(_recent_outcomes) < 20:
+    info = _get_live_outcomes()
+    if info['n'] < 10:
         return False  # not enough data to judge
-    live_prec = sum(_recent_outcomes) / len(_recent_outcomes)
-    if live_prec < 0.40:
+    win_rate = info['win_rate']
+    if win_rate is not None and win_rate < 0.35:
         if not _circuit_breaker_paused:
-            logger.warning(f"Circuit breaker TRIPPED: live precision {live_prec:.1%} "
-                           f"({sum(_recent_outcomes)}/{len(_recent_outcomes)}) — pausing signals")
+            logger.warning(f"Circuit breaker TRIPPED: live win rate {win_rate:.1%} "
+                           f"({info['hits']}/{info['n']}) — pausing signals")
             _circuit_breaker_paused = True
         return True
     if _circuit_breaker_paused:
-        logger.info(f"Circuit breaker RESET: live precision recovered to {live_prec:.1%}")
+        logger.info(f"Circuit breaker RESET: live win rate recovered to {win_rate:.1%}")
         _circuit_breaker_paused = False
     return False
 
@@ -559,13 +652,17 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
             WHERE ({any_not_null})
         """)
 
-        # ── Step 3: Path-aware labeling (zero-copy Arrow → pandas) ────────
+        # ── Step 3: Path-aware labeling with sustained move filter ─────────
         # CRITICAL: Filter to minute=0 only for training.
         # The model predicts on minute=0 (entry point) but was previously
         # trained on ALL minutes (0-14), causing train/serve skew that
         # inflated precision to ~98% while real-time confidence stayed low.
         # By training only on minute=0 data, the model learns patterns
         # at the actual entry point, matching prediction-time conditions.
+        #
+        # V3 CHANGE: Added sustained move filter — price must still be
+        # >= SUSTAINED_PCT at minute 4, not just touched MIN_PUMP_PCT.
+        # Retracement ratio is measured but NOT applied yet (measurement-first).
         arrow_result = con.execute(f"""
             SELECT *,
                 CASE
@@ -573,6 +670,8 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
                          AND min_fwd > -{MAX_DRAWDOWN_PCT}
                          AND min_fwd_imm > {IMMEDIATE_DIP_MAX}
                          AND (pm_price_change_5m IS NULL OR pm_price_change_5m > {CRASH_GATE_5M})
+                         AND fwd_4m IS NOT NULL
+                         AND fwd_4m >= {SUSTAINED_PCT}
                         THEN 'clean_pump'
                     WHEN (pm_price_change_5m IS NULL OR pm_price_change_5m > {CRASH_GATE_5M})
                         THEN 'no_pump'
@@ -595,6 +694,37 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
             logger.info(f"    clean_pump: peak={cp['max_fwd'].mean():.3f}%, "
                         f"worst_dip={cp['min_fwd'].mean():.3f}%, "
                         f"time_to_peak={cp['time_to_peak'].mean():.1f}m")
+
+        # ── Measurement: log impact of sustained floor vs retracement ratio ──
+        # Helps decide whether to add retracement ratio later.
+        try:
+            old_mask = (
+                (df['max_fwd_early'] >= MIN_PUMP_PCT)
+                & (df['min_fwd'] > -MAX_DRAWDOWN_PCT)
+                & (df['min_fwd_imm'] > IMMEDIATE_DIP_MAX)
+            )
+            old_pump_count = int(old_mask.sum())
+
+            has_fwd4 = df['fwd_4m'].notna()
+            fail_sustained = old_mask & (~has_fwd4 | (df['fwd_4m'] < SUSTAINED_PCT))
+            n_fail_sustained = int(fail_sustained.sum())
+
+            retrace = (df['max_fwd_early'] - df['fwd_4m']) / df['max_fwd_early'].replace(0, np.nan)
+            fail_retrace = old_mask & has_fwd4 & (retrace >= MAX_RETRACEMENT_RATIO)
+            n_fail_retrace = int(fail_retrace.sum())
+
+            fail_both = fail_sustained | fail_retrace
+            n_fail_both = int((old_mask & fail_both).sum())
+
+            logger.info(
+                f"  LABEL MEASUREMENT: old_clean_pump={old_pump_count}, "
+                f"fail_sustained_floor={n_fail_sustained}, "
+                f"fail_retrace_ratio={n_fail_retrace}, "
+                f"fail_either={n_fail_both}"
+            )
+        except Exception as meas_err:
+            logger.debug(f"Label measurement error: {meas_err}")
+
         return df
 
     except duckdb.Error as e:
@@ -768,6 +898,99 @@ def _engineer_features(df: pd.DataFrame, base_cols: List[str]) -> Tuple[pd.DataF
     if 'pm_realized_vol_1m' in df.columns and 'pm_volatility_pct' in df.columns:
         df['feat_vol_compress'] = df['pm_volatility_pct'] / df['pm_realized_vol_1m'].clip(lower=1e-8)
         new_cols.append('feat_vol_compress')
+
+    # ── NEW V3 FEATURES ─────────────────────────────────────────────────
+
+    # 1. ask_pull_bid_stack: asks being pulled while bids are stacked
+    #    Sharply positive = someone preparing to push price up
+    if 'ob_bid_depth_velocity' in df.columns and 'ob_ask_depth_velocity' in df.columns:
+        df['feat_ask_pull_bid_stack'] = (
+            df['ob_bid_depth_velocity'].fillna(0) - df['ob_ask_depth_velocity'].fillna(0)
+        )
+        new_cols.append('feat_ask_pull_bid_stack')
+
+    # 2. volume_confirmed_momentum: 30s momentum confirmed by volume and buy pressure
+    if all(c in df.columns for c in ['ts_momentum_30s', 'ts_buy_sell_pressure_30s', 'ts_volume_30s']):
+        pressure_sign = np.sign(df['ts_buy_sell_pressure_30s'].fillna(0))
+        df['feat_volume_confirmed_momentum'] = (
+            df['ts_momentum_30s'].fillna(0) * pressure_sign * np.log1p(df['ts_volume_30s'].fillna(0).abs())
+        )
+        new_cols.append('feat_volume_confirmed_momentum')
+
+    # 3. whale_retail_divergence: whale flow vs retail transaction pressure
+    #    Positive = whales buying while retail is flat/selling (strong signal)
+    if 'wh_net_flow_ratio' in df.columns and 'tx_buy_sell_pressure' in df.columns:
+        df['feat_whale_retail_divergence'] = (
+            df['wh_net_flow_ratio'].fillna(0) - df['tx_buy_sell_pressure'].fillna(0)
+        )
+        new_cols.append('feat_whale_retail_divergence')
+
+    # 4. spread_squeeze_signal: spread tightening + buy-heavy book = imminent move
+    if 'ob_spread_velocity' in df.columns and 'ob_depth_imbalance_ratio' in df.columns:
+        df['feat_spread_squeeze'] = (
+            -df['ob_spread_velocity'].fillna(0) * df['ob_depth_imbalance_ratio'].fillna(0)
+        )
+        new_cols.append('feat_spread_squeeze')
+
+    # 5. delta_acceleration_30s: is buying accelerating? (approx from minute-level data)
+    #    Uses tx_cumulative_delta and tx_cumulative_delta_5m to approximate 30s acceleration
+    if 'tx_cumulative_delta' in df.columns and 'tx_cumulative_delta_5m' in df.columns:
+        recent_delta = df['tx_cumulative_delta'].fillna(0)
+        avg_delta_per_min = df['tx_cumulative_delta_5m'].fillna(0) / 5.0
+        denom = avg_delta_per_min.abs().clip(lower=1.0)
+        df['feat_delta_acceleration'] = (recent_delta - avg_delta_per_min) / denom
+        new_cols.append('feat_delta_acceleration')
+
+    # 6. trade_arrival_burstiness: approximated from trades_per_second and trade_intensity
+    #    High burstiness = someone splitting orders (pump precursor)
+    if 'tx_trades_per_second' in df.columns and 'tx_trade_intensity' in df.columns:
+        tps = df['tx_trades_per_second'].fillna(0)
+        intensity = df['tx_trade_intensity'].fillna(0)
+        mean_intensity = intensity.clip(lower=1e-6)
+        df['feat_trade_burstiness'] = (tps * intensity) / mean_intensity
+        new_cols.append('feat_trade_burstiness')
+
+    # 7. whale_acceleration_ratio: whale buying acceleration (60s vs 5m avg)
+    #    Uses wh_flow_velocity (recent) and wh_flow_acceleration to detect
+    #    whales loading before the crowd.
+    if 'wh_flow_velocity' in df.columns and 'wh_flow_acceleration' in df.columns:
+        vel = df['wh_flow_velocity'].fillna(0)
+        denom = vel.abs().clip(lower=1e-6)
+        df['feat_whale_accel_ratio'] = df['wh_flow_acceleration'].fillna(0) / denom
+        new_cols.append('feat_whale_accel_ratio')
+
+    # ── PRE-ENTRY SLOPE COMPOSITE (Phase 4) ─────────────────────────────
+    # Replace 5 correlated pre_entry_change_* features with slope + level.
+    # Slope captures direction (stabilizing dip vs accelerating selloff).
+    # Level captures magnitude. Model sees 2 features instead of 5 correlated ones.
+    _PRE_ENTRY_COLS = ['pre_entry_change_1m', 'pre_entry_change_2m',
+                       'pre_entry_change_3m', 'pre_entry_change_5m',
+                       'pre_entry_change_10m']
+    _PRE_ENTRY_X = np.array([-1.0, -2.0, -3.0, -5.0, -10.0])
+
+    avail_pe = [c for c in _PRE_ENTRY_COLS if c in df.columns]
+    if len(avail_pe) >= 3:
+        pe_vals = df[avail_pe].values  # shape: (n_rows, n_avail)
+        x_for_avail = _PRE_ENTRY_X[[_PRE_ENTRY_COLS.index(c) for c in avail_pe]]
+
+        slopes = np.full(len(df), np.nan)
+        levels = np.full(len(df), np.nan)
+        for i in range(len(df)):
+            row_vals = pe_vals[i]
+            mask = ~np.isnan(row_vals)
+            if mask.sum() >= 3:
+                slopes[i] = np.polyfit(x_for_avail[mask], row_vals[mask], 1)[0]
+                levels[i] = np.nanmean(row_vals[mask])
+            elif mask.sum() >= 1:
+                levels[i] = np.nanmean(row_vals[mask])
+
+        df['feat_pre_entry_slope'] = slopes
+        df['feat_pre_entry_level'] = levels
+        new_cols.append('feat_pre_entry_slope')
+        new_cols.append('feat_pre_entry_level')
+
+    # Exclude individual pre_entry_change_* from base_cols so GBM sees only slope + level
+    base_cols = [c for c in base_cols if c not in _PRE_ENTRY_COLS]
 
     all_cols = base_cols + new_cols
     logger.info(f"  Features: {len(base_cols)} base + {len(new_cols)} engineered = {len(all_cols)}")
@@ -945,6 +1168,23 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
     for f, v in importances.items():
         logger.info(f"    {f}: {v:.4f}")
 
+    # ── Compute training-time feature distribution stats for drift monitoring ──
+    top_5_names = list(importances.index[:5])
+    training_feature_stats = {}
+    for feat_name in top_5_names:
+        if feat_name in df.columns:
+            col_data = df[feat_name].dropna()
+            if len(col_data) >= 10:
+                training_feature_stats[feat_name] = {
+                    'mean': round(float(col_data.mean()), 6),
+                    'std': round(float(col_data.std()), 6),
+                    'p5': round(float(col_data.quantile(0.05)), 6),
+                    'p25': round(float(col_data.quantile(0.25)), 6),
+                    'p50': round(float(col_data.quantile(0.50)), 6),
+                    'p75': round(float(col_data.quantile(0.75)), 6),
+                    'p95': round(float(col_data.quantile(0.95)), 6),
+                }
+
     return {
         'model': final,
         'feature_columns': feature_cols,
@@ -958,6 +1198,7 @@ def _train_model(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
             'n_samples': len(df),
             'n_positive': int(df['target'].sum()),
             'top_features': {k: round(float(v), 4) for k, v in importances.items()},
+            'training_feature_stats': training_feature_stats,
             'confidence_threshold': MIN_CONFIDENCE,
             'refreshed_at': datetime.now(timezone.utc).isoformat(),
         }
@@ -995,11 +1236,337 @@ def _compute_feat(name: str, row: dict) -> float:
             a, b = row.get('pm_realized_vol_1m'), row.get('pm_volatility_pct')
             return float(b) / max(float(a), 1e-8) if a is not None and b is not None else 1.0
 
-        # feat_ob_zscore and feat_vol_price_div removed (train/serve skew)
+        # ── V3 features ──────────────────────────────────────────────
+        if name == 'feat_ask_pull_bid_stack':
+            a = row.get('ob_bid_depth_velocity')
+            b = row.get('ob_ask_depth_velocity')
+            return float(a or 0) - float(b or 0)
+
+        if name == 'feat_volume_confirmed_momentum':
+            mom = row.get('ts_momentum_30s')
+            pres = row.get('ts_buy_sell_pressure_30s')
+            vol = row.get('ts_volume_30s')
+            if mom is not None and pres is not None and vol is not None:
+                sign = 1.0 if float(pres) >= 0 else -1.0
+                return float(mom) * sign * float(np.log1p(abs(float(vol))))
+            return 0.0
+
+        if name == 'feat_whale_retail_divergence':
+            a = row.get('wh_net_flow_ratio')
+            b = row.get('tx_buy_sell_pressure')
+            return float(a or 0) - float(b or 0)
+
+        if name == 'feat_spread_squeeze':
+            a = row.get('ob_spread_velocity')
+            b = row.get('ob_depth_imbalance_ratio')
+            return -float(a or 0) * float(b or 0)
+
+        if name == 'feat_delta_acceleration':
+            delta = row.get('tx_cumulative_delta')
+            delta_5m = row.get('tx_cumulative_delta_5m')
+            if delta is not None and delta_5m is not None:
+                avg = float(delta_5m) / 5.0
+                denom = max(abs(avg), 1.0)
+                return (float(delta) - avg) / denom
+            return 0.0
+
+        if name == 'feat_trade_burstiness':
+            tps = row.get('tx_trades_per_second')
+            intensity = row.get('tx_trade_intensity')
+            if tps is not None and intensity is not None:
+                mean_i = max(float(intensity), 1e-6)
+                return float(tps) * float(intensity) / mean_i
+            return 0.0
+
+        if name == 'feat_pre_entry_slope' or name == 'feat_pre_entry_level':
+            pe_cols = ['pre_entry_change_1m', 'pre_entry_change_2m',
+                       'pre_entry_change_3m', 'pre_entry_change_5m',
+                       'pre_entry_change_10m']
+            pe_x = np.array([-1.0, -2.0, -3.0, -5.0, -10.0])
+            vals = []
+            xs = []
+            for c, x in zip(pe_cols, pe_x):
+                v = row.get(c)
+                if v is not None:
+                    vals.append(float(v))
+                    xs.append(x)
+            if name == 'feat_pre_entry_level':
+                return float(np.mean(vals)) if vals else 0.0
+            if len(vals) >= 3:
+                return float(np.polyfit(xs, vals, 1)[0])
+            return 0.0
+
+        if name == 'feat_whale_accel_ratio':
+            flow_vel = row.get('wh_flow_velocity')
+            flow_accel = row.get('wh_flow_acceleration')
+            if flow_vel is not None and flow_accel is not None:
+                denom = max(abs(float(flow_vel)), 1e-6)
+                return float(flow_accel) / denom
+            return 0.0
 
     except (ValueError, TypeError):
         pass
     return 0.0
+
+
+# =============================================================================
+# FEATURE DRIFT MONITORING (dual-window)
+# =============================================================================
+
+def _get_drift_window(feature_name: str) -> int:
+    """Return the appropriate drift window size (in samples) for a feature."""
+    for prefix in _FAST_DRIFT_PREFIXES:
+        if feature_name.startswith(prefix):
+            return _DRIFT_FAST_WINDOW_SEC
+    return _DRIFT_SLOW_WINDOW_SEC
+
+
+def _init_drift_buffers() -> None:
+    """Initialize drift buffers for the top features after model training."""
+    global _drift_buffers
+    top_feats = _model_metadata.get('top_features', {})
+    top_5 = list(top_feats.keys())[:5]
+    _drift_buffers = {f: deque(maxlen=3600) for f in top_5}
+
+
+def _check_feature_drift(features: Dict[str, float]) -> List[str]:
+    """Check if live feature values deviate from training distributions.
+
+    Compares the rolling live mean against the training [5th, 95th] percentile range.
+    Uses fast window (12 min) for OB/tx features, slow window (1h) for whale/pre_entry.
+
+    Returns list of warning strings for drifting features.
+    """
+    global _drift_last_check, _drift_warnings
+
+    now = time.time()
+    if now - _drift_last_check < _DRIFT_CHECK_INTERVAL:
+        return _drift_warnings
+
+    _drift_last_check = now
+
+    train_stats = _model_metadata.get('training_feature_stats', {})
+    if not train_stats or not _drift_buffers:
+        return []
+
+    warnings = []
+    for feat_name, buf in _drift_buffers.items():
+        val = features.get(feat_name)
+        if val is not None:
+            buf.append((now, float(val)))
+
+        stats = train_stats.get(feat_name)
+        if stats is None or len(buf) < 30:
+            continue
+
+        window_sec = _get_drift_window(feat_name)
+        cutoff = now - window_sec
+        windowed = [v for t, v in buf if t >= cutoff]
+        if len(windowed) < 10:
+            continue
+
+        live_mean = float(np.mean(windowed))
+        p5 = stats.get('p5', float('-inf'))
+        p95 = stats.get('p95', float('inf'))
+
+        if live_mean < p5 or live_mean > p95:
+            window_label = "fast" if window_sec == _DRIFT_FAST_WINDOW_SEC else "slow"
+            warnings.append(
+                f"{feat_name}: live_mean={live_mean:.4f} outside training "
+                f"[{p5:.4f}, {p95:.4f}] ({window_label} window, n={len(windowed)})"
+            )
+
+    if warnings and warnings != _drift_warnings:
+        for w in warnings:
+            logger.warning(f"FEATURE DRIFT: {w}")
+    _drift_warnings = warnings
+    return warnings
+
+
+# =============================================================================
+# READINESS SCORE — Fast path volatility-event detector
+# =============================================================================
+
+def compute_readiness_score(utc_now: Optional[datetime] = None) -> float:
+    """Compute a rolling readiness score from high-freq cache data.
+
+    The readiness score predicts *volatility events* (any large move imminent),
+    NOT pumps specifically. When it crosses READINESS_THRESHOLD, the caller
+    should trigger an immediate trail generation + full GBM check.
+
+    Score design: fraction of micro features exceeding their 95th percentile
+    in the rolling 10-minute window. Returns 0.0-1.0.
+
+    Uses the high-freq DuckDB cache (read-only) and the price buffer.
+    """
+    global _last_readiness_score
+
+    if utc_now is None:
+        utc_now = datetime.now(timezone.utc)
+
+    # DuckDB stores naive-UTC timestamps, so strip tzinfo for comparisons
+    utc_naive = utc_now.replace(tzinfo=None) if utc_now.tzinfo else utc_now
+
+    try:
+        from pump_highfreq_cache import get_highfreq_reader
+    except ImportError:
+        try:
+            from .pump_highfreq_cache import get_highfreq_reader
+        except ImportError:
+            _last_readiness_score = 0.0
+            return 0.0
+
+    feature_values: Dict[str, float] = {}
+
+    try:
+        with get_highfreq_reader() as con:
+            # Delta acceleration: cumulative delta in last 30s vs prior 30s
+            try:
+                row = con.execute("""
+                    WITH recent AS (
+                        SELECT
+                            SUM(CASE WHEN direction = 'buy' THEN sol_amount ELSE -sol_amount END) AS delta
+                        FROM cached_trades
+                        WHERE trade_timestamp >= ? - INTERVAL '30 seconds'
+                          AND trade_timestamp < ?
+                    ),
+                    prior AS (
+                        SELECT
+                            SUM(CASE WHEN direction = 'buy' THEN sol_amount ELSE -sol_amount END) AS delta
+                        FROM cached_trades
+                        WHERE trade_timestamp >= ? - INTERVAL '60 seconds'
+                          AND trade_timestamp < ? - INTERVAL '30 seconds'
+                    )
+                    SELECT recent.delta AS recent_delta, prior.delta AS prior_delta
+                    FROM recent, prior
+                """, [utc_naive, utc_naive, utc_naive, utc_naive]).fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    prior = float(row[1])
+                    denom = max(abs(prior), 1.0)
+                    feature_values['delta_accel'] = (float(row[0]) - prior) / denom
+            except Exception:
+                pass
+
+            # Ask pull / bid stack: bid depth velocity - ask depth velocity
+            try:
+                row = con.execute("""
+                    SELECT
+                        bid_liquidity - LAG(bid_liquidity) OVER (ORDER BY ts) AS bid_vel,
+                        ask_liquidity - LAG(ask_liquidity) OVER (ORDER BY ts) AS ask_vel
+                    FROM cached_order_book
+                    WHERE ts >= ? - INTERVAL '10 seconds'
+                    ORDER BY ts DESC LIMIT 1
+                """, [utc_naive]).fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    feature_values['ask_pull_bid_stack'] = float(row[0]) - float(row[1])
+            except Exception:
+                pass
+
+            # Spread squeeze: spread tightening * depth imbalance
+            try:
+                row = con.execute("""
+                    WITH recent_ob AS (
+                        SELECT spread_bps, depth_imbalance_ratio,
+                               LAG(spread_bps) OVER (ORDER BY ts) AS prev_spread
+                        FROM cached_order_book
+                        WHERE ts >= ? - INTERVAL '10 seconds'
+                        ORDER BY ts DESC LIMIT 1
+                    )
+                    SELECT
+                        -(spread_bps - COALESCE(prev_spread, spread_bps)) * depth_imbalance_ratio
+                    FROM recent_ob
+                """, [utc_naive]).fetchone()
+                if row and row[0] is not None:
+                    feature_values['spread_squeeze'] = float(row[0])
+            except Exception:
+                pass
+
+            # Volume confirmed momentum (from price buffer + recent trades)
+            try:
+                mom_30s = _get_micro_trend(30)
+                row = con.execute("""
+                    SELECT
+                        SUM(sol_amount) AS vol_30s,
+                        SUM(CASE WHEN direction='buy' THEN sol_amount ELSE 0 END)
+                        - SUM(CASE WHEN direction='sell' THEN sol_amount ELSE 0 END) AS pressure
+                    FROM cached_trades
+                    WHERE trade_timestamp >= ? - INTERVAL '30 seconds'
+                """, [utc_naive]).fetchone()
+                if row and mom_30s is not None and row[0] is not None and row[1] is not None:
+                    sign = 1.0 if float(row[1]) >= 0 else -1.0
+                    feature_values['vol_confirmed_mom'] = mom_30s * sign * float(np.log1p(abs(float(row[0]))))
+            except Exception:
+                pass
+
+            # Whale acceleration
+            try:
+                row = con.execute("""
+                    WITH w60 AS (
+                        SELECT COALESCE(SUM(CASE WHEN direction='inflow' THEN sol_change ELSE -sol_change END), 0) AS net
+                        FROM cached_whales
+                        WHERE ts >= ? - INTERVAL '60 seconds'
+                    ),
+                    w5m AS (
+                        SELECT COALESCE(SUM(CASE WHEN direction='inflow' THEN sol_change ELSE -sol_change END), 0) / 5.0 AS avg_net
+                        FROM cached_whales
+                        WHERE ts >= ? - INTERVAL '5 minutes'
+                    )
+                    SELECT w60.net, w5m.avg_net FROM w60, w5m
+                """, [utc_naive, utc_naive]).fetchone()
+                if row and row[0] is not None and row[1] is not None:
+                    denom = max(abs(float(row[1])), 1.0)
+                    feature_values['whale_accel'] = float(row[0]) / denom
+            except Exception:
+                pass
+
+    except Exception as e:
+        logger.debug(f"Readiness score HF read error: {e}")
+
+    # Price volatility from buffer (std of last 30s returns)
+    if len(_price_buffer) >= 10:
+        recent = [(t, p) for t, p in _price_buffer if t >= time.time() - 30]
+        if len(recent) >= 5:
+            prices = [p for _, p in recent]
+            rets = np.diff(prices) / np.array(prices[:-1]) * 100
+            feature_values['price_volatility'] = float(np.std(rets)) if len(rets) > 1 else 0.0
+
+    # Update rolling buffers and compute percentile ranks
+    n_above_95 = 0
+    n_features = 0
+    for key, buf in _readiness_buffers.items():
+        val = feature_values.get(key)
+        if val is None:
+            continue
+        buf.append(val)
+        n_features += 1
+        if len(buf) < 30:
+            continue
+        rank = sum(1 for v in buf if v <= val)
+        pct = rank / len(buf)
+        if pct >= 0.95:
+            n_above_95 += 1
+
+    score = n_above_95 / max(n_features, 1) if n_features > 0 else 0.0
+    _last_readiness_score = score
+    return score
+
+
+def should_trigger_fast_path() -> bool:
+    """Check if the readiness score warrants an immediate trail gen + GBM check.
+
+    Returns True if score >= threshold and cooldown has elapsed.
+    Caller should then trigger trail generation + check_pump_signal.
+    """
+    global _last_readiness_trigger
+
+    score = compute_readiness_score()
+    now = time.time()
+
+    if score >= READINESS_THRESHOLD and (now - _last_readiness_trigger) >= READINESS_COOLDOWN_SEC:
+        _last_readiness_trigger = now
+        logger.info(f"READINESS TRIGGER: score={score:.3f} >= {READINESS_THRESHOLD}")
+        return True
+    return False
 
 
 # =============================================================================
@@ -1060,9 +1627,13 @@ def refresh_pump_rules():
     _feature_columns = result['feature_columns']
     _model_metadata = result['metadata']
 
-    # Reset circuit breaker on model refresh — new model gets a clean slate
-    global _circuit_breaker_paused
-    _recent_outcomes.clear()
+    # Initialize drift monitoring buffers for top features
+    _init_drift_buffers()
+
+    # Reset circuit breaker cache on model refresh — force a fresh DB read
+    global _circuit_breaker_paused, _cb_cache, _cb_cache_time
+    _cb_cache = None
+    _cb_cache_time = 0.0
     _circuit_breaker_paused = False
 
     opt_t = result['metadata'].get('optimal_threshold', MIN_CONFIDENCE)
@@ -1092,6 +1663,7 @@ def _load_cached_model() -> bool:
         with open(MODEL_CACHE_PATH, 'rb') as f:
             d = pickle.load(f)
         _model, _feature_columns, _model_metadata = d['model'], d['feature_columns'], d['metadata']
+        _init_drift_buffers()
         logger.info(f"Loaded cached V2 model: {len(_feature_columns)} features")
         return True
     except Exception as e:
@@ -1259,6 +1831,14 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     vol_pct = _get_vol_percentile()
     regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
 
+    # Build gate details for outcome attribution
+    gate_details = {
+        'crash_30s': crash_desc,
+        'micro': micro_desc,
+        'xa_selloff': False,
+        'vol_regime': regime_tag,
+    }
+
     # Model confidence check — threshold capped at MAX_PREDICTION_THRESHOLD
     raw_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
     required_confidence = min(max(raw_threshold, MIN_CONFIDENCE), MAX_PREDICTION_THRESHOLD)
@@ -1275,6 +1855,11 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         X = pd.DataFrame([features])[_feature_columns].fillna(0)
         proba = float(_model.predict_proba(X)[0, 1])
 
+        # Feature drift monitoring (runs every 60s, lightweight)
+        drift_warnings = _check_feature_drift(features)
+        if drift_warnings:
+            gate_details['drift_warnings'] = len(drift_warnings)
+
         if proba < required_confidence:
             _gate_stats['low_confidence'] += 1
             logger.info(f"V2: conf={proba:.3f} < {required_confidence:.2f} "
@@ -1284,6 +1869,23 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
         _gate_stats['signal_fired'] += 1
         logger.info(f"V2: SIGNAL! conf={proba:.3f} >= {required_confidence:.2f} "
                     f"({trend_desc}, {micro_desc}, {regime_tag})")
+
+        # ── Outcome attribution: capture context at fire time ─────────
+        buyin_id = trail_row.get('buyin_id')
+        if buyin_id is not None:
+            top_feats = _model_metadata.get('top_features', {})
+            top_3_names = list(top_feats.keys())[:3] if top_feats else []
+            top_3_vals = {name: round(features.get(name, 0.0), 6) for name in top_3_names}
+            _signal_context[int(buyin_id)] = {
+                'top_features': top_3_vals,
+                'gates_passed': gate_details,
+                'confidence': round(proba, 4),
+            }
+            if len(_signal_context) > 200:
+                oldest = sorted(_signal_context.keys())[:100]
+                for k in oldest:
+                    _signal_context.pop(k, None)
+
         return True
 
     except Exception as e:
@@ -1405,19 +2007,22 @@ def check_and_fire_pump_signal(
 
 
 def get_pump_status() -> Dict[str, Any]:
-    live_prec = (sum(_recent_outcomes) / len(_recent_outcomes)) if len(_recent_outcomes) > 0 else None
+    info = _get_live_outcomes()
     return {
-        'version': 'v2',
+        'version': 'v3',
         'has_model': _model is not None,
         'n_features': len(_feature_columns),
         'metadata': _model_metadata,
         'last_refresh': _last_rules_refresh,
         'last_entry': _last_entry_time,
         'circuit_breaker_paused': _circuit_breaker_paused,
-        'live_precision': round(live_prec, 4) if live_prec is not None else None,
-        'live_outcomes_count': len(_recent_outcomes),
+        'live_win_rate': round(info['win_rate'], 4) if info['win_rate'] is not None else None,
+        'live_outcomes_count': info['n'],
         'vol_buffer_size': len(_vol_buffer),
         'vol_percentile': round(_get_vol_percentile(), 1) if _get_vol_percentile() is not None else None,
+        'readiness_score': round(_last_readiness_score, 4),
+        'readiness_threshold': READINESS_THRESHOLD,
+        'drift_warnings': len(_drift_warnings),
     }
 
 

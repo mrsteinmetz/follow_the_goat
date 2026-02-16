@@ -910,6 +910,13 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
             _stats.errors += 1
             return False
         
+        # 3b. Sync high-freq cache (fast incremental, feeds readiness score)
+        try:
+            from pump_highfreq_cache import sync_highfreq_cache
+            sync_highfreq_cache(lookback_minutes=30)
+        except Exception as hf_err:
+            logger.debug(f"HF cache sync skipped: {hf_err}")
+
         # 4. PUMP SIGNAL CHECK — the primary purpose of this cycle
         # Run BEFORE validation so pump detection is as fast as possible
         pump_fired = False
@@ -927,6 +934,18 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
             except Exception as pump_err:
                 logger.error(f"Pump signal check error: {pump_err}", exc_info=True)
         
+        # 4b. READINESS SCORE — fast path volatility-event detector
+        # If the readiness score exceeds threshold, it means "something is
+        # happening" and we should check again ASAP (skip normal 15s wait).
+        # This doesn't run a second model — it just decides when to check
+        # the full GBM more frequently.
+        readiness_triggered = False
+        try:
+            from pump_signal_logic import should_trigger_fast_path
+            readiness_triggered = should_trigger_fast_path()
+        except Exception:
+            pass
+
         # 5. Pattern validation (skip in fast mode to save ~1.5s)
         validation_result = None
         if not PUMP_FAST_MODE:
@@ -964,7 +983,8 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         cycle_ms = round((time.time() - cycle_start) * 1000)
         pump_tag = " PUMP!" if pump_fired else ""
         mode_tag = "fast" if PUMP_FAST_MODE else "full"
-        logger.info(f"✓ #{buyin_id}: {decision}{pump_tag} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms] [{mode_tag}]")
+        readiness_tag = " READY!" if readiness_triggered else ""
+        logger.info(f"✓ #{buyin_id}: {decision}{pump_tag}{readiness_tag} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms] [{mode_tag}]")
         
         return True
         

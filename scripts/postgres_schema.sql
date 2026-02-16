@@ -973,6 +973,31 @@ CREATE TABLE IF NOT EXISTS pump_training_labels (
 CREATE INDEX IF NOT EXISTS idx_pump_training_followed ON pump_training_labels(followed_at);
 
 -- =============================================================================
+-- PUMP SIGNAL OUTCOMES (live trade feedback for circuit breaker & self-improvement)
+-- Written by trailing_stop_seller when Play #3 trades resolve.
+-- Read by pump_signal_logic (train_validator process) for circuit breaker & rolling analysis.
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS pump_signal_outcomes (
+    id BIGSERIAL PRIMARY KEY,
+    buyin_id BIGINT NOT NULL,
+    hit_target BOOLEAN NOT NULL,
+    gain_pct DOUBLE PRECISION,
+    confidence DOUBLE PRECISION,
+    top_features_json JSONB,
+    gates_passed_json JSONB,
+    readiness_score DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pso_created ON pump_signal_outcomes(created_at DESC);
+
+-- Add outcome attribution columns if table already exists
+ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS top_features_json JSONB;
+ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS gates_passed_json JSONB;
+ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS readiness_score DOUBLE PRECISION;
+
+-- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================
 

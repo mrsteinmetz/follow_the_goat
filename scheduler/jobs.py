@@ -531,7 +531,7 @@ def stop_local_api():
 # ---------------------------------------------------------------------------
 
 def run_refresh_pump_model():
-    """Retrain the pump signal V2 model and write to disk cache.
+    """Retrain the pump signal V3 model and write to disk cache.
 
     Runs in its own process so the heavy GBM training (2-4 min) doesn't
     compete with train_validator's 5-second cycle.  train_validator reads
@@ -544,6 +544,13 @@ def run_refresh_pump_model():
         trading_path = str(PROJECT_ROOT / "000trading")
         if trading_path not in sys.path:
             sys.path.insert(0, trading_path)
+
+        # Sync high-freq DuckDB cache before retraining (feeds readiness score)
+        try:
+            from pump_highfreq_cache import sync_highfreq_cache
+            sync_highfreq_cache(lookback_minutes=30)
+        except Exception as hf_err:
+            logger.warning(f"HF cache sync skipped: {hf_err}")
 
         from pump_signal_logic import refresh_pump_rules
         refresh_pump_rules()

@@ -949,12 +949,16 @@ class TrailingStopSeller:
             if play_id == 3:
                 try:
                     from pump_signal_logic import record_signal_outcome
-                    # "hit target" = highest price reached >= 0.2% above entry
-                    hit_target = (highest_price - entry_price_value) / entry_price_value * 100 >= 0.2 if entry_price_value else False
-                    record_signal_outcome(hit_target)
-                    logger.info(f"  Pump circuit breaker: recorded {'HIT' if hit_target else 'MISS'} for #{position_id}")
+                    hit_target = percent_change > 0 if entry_price_value else False
+                    record_signal_outcome(
+                        buyin_id=position_id,
+                        hit_target=hit_target,
+                        gain_pct=percent_change,
+                        confidence=0.0,
+                    )
+                    logger.info(f"  Pump outcome recorded: {'WIN' if hit_target else 'LOSS'} {percent_change:+.3f}% for #{position_id}")
                 except Exception as e:
-                    logger.debug(f"  Pump circuit breaker feedback skipped: {e}")
+                    logger.debug(f"  Pump outcome recording skipped: {e}")
 
             logger.info(f"SOLD Position {position_id} - {result_icon}")
             logger.info(f"  Entry: ${entry_price_value:.4f}")

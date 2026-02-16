@@ -117,7 +117,7 @@ _last_train_data_hash: str = ""  # hash of training data to skip identical retra
 
 _gate_stats: Dict[str, int] = {
     'no_model': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
-    'micro_fail': 0, 'gates_passed': 0, 'low_confidence': 0,
+    'micro_fail': 0, 'xa_selloff': 0, 'gates_passed': 0, 'low_confidence': 0,
     'signal_fired': 0, 'total_checks': 0,
 }
 
@@ -1128,10 +1128,11 @@ def _log_gate_summary() -> None:
         return
     cb = _gate_stats.get('circuit_breaker', 0)
     micro = _gate_stats.get('micro_fail', 0)
+    xa = _gate_stats.get('xa_selloff', 0)
     logger.info(
         f"V2 gates (60s): {total} chk | no_mdl={_gate_stats['no_model']} "
         f"cb={cb} crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
-        f"micro={micro} ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
+        f"micro={micro} xa={xa} ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
         f"FIRED={_gate_stats['signal_fired']}"
     )
     for k in _gate_stats:
@@ -1230,9 +1231,22 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     # AND transactions ALL show selling, the dip is real, not a bounce.
     micro_ok, micro_desc = _check_microstructure_confirmation(trail_row)
     if not micro_ok:
-        _gate_stats.setdefault('micro_fail', 0)
         _gate_stats['micro_fail'] += 1
         logger.info(f"V2: microstructure REJECT ({micro_desc})")
+        return False
+
+    # Gate 4: Cross-asset divergence + deep dip = SOL-specific selloff.
+    # If SOL underperforms BOTH BTC and ETH (>0.15%) AND has a steep 5-min
+    # decline (>0.35%), this is SOL-specific selling — not a bounce setup.
+    xa_btc = trail_row.get('xa_btc_sol_divergence')
+    xa_eth = trail_row.get('xa_eth_sol_divergence')
+    pe5m = trail_row.get('pre_entry_change_5m')
+    if (xa_btc is not None and xa_eth is not None and pe5m is not None
+            and float(xa_btc) < -0.15 and float(xa_eth) < -0.15
+            and float(pe5m) < -0.35):
+        _gate_stats['xa_selloff'] += 1
+        logger.info(f"V2: cross-asset REJECT btc_div={float(xa_btc):+.3f} "
+                    f"eth_div={float(xa_eth):+.3f} pe5m={float(pe5m):+.3f}")
         return False
 
     _gate_stats['gates_passed'] += 1

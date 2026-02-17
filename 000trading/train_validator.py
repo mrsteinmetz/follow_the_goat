@@ -922,7 +922,7 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         pump_fired = False
         if PUMP_SIGNAL_PLAY_ID:
             try:
-                from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal
+                from pump_signal_logic import maybe_refresh_rules, check_and_fire_pump_signal, PUMP_OBSERVATION_MODE
                 maybe_refresh_rules()
                 pump_fired = check_and_fire_pump_signal(
                     buyin_id=buyin_id,
@@ -984,7 +984,11 @@ def run_training_cycle(play_id: Optional[int] = None) -> bool:
         pump_tag = " PUMP!" if pump_fired else ""
         mode_tag = "fast" if PUMP_FAST_MODE else "full"
         readiness_tag = " READY!" if readiness_triggered else ""
-        logger.info(f"✓ #{buyin_id}: {decision}{pump_tag}{readiness_tag} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms] [{mode_tag}]")
+        try:
+            obs_tag = " [OBS]" if PUMP_OBSERVATION_MODE else ""
+        except NameError:
+            obs_tag = ""
+        logger.info(f"✓ #{buyin_id}: {decision}{pump_tag}{readiness_tag}{obs_tag} @ ${market_price:.2f} (cycle {price_cycle}) [{cycle_ms}ms] [{mode_tag}]")
         
         return True
         

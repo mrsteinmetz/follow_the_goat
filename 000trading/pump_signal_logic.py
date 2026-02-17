@@ -107,6 +107,10 @@ READINESS_THRESHOLD = float(os.getenv("READINESS_THRESHOLD", "0.60"))
 READINESS_COOLDOWN_SEC = 30        # min seconds between fast-path triggers
 READINESS_PERCENTILE_WINDOW_SEC = 600  # 10-min window for percentile ranks
 
+# ── Observation mode ─────────────────────────────────────────────────────────
+# Log signals but don't execute trades. Set to "0" to enable live trading.
+PUMP_OBSERVATION_MODE = os.getenv("PUMP_OBSERVATION_MODE", "1") == "1"
+
 # ── Walk-forward ──────────────────────────────────────────────────────────────
 N_WALK_FORWARD_SPLITS = 3
 WALK_FORWARD_TEST_FRAC = 0.15
@@ -2169,6 +2173,70 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
 
 
 # =============================================================================
+# OBSERVATION MODE HELPERS
+# =============================================================================
+
+_obs_table_created = False
+
+def _ensure_observation_table() -> None:
+    """Create pump_signal_observations table if it doesn't exist (once per process)."""
+    global _obs_table_created
+    if _obs_table_created:
+        return
+    try:
+        postgres_execute("""
+            CREATE TABLE IF NOT EXISTS pump_signal_observations (
+                id BIGSERIAL PRIMARY KEY,
+                buyin_id BIGINT,
+                market_price DOUBLE PRECISION,
+                rule_id TEXT,
+                pattern_id TEXT,
+                confidence DOUBLE PRECISION,
+                fire_reason TEXT,
+                features_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        _obs_table_created = True
+    except Exception:
+        pass
+
+
+def _record_observation(buyin_id: int, market_price: float, trail_row: dict,
+                        confidence: float, matched_rule: dict) -> None:
+    """Record an observation-mode signal for later analysis.
+
+    Writes to pump_signal_observations table. After 14 days we can query
+    this table joined with price data to compute virtual P&L.
+    """
+    _ensure_observation_table()
+    try:
+        features_snapshot = {}
+        for feat in ['ob_volume_imbalance', 'ob_spread_velocity', 'ob_bid_depth_velocity',
+                     'tx_buy_sell_pressure', 'tx_cumulative_delta', 'wh_net_flow_ratio',
+                     'wh_accumulation_ratio', 'pm_price_change_1m', 'pm_price_change_5m',
+                     'pm_price_velocity_30s', 'pm_momentum_acceleration_1m',
+                     'tx_large_trade_count', 'tx_whale_volume_pct']:
+            v = trail_row.get(feat)
+            if v is not None:
+                features_snapshot[feat] = round(float(v), 6)
+
+        postgres_execute(
+            """INSERT INTO pump_signal_observations
+               (buyin_id, market_price, rule_id, pattern_id, confidence, fire_reason, features_json)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            [buyin_id, market_price,
+             matched_rule.get('rule_id', ''),
+             matched_rule.get('pattern_id', ''),
+             confidence,
+             matched_rule.get('fire_reason', ''),
+             json.dumps(features_snapshot)]
+        )
+    except Exception as e:
+        logger.warning(f"Failed to record observation: {e}")
+
+
+# =============================================================================
 # BUYIN INSERTION (same API as V1)
 # =============================================================================
 
@@ -2203,6 +2271,17 @@ def check_and_fire_pump_signal(
         _log_gate_summary()
         return False
     _log_gate_summary()
+
+    # Observation mode: log signal but don't execute trade
+    if PUMP_OBSERVATION_MODE:
+        ctx = _signal_context.get(int(trail_row.get('buyin_id', buyin_id)), {})
+        logger.info(f"OBSERVATION: Signal would fire for buyin #{buyin_id} @ {market_price:.4f}")
+        _record_observation(
+            buyin_id, market_price, trail_row,
+            confidence=ctx.get('pattern_precision') or ctx.get('combo_precision') or 0.0,
+            matched_rule=ctx,
+        )
+        return False
 
     # Cooldown
     now = time.time()
@@ -2286,6 +2365,18 @@ def get_pump_status() -> Dict[str, Any]:
     info = _get_live_outcomes()
     n_patterns = len(_rules.get('patterns', [])) if _rules else 0
     n_combos = len(_rules.get('combinations', [])) if _rules else 0
+
+    # Observation mode stats
+    try:
+        obs_stats = postgres_query_one(
+            """SELECT COUNT(*) as n_observations,
+                      MIN(created_at) as first_obs,
+                      MAX(created_at) as last_obs
+               FROM pump_signal_observations"""
+        )
+    except Exception:
+        obs_stats = None
+
     return {
         'version': 'v4',
         'has_rules': _rules is not None,
@@ -2301,6 +2392,117 @@ def get_pump_status() -> Dict[str, Any]:
         'vol_percentile': round(_get_vol_percentile(), 1) if _get_vol_percentile() is not None else None,
         'readiness_score': round(_last_readiness_score, 4),
         'readiness_threshold': READINESS_THRESHOLD,
+        'observation_mode': PUMP_OBSERVATION_MODE,
+        'observation_count': obs_stats['n_observations'] if obs_stats else 0,
+    }
+
+
+# =============================================================================
+# OBSERVATION ANALYSIS (manual review after data accumulation)
+# =============================================================================
+
+def analyze_observations() -> Dict[str, Any]:
+    """Analyze observation-mode signals against actual price outcomes.
+
+    For each recorded observation:
+    1. Find the price at observation time (market_price in the record)
+    2. Find prices at +1m, +2m, +4m, +6m, +10m after observation
+    3. Compute forward returns
+    4. Report: hit rate, avg gain on hits, avg loss on misses, EV
+
+    Call this manually after accumulating 14 days of data:
+        from pump_signal_logic import analyze_observations
+        results = analyze_observations()
+    """
+    try:
+        observations = postgres_query(
+            """SELECT id, market_price, rule_id, pattern_id, created_at
+               FROM pump_signal_observations
+               ORDER BY created_at"""
+        )
+    except Exception as e:
+        return {'error': str(e)}
+
+    if not observations:
+        return {'n_observations': 0, 'message': 'No observations recorded yet'}
+
+    results = []
+    for obs in observations:
+        obs_time = obs['created_at']
+        entry_price = obs['market_price']
+
+        forward_prices = {}
+        for minutes in [1, 2, 4, 6, 10]:
+            try:
+                future = postgres_query_one(
+                    """SELECT price FROM prices
+                       WHERE token = 'SOL'
+                         AND timestamp >= %s + make_interval(mins => %s)
+                       ORDER BY timestamp ASC LIMIT 1""",
+                    [obs_time, minutes]
+                )
+                if future:
+                    fwd_return = (float(future['price']) - entry_price) / entry_price * 100
+                    forward_prices[f'fwd_{minutes}m'] = round(fwd_return, 4)
+            except Exception:
+                pass
+
+        max_fwd = max(forward_prices.values()) if forward_prices else None
+        is_hit = max_fwd is not None and max_fwd >= 0.2  # same target as labeling
+
+        results.append({
+            'obs_id': obs['id'],
+            'entry_price': entry_price,
+            'rule_id': obs['rule_id'],
+            'pattern_id': obs['pattern_id'],
+            'forward_returns': forward_prices,
+            'max_fwd': max_fwd,
+            'is_hit': is_hit,
+        })
+
+    n = len(results)
+    hits = sum(1 for r in results if r['is_hit'])
+    hit_rate = hits / n if n > 0 else 0
+
+    gains = [r['max_fwd'] for r in results if r['is_hit'] and r['max_fwd'] is not None]
+    losses = [r['max_fwd'] for r in results if not r['is_hit'] and r['max_fwd'] is not None]
+
+    avg_gain = sum(gains) / len(gains) if gains else 0
+    avg_loss = sum(losses) / len(losses) if losses else 0
+    ev_raw = hit_rate * avg_gain + (1 - hit_rate) * avg_loss
+    ev_after_costs = ev_raw - 0.1  # 0.1% round-trip cost
+
+    # Per-rule breakdown
+    rule_ids = set(r['rule_id'] for r in results if r['rule_id'])
+    per_rule_stats = {}
+    for rid in rule_ids:
+        rule_results = [r for r in results if r['rule_id'] == rid]
+        rn = len(rule_results)
+        rhits = sum(1 for r in rule_results if r['is_hit'])
+        rgains = [r['max_fwd'] for r in rule_results if r['is_hit'] and r['max_fwd'] is not None]
+        rlosses = [r['max_fwd'] for r in rule_results if not r['is_hit'] and r['max_fwd'] is not None]
+        r_avg_gain = sum(rgains) / len(rgains) if rgains else 0
+        r_avg_loss = sum(rlosses) / len(rlosses) if rlosses else 0
+        r_hit_rate = rhits / rn if rn > 0 else 0
+        r_ev = r_hit_rate * r_avg_gain + (1 - r_hit_rate) * r_avg_loss - 0.1
+        per_rule_stats[rid] = {
+            'n': rn, 'hits': rhits,
+            'hit_rate': round(r_hit_rate, 4),
+            'avg_gain': round(r_avg_gain, 4),
+            'avg_loss': round(r_avg_loss, 4),
+            'ev_after_costs': round(r_ev, 4),
+        }
+
+    return {
+        'n_observations': n,
+        'n_hits': hits,
+        'hit_rate': round(hit_rate, 4),
+        'avg_gain_on_hits': round(avg_gain, 4),
+        'avg_loss_on_misses': round(avg_loss, 4),
+        'ev_raw': round(ev_raw, 4),
+        'ev_after_costs': round(ev_after_costs, 4),
+        'per_rule_stats': per_rule_stats,
+        'details': results,
     }
 
 

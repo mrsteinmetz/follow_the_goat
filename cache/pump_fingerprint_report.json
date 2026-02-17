@@ -1,0 +1,478 @@
+{
+  "generated_at": "2026-02-17T12:59:28.687341+00:00",
+  "lookback_hours": 24.302616709444447,
+  "data_summary": {
+    "total_entries": 144,
+    "n_pumps": 24,
+    "n_independent_pumps": 24,
+    "non_pumps": 120,
+    "pump_rate_pct": 16.67
+  },
+  "deduplication_stats": {
+    "raw_pumps": 122,
+    "independent_pumps": 24,
+    "duplicates_removed": 98,
+    "raw_non_pumps": 17602,
+    "sampled_non_pumps": 120,
+    "window_minutes": 10
+  },
+  "excluded_dip_proxies": {
+    "features": [
+      "pm_cumulative_return_5m",
+      "pm_price_change_10m",
+      "pm_price_change_1m",
+      "pm_price_change_5m",
+      "pm_price_vs_ma5_pct",
+      "pm_price_vs_twap_pct",
+      "pm_price_vs_vwap_pct",
+      "pm_trend_strength_ema",
+      "pre_entry_change_10m",
+      "pre_entry_change_1m",
+      "pre_entry_change_2m",
+      "pre_entry_change_3m",
+      "pre_entry_change_5m"
+    ],
+    "reason": "These features are proxies for \"price just dropped\" and would cause the system to label dip bounces as pump signals."
+  },
+  "feature_rankings": [
+    {
+      "feature": "pm_trend_strength_ema",
+      "separation": -1.4871,
+      "abs_separation": 1.4871,
+      "median_pump": -0.052598,
+      "median_non_pump": 0.004939,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": false
+    },
+    {
+      "feature": "tx_whale_volume_pct",
+      "separation": -0.7048,
+      "abs_separation": 0.7048,
+      "median_pump": 0.0,
+      "median_non_pump": 37.623153,
+      "n_pump_valid": 21,
+      "n_non_pump_valid": 114,
+      "rule_eligible": true
+    },
+    {
+      "feature": "pm_momentum_acceleration_1m",
+      "separation": 0.6625,
+      "abs_separation": 0.6625,
+      "median_pump": 0.085346,
+      "median_non_pump": 0.003321,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_large_trade_count",
+      "separation": -0.5714,
+      "abs_separation": 0.5714,
+      "median_pump": 0.0,
+      "median_non_pump": 2.0,
+      "n_pump_valid": 21,
+      "n_non_pump_valid": 114,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_spread_velocity",
+      "separation": 0.5644,
+      "abs_separation": 0.5644,
+      "median_pump": 7e-06,
+      "median_non_pump": -1e-06,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_flow_acceleration",
+      "separation": 0.4639,
+      "abs_separation": 0.4639,
+      "median_pump": 7.9e-05,
+      "median_non_pump": 1e-06,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_trade_intensity",
+      "separation": -0.432,
+      "abs_separation": 0.432,
+      "median_pump": 0.30072,
+      "median_non_pump": 0.507661,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_net_flow_ratio",
+      "separation": 0.3952,
+      "abs_separation": 0.3952,
+      "median_pump": -0.551206,
+      "median_non_pump": -0.771734,
+      "n_pump_valid": 22,
+      "n_non_pump_valid": 116,
+      "rule_eligible": true
+    },
+    {
+      "feature": "pm_price_change_1m",
+      "separation": -0.3819,
+      "abs_separation": 0.3819,
+      "median_pump": -0.022663,
+      "median_non_pump": -0.000919,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": false
+    },
+    {
+      "feature": "wh_accumulation_ratio",
+      "separation": 0.3651,
+      "abs_separation": 0.3651,
+      "median_pump": 0.291737,
+      "median_non_pump": 0.128839,
+      "n_pump_valid": 22,
+      "n_non_pump_valid": 116,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_imbalance_shift_1m",
+      "separation": 0.2297,
+      "abs_separation": 0.2297,
+      "median_pump": 0.018398,
+      "median_non_pump": -0.010634,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_aggression_ratio",
+      "separation": 0.1939,
+      "abs_separation": 0.1939,
+      "median_pump": 1.654265,
+      "median_non_pump": 1.166262,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_microprice_deviation",
+      "separation": -0.1478,
+      "abs_separation": 0.1478,
+      "median_pump": -0.02725,
+      "median_non_pump": -0.002605,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_buy_sell_pressure",
+      "separation": 0.1196,
+      "abs_separation": 0.1196,
+      "median_pump": 0.087597,
+      "median_non_pump": 0.026888,
+      "n_pump_valid": 21,
+      "n_non_pump_valid": 114,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_buy_volume_pct",
+      "separation": 0.1196,
+      "abs_separation": 0.1196,
+      "median_pump": 54.379829,
+      "median_non_pump": 51.344401,
+      "n_pump_valid": 21,
+      "n_non_pump_valid": 114,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_depth_imbalance_ratio",
+      "separation": 0.1081,
+      "abs_separation": 0.1081,
+      "median_pump": 1.021872,
+      "median_non_pump": 0.974297,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_cumulative_delta",
+      "separation": 0.1076,
+      "abs_separation": 0.1076,
+      "median_pump": 91637.342101,
+      "median_non_pump": -2231.161483,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_volume_imbalance",
+      "separation": 0.106,
+      "abs_separation": 0.106,
+      "median_pump": 0.010427,
+      "median_non_pump": -0.012247,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_flow_velocity",
+      "separation": 0.0795,
+      "abs_separation": 0.0795,
+      "median_pump": 0.000421,
+      "median_non_pump": -0.000222,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_net_flow_5m",
+      "separation": -0.0702,
+      "abs_separation": 0.0702,
+      "median_pump": -2973.065,
+      "median_non_pump": -1506.18,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_spread_bps",
+      "separation": 0.0423,
+      "abs_separation": 0.0423,
+      "median_pump": 1.171686,
+      "median_non_pump": 1.170875,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_cumulative_imbalance_5m",
+      "separation": 0.0257,
+      "abs_separation": 0.0257,
+      "median_pump": 0.023449,
+      "median_non_pump": -0.001035,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_cumulative_delta_5m",
+      "separation": -0.0113,
+      "abs_separation": 0.0113,
+      "median_pump": 48.762054,
+      "median_non_pump": 4238.142312,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_bid_depth_velocity",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_ask_depth_velocity",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_imbalance_velocity_30s",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.000453,
+      "median_non_pump": -0.000537,
+      "n_pump_valid": 3,
+      "n_non_pump_valid": 1,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_volume_surge_ratio",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 0,
+      "n_non_pump_valid": 0,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_aggressive_buy_ratio",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 0,
+      "n_non_pump_valid": 0,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_cumulative_flow_5m",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 0,
+      "n_non_pump_valid": 0,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_stealth_acc_score",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.0,
+      "median_non_pump": 0.0,
+      "n_pump_valid": 24,
+      "n_non_pump_valid": 120,
+      "rule_eligible": true
+    },
+    {
+      "feature": "pm_price_velocity_30s",
+      "separation": 0.0,
+      "abs_separation": 0.0,
+      "median_pump": 0.000693,
+      "median_non_pump": 0.000712,
+      "n_pump_valid": 3,
+      "n_non_pump_valid": 1,
+      "rule_eligible": true
+    }
+  ],
+  "single_feature_thresholds": {
+    "ob_spread_velocity": {
+      "threshold": 1.6e-05,
+      "precision": 0.4667,
+      "recall": 0.2917,
+      "n_signals": 15,
+      "n_hits": 7,
+      "score": 0.252,
+      "direction": "above"
+    }
+  },
+  "best_combinations": [],
+  "approved_patterns": [
+    {
+      "cluster_id": 0,
+      "label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
+      "description": "whale_volume_pct high + momentum_acceleration_1m high",
+      "n_occurrences": 7,
+      "n_pumps": 4,
+      "precision": 0.5714,
+      "avg_gain": 0.2253,
+      "feature_ranges": {
+        "tx_whale_volume_pct": [
+          61.48649,
+          92.958967
+        ],
+        "pm_momentum_acceleration_1m": [
+          0.075335,
+          0.181457
+        ],
+        "tx_large_trade_count": [
+          2.0,
+          3.0
+        ],
+        "ob_spread_velocity": [
+          0.0,
+          2.1e-05
+        ],
+        "wh_flow_acceleration": [
+          -0.000118,
+          0.000107
+        ],
+        "tx_trade_intensity": [
+          0.092337,
+          0.260681
+        ],
+        "wh_net_flow_ratio": [
+          -1.0,
+          -0.401904
+        ],
+        "wh_accumulation_ratio": [
+          0.0,
+          0.43425
+        ]
+      },
+      "cluster_features": [
+        "tx_whale_volume_pct",
+        "pm_momentum_acceleration_1m",
+        "tx_large_trade_count"
+      ]
+    }
+  ],
+  "stress_test_results": {
+    "combination_results": [],
+    "pattern_results": []
+  },
+  "quality_scores": [
+    {
+      "rule_id": 1,
+      "source": "cluster",
+      "pattern_label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
+      "quality_score": 0.1287,
+      "approved": true,
+      "precision": 0.5714,
+      "signal_rate_per_day": 6.91,
+      "avg_gain": 0.2253,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    }
+  ],
+  "recommended_rules": [
+    {
+      "rule_id": 1,
+      "pattern_id": 0,
+      "pattern_label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
+      "feature_ranges": {
+        "tx_whale_volume_pct": [
+          61.48649,
+          92.958967
+        ],
+        "pm_momentum_acceleration_1m": [
+          0.075335,
+          0.181457
+        ],
+        "tx_large_trade_count": [
+          2.0,
+          3.0
+        ],
+        "ob_spread_velocity": [
+          0.0,
+          2.1e-05
+        ],
+        "wh_flow_acceleration": [
+          -0.000118,
+          0.000107
+        ],
+        "tx_trade_intensity": [
+          0.092337,
+          0.260681
+        ],
+        "wh_net_flow_ratio": [
+          -1.0,
+          -0.401904
+        ],
+        "wh_accumulation_ratio": [
+          0.0,
+          0.43425
+        ]
+      },
+      "expected_precision": 0.5714,
+      "expected_signals_per_day": 6.9,
+      "n_signals_in_window": 7,
+      "avg_gain_on_hit": 0.2253,
+      "source": "cluster",
+      "quality_score": 0.1287,
+      "quality_approved": true
+    }
+  ]
+}

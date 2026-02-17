@@ -527,15 +527,15 @@ def stop_local_api():
 
 
 # ---------------------------------------------------------------------------
-# Pump Signal V2 Model Refresh (separate process from train_validator)
+# Pump Signal V4 Fingerprint Refresh (separate process from train_validator)
 # ---------------------------------------------------------------------------
 
 def run_refresh_pump_model():
-    """Retrain the pump signal V3 model and write to disk cache.
+    """Run pump fingerprint analysis and refresh V4 rules.
 
-    Runs in its own process so the heavy GBM training (2-4 min) doesn't
-    compete with train_validator's 5-second cycle.  train_validator reads
-    the updated model from the cache file.
+    Runs in its own process every 5 minutes. Analyzes 7 days of trail data
+    to discover repeatable pump patterns and combination rules.
+    train_validator reads the resulting JSON rules via maybe_refresh_rules().
     """
     try:
         import logging as _logging
@@ -554,10 +554,10 @@ def run_refresh_pump_model():
 
         from pump_signal_logic import refresh_pump_rules
         refresh_pump_rules()
-        logger.info("Pump model refresh cycle complete.")
+        logger.info("V4 fingerprint refresh cycle complete.")
 
     except Exception as e:
-        logger.error(f"Pump model refresh error: {e}", exc_info=True)
+        logger.error(f"V4 fingerprint refresh error: {e}", exc_info=True)
         raise
 
 

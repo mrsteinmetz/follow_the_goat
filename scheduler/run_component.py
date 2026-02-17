@@ -103,7 +103,7 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         "archive_old_data": IntervalJobSpec("archive_old_data", 3600.0, run_archive_old_data),
         "restart_quicknode_streams": IntervalJobSpec("restart_quicknode_streams", 15.0, run_restart_quicknode_streams),
         "recalculate_pump_filters": IntervalJobSpec("recalculate_pump_filters", 300.0, run_recalculate_pump_filters),
-        "refresh_pump_model": IntervalJobSpec("refresh_pump_model", 900.0, run_refresh_pump_model),
+        "refresh_pump_model": IntervalJobSpec("refresh_pump_model", 300.0, run_refresh_pump_model),
         "export_job_status": IntervalJobSpec("export_job_status", 5.0, export_job_status_to_file),
         # Standalone jobs
         "sde_overnight_sweep": IntervalJobSpec("sde_overnight_sweep", 43200.0, run_sde_overnight_sweep),

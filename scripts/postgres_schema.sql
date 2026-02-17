@@ -997,6 +997,10 @@ ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS top_features_json JSON
 ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS gates_passed_json JSONB;
 ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS readiness_score DOUBLE PRECISION;
 
+-- V4: Per-rule tracking columns
+ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS rule_id TEXT;
+ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS pattern_id TEXT;
+
 -- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================

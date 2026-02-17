@@ -1,29 +1,37 @@
 """
-Pump Signal Logic V3 — Precision Signal Detection
-===================================================
-Key changes from V2:
-  1. SUSTAINED MOVE labeling: price must still be >= +0.10% at minute 4
-  2. Six new microstructure features: ask_pull_bid_stack, volume_confirmed_momentum,
-     whale_retail_divergence, spread_squeeze, delta_acceleration, trade_burstiness
-  3. Pre-entry slope composite: replaces 5 correlated pre_entry_change_* with
-     feat_pre_entry_slope (OLS) + feat_pre_entry_level (mean)
-  4. Whale acceleration ratio: whale net inflow 60s vs 5m average
-  5. Readiness score fast path: volatility-event detector triggers immediate
-     trail gen + full GBM check when threshold crossed (every 5-10s)
-  6. Feature drift monitoring: dual-window (12 min fast, 1h slow) percentile check
-  7. Outcome attribution: top features + gate details logged per signal
+Pump Signal Logic V4 — Fingerprint-Based Signal Detection
+==========================================================
+V4 replaces the GBM model with empirical fingerprint rules:
+  1. Fingerprint analysis (pump_fingerprint.py) runs every 5 minutes
+  2. Discovers repeatable patterns from 7 days of data
+  3. Only fires on patterns that have appeared AND succeeded multiple times
+  4. Transparent, debuggable rules instead of black-box ML
 
-Retained from V2:
-  - PATH-AWARE labeling, walk-forward validation, gradient-boosted model
-  - Safety gates: crash, microstructure, cross-asset
+Key changes from V3:
+  - GBM model replaced by rule matching (pattern clusters + feature combinations)
+  - 7 safety gates reduced to 3 (crash, chase, circuit breaker)
+  - Removed gates (trend, microstructure, whale dump, cross-asset) are now
+    encoded in the fingerprint rules themselves
+  - Per-rule hit rate tracking for adaptive rule enable/disable
+  - Lookback extended from 48h to 168h (7 days) for better pattern discovery
+
+Retained from V3:
+  - DuckDB trail cache + incremental sync (_sync_trail_cache)
   - Circuit breaker with PostgreSQL-based win rate tracking
+  - Price buffer and micro trend detection
+  - Cooldown logic (COOLDOWN_SECONDS)
+  - Readiness score fast path (volatility-event detector)
+  - Outcome attribution via _signal_context
 
-External API (unchanged):
+V3 GBM code is kept as fallback (not deleted, just unreferenced).
+
+External API (unchanged signatures):
   - maybe_refresh_rules()
   - check_and_fire_pump_signal(buyin_id, market_price, price_cycle)
   - get_pump_status()
-  - compute_readiness_score() — NEW: fast path readiness
-  - should_trigger_fast_path() — NEW: check if immediate trail gen needed
+  - record_signal_outcome(buyin_id, hit_target, gain_pct, confidence)
+  - compute_readiness_score()
+  - should_trigger_fast_path()
 """
 
 from __future__ import annotations
@@ -83,6 +91,16 @@ COOLDOWN_SECONDS = 120
 # ── Safety gates ──────────────────────────────────────────────────────────────
 CRASH_GATE_5M = -0.3
 CRASH_GATE_MICRO_30S = -0.05
+TREND_GATE_EMA_THRESHOLD = -0.02       # pm_trend_strength_ema below this = downtrend (was -0.03)
+TREND_GATE_5M_THRESHOLD = -0.05        # pm_price_change_5m below this + EMA = confirmed downtrend (was -0.08)
+TREND_GATE_1M_STANDALONE = -0.10       # pm_price_change_1m below this = block regardless of EMA
+WHALE_DUMP_THRESHOLD = -0.5            # wh_net_flow_ratio below this = heavy whale selling
+WHALE_DUMP_TX_REQUIRED = 0.20          # tx_buy_sell_pressure must exceed this when whales dump
+
+# ── Chase prevention gate ────────────────────────────────────────────────────
+# Block entries right after a spike — buying local tops that often reverse.
+CHASE_GATE_1M_MAX = 0.15               # pm_price_change_1m above this = chasing a spike
+CHASE_GATE_30S_MAX = 0.10              # pm_price_velocity_30s above this = chasing micro spike
 
 # ── Readiness score (fast path) ──────────────────────────────────────────────
 READINESS_THRESHOLD = float(os.getenv("READINESS_THRESHOLD", "0.60"))
@@ -134,9 +152,11 @@ _last_gate_summary_time: float = 0.0
 _last_train_data_hash: str = ""  # hash of training data to skip identical retrains
 
 _gate_stats: Dict[str, int] = {
-    'no_model': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
-    'micro_fail': 0, 'xa_selloff': 0, 'gates_passed': 0, 'low_confidence': 0,
+    'no_rules': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
+    'chase_gate_fail': 0, 'gates_passed': 0,
+    'no_pattern': 0, 'no_combo': 0,
     'signal_fired': 0, 'total_checks': 0,
+    'circuit_breaker': 0,
 }
 
 _price_buffer: deque = deque(maxlen=200)
@@ -183,6 +203,11 @@ _cb_cache: Optional[Dict[str, Any]] = None  # cached query result
 _cb_cache_time: float = 0.0
 _CB_CACHE_TTL: float = 30.0  # seconds between DB queries
 
+# ── V4 Fingerprint rules (replaces GBM model) ────────────────────────────────
+_rules: Optional[Dict[str, Any]] = None
+_rules_metadata: Dict[str, Any] = {}
+_FINGERPRINT_REPORT_PATH = _PROJECT_ROOT / "cache" / "pump_fingerprint_report.json"
+
 
 def record_signal_outcome(buyin_id: int, hit_target: bool,
                           gain_pct: float = 0.0, confidence: float = 0.0) -> None:
@@ -192,20 +217,23 @@ def record_signal_outcome(buyin_id: int, hit_target: bool,
     Both processes share the same DB table, so the train_validator
     (which runs check_pump_signal) can read the outcomes.
 
-    Includes outcome attribution: top feature values and gate details
-    captured at signal-fire time (stored in _signal_context).
+    V4: Also stores rule_id and pattern_id for per-rule tracking.
     """
     # Retrieve signal context captured at fire time
     ctx = _signal_context.pop(buyin_id, {})
     top_features_json = json.dumps(ctx.get('top_features', {})) if ctx.get('top_features') else None
     gates_passed_json = json.dumps(ctx.get('gates_passed', {})) if ctx.get('gates_passed') else None
+    rule_id = ctx.get('rule_id')
+    pattern_id = ctx.get('pattern_id')
 
     try:
         postgres_execute(
             """INSERT INTO pump_signal_outcomes
-               (buyin_id, hit_target, gain_pct, confidence, top_features_json, gates_passed_json)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
-            [buyin_id, hit_target, gain_pct, confidence, top_features_json, gates_passed_json])
+               (buyin_id, hit_target, gain_pct, confidence,
+                top_features_json, gates_passed_json, rule_id, pattern_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            [buyin_id, hit_target, gain_pct, confidence,
+             top_features_json, gates_passed_json, rule_id, pattern_id])
     except Exception as e:
         logger.warning(f"Failed to record signal outcome: {e}")
 
@@ -251,6 +279,67 @@ def _check_circuit_breaker() -> bool:
     return False
 
 
+def _compute_rule_performance() -> Dict[str, Dict[str, Any]]:
+    """Query pump_signal_outcomes to get per-rule hit rates over last 24h.
+
+    Returns: {rule_id: {n_fires, n_hits, hit_rate, avg_gain, disabled}}
+
+    Rules with hit_rate < 35% over 10+ fires: marked as disabled.
+    Rules with hit_rate > 60% over 5+ fires: marked as boosted.
+    """
+    try:
+        rows = postgres_query("""
+            SELECT rule_id, pattern_id, hit_target, gain_pct
+            FROM pump_signal_outcomes
+            WHERE created_at >= NOW() - INTERVAL '24 hours'
+              AND (rule_id IS NOT NULL OR pattern_id IS NOT NULL)
+            ORDER BY created_at DESC
+        """)
+    except Exception as e:
+        logger.debug(f"Rule performance query failed: {e}")
+        return {}
+
+    if not rows:
+        return {}
+
+    # Aggregate by rule_id and pattern_id
+    perf: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        for key_col in ('rule_id', 'pattern_id'):
+            key = row.get(key_col)
+            if not key:
+                continue
+            if key not in perf:
+                perf[key] = {'n_fires': 0, 'n_hits': 0, 'total_gain': 0.0}
+            perf[key]['n_fires'] += 1
+            if row.get('hit_target'):
+                perf[key]['n_hits'] += 1
+            gain = row.get('gain_pct') or 0.0
+            perf[key]['total_gain'] += float(gain)
+
+    # Compute rates and disable/boost flags
+    for key, stats in perf.items():
+        n = stats['n_fires']
+        hits = stats['n_hits']
+        stats['hit_rate'] = hits / n if n > 0 else 0.0
+        stats['avg_gain'] = stats['total_gain'] / n if n > 0 else 0.0
+        stats['disabled'] = (n >= 10 and stats['hit_rate'] < 0.35)
+        stats['boosted'] = (n >= 5 and stats['hit_rate'] > 0.60)
+
+    return perf
+
+
+def _ensure_outcome_columns() -> None:
+    """Add rule_id and pattern_id columns to pump_signal_outcomes if missing."""
+    try:
+        postgres_execute(
+            "ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS rule_id TEXT")
+        postgres_execute(
+            "ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS pattern_id TEXT")
+    except Exception as e:
+        logger.debug(f"Outcome column migration: {e}")
+
+
 def _update_vol_buffer(vol_1m: Optional[float]) -> None:
     if vol_1m is not None:
         _vol_buffer.append(float(vol_1m))
@@ -263,6 +352,176 @@ def _get_vol_percentile() -> Optional[float]:
     current = _vol_buffer[-1]
     rank = sum(1 for v in _vol_buffer if v <= current)
     return rank / len(_vol_buffer) * 100
+
+
+# =============================================================================
+# V4 FINGERPRINT RULE LOADING & MATCHING
+# =============================================================================
+
+# Features where LOWER values are bullish (must match pump_fingerprint.py)
+_BEARISH_POLARITY_FEATURES = frozenset([
+    'ob_ask_depth_velocity',
+    'ob_spread_bps',
+    'ob_spread_velocity',
+])
+
+# The ~30 features used by V4 signal detection
+_V4_SIGNAL_FEATURES = [
+    'ob_volume_imbalance', 'ob_depth_imbalance_ratio', 'ob_bid_depth_velocity',
+    'ob_ask_depth_velocity', 'ob_spread_bps', 'ob_spread_velocity',
+    'ob_microprice_deviation', 'ob_aggression_ratio', 'ob_imbalance_velocity_30s',
+    'ob_cumulative_imbalance_5m', 'ob_imbalance_shift_1m', 'ob_net_flow_5m',
+    'tx_buy_sell_pressure', 'tx_buy_volume_pct', 'tx_cumulative_delta',
+    'tx_cumulative_delta_5m', 'tx_volume_surge_ratio', 'tx_aggressive_buy_ratio',
+    'tx_trade_intensity', 'tx_large_trade_count', 'tx_whale_volume_pct',
+    'wh_net_flow_ratio', 'wh_accumulation_ratio', 'wh_flow_velocity',
+    'wh_flow_acceleration', 'wh_cumulative_flow_5m', 'wh_stealth_acc_score',
+    'pm_price_velocity_30s', 'pm_price_change_1m', 'pm_trend_strength_ema',
+    'pm_momentum_acceleration_1m',
+]
+
+
+def _load_fingerprint_rules() -> Optional[Dict[str, Any]]:
+    """Load rules from pump_fingerprint_report.json.
+
+    Called by refresh_pump_rules() instead of _train_model().
+    Returns dict with combinations, patterns, thresholds, metadata.
+    """
+    if not _FINGERPRINT_REPORT_PATH.exists():
+        logger.warning(f"No fingerprint report at {_FINGERPRINT_REPORT_PATH}")
+        return None
+
+    try:
+        with open(_FINGERPRINT_REPORT_PATH) as f:
+            report = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.error(f"Failed to load fingerprint report: {e}")
+        return None
+
+    return {
+        'combinations': report.get('best_combinations', []),
+        'patterns': report.get('approved_patterns', []),
+        'thresholds': report.get('single_feature_thresholds', {}),
+        'metadata': report.get('data_summary', {}),
+        'generated_at': report.get('generated_at', ''),
+    }
+
+
+def extract_signal_features(trail_row: dict) -> Dict[str, float]:
+    """Extract the ~30 V4 features from a trail row dict.
+
+    Returns a dict of feature_name -> float value (NaN for missing).
+    """
+    features = {}
+    for feat in _V4_SIGNAL_FEATURES:
+        val = trail_row.get(feat)
+        if val is not None:
+            try:
+                features[feat] = float(val)
+            except (TypeError, ValueError):
+                features[feat] = float('nan')
+        else:
+            features[feat] = float('nan')
+    return features
+
+
+def match_approved_pattern(features: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """Check if current features fall within any approved pattern's feature ranges.
+
+    For each approved pattern, checks if ALL features in the pattern's
+    feature_ranges have current values within [min, max].
+
+    Returns the best matching pattern (highest precision), or None.
+    """
+    if _rules is None:
+        return None
+
+    patterns = _rules.get('patterns', [])
+    if not patterns:
+        return None
+
+    best_match = None
+    best_precision = -1.0
+
+    for pattern in patterns:
+        feature_ranges = pattern.get('feature_ranges', {})
+        if not feature_ranges:
+            continue
+
+        all_match = True
+        n_checked = 0
+        for feat, (low, high) in feature_ranges.items():
+            val = features.get(feat)
+            if val is None or np.isnan(val):
+                continue
+            n_checked += 1
+            if not (low <= val <= high):
+                all_match = False
+                break
+
+        if all_match and n_checked >= 2:
+            prec = pattern.get('precision', 0.0)
+            if prec > best_precision:
+                best_precision = prec
+                best_match = pattern
+
+    return best_match
+
+
+def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    """Check if current features satisfy any top combination rule.
+
+    For each combination rule, checks if ALL feature conditions are met
+    (value > threshold for bullish features, < threshold for bearish).
+
+    Returns the best matching rule (highest score = precision * n_signals), or None.
+    """
+    if _rules is None:
+        return None
+
+    combos = _rules.get('combinations', [])
+    if not combos:
+        return None
+
+    best_match = None
+    best_score = -1.0
+
+    for combo in combos:
+        feat_names = combo.get('features', [])
+        thresholds = combo.get('thresholds', [])
+        directions = combo.get('directions', [])
+
+        if not feat_names or len(feat_names) != len(thresholds):
+            continue
+
+        all_met = True
+        n_checked = 0
+        for i, feat in enumerate(feat_names):
+            val = features.get(feat)
+            if val is None or np.isnan(val):
+                all_met = False
+                break
+
+            thr = thresholds[i]
+            direction = directions[i] if i < len(directions) else 'above'
+
+            if direction == 'below':
+                if val >= thr:
+                    all_met = False
+                    break
+            else:
+                if val <= thr:
+                    all_met = False
+                    break
+            n_checked += 1
+
+        if all_met and n_checked >= 2:
+            score = combo.get('score', 0.0)
+            if score > best_score:
+                best_score = score
+                best_match = combo
+
+    return best_match
 
 
 # =============================================================================
@@ -460,8 +719,18 @@ def _trail_cache_columns() -> List[str]:
     return _TRAIL_CACHE_COLUMNS
 
 
+_TRAIL_CACHE_MIN_RETENTION_HOURS = 336  # 14 days — DuckDB accumulates long history
+                                        # even though PostgreSQL only keeps 24h
+
+
 def _sync_trail_cache(hours: int) -> duckdb.DuckDBPyConnection:
     """Incrementally sync trail data from PostgreSQL into DuckDB.
+
+    The DuckDB cache acts as the long-term data store since PostgreSQL
+    archives data after 24 hours. Retention is at least
+    _TRAIL_CACHE_MIN_RETENTION_HOURS (14 days) regardless of the caller's
+    lookback, so short-lookback callers (48h) don't destroy data that the
+    fingerprint analysis (336h) needs.
 
     Returns an open DuckDB connection ready for queries.
     """
@@ -476,8 +745,10 @@ def _sync_trail_cache(hours: int) -> duckdb.DuckDBPyConnection:
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    # ── Cleanup old data ────────────────────────────────────────────────
-    con.execute("DELETE FROM cached_trail WHERE followed_at < ?", [cutoff])
+    # ── Cleanup old data (respect minimum retention for fingerprint) ────
+    retention_hours = max(hours, _TRAIL_CACHE_MIN_RETENTION_HOURS)
+    retention_cutoff = datetime.now(timezone.utc) - timedelta(hours=retention_hours)
+    con.execute("DELETE FROM cached_trail WHERE followed_at < ?", [retention_cutoff])
 
     # ── Determine which buyins to fetch ─────────────────────────────────
     if max_ts is not None:
@@ -827,7 +1098,11 @@ def _persist_training_labels(df: pd.DataFrame) -> None:
 
 
 # =============================================================================
-# FEATURE ENGINEERING
+# V3 GBM FALLBACK — commented out 2026-02-17
+# The following functions (_get_base_feature_columns, _engineer_features,
+# _train_model, _compute_feat, _check_feature_drift, _init_drift_buffers,
+# _get_drift_window, _check_microstructure_confirmation) are kept as fallback.
+# They were part of the V3 GBM pipeline. V4 uses fingerprint-based rules instead.
 # =============================================================================
 
 def _get_base_feature_columns(df: pd.DataFrame) -> List[str]:
@@ -1574,113 +1849,97 @@ def should_trigger_fast_path() -> bool:
 # =============================================================================
 
 def refresh_pump_rules():
-    """Train a new pump model and write to disk cache.
+    """Regenerate fingerprint analysis and load rules.
 
-    This is CPU-heavy (~4 minutes) and should be called from the
-    dedicated refresh_pump_model component process — NOT from train_validator.
-    train_validator only reads the cached model via maybe_refresh_rules().
-    
-    Smart skip: if the training data hasn't changed since last run, we skip
-    the expensive GBM training and only refresh the training labels chart.
+    Called every 5 minutes by the scheduler (refresh_pump_model component).
+    Runs the full fingerprint analysis on 14 days of data, writes the
+    JSON report, then loads the resulting rules.
+
+    Also persists training labels for the dashboard and computes
+    per-rule performance from recent outcomes.
     """
-    global _model, _feature_columns, _model_metadata, _last_train_data_hash
+    global _rules, _rules_metadata
 
-    logger.info("=== V2: Refreshing pump model ===")
+    logger.info("=== V4: Refreshing fingerprint rules ===")
     t0 = time.time()
 
-    df = _load_and_label_data()
-    if df is None or len(df) < MIN_SAMPLES_TO_TRAIN:
-        logger.warning("Insufficient data — keeping model")
+    # Persist training labels for the pumps chart (uses existing data loading)
+    try:
+        df = _load_and_label_data(lookback_hours=336)
+        if df is not None and len(df) > 0:
+            _persist_training_labels(df)
+    except Exception as e:
+        logger.warning(f"Training label persistence failed: {e}")
+
+    # Run fingerprint analysis (writes to cache/pump_fingerprint_report.json)
+    try:
+        from pump_fingerprint import run_fingerprint_analysis
+        report = run_fingerprint_analysis(lookback_hours=336)
+    except Exception as e:
+        logger.error(f"Fingerprint analysis failed: {e}", exc_info=True)
+        report = None
+
+    if report is None:
+        logger.warning("Fingerprint analysis failed — keeping current rules")
         return
 
-    # Persist clean_pump entry points (minute=0) for the pumps chart
-    _persist_training_labels(df)
-
-    # Smart skip: hash the data shape + label distribution to detect changes.
-    # If the data is identical to the last training run, skip the expensive
-    # GBM training (~4 min) since it would produce the same model.
-    n_pump = int(df['label'].eq('clean_pump').sum())
-    n_total = len(df)
-    data_hash = hashlib.md5(f"{n_total}:{n_pump}:{df.iloc[-1].get('buyin_id', 0)}".encode()).hexdigest()[:12]
-    if data_hash == _last_train_data_hash and _model is not None:
-        logger.info(f"  Data unchanged ({n_total} rows, {n_pump} pumps, hash={data_hash}) — skipping retrain")
-        return
-    logger.info(f"  Data changed: {n_total} rows, {n_pump} pumps (hash {_last_train_data_hash or 'none'} → {data_hash})")
-
-    result = _train_model(df)
-    if result is None:
-        logger.warning("Training failed — keeping model")
+    # Load rules from the report
+    rules = _load_fingerprint_rules()
+    if rules is None:
+        logger.warning("Failed to load fingerprint rules after analysis")
         return
 
-    new_profit = result['metadata']['avg_expected_profit']
-    cur_profit = _model_metadata.get('avg_expected_profit')
+    n_patterns = len(rules.get('patterns', []))
+    n_combos = len(rules.get('combinations', []))
 
-    # Always replace — crypto patterns shift fast.
-    # Only skip if new model has *negative* expected profit.
-    if new_profit <= 0:
-        logger.warning(f"New model unprofitable ({new_profit:+.4f}%), keeping current")
-        return
+    _rules = rules
+    _rules_metadata = rules.get('metadata', {})
 
-    logger.info(f"  Replacing model: cur={cur_profit}  →  new={new_profit:+.4f}%")
-
-    _model = result['model']
-    _feature_columns = result['feature_columns']
-    _model_metadata = result['metadata']
-
-    # Initialize drift monitoring buffers for top features
-    _init_drift_buffers()
-
-    # Reset circuit breaker cache on model refresh — force a fresh DB read
+    # Reset circuit breaker cache on rule refresh
     global _circuit_breaker_paused, _cb_cache, _cb_cache_time
     _cb_cache = None
     _cb_cache_time = 0.0
     _circuit_breaker_paused = False
 
-    opt_t = result['metadata'].get('optimal_threshold', MIN_CONFIDENCE)
-    logger.info(f"  NEW MODEL: {len(_feature_columns)} features, "
-                f"prec={result['metadata']['avg_precision']:.1f}%, "
-                f"E[profit]={new_profit:+.4f}%, thresh={opt_t:.2f} "
-                f"({time.time()-t0:.1f}s)")
-
+    # Compute per-rule performance from recent outcomes
     try:
-        MODEL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = MODEL_CACHE_PATH.with_suffix('.pkl.tmp')
-        with open(tmp_path, 'wb') as f:
-            pickle.dump({'model': _model, 'feature_columns': _feature_columns,
-                         'metadata': _model_metadata}, f)
-        tmp_path.replace(MODEL_CACHE_PATH)  # atomic rename
-        _last_train_data_hash = data_hash  # remember so we skip identical data next time
-        logger.info(f"  Cache written to {MODEL_CACHE_PATH}")
+        rule_perf = _compute_rule_performance()
+        if rule_perf:
+            n_disabled = sum(1 for rp in rule_perf.values()
+                            if rp.get('disabled', False))
+            logger.info(f"  Rule performance: {len(rule_perf)} tracked, "
+                        f"{n_disabled} disabled")
     except Exception as e:
-        logger.warning(f"Cache write failed: {e}")
+        logger.debug(f"Rule performance computation failed: {e}")
+
+    logger.info(f"  V4 rules refreshed: {n_patterns} patterns, {n_combos} combos "
+                f"({time.time()-t0:.1f}s)")
 
 
 def _load_cached_model() -> bool:
-    global _model, _feature_columns, _model_metadata
-    if not MODEL_CACHE_PATH.exists():
+    """V4: Load fingerprint rules from JSON cache (replaces GBM pickle load)."""
+    global _rules, _rules_metadata
+    rules = _load_fingerprint_rules()
+    if rules is None:
         return False
-    try:
-        with open(MODEL_CACHE_PATH, 'rb') as f:
-            d = pickle.load(f)
-        _model, _feature_columns, _model_metadata = d['model'], d['feature_columns'], d['metadata']
-        _init_drift_buffers()
-        logger.info(f"Loaded cached V2 model: {len(_feature_columns)} features")
-        return True
-    except Exception as e:
-        logger.warning(f"Cache load failed: {e}")
-        return False
+    _rules = rules
+    _rules_metadata = rules.get('metadata', {})
+    n_pat = len(rules.get('patterns', []))
+    n_combo = len(rules.get('combinations', []))
+    logger.info(f"Loaded V4 fingerprint rules: {n_pat} patterns, {n_combo} combos")
+    return True
 
 
 def maybe_refresh_rules():
-    """Reload the pump model from disk cache if stale.
+    """Reload fingerprint rules from disk cache if stale.
 
-    Called by train_validator every cycle. This is lightweight (just a file
-    read) — the heavy model training runs in the separate refresh_pump_model
-    component which writes to the same cache file.
+    Called by train_validator every cycle. This is lightweight (just a JSON
+    file read) — the heavy fingerprint analysis runs in the separate
+    refresh_pump_model component which writes the JSON report.
     """
     global _last_rules_refresh
     now = time.time()
-    if _model is None or (now - _last_rules_refresh >= RULES_REFRESH_INTERVAL):
+    if _rules is None or (now - _last_rules_refresh >= RULES_REFRESH_INTERVAL):
         _load_cached_model()
         _last_rules_refresh = now
 
@@ -1699,12 +1958,12 @@ def _log_gate_summary() -> None:
     if total == 0:
         return
     cb = _gate_stats.get('circuit_breaker', 0)
-    micro = _gate_stats.get('micro_fail', 0)
-    xa = _gate_stats.get('xa_selloff', 0)
     logger.info(
-        f"V2 gates (60s): {total} chk | no_mdl={_gate_stats['no_model']} "
+        f"V4 gates (60s): {total} chk | no_rules={_gate_stats['no_rules']} "
         f"cb={cb} crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
-        f"micro={micro} xa={xa} ok={_gate_stats['gates_passed']} low_conf={_gate_stats['low_confidence']} "
+        f"chase={_gate_stats['chase_gate_fail']} "
+        f"ok={_gate_stats['gates_passed']} no_pat={_gate_stats['no_pattern']} "
+        f"no_combo={_gate_stats['no_combo']} "
         f"FIRED={_gate_stats['signal_fired']}"
     )
     for k in _gate_stats:
@@ -1765,132 +2024,148 @@ def _check_microstructure_confirmation(trail_row: dict) -> Tuple[bool, str]:
     if checks == 0:
         return True, "no microstructure data"
 
-    # Block if ALL available microstructure signals are bearish
-    # (i.e., zero bullish confirmations = pure selloff, not a bounce)
-    if bearish_count == checks:
+    # Block if majority of microstructure signals are bearish.
+    # Previously required ALL to be bearish, but that almost never triggered
+    # because order book imbalance is usually slightly positive from market-making.
+    # Now blocks if 2+ of 3 are bearish — catches the common case where whales
+    # are dumping and transactions are selling but order book hasn't caught up.
+    if checks >= 2 and bearish_count >= 2:
+        return False, desc
+
+    # Also block if all signals present are bearish (handles 1-signal case)
+    if bearish_count > 0 and bearish_count == checks:
         return False, desc
 
     return True, desc
 
 
 def check_pump_signal(trail_row: dict, market_price: float) -> bool:
+    """V4 rule-based signal detection using fingerprint analysis.
+
+    Simplified flow:
+    1. Safety gates (crash, chase, circuit breaker — 3 hard gates)
+    2. Check if current features match any approved pattern (cluster match)
+    3. Check if current features satisfy any top combination rule
+    4. Require: strong pattern OR (pattern + combo) OR strong combo
+    5. Log exactly which pattern/rule triggered and why
+    """
     _gate_stats['total_checks'] += 1
 
-    if _model is None:
-        _gate_stats['no_model'] += 1
+    if _rules is None:
+        _gate_stats['no_rules'] += 1
         return False
 
-    # Gate 0: Circuit breaker — auto-pause if live precision is too low
+    # Gate 1: Circuit breaker — auto-pause if live precision is too low
     if _check_circuit_breaker():
-        _gate_stats.setdefault('circuit_breaker', 0)
         _gate_stats['circuit_breaker'] += 1
         return False
 
-    # Gate 1: Crash protection (micro 30s)
+    # Gate 2: Crash protection (micro 30s + 5m)
     crash_ok, crash_desc = _is_not_crashing()
     if not crash_ok:
         _gate_stats['crash_gate_fail'] += 1
         return False
 
-    # Gate 2: 5-minute crash protection
     pm_5m = trail_row.get('pm_price_change_5m')
     if pm_5m is not None and float(pm_5m) < CRASH_GATE_5M:
         _gate_stats['crash_5m_fail'] += 1
         return False
 
-    # Gate 3: Microstructure confirmation — prevent buying into pure selloffs.
-    # The model sees any dip as a bounce opportunity, but if order book, whales,
-    # AND transactions ALL show selling, the dip is real, not a bounce.
-    micro_ok, micro_desc = _check_microstructure_confirmation(trail_row)
-    if not micro_ok:
-        _gate_stats['micro_fail'] += 1
-        logger.info(f"V2: microstructure REJECT ({micro_desc})")
-        return False
+    # Gate 3: Chase prevention — block entries at local highs
+    pm_1m = trail_row.get('pm_price_change_1m')
+    pm_1m_val = float(pm_1m) if pm_1m is not None else 0.0
+    pm_vel_30s = trail_row.get('pm_price_velocity_30s')
+    pm_vel_30s_val = float(pm_vel_30s) if pm_vel_30s is not None else 0.0
 
-    # Gate 4: Cross-asset divergence + deep dip = SOL-specific selloff.
-    # If SOL underperforms BOTH BTC and ETH (>0.15%) AND has a steep 5-min
-    # decline (>0.35%), this is SOL-specific selling — not a bounce setup.
-    xa_btc = trail_row.get('xa_btc_sol_divergence')
-    xa_eth = trail_row.get('xa_eth_sol_divergence')
-    pe5m = trail_row.get('pre_entry_change_5m')
-    if (xa_btc is not None and xa_eth is not None and pe5m is not None
-            and float(xa_btc) < -0.15 and float(xa_eth) < -0.15
-            and float(pe5m) < -0.35):
-        _gate_stats['xa_selloff'] += 1
-        logger.info(f"V2: cross-asset REJECT btc_div={float(xa_btc):+.3f} "
-                    f"eth_div={float(xa_eth):+.3f} pe5m={float(pe5m):+.3f}")
+    if pm_1m is not None and pm_1m_val > CHASE_GATE_1M_MAX:
+        _gate_stats['chase_gate_fail'] += 1
+        return False
+    if pm_vel_30s is not None and pm_vel_30s_val > CHASE_GATE_30S_MAX:
+        _gate_stats['chase_gate_fail'] += 1
         return False
 
     _gate_stats['gates_passed'] += 1
 
-    # Trend description for logging
-    trend_desc = _get_trend_description(trail_row)
-
-    # Track volatility for monitoring but DO NOT boost threshold
+    # Track volatility for monitoring
     _update_vol_buffer(trail_row.get('pm_realized_vol_1m'))
-    vol_pct = _get_vol_percentile()
-    regime_tag = f"vol_p{vol_pct:.0f}" if vol_pct is not None else "vol_warmup"
 
-    # Build gate details for outcome attribution
-    gate_details = {
-        'crash_30s': crash_desc,
-        'micro': micro_desc,
-        'xa_selloff': False,
-        'vol_regime': regime_tag,
-    }
+    # --- PATTERN MATCHING ---
+    features = extract_signal_features(trail_row)
 
-    # Model confidence check — threshold capped at MAX_PREDICTION_THRESHOLD
-    raw_threshold = _model_metadata.get('optimal_threshold', MIN_CONFIDENCE)
-    required_confidence = min(max(raw_threshold, MIN_CONFIDENCE), MAX_PREDICTION_THRESHOLD)
+    pattern_match = match_approved_pattern(features)
+    combo_match = match_combination_rule(features)
 
-    try:
-        features = {}
-        for col in _feature_columns:
-            if col.startswith('feat_'):
-                features[col] = _compute_feat(col, trail_row)
-            else:
-                v = trail_row.get(col)
-                features[col] = float(v) if v is not None else 0.0
+    # Fire logic:
+    # 1. Strong pattern (precision >= 55%) — fire even without combo
+    # 2. Pattern + combo confirmation — fire
+    # 3. Very strong combo (precision >= 60%) — fire even without pattern
+    fired = False
+    fire_reason = ""
 
-        X = pd.DataFrame([features])[_feature_columns].fillna(0)
-        proba = float(_model.predict_proba(X)[0, 1])
+    if pattern_match and pattern_match.get('precision', 0) >= 0.55:
+        fired = True
+        fire_reason = (f"Pattern: {pattern_match.get('label', '?')} "
+                       f"(prec={pattern_match['precision']:.0%}, "
+                       f"n={pattern_match.get('n_occurrences', '?')})")
 
-        # Feature drift monitoring (runs every 60s, lightweight)
-        drift_warnings = _check_feature_drift(features)
-        if drift_warnings:
-            gate_details['drift_warnings'] = len(drift_warnings)
+    elif pattern_match and combo_match:
+        fired = True
+        combo_feats = ' + '.join(combo_match.get('features', []))
+        fire_reason = (f"Pattern: {pattern_match.get('label', '?')} "
+                       f"(prec={pattern_match['precision']:.0%}) + "
+                       f"Combo: [{combo_feats}] "
+                       f"(prec={combo_match.get('precision', 0):.0%})")
 
-        if proba < required_confidence:
-            _gate_stats['low_confidence'] += 1
-            logger.info(f"V2: conf={proba:.3f} < {required_confidence:.2f} "
-                        f"({trend_desc}, {micro_desc}, {regime_tag})")
-            return False
+    elif combo_match and combo_match.get('precision', 0) >= 0.60:
+        fired = True
+        combo_feats = ' + '.join(combo_match.get('features', []))
+        fire_reason = (f"Combo: [{combo_feats}] "
+                       f"(prec={combo_match['precision']:.0%}, "
+                       f"n={combo_match.get('n_signals', '?')})")
 
-        _gate_stats['signal_fired'] += 1
-        logger.info(f"V2: SIGNAL! conf={proba:.3f} >= {required_confidence:.2f} "
-                    f"({trend_desc}, {micro_desc}, {regime_tag})")
-
-        # ── Outcome attribution: capture context at fire time ─────────
-        buyin_id = trail_row.get('buyin_id')
-        if buyin_id is not None:
-            top_feats = _model_metadata.get('top_features', {})
-            top_3_names = list(top_feats.keys())[:3] if top_feats else []
-            top_3_vals = {name: round(features.get(name, 0.0), 6) for name in top_3_names}
-            _signal_context[int(buyin_id)] = {
-                'top_features': top_3_vals,
-                'gates_passed': gate_details,
-                'confidence': round(proba, 4),
-            }
-            if len(_signal_context) > 200:
-                oldest = sorted(_signal_context.keys())[:100]
-                for k in oldest:
-                    _signal_context.pop(k, None)
-
-        return True
-
-    except Exception as e:
-        logger.error(f"V2 prediction error: {e}", exc_info=True)
+    if not fired:
+        if not pattern_match:
+            _gate_stats['no_pattern'] += 1
+        if not combo_match:
+            _gate_stats['no_combo'] += 1
         return False
+
+    _gate_stats['signal_fired'] += 1
+    logger.info(f"V4: SIGNAL! {fire_reason}")
+
+    # Outcome attribution: capture context at fire time
+    buyin_id = trail_row.get('buyin_id')
+    if buyin_id is not None:
+        rule_id = None
+        pattern_id = None
+        if combo_match:
+            rule_id = f"combo_{'_'.join(combo_match.get('features', []))}"
+        if pattern_match:
+            pattern_id = f"pat_{pattern_match.get('cluster_id', '?')}"
+
+        top_feat_vals = {k: round(v, 6) for k, v in sorted(
+            features.items(), key=lambda x: abs(x[1]) if not np.isnan(x[1]) else 0,
+            reverse=True,
+        )[:5]}
+
+        _signal_context[int(buyin_id)] = {
+            'top_features': top_feat_vals,
+            'gates_passed': {
+                'crash_30s': crash_desc,
+                'chase': f"1m={pm_1m_val:+.4f}%,30s={pm_vel_30s_val:+.4f}%",
+            },
+            'fire_reason': fire_reason,
+            'rule_id': rule_id,
+            'pattern_id': pattern_id,
+            'pattern_precision': pattern_match.get('precision') if pattern_match else None,
+            'combo_precision': combo_match.get('precision') if combo_match else None,
+        }
+        if len(_signal_context) > 200:
+            oldest = sorted(_signal_context.keys())[:100]
+            for k in oldest:
+                _signal_context.pop(k, None)
+
+    return True
 
 
 # =============================================================================
@@ -1910,7 +2185,7 @@ def check_and_fire_pump_signal(
 
     _update_price_buffer(market_price)
 
-    if _model is None:
+    if _rules is None:
         return False
 
     try:
@@ -1918,7 +2193,7 @@ def check_and_fire_pump_signal(
             "SELECT * FROM buyin_trail_minutes WHERE buyin_id=%s AND minute=0 AND (sub_minute=0 OR sub_minute IS NULL)",
             [buyin_id])
     except Exception as e:
-        logger.error(f"V2 trail read error: {e}")
+        logger.error(f"V4 trail read error: {e}")
         return False
 
     if not trail_row:
@@ -1932,10 +2207,10 @@ def check_and_fire_pump_signal(
     # Cooldown
     now = time.time()
     if now - _last_entry_time < COOLDOWN_SECONDS:
-        logger.info(f"V2: signal but cooldown ({int(COOLDOWN_SECONDS-(now-_last_entry_time))}s)")
+        logger.info(f"V4: signal but cooldown ({int(COOLDOWN_SECONDS-(now-_last_entry_time))}s)")
         return False
 
-    # Cooldown: only consider real pump entries (exclude TRAINING_TEST_ so training cycles don't block firing)
+    # Cooldown: only consider real pump entries (exclude TRAINING_TEST_)
     try:
         last = postgres_query_one(
             """SELECT followed_at FROM follow_the_goat_buyins
@@ -1955,7 +2230,7 @@ def check_and_fire_pump_signal(
             "SELECT id FROM follow_the_goat_buyins WHERE play_id=%s AND our_status IN ('pending','validating') AND wallet_address NOT LIKE 'TRAINING_TEST_%%' LIMIT 1",
             [pump_play_id])
         if op:
-            logger.info(f"V2: signal but open position {op['id']}")
+            logger.info(f"V4: signal but open position {op['id']}")
             return False
     except Exception:
         return False
@@ -1964,20 +2239,21 @@ def check_and_fire_pump_signal(
     ts = str(int(now))
     bt = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    # Compute confidence for logging
-    try:
-        feats = {}
-        for col in _feature_columns:
-            feats[col] = _compute_feat(col, trail_row) if col.startswith('feat_') else float(trail_row.get(col, 0) or 0)
-        conf = float(_model.predict_proba(pd.DataFrame([feats])[_feature_columns].fillna(0))[0, 1])
-    except Exception:
-        conf = -1
+    # Get signal context for the entry log
+    ctx = _signal_context.get(int(trail_row.get('buyin_id', buyin_id)), {})
+    fire_reason = ctx.get('fire_reason', 'unknown')
+    pat_prec = ctx.get('pattern_precision')
+    combo_prec = ctx.get('combo_precision')
 
     entry_log = json.dumps({
-        'signal_type': 'pump_detection_v2',
+        'signal_type': 'pump_detection_v4',
         'source_buyin_id': buyin_id,
-        'model_confidence': conf,
-        'model_metadata': _model_metadata,
+        'fire_reason': fire_reason,
+        'pattern_precision': pat_prec,
+        'combo_precision': combo_prec,
+        'rule_id': ctx.get('rule_id'),
+        'pattern_id': ctx.get('pattern_id'),
+        'rules_metadata': _rules_metadata,
         'sol_price': market_price,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
@@ -1994,25 +2270,28 @@ def check_and_fire_pump_signal(
              quote_amount,base_amount,price,direction,our_entry_price,live_trade,price_cycle,
              entry_log,pattern_validator_log,our_status,followed_at,higest_price_reached)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, [nid, pump_play_id, f'PUMP_V2_{ts}', 0, f'pump_v2_{ts}', bt,
+        """, [nid, pump_play_id, f'PUMP_V4_{ts}', 0, f'pump_v4_{ts}', bt,
               100.0, market_price, market_price, 'buy', market_price, 0, price_cycle,
               entry_log, None, 'pending', bt, market_price])
 
         _last_entry_time = now
-        logger.info(f"  V2 buyin #{nid} @ {market_price:.4f} conf={conf:.3f}")
+        logger.info(f"  V4 buyin #{nid} @ {market_price:.4f} [{fire_reason}]")
         return True
     except Exception as e:
-        logger.error(f"V2 insert error: {e}", exc_info=True)
+        logger.error(f"V4 insert error: {e}", exc_info=True)
         return False
 
 
 def get_pump_status() -> Dict[str, Any]:
     info = _get_live_outcomes()
+    n_patterns = len(_rules.get('patterns', [])) if _rules else 0
+    n_combos = len(_rules.get('combinations', [])) if _rules else 0
     return {
-        'version': 'v3',
-        'has_model': _model is not None,
-        'n_features': len(_feature_columns),
-        'metadata': _model_metadata,
+        'version': 'v4',
+        'has_rules': _rules is not None,
+        'n_patterns': n_patterns,
+        'n_combinations': n_combos,
+        'rules_metadata': _rules_metadata,
         'last_refresh': _last_rules_refresh,
         'last_entry': _last_entry_time,
         'circuit_breaker_paused': _circuit_breaker_paused,
@@ -2022,11 +2301,16 @@ def get_pump_status() -> Dict[str, Any]:
         'vol_percentile': round(_get_vol_percentile(), 1) if _get_vol_percentile() is not None else None,
         'readiness_score': round(_last_readiness_score, 4),
         'readiness_threshold': READINESS_THRESHOLD,
-        'drift_warnings': len(_drift_warnings),
     }
 
 
-# Load cached model on import
+# V4: Ensure DB schema has rule_id/pattern_id columns
+try:
+    _ensure_outcome_columns()
+except Exception:
+    pass
+
+# Load cached fingerprint rules on import
 try:
     _load_cached_model()
 except Exception:

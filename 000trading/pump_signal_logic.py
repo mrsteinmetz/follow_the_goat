@@ -166,9 +166,13 @@ _gate_stats: Dict[str, int] = {
 _price_buffer: deque = deque(maxlen=200)
 
 # ── Simulator rules cache (loaded from simulation_results PostgreSQL table) ──
-_sim_rules: List[Dict[str, Any]] = []
-_sim_rules_loaded_at: float = 0.0
+# Keyed by play_id so each play maintains its own filtered rule set.
+_sim_rules: Dict[int, List[Dict[str, Any]]] = {}
+_sim_rules_loaded_at: Dict[int, float] = {}
 SIM_RULES_TTL: float = 300.0  # refresh every 5 min
+
+# ── Per-play last-entry timestamp (replaces single global _last_entry_time) ──
+_last_entry_time_per_play: Dict[int, float] = {}
 
 # ── Volatility regime tracking ───────────────────────────────────────────────
 _vol_buffer: deque = deque(maxlen=720)     # ~12 hours at 1 sample per ~minute
@@ -600,10 +604,16 @@ def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any
 # SIMULATOR RULES — direct check against raw_data_cache feature names
 # =============================================================================
 
-def _load_sim_rules() -> List[Dict[str, Any]]:
+def _load_sim_rules(
+    win_rate_min: float = 0.65,
+    oos_gap_max: float = 0.004,
+    daily_ev_min: float = 0.0,
+    n_signals_min: int = 10,
+) -> List[Dict[str, Any]]:
     """Load top simulation rules from simulation_results (PostgreSQL).
 
-    Selects rules that generalise well (low OOS gap) with high win rate.
+    Per-play thresholds allow each play to apply different quality bars
+    when selecting which simulator rules to activate.
     Feature names match raw_data_cache.get_live_features() exactly —
     no remapping needed.
     """
@@ -615,40 +625,56 @@ def _load_sim_rules() -> List[Dict[str, Any]]:
                            exit_config_json, sharpe, oos_gap,
                            COALESCE(oos_consistency, 0.5) AS oos_consistency
                     FROM simulation_results
-                    WHERE win_rate   >= 0.65
-                      AND n_signals  >= 10
-                      AND oos_gap    <= 0.004
-                      AND daily_ev   >  0
+                    WHERE win_rate   >= %s
+                      AND n_signals  >= %s
+                      AND oos_gap    <= %s
+                      AND daily_ev   >= %s
                       AND COALESCE(oos_consistency, 0) >= 0.33
                     ORDER BY daily_ev * COALESCE(oos_consistency, 0.5) DESC
                     LIMIT 8
-                """)
+                """, [win_rate_min, n_signals_min, oos_gap_max, daily_ev_min])
                 return [dict(r) for r in cur.fetchall()]
     except Exception as e:
         logger.warning(f"[sim_rules] Failed to load: {e}")
         return []
 
 
-def check_sim_rules(live_features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def check_sim_rules(
+    live_features: Dict[str, Any],
+    play_id: int = 3,
+    sim_filter: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Check live raw-cache features against best simulation_results rules.
 
     Feature names in conditions_json use the same naming as
     raw_data_cache.get_live_features() — no translation required.
+
+    Each play passes its own sim_filter thresholds so rules are filtered
+    differently per play (e.g. aggressive play uses lower win_rate_min).
 
     Returns the first matching rule dict (highest daily_ev), or None.
     """
     global _sim_rules, _sim_rules_loaded_at
 
     now = time.time()
-    if now - _sim_rules_loaded_at > SIM_RULES_TTL or not _sim_rules:
-        _sim_rules = _load_sim_rules()
-        _sim_rules_loaded_at = now
-        logger.debug(f"[sim_rules] Loaded {len(_sim_rules)} rules from simulation_results")
+    play_last_loaded = _sim_rules_loaded_at.get(play_id, 0.0)
+    if now - play_last_loaded > SIM_RULES_TTL or play_id not in _sim_rules:
+        sf = sim_filter or {}
+        rules = _load_sim_rules(
+            win_rate_min=sf.get('win_rate_min', 0.65),
+            oos_gap_max=sf.get('oos_gap_max', 0.004),
+            daily_ev_min=sf.get('daily_ev_min', 0.0),
+            n_signals_min=sf.get('n_signals_min', 10),
+        )
+        _sim_rules[play_id] = rules
+        _sim_rules_loaded_at[play_id] = now
+        logger.debug(f"[sim_rules] play={play_id} loaded {len(rules)} rules")
 
-    if not _sim_rules:
+    rules = _sim_rules.get(play_id, [])
+    if not rules:
         return None
 
-    for rule in _sim_rules:
+    for rule in rules:
         conditions = rule.get('conditions_json') or []
         if not conditions:
             continue
@@ -2466,13 +2492,23 @@ def _record_observation(buyin_id: int, market_price: float, trail_row: dict,
 # =============================================================================
 
 def check_and_fire_pump_signal(
+    play_config: Optional[Dict[str, Any]] = None,
     buyin_id: Optional[int] = None,
     market_price: float = 0.0,
     price_cycle: Optional[int] = None,
 ) -> bool:
-    global _last_entry_time
+    global _last_entry_time, _last_entry_time_per_play
 
-    pump_play_id = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
+    # Resolve play config — support both new dict API and legacy env-var fallback
+    if play_config is not None:
+        pump_play_id = int(play_config['play_id'])
+        sim_filter: Dict[str, Any] = play_config.get('sim_filter') or {}
+        play_cooldown = float(sim_filter.get('cooldown_seconds', COOLDOWN_SECONDS))
+    else:
+        pump_play_id = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
+        sim_filter = {}
+        play_cooldown = COOLDOWN_SECONDS
+
     if not pump_play_id:
         return False
 
@@ -2522,23 +2558,34 @@ def check_and_fire_pump_signal(
 
     # ── Path A: Simulator rules (primary — uses raw feature names directly) ───
     # `live` is guaranteed non-None and ob_n >= 3 here (trail_row guard passed)
-    sim_match = check_sim_rules(live)
+    sim_match = check_sim_rules(live, play_id=pump_play_id, sim_filter=sim_filter)
     signal_fires_sim = sim_match is not None
 
-    # ── Path B: Fingerprint rules (fallback — uses mapped V4 names) ───────────
-    signal_fires_fp = check_pump_signal(trail_row, market_price)
-    _log_gate_summary()
+    # ── Path B: Fingerprint rules ─────────────────────────────────────────────
+    # Only run if no sim rules are loaded (i.e. simulation_results is empty for
+    # this play). When the simulator has qualifying rules, fingerprint fallback
+    # is DISABLED — live performance shows fingerprint combos fire on noise and
+    # generate losing trades at ~21% win rate vs simulator rules at 78-81%.
+    play_has_sim_rules = bool(_sim_rules.get(pump_play_id))
+    if play_has_sim_rules:
+        signal_fires_fp = False
+        _log_gate_summary()
+    else:
+        signal_fires_fp = check_pump_signal(trail_row, market_price)
+        _log_gate_summary()
 
-    # Signal fires if EITHER path matches
+    # Signal fires if EITHER path matches (Path B only fires when no sim rules)
     signal_fires = signal_fires_sim or signal_fires_fp
 
-    if signal_fires_sim and not signal_fires_fp:
+    if signal_fires_sim:
         logger.info(
-            f"[sim_rules] Signal via simulator rule | "
+            f"[sim_rules] play={pump_play_id} Signal via simulator rule | "
             f"win_rate={sim_match.get('win_rate', 0):.0%} "
             f"ev/trade={sim_match.get('ev_per_trade', 0):.4f} "
             f"daily_ev={sim_match.get('daily_ev', 0):.3f}"
         )
+    elif signal_fires_fp and not play_has_sim_rules:
+        logger.info(f"[fingerprint] play={pump_play_id} Signal via fingerprint (no sim rules loaded)")
 
     # Observation mode: record EVERY cycle (fired or not) so there is a
     # continuous 5-second reference trail in pump_signal_observations.
@@ -2566,13 +2613,15 @@ def check_and_fire_pump_signal(
     if not signal_fires:
         return False
 
-    # Cooldown
+    # Cooldown — checked per play so plays don't block each other
     now = time.time()
-    if now - _last_entry_time < COOLDOWN_SECONDS:
-        logger.info(f"V4: signal but cooldown ({int(COOLDOWN_SECONDS-(now-_last_entry_time))}s)")
+    play_last = _last_entry_time_per_play.get(pump_play_id, 0.0)
+    if now - play_last < play_cooldown:
+        remaining = int(play_cooldown - (now - play_last))
+        logger.info(f"V4 play={pump_play_id}: signal but cooldown ({remaining}s)")
         return False
 
-    # Cooldown: only consider real pump entries (exclude TRAINING_TEST_)
+    # DB-level cooldown: guard against multiple processes / restarts
     try:
         last = postgres_query_one(
             """SELECT followed_at FROM follow_the_goat_buyins
@@ -2582,7 +2631,7 @@ def check_and_fire_pump_signal(
         if last and last.get('followed_at'):
             ft = last['followed_at']
             ts = ft.timestamp() if hasattr(ft, 'timestamp') else (ft if isinstance(ft, (int, float)) else None)
-            if ts is not None and now - ts < COOLDOWN_SECONDS:
+            if ts is not None and now - ts < play_cooldown:
                 return False
     except Exception:
         pass
@@ -2610,16 +2659,27 @@ def check_and_fire_pump_signal(
 
     entry_log = json.dumps({
         'signal_type': 'pump_detection_v4',
+        'play_id': pump_play_id,
         'signal_key': sig_key,
         'fire_reason': fire_reason,
         'pattern_precision': pat_prec,
         'combo_precision': combo_prec,
         'rule_id': ctx.get('rule_id'),
         'pattern_id': ctx.get('pattern_id'),
+        'sim_rule': {
+            'win_rate': sim_match.get('win_rate') if sim_match else None,
+            'ev_per_trade': sim_match.get('ev_per_trade') if sim_match else None,
+            'daily_ev': sim_match.get('daily_ev') if sim_match else None,
+            'conditions': sim_match.get('conditions_json') if sim_match else None,
+        } if signal_fires_sim else None,
+        'sim_filter': sim_filter or None,
         'rules_metadata': _rules_metadata,
         'sol_price': market_price,
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
+
+    wallet_tag = f'PUMP_V4_P{pump_play_id}_{ts}'
+    sig_tag    = f'pump_v4_p{pump_play_id}_{ts}'
 
     try:
         with get_postgres() as conn:
@@ -2633,15 +2693,16 @@ def check_and_fire_pump_signal(
              quote_amount,base_amount,price,direction,our_entry_price,live_trade,price_cycle,
              entry_log,pattern_validator_log,our_status,followed_at,higest_price_reached)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, [nid, pump_play_id, f'PUMP_V4_{ts}', 0, f'pump_v4_{ts}', bt,
+        """, [nid, pump_play_id, wallet_tag, 0, sig_tag, bt,
               100.0, market_price, market_price, 'buy', market_price, 0, price_cycle,
               entry_log, None, 'pending', bt, market_price])
 
         _last_entry_time = now
-        logger.info(f"  V4 buyin #{nid} @ {market_price:.4f} [{fire_reason}]")
+        _last_entry_time_per_play[pump_play_id] = now
+        logger.info(f"  V4 play={pump_play_id} buyin #{nid} @ {market_price:.4f} [{fire_reason}]")
         return True
     except Exception as e:
-        logger.error(f"V4 insert error: {e}", exc_info=True)
+        logger.error(f"V4 insert error (play={pump_play_id}): {e}", exc_info=True)
         return False
 
 
@@ -2669,6 +2730,8 @@ def get_pump_status() -> Dict[str, Any]:
         'rules_metadata': _rules_metadata,
         'last_refresh': _last_rules_refresh,
         'last_entry': _last_entry_time,
+        'last_entry_per_play': dict(_last_entry_time_per_play),
+        'sim_rules_loaded': {pid: len(rules) for pid, rules in _sim_rules.items()},
         'circuit_breaker_paused': _circuit_breaker_paused,
         'live_win_rate': round(info['win_rate'], 4) if info['win_rate'] is not None else None,
         'live_outcomes_count': info['n'],

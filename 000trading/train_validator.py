@@ -7,10 +7,18 @@ Each cycle:
   1. Checks that raw Parquet cache is fresh (populated by binance_stream + webhook_server)
   2. Fetches current SOL market price and cycle
   3. Refreshes fingerprint rules if stale (every 5 min)
-  4. Fires pump signal if live features match any approved rule
+  4. Refreshes pump play configs from follow_the_goat_plays (every 5 min)
+  5. For each active pump play, fires a signal if live features match any approved rule
 
-No synthetic buyins, no trail generation. Features come directly from the
-raw Parquet cache written by the data feed processes.
+Multiple plays run simultaneously, each with independent signal thresholds, cooldowns
+and exit configs. This allows A/B testing of different trading strategies in parallel:
+  - Play 3 (Balanced):     win_rate >= 65%, 120s cooldown, standard trailing stops
+  - Play 4 (Aggressive):   win_rate >= 55%, 60s cooldown, tighter trailing stops
+  - Play 5 (Conservative): win_rate >= 75%, 180s cooldown, looser trailing stops
+  - Play 6 (High-EV):      win_rate >= 65% + daily_ev >= 0.002, 120s cooldown
+
+The mega_simulator component (every 30 min) keeps simulation_results fresh;
+each play reads from it using its own filter thresholds.
 
 Usage:
     python 000trading/train_validator.py
@@ -38,10 +46,22 @@ from core.database import get_postgres
 
 # Configuration
 TRAINING_INTERVAL_SECONDS = int(os.getenv("TRAIN_VALIDATOR_INTERVAL", "5"))
-PUMP_SIGNAL_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
+
+# Comma-separated play IDs to run. Defaults to plays 3,4,5,6.
+# Set to "3" to run only the original balanced play.
+PUMP_PLAY_IDS_RAW = os.getenv("PUMP_SIGNAL_PLAY_IDS", "3,4,5,6")
+PUMP_PLAY_IDS: List[int] = [int(x.strip()) for x in PUMP_PLAY_IDS_RAW.split(",") if x.strip()]
+
+# Legacy single-play env var — used as fallback if PUMP_SIGNAL_PLAY_IDS is not set
+_LEGACY_PLAY_ID = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
+if not PUMP_PLAY_IDS and _LEGACY_PLAY_ID:
+    PUMP_PLAY_IDS = [_LEGACY_PLAY_ID]
 
 # How stale the OB Parquet can be before we skip the cycle (seconds)
 MAX_PARQUET_AGE_SECONDS = int(os.getenv("MAX_PARQUET_AGE_SECONDS", "60"))
+
+# How often to refresh play configs from the DB (seconds)
+PLAY_CONFIG_REFRESH_INTERVAL = 300
 
 # Setup logging
 LOGS_DIR = Path(__file__).parent / "logs"
@@ -127,6 +147,78 @@ def get_current_price_cycle() -> Optional[int]:
 
 
 # =============================================================================
+# PLAY CONFIG LOADER
+# =============================================================================
+
+_pump_play_configs: List[Dict[str, Any]] = []
+_play_configs_loaded_at: float = 0.0
+
+
+def load_pump_play_configs(play_ids: List[int]) -> List[Dict[str, Any]]:
+    """Load active pump play configs from follow_the_goat_plays.
+
+    Returns a list of play config dicts, each containing:
+      - play_id: int
+      - name: str
+      - sim_filter: dict (from pattern_validator.sim_filter JSONB key)
+      - sell_logic: dict
+    """
+    if not play_ids:
+        return []
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, name, pattern_validator, sell_logic
+                    FROM follow_the_goat_plays
+                    WHERE id = ANY(%s) AND is_active = 1
+                    ORDER BY id
+                """, [play_ids])
+                rows = cursor.fetchall()
+
+        configs = []
+        for row in rows:
+            pv = row.get('pattern_validator') or {}
+            if isinstance(pv, str):
+                try:
+                    pv = json.loads(pv)
+                except Exception:
+                    pv = {}
+            sell = row.get('sell_logic') or {}
+            if isinstance(sell, str):
+                try:
+                    sell = json.loads(sell)
+                except Exception:
+                    sell = {}
+
+            configs.append({
+                'play_id':    int(row['id']),
+                'name':       row.get('name') or f'Play {row["id"]}',
+                'sim_filter': pv.get('sim_filter') or {},
+                'sell_logic': sell,
+            })
+
+        logger.info(
+            f"Loaded {len(configs)} pump play configs: "
+            + ", ".join(f"#{c['play_id']} {c['name']}" for c in configs)
+        )
+        return configs
+    except Exception as e:
+        logger.error(f"Error loading pump play configs: {e}")
+        return []
+
+
+def maybe_refresh_play_configs() -> None:
+    """Refresh play configs from DB if stale (every PLAY_CONFIG_REFRESH_INTERVAL seconds)."""
+    global _pump_play_configs, _play_configs_loaded_at
+    now = time.time()
+    if now - _play_configs_loaded_at < PLAY_CONFIG_REFRESH_INTERVAL and _pump_play_configs:
+        return
+    _pump_play_configs = load_pump_play_configs(PUMP_PLAY_IDS)
+    _play_configs_loaded_at = now
+
+
+# =============================================================================
 # STUCK TRADE CLEANUP
 # =============================================================================
 
@@ -181,13 +273,22 @@ class TrainingStats:
         self.skipped = 0
         self.errors = 0
         self.start_time = datetime.now(timezone.utc)
+        self.signals_per_play: Dict[int, int] = {}
+
+    def record_signal(self, play_id: int) -> None:
+        self.signals_fired += 1
+        self.signals_per_play[play_id] = self.signals_per_play.get(play_id, 0) + 1
 
     def log_summary(self) -> None:
         uptime = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        play_breakdown = " ".join(
+            f"p{pid}={cnt}" for pid, cnt in sorted(self.signals_per_play.items())
+        )
         logger.info(
             f"Stats | cycles={self.cycles} fired={self.signals_fired} "
             f"skipped={self.skipped} errors={self.errors} "
             f"uptime={uptime/60:.1f}m"
+            + (f" [{play_breakdown}]" if play_breakdown else "")
         )
 
 
@@ -199,14 +300,14 @@ def run_training_cycle() -> bool:
 
     Flow:
       1. Check Parquet cache freshness
-      2. Get market price + active cycle
-      3. Refresh fingerprint rules if stale
-      4. Fire pump signal if live features match
+      2. Refresh play configs if stale
+      3. Get market price + active cycle
+      4. Refresh fingerprint rules if stale
+      5. For each active play, fire pump signal if live features match
 
-    Returns True if cycle completed (regardless of signal fired).
+    Returns True if cycle completed (regardless of signals fired).
     """
     _stats.cycles += 1
-    cycle_start = time.time()
 
     # 1. Verify raw cache is fresh
     is_ready, reason = check_data_readiness()
@@ -219,7 +320,10 @@ def run_training_cycle() -> bool:
     if _stats.cycles % 10 == 0:
         cleanup_stuck_validating_trades(max_age_seconds=120)
 
-    # 3. Market data
+    # 3. Refresh play configs (every 5 min)
+    maybe_refresh_play_configs()
+
+    # 4. Market data
     market_price = get_current_market_price()
     if not market_price:
         logger.debug("No market price — skipping")
@@ -228,9 +332,9 @@ def run_training_cycle() -> bool:
 
     price_cycle = get_current_price_cycle()
 
-    # 4. Pump signal check
-    pump_fired = False
-    if PUMP_SIGNAL_PLAY_ID:
+    # 5. Pump signal checks — one per active play
+    play_tags: List[str] = []
+    if _pump_play_configs:
         try:
             from pump_signal_logic import (
                 maybe_refresh_rules,
@@ -238,17 +342,34 @@ def run_training_cycle() -> bool:
                 PUMP_OBSERVATION_MODE,
             )
             maybe_refresh_rules()
-            pump_fired = check_and_fire_pump_signal(
-                market_price=market_price,
-                price_cycle=price_cycle,
-            )
-            if pump_fired:
-                _stats.signals_fired += 1
+
+            for play_config in _pump_play_configs:
+                try:
+                    fired = check_and_fire_pump_signal(
+                        play_config=play_config,
+                        market_price=market_price,
+                        price_cycle=price_cycle,
+                    )
+                    if fired:
+                        pid = play_config['play_id']
+                        _stats.record_signal(pid)
+                        play_tags.append(f"PUMP!p{pid}")
+                except Exception as play_err:
+                    logger.error(
+                        f"Pump signal error (play={play_config.get('play_id')}): {play_err}",
+                        exc_info=True,
+                    )
+                    _stats.errors += 1
+
         except Exception as pump_err:
-            logger.error(f"Pump signal error: {pump_err}", exc_info=True)
+            logger.error(f"Pump signal module error: {pump_err}", exc_info=True)
             _stats.errors += 1
 
-    # 5. Fast-path readiness (skip normal wait if something is happening)
+    elif PUMP_PLAY_IDS:
+        # Play configs not yet loaded — will retry next cycle
+        logger.debug("Pump play configs not loaded yet — skipping signal check")
+
+    # 6. Fast-path readiness (skip normal wait if something is happening)
     readiness_triggered = False
     try:
         from pump_signal_logic import should_trigger_fast_path
@@ -256,20 +377,22 @@ def run_training_cycle() -> bool:
     except Exception:
         pass
 
-    cycle_ms = round((time.time() - cycle_start) * 1000)
-    tags = []
-    if pump_fired:
-        tags.append("PUMP!")
+    tags = play_tags[:]
     if readiness_triggered:
         tags.append("READY!")
     try:
-        if PUMP_OBSERVATION_MODE:  # type: ignore[name-defined]
+        from pump_signal_logic import PUMP_OBSERVATION_MODE  # type: ignore[attr-defined]
+        if PUMP_OBSERVATION_MODE:
             tags.append("[OBS]")
-    except NameError:
+    except Exception:
         pass
 
     tag_str = " ".join(tags)
-    logger.info(f"✓ ${market_price:.2f} cycle={price_cycle} [{cycle_ms}ms]{' ' + tag_str if tag_str else ''}")
+    n_plays = len(_pump_play_configs)
+    logger.info(
+        f"✓ ${market_price:.2f} cycle={price_cycle} plays={n_plays}"
+        + (f" {tag_str}" if tag_str else "")
+    )
 
     return True
 
@@ -279,11 +402,14 @@ def run_continuous_training(interval_seconds: Optional[int] = None) -> None:
     interval = interval_seconds or TRAINING_INTERVAL_SECONDS
 
     logger.info("=" * 70)
-    logger.info("PUMP SIGNAL DETECTOR STARTED")
+    logger.info("PUMP SIGNAL DETECTOR STARTED (multi-play)")
     logger.info(f"  Interval:          {interval}s")
-    logger.info(f"  Pump play ID:      {PUMP_SIGNAL_PLAY_ID}")
+    logger.info(f"  Pump play IDs:     {PUMP_PLAY_IDS}")
     logger.info(f"  Max Parquet age:   {MAX_PARQUET_AGE_SECONDS}s")
     logger.info("=" * 70)
+
+    # Pre-load play configs before first cycle
+    maybe_refresh_play_configs()
 
     while True:
         try:
@@ -313,13 +439,20 @@ def run_continuous_training(interval_seconds: Optional[int] = None) -> None:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run pump signal detector")
+    parser = argparse.ArgumentParser(description="Run pump signal detector (multi-play)")
     parser.add_argument("--interval", type=int, default=TRAINING_INTERVAL_SECONDS,
                         help="Interval between cycles (seconds)")
     parser.add_argument("--once", action="store_true", help="Run single cycle and exit")
+    parser.add_argument("--plays", type=str, default=None,
+                        help="Comma-separated play IDs to run (overrides PUMP_SIGNAL_PLAY_IDS)")
     args = parser.parse_args()
 
+    if args.plays:
+        PUMP_PLAY_IDS.clear()
+        PUMP_PLAY_IDS.extend(int(x.strip()) for x in args.plays.split(",") if x.strip())
+
     if args.once:
+        maybe_refresh_play_configs()
         success = run_training_cycle()
         sys.exit(0 if success else 1)
     else:

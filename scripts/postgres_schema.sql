@@ -1060,6 +1060,42 @@ CREATE INDEX IF NOT EXISTS idx_sim_results_daily_ev ON simulation_results (daily
 CREATE INDEX IF NOT EXISTS idx_sim_results_created  ON simulation_results (created_at DESC);
 
 -- =============================================================================
+-- PUMP SIGNAL PLAYS — seed rows (idempotent, keyed on name)
+-- =============================================================================
+-- Play 4: Aggressive — lower win_rate bar, tighter exit tolerances, 60s cooldown
+INSERT INTO follow_the_goat_plays (name, description, is_active, max_buys_per_cycle, pattern_validator, sell_logic)
+SELECT
+    'Pump Aggressive',
+    'Aggressive pump signal play. Lower win-rate threshold (55%) allows more signals; tighter trailing stops lock in gains quickly. Tests whether higher signal frequency outweighs lower precision.',
+    1,
+    1,
+    '{"sim_filter": {"win_rate_min": 0.55, "oos_gap_max": 0.008, "daily_ev_min": 0.0, "n_signals_min": 10, "cooldown_seconds": 60}}'::jsonb,
+    '{"tolerance_rules": {"decreases": [{"range": [-999999, 0], "tolerance": 0.0015}], "increases": [{"range": [0.0, 0.003], "tolerance": 0.0015}, {"range": [0.003, 0.006], "tolerance": 0.0008}, {"range": [0.006, 1.0], "tolerance": 0.0005}]}}'::jsonb
+WHERE NOT EXISTS (SELECT 1 FROM follow_the_goat_plays WHERE name = 'Pump Aggressive');
+
+-- Play 5: Conservative — high win_rate bar, looser exits to let winners run, 180s cooldown
+INSERT INTO follow_the_goat_plays (name, description, is_active, max_buys_per_cycle, pattern_validator, sell_logic)
+SELECT
+    'Pump Conservative',
+    'Conservative pump signal play. Stricter win-rate threshold (75%) with low OOS gap requirement ensures only the most reliable simulator rules fire. Looser trailing stops let winning trades run longer.',
+    1,
+    1,
+    '{"sim_filter": {"win_rate_min": 0.75, "oos_gap_max": 0.002, "daily_ev_min": 0.0, "n_signals_min": 10, "cooldown_seconds": 180}}'::jsonb,
+    '{"tolerance_rules": {"decreases": [{"range": [-999999, 0], "tolerance": 0.0020}], "increases": [{"range": [0.0, 0.003], "tolerance": 0.0030}, {"range": [0.003, 0.006], "tolerance": 0.0018}, {"range": [0.006, 1.0], "tolerance": 0.0008}]}}'::jsonb
+WHERE NOT EXISTS (SELECT 1 FROM follow_the_goat_plays WHERE name = 'Pump Conservative');
+
+-- Play 6: High-EV — same win_rate as balanced but requires meaningful daily EV floor (0.002)
+INSERT INTO follow_the_goat_plays (name, description, is_active, max_buys_per_cycle, pattern_validator, sell_logic)
+SELECT
+    'Pump High-EV',
+    'High expected-value pump signal play. Filters simulator rules to only those with daily_ev >= 0.002 — ignores low-EV rules even if they generalise well. Medium tiered trailing stops balance capture vs ride.',
+    1,
+    1,
+    '{"sim_filter": {"win_rate_min": 0.65, "oos_gap_max": 0.004, "daily_ev_min": 0.002, "n_signals_min": 10, "cooldown_seconds": 120}}'::jsonb,
+    '{"tolerance_rules": {"decreases": [{"range": [-999999, 0], "tolerance": 0.0015}], "increases": [{"range": [0.0, 0.003], "tolerance": 0.0020}, {"range": [0.003, 0.006], "tolerance": 0.0010}, {"range": [0.006, 1.0], "tolerance": 0.0005}]}}'::jsonb
+WHERE NOT EXISTS (SELECT 1 FROM follow_the_goat_plays WHERE name = 'Pump High-EV');
+
+-- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================
 

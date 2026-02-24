@@ -30,7 +30,6 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import duckdb
 import numpy as np
 import pandas as pd
 
@@ -45,14 +44,14 @@ _REPORT_PATH = _CACHE_DIR / "pump_fingerprint_report.json"
 # CONSTANTS
 # =============================================================================
 
-DEFAULT_LOOKBACK_HOURS = 336  # 14 days
+DEFAULT_LOOKBACK_HOURS = 24  # 24 hours — matches PostgreSQL retention window
 
 # Labeling — same thresholds as pump_signal_logic.py
 MIN_PUMP_PCT = 0.2
 MAX_DRAWDOWN_PCT = 0.10
 FORWARD_WINDOW = 10
 EARLY_WINDOW = 4
-IMMEDIATE_DIP_MAX = -0.08
+IMMEDIATE_DIP_MAX = -0.12
 SUSTAINED_PCT = 0.10
 CRASH_GATE_5M = -0.3
 
@@ -68,8 +67,8 @@ HIGH_VOL_MIN_TARGET = 0.3    # require higher target in high-vol conditions
 
 # Combination discovery constraints
 MIN_COMBO_PRECISION = 0.45
-MIN_COMBO_SIGNALS = 5      # At least ~1x/day over 7 days
-MIN_PATTERN_OCCURRENCES = 3
+MIN_COMBO_SIGNALS = 5      # At least 5x/day over 24h window (n=3 was too noisy)
+MIN_PATTERN_OCCURRENCES = 2
 MIN_PATTERN_PRECISION = 0.50
 MIN_SINGLE_PRECISION = 0.45
 
@@ -90,6 +89,9 @@ ORDER_BOOK_FEATURES = [
     'ob_cumulative_imbalance_5m',
     'ob_imbalance_shift_1m',
     'ob_net_flow_5m',
+    # raw-cache features (mapped from core/raw_data_cache column names)
+    'ob_depth_ratio_velocity',
+    'ob_liquidity_score',
 ]
 
 TRANSACTION_FEATURES = [
@@ -102,6 +104,8 @@ TRANSACTION_FEATURES = [
     'tx_trade_intensity',
     'tx_large_trade_count',
     'tx_whale_volume_pct',
+    'tx_avg_trade_size',
+    'tx_trade_count',
 ]
 
 WHALE_FEATURES = [
@@ -111,6 +115,9 @@ WHALE_FEATURES = [
     'wh_flow_acceleration',
     'wh_cumulative_flow_5m',
     'wh_stealth_acc_score',
+    # raw-cache features
+    'wh_net_flow_sol',
+    'wh_movement_count',
 ]
 
 MOMENTUM_FEATURES = [
@@ -245,117 +252,70 @@ def deduplicate_signals(df: pd.DataFrame,
 # =============================================================================
 
 def load_trail_data(lookback_hours: int = DEFAULT_LOOKBACK_HOURS) -> Optional[pd.DataFrame]:
-    """Load trail data for fingerprint analysis.
+    """Load training data for fingerprint analysis from the raw Parquet cache.
 
-    Uses the existing DuckDB trail cache from pump_signal_logic.py with a
-    longer lookback window (168h vs 48h). Computes forward returns and
-    multi-tier labels.
+    Uses raw DuckDB cache (OB snapshots, trades, whale events) with pump labels
+    derived from cycle_tracker — the same source as the dashboard. This gives
+    60-90 pump events per 24h vs 2-4 from the old buyin-trail approach.
 
-    Returns DataFrame with features + forward returns + tier labels, or None.
+    Raises RuntimeError if Parquet files are missing or too small (< 50 KB),
+    which means backfill_raw_cache.py needs to be run first.
+
+    Returns DataFrame with features + is_pump column, or None on query failure.
     """
-    logger.info(f"Loading trail data (last {lookback_hours}h)...")
+    logger.info(f"Loading training data (last {lookback_hours}h) from raw cache...")
     t0 = time.time()
 
-    con: Optional[duckdb.DuckDBPyConnection] = None
-    try:
-        from pump_signal_logic import _sync_trail_cache
+    from core.raw_data_cache import load_training_data, OB_PARQUET
 
-        con = _sync_trail_cache(lookback_hours)
+    if not OB_PARQUET.exists() or OB_PARQUET.stat().st_size < 50_000:
+        raise RuntimeError(
+            f"Raw cache Parquet not ready: {OB_PARQUET} "
+            f"({'missing' if not OB_PARQUET.exists() else f'{OB_PARQUET.stat().st_size} bytes'}). "
+            "Run scripts/backfill_raw_cache.py first."
+        )
 
-        n_rows = con.execute("SELECT COUNT(*) FROM cached_trail").fetchone()[0]
-        n_buyins = con.execute(
-            "SELECT COUNT(DISTINCT buyin_id) FROM cached_trail"
-        ).fetchone()[0]
+    df = load_training_data(
+        lookback_hours = lookback_hours,
+        pump_threshold = MIN_PUMP_PCT,
+        window_min     = 5,
+        non_pump_ratio = 3,
+    )
 
-        if n_rows == 0:
-            logger.warning("Cache is empty after sync")
-            return None
-        logger.info(f"  Cache: {n_rows:,} trail rows, {n_buyins:,} buyins")
-
-        # Forward returns via LEAD()
-        lead_cols = []
-        for k in range(1, FORWARD_WINDOW + 1):
-            lead_cols.append(
-                f"(LEAD(pm_close_price, {k}) OVER w - pm_close_price) "
-                f"/ NULLIF(pm_close_price, 0) * 100 AS fwd_{k}m"
-            )
-        lead_sql = ",\n            ".join(lead_cols)
-
-        fwd_all = [f"fwd_{k}m" for k in range(1, FORWARD_WINDOW + 1)]
-        fwd_early = [f"fwd_{k}m" for k in range(1, EARLY_WINDOW + 1)]
-        fwd_imm = [f"fwd_{k}m" for k in range(1, min(3, FORWARD_WINDOW + 1))]
-
-        greatest_all = f"GREATEST({', '.join(fwd_all)})"
-        least_all = f"LEAST({', '.join(fwd_all)})"
-        greatest_early = f"GREATEST({', '.join(fwd_early)})"
-        least_imm = f"LEAST({', '.join(fwd_imm)})"
-        any_not_null = " OR ".join([f"{c} IS NOT NULL" for c in fwd_all])
-
-        con.execute(f"""
-            CREATE OR REPLACE TEMP TABLE fwd_returns AS
-            WITH base AS (
-                SELECT *,
-                    {lead_sql}
-                FROM cached_trail
-                WHERE pm_close_price IS NOT NULL AND pm_close_price > 0
-                WINDOW w AS (PARTITION BY buyin_id ORDER BY minute)
-            )
-            SELECT *,
-                CASE WHEN {any_not_null} THEN {greatest_all} ELSE NULL END AS max_fwd,
-                CASE WHEN {any_not_null} THEN {least_all}    ELSE NULL END AS min_fwd,
-                CASE WHEN {any_not_null} THEN {greatest_early} ELSE NULL END AS max_fwd_early,
-                CASE WHEN {any_not_null} THEN {least_imm}    ELSE NULL END AS min_fwd_imm
-            FROM base
-            WHERE ({any_not_null})
-        """)
-
-        # Single pump label with adaptive vol threshold (minute=0 only).
-        # Context filters eliminate dip bounces: a real pump starts from a
-        # stable or rising base, not from a -0.5% dip bouncing back 0.2%.
-        # In high volatility, require a higher target to avoid labeling
-        # normal fluctuations as pumps.
-        arrow_result = con.execute(f"""
-            SELECT *,
-                CASE
-                    WHEN max_fwd_early >= (
-                             CASE WHEN pm_realized_vol_1m IS NOT NULL
-                                       AND pm_realized_vol_1m > {HIGH_VOL_THRESHOLD}
-                                  THEN {HIGH_VOL_MIN_TARGET}
-                                  ELSE {MIN_PUMP_PCT}
-                             END
-                         )
-                         AND min_fwd > -{MAX_DRAWDOWN_PCT}
-                         AND min_fwd_imm > {IMMEDIATE_DIP_MAX}
-                         AND fwd_4m IS NOT NULL AND fwd_4m >= {SUSTAINED_PCT}
-                         AND (pm_price_change_5m IS NULL OR pm_price_change_5m > {CONTEXT_5M_MIN})
-                         AND (pm_price_change_1m IS NULL OR pm_price_change_1m > {CONTEXT_1M_MIN})
-                         AND (fwd_6m IS NULL OR fwd_6m >= {SUSTAINED_6M_MIN})
-                        THEN 1
-                    ELSE 0
-                END AS is_pump
-            FROM fwd_returns
-            WHERE max_fwd IS NOT NULL
-              AND minute = 0
-            ORDER BY followed_at, buyin_id
-        """).arrow()
-        df = arrow_result.read_all().to_pandas()
-
-        elapsed = time.time() - t0
-        n_pump = int(df['is_pump'].sum())
-        logger.info(f"  {len(df):,} entries in {elapsed:.1f}s  "
-                    f"(pumps: {n_pump}, non-pumps: {len(df) - n_pump})")
-
-        return df
-
-    except Exception as e:
-        logger.error(f"Data load error: {e}", exc_info=True)
+    if df is None or len(df) < 10:
+        logger.warning(f"Raw cache returned {'None' if df is None else len(df)} rows — too few to train")
         return None
-    finally:
-        if con is not None:
-            try:
-                con.close()
-            except Exception:
-                pass
+
+    # Rename raw-cache column names → names expected by the rest of the pipeline
+    col_map = {
+        'ob_avg_vol_imb':     'ob_volume_imbalance',
+        'ob_avg_depth_ratio': 'ob_depth_imbalance_ratio',
+        'ob_avg_spread_bps':  'ob_spread_bps',
+        'ob_imb_1m':          'ob_imbalance_shift_1m',
+        'ob_net_liq_change':  'ob_net_flow_5m',
+        'ob_bid_ask_ratio':   'ob_aggression_ratio',
+        'ob_imb_trend':       'ob_imbalance_velocity_30s',
+        'ob_depth_trend':     'ob_depth_ratio_velocity',
+        'ob_liq_accel':       'ob_liquidity_score',
+        'tr_buy_ratio':       'tx_buy_volume_pct',
+        'tr_large_ratio':     'tx_whale_volume_pct',
+        'tr_avg_size':        'tx_avg_trade_size',
+        'tr_buy_accel':       'tx_aggressive_buy_ratio',
+        'tr_n':               'tx_trade_count',
+        'wh_net_flow':        'wh_net_flow_sol',
+        'wh_inflow_ratio':    'wh_accumulation_ratio',
+        'wh_n':               'wh_movement_count',
+    }
+    df = df.rename(columns=col_map)
+
+    if 'followed_at' not in df.columns:
+        df['followed_at'] = df['event_time']
+
+    elapsed = time.time() - t0
+    n_p  = int(df['is_pump'].sum())
+    n_np = int((df['is_pump'] == 0).sum())
+    logger.info(f"  Raw cache: {n_p} pumps, {n_np} non-pumps in {elapsed:.1f}s")
+    return df
 
 
 # =============================================================================
@@ -1036,14 +996,15 @@ def compute_rule_quality(
 
     Components:
       - precision: overall hit rate (target: > 45%)
-      - signal_rate: independent signals per day (full credit at 1/day)
+      - signal_rate: independent signals per day (full credit at 3/day)
       - avg_gain: average gain on hits (target: > 0.3%)
       - robustness: worst-day precision (target: > 25%)
 
     Score = precision * min(avg_gain, 1.0) * robustness_factor * frequency_factor
 
-    Frequency: full credit at >= 1 signal/day. Hard zero below 0.5/day
-    (1 signal every 2 days is too sparse to trust).
+    Frequency: full credit at >= 3 signals/day. Hard zero below 1/day.
+    With 24h lookback and ~1,600 opportunities/day, a rule needs at least 3
+    fires to be considered reliably frequent.
 
     Returns dict with score and component breakdown.
     """
@@ -1051,10 +1012,10 @@ def compute_rule_quality(
     robustness_factor = min(max(worst_day_precision / 0.30, 0), 1.0)
     capped_gain = min(avg_gain, 1.0)
 
-    if signal_rate < 0.5:
+    if signal_rate < 1.0:
         frequency_factor = 0.0
     else:
-        frequency_factor = min(signal_rate / 1.0, 1.0)
+        frequency_factor = min(signal_rate / 3.0, 1.0)
 
     score = precision * capped_gain * robustness_factor * frequency_factor
     approved = score > MIN_QUALITY_SCORE and precision > MIN_QUALITY_PRECISION
@@ -1075,6 +1036,22 @@ def compute_rule_quality(
 # 1H: OUTPUT — Build and Write Report
 # =============================================================================
 
+def _classify_volume_regime(mean_intensity: float) -> str:
+    """Classify mean tx_trade_intensity into a volume regime label.
+
+    Thresholds based on typical SOL DEX activity:
+      low    < 0.8  — quiet market, low trade flow
+      medium 0.8–1.5 — normal conditions
+      high   >= 1.5 — elevated activity / volume surge
+    """
+    if mean_intensity < 0.8:
+        return "low"
+    elif mean_intensity < 1.5:
+        return "medium"
+    else:
+        return "high"
+
+
 def build_report(
     df: pd.DataFrame,
     feature_rankings: List[Dict[str, Any]],
@@ -1085,6 +1062,7 @@ def build_report(
     dedup_stats: Optional[Dict[str, int]] = None,
     combo_stress_results: Optional[List[Dict[str, Any]]] = None,
     pattern_stress_results: Optional[List[Dict[str, Any]]] = None,
+    volume_regime: str = "unknown",
 ) -> Dict[str, Any]:
     """Build the full fingerprint report dict with quality gating.
 
@@ -1191,6 +1169,7 @@ def build_report(
     report = {
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'lookback_hours': lookback_hours,
+        'volume_regime': volume_regime,
         'data_summary': {
             'total_entries': len(df),
             'n_pumps': n_pumps,
@@ -1239,6 +1218,215 @@ def write_report(report: Dict[str, Any]) -> Path:
 
 
 # =============================================================================
+# AI ANALYSIS — format run for LLM, call Claude, save to DB
+# =============================================================================
+
+_AI_SYSTEM_PROMPT = """You are a quantitative data scientist specialising in \
+high-frequency crypto pump signal detection on Solana DEX. Your job is to \
+analyse each fingerprint training run and give specific, actionable \
+recommendations to improve signal precision and recall.
+
+For each run, cover:
+- Which features are most and least predictive — and why
+- Whether the approved rules look statistically robust or fragile given the sample size
+- Specific threshold adjustments that could improve precision without cutting too many signals
+- Whether the current volume regime (low/medium/high) affects rule reliability
+- Any warning signs (too few pumps, low pump rate, high noise, fragile patterns)
+- One concrete next experiment to run (e.g. add/remove a feature, change a threshold, adjust MIN_COMBO_SIGNALS)
+
+Be direct and specific. Reference actual feature names, thresholds and numbers \
+from the data. Keep your response under 600 words."""
+
+
+def _format_report_for_llm(report: Dict[str, Any]) -> str:
+    """Format a fingerprint report into a compact LLM-readable text summary."""
+    lines: List[str] = []
+    ts = report.get('generated_at', 'unknown')
+    ds = report.get('data_summary', {})
+    lines.append(f"=== PUMP FINGERPRINT RUN — {ts} ===")
+    lines.append(
+        f"Lookback: {report.get('lookback_hours', '?')}h | "
+        f"Volume regime: {report.get('volume_regime', 'unknown')} | "
+        f"Data: {ds.get('total_entries', 0):,} rows | "
+        f"Pump rate: {ds.get('pump_rate_pct', 0):.2f}%"
+    )
+    lines.append(
+        f"Independent pumps: {ds.get('n_independent_pumps', ds.get('n_pumps', 0))} | "
+        f"Non-pumps: {ds.get('non_pumps', 0):,}"
+    )
+
+    # Top 5 features by separation
+    rankings = report.get('feature_rankings', [])
+    rule_eligible = [r for r in rankings if r.get('rule_eligible', True)]
+    top5 = sorted(rule_eligible, key=lambda r: abs(r.get('separation', 0)), reverse=True)[:5]
+    if top5:
+        lines.append("")
+        lines.append(f"TOP SIGNAL FEATURES (by pump/non-pump separation):")
+        for i, f in enumerate(top5, 1):
+            lines.append(
+                f"  {i}. {f['feature']}: sep={f.get('separation', 0):.3f}, "
+                f"pump_median={f.get('median_pump', 0):.3f}, "
+                f"non_pump_median={f.get('median_non_pump', 0):.3f}"
+            )
+
+    # Recommended rules
+    rules = report.get('recommended_rules', [])
+    lines.append("")
+    lines.append(f"RECOMMENDED RULES ({len(rules)} approved):")
+    if rules:
+        for r in rules:
+            src = r.get('source', '?').upper()
+            prec = r.get('expected_precision', r.get('precision', 0))
+            spd = r.get('expected_signals_per_day', r.get('signal_rate_per_day', 0))
+            gain = r.get('avg_gain_on_hit', r.get('avg_gain', 0))
+            qs = r.get('quality_score', 0)
+            n = r.get('n_signals_in_window', r.get('n_occurrences', '?'))
+            if src == 'COMBINATION':
+                conds = r.get('conditions', {})
+                cond_str = ' + '.join(
+                    f"{feat}{'>' if v.get('direction','above')=='above' else '<'}{v.get('threshold',0):.3f}"
+                    for feat, v in conds.items()
+                ) if isinstance(conds, dict) else str(conds)
+                lines.append(f"  [COMBO] {cond_str}")
+            else:
+                lines.append(f"  [CLUSTER] {r.get('pattern_label', r.get('label', '?'))}")
+            lines.append(
+                f"    Precision: {prec:.0%} | Signals/day: {spd:.1f} | "
+                f"Avg gain: {gain:.3f}% | Quality: {qs:.4f} | N: {n}"
+            )
+    else:
+        lines.append("  (none — system will fire zero signals this cycle)")
+
+    # Approved patterns
+    patterns = report.get('approved_patterns', [])
+    lines.append("")
+    lines.append(f"APPROVED PATTERNS ({len(patterns)}):")
+    for p in patterns:
+        lines.append(
+            f"  [CLUSTER] {p.get('label', '?')} — "
+            f"Precision: {p.get('precision', 0):.0%} | "
+            f"N={p.get('n_occurrences', '?')} | "
+            f"Avg gain: {p.get('avg_gain', 0):.3f}%"
+        )
+        ranges = p.get('feature_ranges', {})
+        if ranges:
+            range_strs = [f"{k}=[{v[0]:.3f},{v[1]:.3f}]" for k, v in list(ranges.items())[:4]]
+            lines.append(f"    Ranges: {', '.join(range_strs)}")
+
+    # Quality score summary
+    qs_list = report.get('quality_scores', [])
+    if qs_list:
+        approved_count = sum(1 for q in qs_list if q.get('approved', False))
+        lines.append("")
+        lines.append(
+            f"QUALITY GATING: {approved_count} of {len(qs_list)} candidates approved"
+        )
+        # Show top 3 rejected (to help diagnose what nearly passed)
+        rejected = sorted(
+            [q for q in qs_list if not q.get('approved', False)],
+            key=lambda q: q.get('quality_score', 0), reverse=True
+        )[:3]
+        if rejected:
+            lines.append("  Top rejected candidates:")
+            for q in rejected:
+                lines.append(
+                    f"    {q.get('source','?')} prec={q.get('precision',0):.0%} "
+                    f"rate={q.get('signal_rate_per_day',0):.1f}/day "
+                    f"score={q.get('quality_score',0):.4f}"
+                )
+
+    return "\n".join(lines)
+
+
+def _call_claude_analysis(llm_input: str) -> Tuple[str, str]:
+    """Call Claude with the formatted fingerprint report and return (response, model_name)."""
+    import os
+    import anthropic  # type: ignore[import-untyped]
+
+    api_key = os.getenv('claude_ai_api_key')
+    if not api_key:
+        raise ValueError("claude_ai_api_key not set in environment")
+
+    client = anthropic.Anthropic(api_key=api_key)
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        system=_AI_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": llm_input}],
+    )
+    response_text = message.content[0].text
+    return response_text, message.model
+
+
+def _save_fingerprint_run(
+    report: Dict[str, Any],
+    llm_input: str,
+    ai_summary: str,
+    ai_model: str,
+) -> None:
+    """Persist one fingerprint run (metrics + AI summary) to pump_fingerprint_runs."""
+    import sys as _sys
+    _project_root_str = str(_PROJECT_ROOT)
+    if _project_root_str not in _sys.path:
+        _sys.path.insert(0, _project_root_str)
+
+    from core.database import postgres_execute
+
+    ds = report.get('data_summary', {})
+    rules = report.get('recommended_rules', [])
+    patterns = report.get('approved_patterns', [])
+    combos = report.get('best_combinations', [])
+    rankings = report.get('feature_rankings', [])
+
+    top5_features = [
+        {
+            'feature': r['feature'],
+            'separation': round(r.get('separation', 0), 4),
+            'median_pump': round(r.get('median_pump', 0), 4),
+            'median_non_pump': round(r.get('median_non_pump', 0), 4),
+        }
+        for r in sorted(
+            [x for x in rankings if x.get('rule_eligible', True)],
+            key=lambda x: abs(x.get('separation', 0)), reverse=True
+        )[:5]
+    ]
+
+    postgres_execute(
+        """
+        INSERT INTO pump_fingerprint_runs (
+            lookback_hours, volume_regime,
+            n_total_entries, n_pumps, n_independent_pumps, pump_rate_pct,
+            n_recommended_rules, n_approved_patterns, n_combinations,
+            top_features, recommended_rules,
+            llm_input, ai_summary, ai_model
+        ) VALUES (
+            %s, %s,
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s, %s,
+            %s, %s, %s
+        )
+        """,
+        [
+            report.get('lookback_hours'),
+            report.get('volume_regime', 'unknown'),
+            ds.get('total_entries'),
+            ds.get('n_pumps'),
+            ds.get('n_independent_pumps', ds.get('n_pumps')),
+            ds.get('pump_rate_pct'),
+            len(rules),
+            len(patterns),
+            len(combos),
+            json.dumps(top5_features),
+            json.dumps(rules),
+            llm_input,
+            ai_summary,
+            ai_model,
+        ],
+    )
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -1269,8 +1457,8 @@ def run_fingerprint_analysis(
         return None
 
     n_pumps = int(df['is_pump'].sum())
-    if n_pumps < 5:
-        logger.error(f"Only {n_pumps} pumps found — need at least 5")
+    if n_pumps < 3:
+        logger.error(f"Only {n_pumps} pumps found — need at least 3")
         return None
 
     # Compute actual data span (may be less than requested lookback)
@@ -1287,9 +1475,17 @@ def run_fingerprint_analysis(
     df, dedup_stats = deduplicate_signals(df)
 
     n_pumps = int(df['is_pump'].sum())
-    if n_pumps < 5:
-        logger.error(f"Only {n_pumps} independent pumps after dedup — need at least 5")
+    if n_pumps < 3:
+        logger.error(f"Only {n_pumps} independent pumps after dedup — need at least 3")
         return None
+
+    # Compute volume regime from the 24h window before dedup filtering changes df
+    volume_regime = "unknown"
+    if 'tx_trade_intensity' in df.columns:
+        mean_intensity = float(df['tx_trade_intensity'].dropna().mean())
+        volume_regime = _classify_volume_regime(mean_intensity)
+        logger.info(f"  Volume regime: {volume_regime} "
+                    f"(mean tx_trade_intensity={mean_intensity:.3f})")
 
     # 1B: Feature separation (computes for all, flags dip proxies)
     feature_rankings = rank_features(df)
@@ -1329,6 +1525,7 @@ def run_fingerprint_analysis(
         dedup_stats=dedup_stats,
         combo_stress_results=combo_stress_results,
         pattern_stress_results=pattern_stress_results,
+        volume_regime=volume_regime,
     )
     write_report(report)
 
@@ -1339,6 +1536,20 @@ def run_fingerprint_analysis(
                 f"{len(best_combinations)} combos ({elapsed:.1f}s) ===")
     if n_rules == 0:
         logger.warning("=== No rules approved — system will fire zero signals ===")
+
+    # AI analysis: format run, call Claude, save to DB
+    # Runs after the fingerprint is complete so a failure never blocks signal delivery.
+    try:
+        llm_input = _format_report_for_llm(report)
+        logger.info("Calling Claude for AI analysis of this fingerprint run...")
+        ai_summary, ai_model = _call_claude_analysis(llm_input)
+        _save_fingerprint_run(report, llm_input, ai_summary, ai_model)
+        logger.info(
+            f"AI analysis saved to pump_fingerprint_runs "
+            f"({len(ai_summary)} chars, model={ai_model})"
+        )
+    except Exception as ai_err:
+        logger.warning(f"AI analysis skipped (non-fatal): {ai_err}")
 
     return report
 

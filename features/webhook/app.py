@@ -8,7 +8,7 @@ retries failing the pipeline.
 Architecture: PostgreSQL-only (no in-memory caching)
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 import logging
 from pathlib import Path
@@ -23,6 +23,16 @@ from features.webhook.parser import parse_timestamp
 from features.webhook.models import TradePayload, WhalePayload
 
 logger = logging.getLogger("webhook_api")
+
+# DuckDB raw cache — lazy singleton, failure never blocks the webhook
+_trade_cache = None
+
+def _get_trade_cache():
+    global _trade_cache
+    if _trade_cache is None:
+        from core.raw_data_cache import TradeCache
+        _trade_cache = TradeCache()
+    return _trade_cache
 
 # File logging for webhook (placed in project-level logs/)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -68,8 +78,8 @@ def _next_id(table: str) -> int:
 def _upsert_trade(payload: TradePayload) -> int:
     """Insert trade into PostgreSQL."""
     trade_id = payload.id or _next_id("sol_stablecoin_trades")
-    ts = parse_timestamp(payload.trade_timestamp) or datetime.utcnow()
-    created_at = datetime.utcnow()
+    ts = parse_timestamp(payload.trade_timestamp) or datetime.now(timezone.utc)
+    created_at = datetime.now(timezone.utc)
     
     # Write directly to PostgreSQL
     try:
@@ -108,16 +118,29 @@ def _upsert_trade(payload: TradePayload) -> int:
     except Exception as e:
         logger.error(f"Trade upsert failed for trade {trade_id}: {e}")
         raise
-    
+
+    # Dual-write to DuckDB raw cache (non-blocking)
+    try:
+        _get_trade_cache().append_trade(
+            ts         = ts,
+            sol_amount = float(payload.sol_amount or 0),
+            stable_amt = float(payload.stablecoin_amount or 0),
+            price      = float(payload.price or 0),
+            direction  = str(payload.direction or 'buy'),
+            is_perp    = payload.perp_direction is not None,
+        )
+    except Exception as de:
+        logger.debug(f"DuckDB trade write skipped: {de}")
+
     return trade_id
 
 
 def _upsert_whale(payload: WhalePayload) -> int:
     """Insert whale movement into PostgreSQL."""
     whale_id = payload.id or _next_id("whale_movements")
-    ts = parse_timestamp(payload.timestamp) or datetime.utcnow()
-    received_at = parse_timestamp(payload.received_at) or datetime.utcnow()
-    created_at = datetime.utcnow()
+    ts = parse_timestamp(payload.timestamp) or datetime.now(timezone.utc)
+    received_at = parse_timestamp(payload.received_at) or datetime.now(timezone.utc)
+    created_at = datetime.now(timezone.utc)
     
     # Write directly to PostgreSQL
     try:
@@ -176,7 +199,38 @@ def _upsert_whale(payload: WhalePayload) -> int:
     except Exception as e:
         logger.error(f"Whale upsert failed for whale {whale_id}: {e}")
         raise
-    
+
+    # Dual-write to DuckDB raw cache (non-blocking)
+    try:
+        # Convert string significance label to a 0-1 float score
+        _SIG_MAP = {'major': 1.0, 'significant': 0.7, 'minor': 0.3}
+        sig_raw = payload.movement_significance
+        if sig_raw is None:
+            sig = None
+        elif isinstance(sig_raw, (int, float)):
+            sig = float(sig_raw)
+        else:
+            sig = _SIG_MAP.get(str(sig_raw).lower(), 0.5)
+
+        # sol_change is signed (negative for sends); use absolute value — direction is tracked separately
+        sol_moved = abs(float(payload.sol_change or payload.abs_change or 0))
+
+        # Normalize QuickNode direction labels → canonical 'in' / 'out'
+        _DIR_NORM = {'receiving': 'in', 'buy': 'in', 'inflow': 'in',
+                     'sending': 'out', 'sell': 'out', 'outflow': 'out'}
+        dir_raw   = str(payload.direction or 'out').lower()
+        direction = _DIR_NORM.get(dir_raw, 'out')
+
+        _get_trade_cache().append_whale(
+            ts           = ts,
+            sol_moved    = sol_moved,
+            direction    = direction,
+            significance = sig,
+            pct_moved    = float(payload.percentage_moved or 0),
+        )
+    except Exception as de:
+        logger.warning(f"DuckDB whale write failed: {de}")
+
     return whale_id
 
 
@@ -240,6 +294,21 @@ def _ensure_list(payload: Union[Dict[str, Any], List[Dict[str, Any]]]) -> List[D
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
+
+
+@app.get("/health")
+async def health_live():
+    """
+    Liveness check: returns 200 with no DB dependency.
+    Use this for QuickNode/load balancers so streams are not terminated when DB is slow or temporarily down.
+    """
+    return {"status": "ok", "service": "webhook"}
+
+
+@app.get("/")
+async def root():
+    """Root GET for liveness; POST / is the webhook receiver."""
+    return {"status": "ok", "service": "webhook", "endpoints": ["POST /", "POST /webhook", "GET /health", "GET /webhook/health"]}
 
 
 @app.post("/")
@@ -367,7 +436,7 @@ async def webhook_health():
         
         return {
             "status": "ok",
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "postgresql": {
                 "trades": trades_count,
                 "whale_movements": whales_count,

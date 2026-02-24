@@ -1,19 +1,20 @@
 {
-  "generated_at": "2026-02-17T12:59:28.687341+00:00",
-  "lookback_hours": 24.302616709444447,
+  "generated_at": "2026-02-23T03:49:35.608242+00:00",
+  "lookback_hours": 23.393277311388886,
+  "volume_regime": "unknown",
   "data_summary": {
-    "total_entries": 144,
-    "n_pumps": 24,
-    "n_independent_pumps": 24,
-    "non_pumps": 120,
-    "pump_rate_pct": 16.67
+    "total_entries": 136,
+    "n_pumps": 46,
+    "n_independent_pumps": 46,
+    "non_pumps": 90,
+    "pump_rate_pct": 33.82
   },
   "deduplication_stats": {
-    "raw_pumps": 122,
-    "independent_pumps": 24,
-    "duplicates_removed": 98,
-    "raw_non_pumps": 17602,
-    "sampled_non_pumps": 120,
+    "raw_pumps": 181,
+    "independent_pumps": 46,
+    "duplicates_removed": 135,
+    "raw_non_pumps": 90,
+    "sampled_non_pumps": 90,
     "window_minutes": 10
   },
   "excluded_dip_proxies": {
@@ -36,267 +37,137 @@
   },
   "feature_rankings": [
     {
-      "feature": "pm_trend_strength_ema",
-      "separation": -1.4871,
-      "abs_separation": 1.4871,
-      "median_pump": -0.052598,
-      "median_non_pump": 0.004939,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": false
-    },
-    {
-      "feature": "tx_whale_volume_pct",
-      "separation": -0.7048,
-      "abs_separation": 0.7048,
-      "median_pump": 0.0,
-      "median_non_pump": 37.623153,
-      "n_pump_valid": 21,
-      "n_non_pump_valid": 114,
-      "rule_eligible": true
-    },
-    {
-      "feature": "pm_momentum_acceleration_1m",
-      "separation": 0.6625,
-      "abs_separation": 0.6625,
-      "median_pump": 0.085346,
-      "median_non_pump": 0.003321,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "tx_large_trade_count",
-      "separation": -0.5714,
-      "abs_separation": 0.5714,
-      "median_pump": 0.0,
-      "median_non_pump": 2.0,
-      "n_pump_valid": 21,
-      "n_non_pump_valid": 114,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_spread_velocity",
-      "separation": 0.5644,
-      "abs_separation": 0.5644,
-      "median_pump": 7e-06,
-      "median_non_pump": -1e-06,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "wh_flow_acceleration",
-      "separation": 0.4639,
-      "abs_separation": 0.4639,
-      "median_pump": 7.9e-05,
-      "median_non_pump": 1e-06,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "tx_trade_intensity",
-      "separation": -0.432,
-      "abs_separation": 0.432,
-      "median_pump": 0.30072,
-      "median_non_pump": 0.507661,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "wh_net_flow_ratio",
-      "separation": 0.3952,
-      "abs_separation": 0.3952,
-      "median_pump": -0.551206,
-      "median_non_pump": -0.771734,
-      "n_pump_valid": 22,
-      "n_non_pump_valid": 116,
-      "rule_eligible": true
-    },
-    {
-      "feature": "pm_price_change_1m",
-      "separation": -0.3819,
-      "abs_separation": 0.3819,
-      "median_pump": -0.022663,
-      "median_non_pump": -0.000919,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": false
-    },
-    {
-      "feature": "wh_accumulation_ratio",
-      "separation": 0.3651,
-      "abs_separation": 0.3651,
-      "median_pump": 0.291737,
-      "median_non_pump": 0.128839,
-      "n_pump_valid": 22,
-      "n_non_pump_valid": 116,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_imbalance_shift_1m",
-      "separation": 0.2297,
-      "abs_separation": 0.2297,
-      "median_pump": 0.018398,
-      "median_non_pump": -0.010634,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_aggression_ratio",
-      "separation": 0.1939,
-      "abs_separation": 0.1939,
-      "median_pump": 1.654265,
-      "median_non_pump": 1.166262,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_microprice_deviation",
-      "separation": -0.1478,
-      "abs_separation": 0.1478,
-      "median_pump": -0.02725,
-      "median_non_pump": -0.002605,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "tx_buy_sell_pressure",
-      "separation": 0.1196,
-      "abs_separation": 0.1196,
-      "median_pump": 0.087597,
-      "median_non_pump": 0.026888,
-      "n_pump_valid": 21,
-      "n_non_pump_valid": 114,
+      "feature": "tx_trade_count",
+      "separation": 0.6602,
+      "abs_separation": 0.6602,
+      "median_pump": 2295802.5,
+      "median_non_pump": 1196204.0,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 90,
       "rule_eligible": true
     },
     {
       "feature": "tx_buy_volume_pct",
-      "separation": 0.1196,
-      "abs_separation": 0.1196,
-      "median_pump": 54.379829,
-      "median_non_pump": 51.344401,
-      "n_pump_valid": 21,
-      "n_non_pump_valid": 114,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_depth_imbalance_ratio",
-      "separation": 0.1081,
-      "abs_separation": 0.1081,
-      "median_pump": 1.021872,
-      "median_non_pump": 0.974297,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "tx_cumulative_delta",
-      "separation": 0.1076,
-      "abs_separation": 0.1076,
-      "median_pump": 91637.342101,
-      "median_non_pump": -2231.161483,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_volume_imbalance",
-      "separation": 0.106,
-      "abs_separation": 0.106,
-      "median_pump": 0.010427,
-      "median_non_pump": -0.012247,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "wh_flow_velocity",
-      "separation": 0.0795,
-      "abs_separation": 0.0795,
-      "median_pump": 0.000421,
-      "median_non_pump": -0.000222,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_net_flow_5m",
-      "separation": -0.0702,
-      "abs_separation": 0.0702,
-      "median_pump": -2973.065,
-      "median_non_pump": -1506.18,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_spread_bps",
-      "separation": 0.0423,
-      "abs_separation": 0.0423,
-      "median_pump": 1.171686,
-      "median_non_pump": 1.170875,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_cumulative_imbalance_5m",
-      "separation": 0.0257,
-      "abs_separation": 0.0257,
-      "median_pump": 0.023449,
-      "median_non_pump": -0.001035,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "tx_cumulative_delta_5m",
-      "separation": -0.0113,
-      "abs_separation": 0.0113,
-      "median_pump": 48.762054,
-      "median_non_pump": 4238.142312,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_bid_depth_velocity",
-      "separation": 0.0,
-      "abs_separation": 0.0,
-      "median_pump": 0.0,
-      "median_non_pump": 0.0,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "ob_ask_depth_velocity",
-      "separation": 0.0,
-      "abs_separation": 0.0,
-      "median_pump": 0.0,
-      "median_non_pump": 0.0,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
+      "separation": -0.5197,
+      "abs_separation": 0.5197,
+      "median_pump": 0.505991,
+      "median_non_pump": 0.559438,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 88,
       "rule_eligible": true
     },
     {
       "feature": "ob_imbalance_velocity_30s",
-      "separation": 0.0,
-      "abs_separation": 0.0,
-      "median_pump": 0.000453,
-      "median_non_pump": -0.000537,
-      "n_pump_valid": 3,
-      "n_non_pump_valid": 1,
+      "separation": -0.3943,
+      "abs_separation": 0.3943,
+      "median_pump": -0.041524,
+      "median_non_pump": 0.005452,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
       "rule_eligible": true
     },
     {
-      "feature": "tx_volume_surge_ratio",
+      "feature": "ob_depth_ratio_velocity",
+      "separation": -0.3874,
+      "abs_separation": 0.3874,
+      "median_pump": -0.040203,
+      "median_non_pump": 0.003362,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_liquidity_score",
+      "separation": -0.254,
+      "abs_separation": 0.254,
+      "median_pump": -0.045065,
+      "median_non_pump": 0.009581,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_avg_trade_size",
+      "separation": 0.2259,
+      "abs_separation": 0.2259,
+      "median_pump": 18.323662,
+      "median_non_pump": 17.038391,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 88,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_aggression_ratio",
+      "separation": 0.2065,
+      "abs_separation": 0.2065,
+      "median_pump": 0.994016,
+      "median_non_pump": 0.809573,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_volume_imbalance",
+      "separation": 0.1744,
+      "abs_separation": 0.1744,
+      "median_pump": -0.04912,
+      "median_non_pump": -0.132195,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_depth_imbalance_ratio",
+      "separation": 0.149,
+      "abs_separation": 0.149,
+      "median_pump": -0.087554,
+      "median_non_pump": -0.181549,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_spread_bps",
+      "separation": 0.1012,
+      "abs_separation": 0.1012,
+      "median_pump": 1.201391,
+      "median_non_pump": 1.196582,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_net_flow_5m",
+      "separation": 0.0962,
+      "abs_separation": 0.0962,
+      "median_pump": -1494614.765072,
+      "median_non_pump": -9576587.454006,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "ob_imbalance_shift_1m",
+      "separation": 0.0885,
+      "abs_separation": 0.0885,
+      "median_pump": -0.102924,
+      "median_non_pump": -0.149905,
+      "n_pump_valid": 41,
+      "n_non_pump_valid": 90,
+      "rule_eligible": true
+    },
+    {
+      "feature": "tx_whale_volume_pct",
+      "separation": 0.07,
+      "abs_separation": 0.07,
+      "median_pump": 0.725629,
+      "median_non_pump": 0.717289,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 88,
+      "rule_eligible": true
+    },
+    {
+      "feature": "wh_accumulation_ratio",
       "separation": 0.0,
       "abs_separation": 0.0,
       "median_pump": 0.0,
@@ -306,105 +177,1109 @@
       "rule_eligible": true
     },
     {
-      "feature": "tx_aggressive_buy_ratio",
+      "feature": "wh_net_flow_sol",
       "separation": 0.0,
       "abs_separation": 0.0,
       "median_pump": 0.0,
       "median_non_pump": 0.0,
-      "n_pump_valid": 0,
-      "n_non_pump_valid": 0,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 90,
       "rule_eligible": true
     },
     {
-      "feature": "wh_cumulative_flow_5m",
+      "feature": "wh_movement_count",
       "separation": 0.0,
       "abs_separation": 0.0,
       "median_pump": 0.0,
       "median_non_pump": 0.0,
-      "n_pump_valid": 0,
-      "n_non_pump_valid": 0,
-      "rule_eligible": true
-    },
-    {
-      "feature": "wh_stealth_acc_score",
-      "separation": 0.0,
-      "abs_separation": 0.0,
-      "median_pump": 0.0,
-      "median_non_pump": 0.0,
-      "n_pump_valid": 24,
-      "n_non_pump_valid": 120,
-      "rule_eligible": true
-    },
-    {
-      "feature": "pm_price_velocity_30s",
-      "separation": 0.0,
-      "abs_separation": 0.0,
-      "median_pump": 0.000693,
-      "median_non_pump": 0.000712,
-      "n_pump_valid": 3,
-      "n_non_pump_valid": 1,
+      "n_pump_valid": 46,
+      "n_non_pump_valid": 90,
       "rule_eligible": true
     }
   ],
   "single_feature_thresholds": {
-    "ob_spread_velocity": {
-      "threshold": 1.6e-05,
-      "precision": 0.4667,
-      "recall": 0.2917,
-      "n_signals": 15,
+    "tx_trade_count": {
+      "threshold": 2387465.0,
+      "precision": 0.8148,
+      "recall": 0.4783,
+      "n_signals": 27,
+      "n_hits": 22,
+      "score": 0.5635,
+      "direction": "above"
+    },
+    "tx_buy_volume_pct": {
+      "threshold": 0.541449,
+      "precision": 0.4925,
+      "recall": 0.7174,
+      "n_signals": 67,
+      "n_hits": 33,
+      "score": 0.4172,
+      "direction": "below"
+    },
+    "ob_imbalance_velocity_30s": {
+      "threshold": -0.041683,
+      "precision": 0.5128,
+      "recall": 0.4878,
+      "n_signals": 39,
+      "n_hits": 20,
+      "score": 0.3582,
+      "direction": "below"
+    },
+    "ob_depth_ratio_velocity": {
+      "threshold": -0.026871,
+      "precision": 0.4615,
+      "recall": 0.5854,
+      "n_signals": 52,
+      "n_hits": 24,
+      "score": 0.3531,
+      "direction": "below"
+    },
+    "ob_liquidity_score": {
+      "threshold": -0.136019,
+      "precision": 0.5385,
+      "recall": 0.3415,
+      "n_signals": 26,
+      "n_hits": 14,
+      "score": 0.3146,
+      "direction": "below"
+    },
+    "ob_aggression_ratio": {
+      "threshold": 1.633382,
+      "precision": 0.5385,
+      "recall": 0.1707,
+      "n_signals": 13,
       "n_hits": 7,
-      "score": 0.252,
+      "score": 0.2225,
+      "direction": "above"
+    },
+    "ob_volume_imbalance": {
+      "threshold": 0.22321,
+      "precision": 0.4615,
+      "recall": 0.1463,
+      "n_signals": 13,
+      "n_hits": 6,
+      "score": 0.1766,
+      "direction": "above"
+    },
+    "ob_depth_imbalance_ratio": {
+      "threshold": 0.289075,
+      "precision": 0.4615,
+      "recall": 0.1463,
+      "n_signals": 13,
+      "n_hits": 6,
+      "score": 0.1766,
+      "direction": "above"
+    },
+    "ob_spread_bps": {
+      "threshold": 1.232874,
+      "precision": 0.8462,
+      "recall": 0.2683,
+      "n_signals": 13,
+      "n_hits": 11,
+      "score": 0.4383,
+      "direction": "above"
+    },
+    "ob_net_flow_5m": {
+      "threshold": 83827412.668907,
+      "precision": 0.7692,
+      "recall": 0.2439,
+      "n_signals": 13,
+      "n_hits": 10,
+      "score": 0.3799,
       "direction": "above"
     }
   },
-  "best_combinations": [],
+  "best_combinations": [
+    {
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct"
+      ],
+      "thresholds": [
+        2387465.0,
+        0.541449
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.9,
+      "n_signals": 20,
+      "n_hits": 18,
+      "score": 18.0,
+      "avg_gain_on_hit": 0.3109
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.026871
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.6923,
+      "n_signals": 26,
+      "n_hits": 18,
+      "score": 18.0,
+      "avg_gain_on_hit": 0.3596
+    },
+    {
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        -0.041683,
+        -0.026871
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.5667,
+      "n_signals": 30,
+      "n_hits": 17,
+      "score": 17.0,
+      "avg_gain_on_hit": 0.3821
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.041683
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.7273,
+      "n_signals": 22,
+      "n_hits": 16,
+      "score": 16.0,
+      "avg_gain_on_hit": 0.381
+    },
+    {
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        -0.041683,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.5833,
+      "n_signals": 24,
+      "n_hits": 14,
+      "score": 14.0,
+      "avg_gain_on_hit": 0.3839
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.041683,
+        -0.026871
+      ],
+      "directions": [
+        "below",
+        "below",
+        "below"
+      ],
+      "precision": 0.8235,
+      "n_signals": 17,
+      "n_hits": 14,
+      "score": 14.0,
+      "avg_gain_on_hit": 0.3953
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.026871
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.8571,
+      "n_signals": 14,
+      "n_hits": 12,
+      "score": 12.0,
+      "avg_gain_on_hit": 0.376
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_spread_bps"
+      ],
+      "thresholds": [
+        2387465.0,
+        1.232874
+      ],
+      "directions": [
+        "above",
+        "above"
+      ],
+      "precision": 0.8462,
+      "n_signals": 13,
+      "n_hits": 11,
+      "score": 11.0,
+      "avg_gain_on_hit": 0.3764
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.7857,
+      "n_signals": 14,
+      "n_hits": 11,
+      "score": 11.0,
+      "avg_gain_on_hit": 0.3613
+    },
+    {
+      "features": [
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        -0.026871,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below"
+      ],
+      "precision": 0.5789,
+      "n_signals": 19,
+      "n_hits": 11,
+      "score": 11.0,
+      "avg_gain_on_hit": 0.3734
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.041683,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below",
+        "below"
+      ],
+      "precision": 0.8462,
+      "n_signals": 13,
+      "n_hits": 11,
+      "score": 11.0,
+      "avg_gain_on_hit": 0.3613
+    },
+    {
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        -0.041683,
+        -0.026871,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below",
+        "below"
+      ],
+      "precision": 0.5789,
+      "n_signals": 19,
+      "n_hits": 11,
+      "score": 11.0,
+      "avg_gain_on_hit": 0.3734
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_imbalance_velocity_30s"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.041683
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.8333,
+      "n_signals": 12,
+      "n_hits": 10,
+      "score": 10.0,
+      "avg_gain_on_hit": 0.3914
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_net_flow_5m"
+      ],
+      "thresholds": [
+        2387465.0,
+        83827412.668907
+      ],
+      "directions": [
+        "above",
+        "above"
+      ],
+      "precision": 1.0,
+      "n_signals": 9,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.4314
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.136019
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.8182,
+      "n_signals": 11,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.4108
+    },
+    {
+      "features": [
+        "ob_spread_bps",
+        "tx_buy_volume_pct"
+      ],
+      "thresholds": [
+        1.232874,
+        0.541449
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.8182,
+      "n_signals": 11,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.3295
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_spread_bps",
+        "tx_buy_volume_pct"
+      ],
+      "thresholds": [
+        2387465.0,
+        1.232874,
+        0.541449
+      ],
+      "directions": [
+        "above",
+        "above",
+        "below"
+      ],
+      "precision": 0.8182,
+      "n_signals": 11,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.3295
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        2387465.0,
+        0.541449,
+        -0.026871
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 1.0,
+      "n_signals": 9,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.3314
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.041683,
+        -0.136019
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 0.9,
+      "n_signals": 10,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.4108
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        0.541449,
+        -0.026871,
+        -0.136019
+      ],
+      "directions": [
+        "below",
+        "below",
+        "below"
+      ],
+      "precision": 0.8182,
+      "n_signals": 11,
+      "n_hits": 9,
+      "score": 9.0,
+      "avg_gain_on_hit": 0.3792
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ],
+      "thresholds": [
+        2387465.0,
+        0.541449,
+        -0.041683
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 1.0,
+      "n_signals": 8,
+      "n_hits": 8,
+      "score": 8.0,
+      "avg_gain_on_hit": 0.3425
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.041683,
+        -0.026871
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 0.8,
+      "n_signals": 10,
+      "n_hits": 8,
+      "score": 8.0,
+      "avg_gain_on_hit": 0.3706
+    },
+    {
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_net_flow_5m"
+      ],
+      "thresholds": [
+        0.541449,
+        83827412.668907
+      ],
+      "directions": [
+        "below",
+        "above"
+      ],
+      "precision": 0.7778,
+      "n_signals": 9,
+      "n_hits": 7,
+      "score": 7.0,
+      "avg_gain_on_hit": 0.3291
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        2387465.0,
+        0.541449,
+        -0.136019
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 0.875,
+      "n_signals": 8,
+      "n_hits": 7,
+      "score": 7.0,
+      "avg_gain_on_hit": 0.3604
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        2387465.0,
+        -0.026871,
+        -0.136019
+      ],
+      "directions": [
+        "above",
+        "below",
+        "below"
+      ],
+      "precision": 0.875,
+      "n_signals": 8,
+      "n_hits": 7,
+      "score": 7.0,
+      "avg_gain_on_hit": 0.3925
+    },
+    {
+      "features": [
+        "ob_spread_bps",
+        "ob_imbalance_velocity_30s"
+      ],
+      "thresholds": [
+        1.232874,
+        -0.041683
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 1.0,
+      "n_signals": 6,
+      "n_hits": 6,
+      "score": 6.0,
+      "avg_gain_on_hit": 0.4225
+    },
+    {
+      "features": [
+        "ob_spread_bps",
+        "ob_liquidity_score"
+      ],
+      "thresholds": [
+        1.232874,
+        -0.136019
+      ],
+      "directions": [
+        "above",
+        "below"
+      ],
+      "precision": 0.8571,
+      "n_signals": 7,
+      "n_hits": 6,
+      "score": 6.0,
+      "avg_gain_on_hit": 0.4225
+    },
+    {
+      "features": [
+        "ob_aggression_ratio",
+        "ob_volume_imbalance"
+      ],
+      "thresholds": [
+        1.633382,
+        0.22321
+      ],
+      "directions": [
+        "above",
+        "above"
+      ],
+      "precision": 0.5,
+      "n_signals": 12,
+      "n_hits": 6,
+      "score": 6.0,
+      "avg_gain_on_hit": 0.4079
+    },
+    {
+      "features": [
+        "ob_aggression_ratio",
+        "ob_depth_imbalance_ratio"
+      ],
+      "thresholds": [
+        1.633382,
+        0.289075
+      ],
+      "directions": [
+        "above",
+        "above"
+      ],
+      "precision": 0.5455,
+      "n_signals": 11,
+      "n_hits": 6,
+      "score": 6.0,
+      "avg_gain_on_hit": 0.3761
+    },
+    {
+      "features": [
+        "tx_trade_count",
+        "ob_spread_bps",
+        "ob_imbalance_velocity_30s"
+      ],
+      "thresholds": [
+        2387465.0,
+        1.232874,
+        -0.041683
+      ],
+      "directions": [
+        "above",
+        "above",
+        "below"
+      ],
+      "precision": 1.0,
+      "n_signals": 6,
+      "n_hits": 6,
+      "score": 6.0,
+      "avg_gain_on_hit": 0.4225
+    }
+  ],
   "approved_patterns": [
     {
       "cluster_id": 0,
-      "label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
-      "description": "whale_volume_pct high + momentum_acceleration_1m high",
-      "n_occurrences": 7,
-      "n_pumps": 4,
-      "precision": 0.5714,
-      "avg_gain": 0.2253,
+      "label": "high_trade_count + low_buy_volume_pct + high_imbalance_velocity_30s",
+      "description": "trade_count high + buy_volume_pct low + imbalance_velocity_30s high",
+      "n_occurrences": 9,
+      "n_pumps": 9,
+      "precision": 1.0,
+      "avg_gain": 0.3176,
       "feature_ranges": {
-        "tx_whale_volume_pct": [
-          61.48649,
-          92.958967
+        "tx_trade_count": [
+          1987107.6,
+          14271492.0
         ],
-        "pm_momentum_acceleration_1m": [
-          0.075335,
-          0.181457
+        "tx_buy_volume_pct": [
+          0.400723,
+          0.490343
         ],
-        "tx_large_trade_count": [
-          2.0,
-          3.0
+        "ob_imbalance_velocity_30s": [
+          0.036921,
+          0.096291
         ],
-        "ob_spread_velocity": [
-          0.0,
-          2.1e-05
+        "ob_depth_ratio_velocity": [
+          0.028167,
+          0.184543
         ],
-        "wh_flow_acceleration": [
-          -0.000118,
-          0.000107
+        "ob_liquidity_score": [
+          0.094572,
+          0.244972
         ],
-        "tx_trade_intensity": [
-          0.092337,
-          0.260681
+        "tx_avg_trade_size": [
+          13.479442,
+          22.886698
         ],
-        "wh_net_flow_ratio": [
-          -1.0,
-          -0.401904
+        "ob_aggression_ratio": [
+          0.578619,
+          1.526056
         ],
-        "wh_accumulation_ratio": [
-          0.0,
-          0.43425
+        "ob_volume_imbalance": [
+          -0.292192,
+          0.17541
         ]
       },
       "cluster_features": [
-        "tx_whale_volume_pct",
-        "pm_momentum_acceleration_1m",
-        "tx_large_trade_count"
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 1,
+      "label": "high_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "description": "trade_count high + buy_volume_pct low + imbalance_velocity_30s low",
+      "n_occurrences": 8,
+      "n_pumps": 7,
+      "precision": 0.875,
+      "avg_gain": 0.3634,
+      "feature_ranges": {
+        "tx_trade_count": [
+          1903051.8,
+          14556650.2
+        ],
+        "tx_buy_volume_pct": [
+          0.439939,
+          0.498355
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.109771,
+          -0.04325
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.139679,
+          0.012238
+        ],
+        "ob_liquidity_score": [
+          -0.334591,
+          -0.041343
+        ],
+        "tx_avg_trade_size": [
+          15.511736,
+          26.23868
+        ],
+        "ob_aggression_ratio": [
+          0.401976,
+          1.860208
+        ],
+        "ob_volume_imbalance": [
+          -0.443632,
+          0.257977
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 2,
+      "label": "high_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "description": "trade_count high + imbalance_velocity_30s low",
+      "n_occurrences": 11,
+      "n_pumps": 7,
+      "precision": 0.6364,
+      "avg_gain": 0.367,
+      "feature_ranges": {
+        "tx_trade_count": [
+          2142352.0,
+          4258443.0
+        ],
+        "tx_buy_volume_pct": [
+          0.515341,
+          0.564024
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.245125,
+          -0.044722
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.222855,
+          -0.026855
+        ],
+        "ob_liquidity_score": [
+          -0.743675,
+          -0.053035
+        ],
+        "tx_avg_trade_size": [
+          17.086731,
+          26.42306
+        ],
+        "ob_aggression_ratio": [
+          0.405019,
+          1.989258
+        ],
+        "ob_volume_imbalance": [
+          -0.437456,
+          0.272572
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 3,
+      "label": "high_trade_count + low_buy_volume_pct + mid_imbalance_velocity_30s",
+      "description": "trade_count high + buy_volume_pct low",
+      "n_occurrences": 2,
+      "n_pumps": 1,
+      "precision": 0.5,
+      "avg_gain": 0.2418,
+      "feature_ranges": {
+        "tx_trade_count": [
+          2277146.7,
+          2400544.3
+        ],
+        "tx_buy_volume_pct": [
+          0.47007,
+          0.477023
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.010896,
+          0.008865
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.033138,
+          0.02339
+        ],
+        "ob_liquidity_score": [
+          -0.011239,
+          0.006602
+        ],
+        "tx_avg_trade_size": [
+          16.342667,
+          18.922148
+        ],
+        "ob_aggression_ratio": [
+          0.317044,
+          0.555099
+        ],
+        "ob_volume_imbalance": [
+          -0.533459,
+          -0.299855
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 4,
+      "label": "high_trade_count + mid_buy_volume_pct + high_imbalance_velocity_30s",
+      "description": "trade_count high + imbalance_velocity_30s high",
+      "n_occurrences": 4,
+      "n_pumps": 2,
+      "precision": 0.5,
+      "avg_gain": 0.2337,
+      "feature_ranges": {
+        "tx_trade_count": [
+          2280313.2,
+          12613518.4
+        ],
+        "tx_buy_volume_pct": [
+          0.508486,
+          0.551408
+        ],
+        "ob_imbalance_velocity_30s": [
+          0.032466,
+          0.073052
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.00826,
+          0.073675
+        ],
+        "ob_liquidity_score": [
+          0.036325,
+          0.073836
+        ],
+        "tx_avg_trade_size": [
+          12.040301,
+          22.478386
+        ],
+        "ob_aggression_ratio": [
+          0.355923,
+          1.306517
+        ],
+        "ob_volume_imbalance": [
+          -0.527026,
+          0.10679
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 5,
+      "label": "low_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "description": "trade_count low + buy_volume_pct low + imbalance_velocity_30s low",
+      "n_occurrences": 4,
+      "n_pumps": 2,
+      "precision": 0.5,
+      "avg_gain": 0.5054,
+      "feature_ranges": {
+        "tx_trade_count": [
+          664755.0,
+          1052721.2
+        ],
+        "tx_buy_volume_pct": [
+          0.338972,
+          0.445511
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.142197,
+          -0.042703
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.151289,
+          -0.054938
+        ],
+        "ob_liquidity_score": [
+          -0.228346,
+          -0.073998
+        ],
+        "tx_avg_trade_size": [
+          12.577619,
+          23.767981
+        ],
+        "ob_aggression_ratio": [
+          0.494534,
+          1.086617
+        ],
+        "ob_volume_imbalance": [
+          -0.363814,
+          0.024433
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 6,
+      "label": "mid_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "description": "buy_volume_pct low + imbalance_velocity_30s low",
+      "n_occurrences": 2,
+      "n_pumps": 1,
+      "precision": 0.5,
+      "avg_gain": 0.3579,
+      "feature_ranges": {
+        "tx_trade_count": [
+          1429353.0,
+          1782177.0
+        ],
+        "tx_buy_volume_pct": [
+          0.48183,
+          0.501679
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.175948,
+          -0.169299
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.114977,
+          -0.102193
+        ],
+        "ob_liquidity_score": [
+          -0.258903,
+          -0.190964
+        ],
+        "tx_avg_trade_size": [
+          13.511434,
+          18.63313
+        ],
+        "ob_aggression_ratio": [
+          0.495081,
+          0.789047
+        ],
+        "ob_volume_imbalance": [
+          -0.368371,
+          -0.1473
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ]
+    },
+    {
+      "cluster_id": 7,
+      "label": "mid_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "description": "imbalance_velocity_30s low",
+      "n_occurrences": 4,
+      "n_pumps": 2,
+      "precision": 0.5,
+      "avg_gain": 0.5167,
+      "feature_ranges": {
+        "tx_trade_count": [
+          1227351.3,
+          1535816.4
+        ],
+        "tx_buy_volume_pct": [
+          0.513655,
+          0.56062
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.107226,
+          -0.064325
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.077849,
+          -0.029556
+        ],
+        "ob_liquidity_score": [
+          -0.110774,
+          -0.057466
+        ],
+        "tx_avg_trade_size": [
+          9.610137,
+          23.314328
+        ],
+        "ob_aggression_ratio": [
+          0.272377,
+          0.522059
+        ],
+        "ob_volume_imbalance": [
+          -0.579472,
+          -0.334077
+        ]
+      },
+      "cluster_features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
       ]
     }
   ],
@@ -415,13 +1290,431 @@
   "quality_scores": [
     {
       "rule_id": 1,
-      "source": "cluster",
-      "pattern_label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
-      "quality_score": 0.1287,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct"
+      ],
+      "quality_score": 0.2798,
       "approved": true,
-      "precision": 0.5714,
-      "signal_rate_per_day": 6.91,
-      "avg_gain": 0.2253,
+      "precision": 0.9,
+      "signal_rate_per_day": 20.0,
+      "avg_gain": 0.3109,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 2,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity"
+      ],
+      "quality_score": 0.249,
+      "approved": true,
+      "precision": 0.6923,
+      "signal_rate_per_day": 26.0,
+      "avg_gain": 0.3596,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 3,
+      "source": "combination",
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity"
+      ],
+      "quality_score": 0.2165,
+      "approved": true,
+      "precision": 0.5667,
+      "signal_rate_per_day": 30.0,
+      "avg_gain": 0.3821,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 4,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s"
+      ],
+      "quality_score": 0.2771,
+      "approved": true,
+      "precision": 0.7273,
+      "signal_rate_per_day": 22.0,
+      "avg_gain": 0.381,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 5,
+      "source": "combination",
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.2239,
+      "approved": true,
+      "precision": 0.5833,
+      "signal_rate_per_day": 24.0,
+      "avg_gain": 0.3839,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 6,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity"
+      ],
+      "quality_score": 0.3255,
+      "approved": true,
+      "precision": 0.8235,
+      "signal_rate_per_day": 17.0,
+      "avg_gain": 0.3953,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 7,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_depth_ratio_velocity"
+      ],
+      "quality_score": 0.3223,
+      "approved": true,
+      "precision": 0.8571,
+      "signal_rate_per_day": 14.0,
+      "avg_gain": 0.376,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 8,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_spread_bps"
+      ],
+      "quality_score": 0.3185,
+      "approved": true,
+      "precision": 0.8462,
+      "signal_rate_per_day": 13.0,
+      "avg_gain": 0.3764,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 9,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.2839,
+      "approved": true,
+      "precision": 0.7857,
+      "signal_rate_per_day": 14.0,
+      "avg_gain": 0.3613,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 10,
+      "source": "combination",
+      "features": [
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.2162,
+      "approved": true,
+      "precision": 0.5789,
+      "signal_rate_per_day": 19.0,
+      "avg_gain": 0.3734,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 11,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.3057,
+      "approved": true,
+      "precision": 0.8462,
+      "signal_rate_per_day": 13.0,
+      "avg_gain": 0.3613,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 12,
+      "source": "combination",
+      "features": [
+        "ob_imbalance_velocity_30s",
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.2162,
+      "approved": true,
+      "precision": 0.5789,
+      "signal_rate_per_day": 19.0,
+      "avg_gain": 0.3734,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 13,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_imbalance_velocity_30s"
+      ],
+      "quality_score": 0.3262,
+      "approved": true,
+      "precision": 0.8333,
+      "signal_rate_per_day": 12.0,
+      "avg_gain": 0.3914,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 14,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_net_flow_5m"
+      ],
+      "quality_score": 0.4314,
+      "approved": true,
+      "precision": 1.0,
+      "signal_rate_per_day": 9.0,
+      "avg_gain": 0.4314,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 15,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.3361,
+      "approved": true,
+      "precision": 0.8182,
+      "signal_rate_per_day": 11.0,
+      "avg_gain": 0.4108,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 16,
+      "source": "combination",
+      "features": [
+        "ob_spread_bps",
+        "tx_buy_volume_pct"
+      ],
+      "quality_score": 0.2696,
+      "approved": true,
+      "precision": 0.8182,
+      "signal_rate_per_day": 11.0,
+      "avg_gain": 0.3295,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 17,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_spread_bps",
+        "tx_buy_volume_pct"
+      ],
+      "quality_score": 0.2696,
+      "approved": true,
+      "precision": 0.8182,
+      "signal_rate_per_day": 11.0,
+      "avg_gain": 0.3295,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 18,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity"
+      ],
+      "quality_score": 0.3314,
+      "approved": true,
+      "precision": 1.0,
+      "signal_rate_per_day": 9.0,
+      "avg_gain": 0.3314,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 19,
+      "source": "combination",
+      "features": [
+        "tx_trade_count",
+        "ob_imbalance_velocity_30s",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.3697,
+      "approved": true,
+      "precision": 0.9,
+      "signal_rate_per_day": 10.0,
+      "avg_gain": 0.4108,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 20,
+      "source": "combination",
+      "features": [
+        "tx_buy_volume_pct",
+        "ob_depth_ratio_velocity",
+        "ob_liquidity_score"
+      ],
+      "quality_score": 0.3103,
+      "approved": true,
+      "precision": 0.8182,
+      "signal_rate_per_day": 11.0,
+      "avg_gain": 0.3792,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 21,
+      "source": "cluster",
+      "pattern_label": "high_trade_count + low_buy_volume_pct + high_imbalance_velocity_30s",
+      "quality_score": 0.3176,
+      "approved": true,
+      "precision": 1.0,
+      "signal_rate_per_day": 9.0,
+      "avg_gain": 0.3176,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 22,
+      "source": "cluster",
+      "pattern_label": "high_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "quality_score": 0.318,
+      "approved": true,
+      "precision": 0.875,
+      "signal_rate_per_day": 8.0,
+      "avg_gain": 0.3634,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 23,
+      "source": "cluster",
+      "pattern_label": "high_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "quality_score": 0.2336,
+      "approved": true,
+      "precision": 0.6364,
+      "signal_rate_per_day": 11.0,
+      "avg_gain": 0.367,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 24,
+      "source": "cluster",
+      "pattern_label": "high_trade_count + low_buy_volume_pct + mid_imbalance_velocity_30s",
+      "quality_score": 0.0806,
+      "approved": true,
+      "precision": 0.5,
+      "signal_rate_per_day": 2.0,
+      "avg_gain": 0.2418,
+      "robustness_factor": 1.0,
+      "frequency_factor": 0.6667,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 25,
+      "source": "cluster",
+      "pattern_label": "high_trade_count + mid_buy_volume_pct + high_imbalance_velocity_30s",
+      "quality_score": 0.1168,
+      "approved": true,
+      "precision": 0.5,
+      "signal_rate_per_day": 4.0,
+      "avg_gain": 0.2337,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 26,
+      "source": "cluster",
+      "pattern_label": "low_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "quality_score": 0.2527,
+      "approved": true,
+      "precision": 0.5,
+      "signal_rate_per_day": 4.0,
+      "avg_gain": 0.5054,
+      "robustness_factor": 1.0,
+      "frequency_factor": 1.0,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 27,
+      "source": "cluster",
+      "pattern_label": "mid_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "quality_score": 0.1193,
+      "approved": true,
+      "precision": 0.5,
+      "signal_rate_per_day": 2.0,
+      "avg_gain": 0.3579,
+      "robustness_factor": 1.0,
+      "frequency_factor": 0.6667,
+      "worst_day_precision": 1.0
+    },
+    {
+      "rule_id": 28,
+      "source": "cluster",
+      "pattern_label": "mid_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "quality_score": 0.2584,
+      "approved": true,
+      "precision": 0.5,
+      "signal_rate_per_day": 4.0,
+      "avg_gain": 0.5167,
       "robustness_factor": 1.0,
       "frequency_factor": 1.0,
       "worst_day_precision": 1.0
@@ -430,48 +1723,798 @@
   "recommended_rules": [
     {
       "rule_id": 1,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.9,
+      "expected_signals_per_day": 20.5,
+      "n_signals_in_window": 20,
+      "avg_gain_on_hit": 0.3109,
+      "source": "combination",
+      "quality_score": 0.2798,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 2,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.6923,
+      "expected_signals_per_day": 26.7,
+      "n_signals_in_window": 26,
+      "avg_gain_on_hit": 0.3596,
+      "source": "combination",
+      "quality_score": 0.249,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 3,
+      "conditions": {
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.5667,
+      "expected_signals_per_day": 30.8,
+      "n_signals_in_window": 30,
+      "avg_gain_on_hit": 0.3821,
+      "source": "combination",
+      "quality_score": 0.2165,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 4,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.7273,
+      "expected_signals_per_day": 22.6,
+      "n_signals_in_window": 22,
+      "avg_gain_on_hit": 0.381,
+      "source": "combination",
+      "quality_score": 0.2771,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 5,
+      "conditions": {
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.5833,
+      "expected_signals_per_day": 24.6,
+      "n_signals_in_window": 24,
+      "avg_gain_on_hit": 0.3839,
+      "source": "combination",
+      "quality_score": 0.2239,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 6,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8235,
+      "expected_signals_per_day": 17.4,
+      "n_signals_in_window": 17,
+      "avg_gain_on_hit": 0.3953,
+      "source": "combination",
+      "quality_score": 0.3255,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 7,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8571,
+      "expected_signals_per_day": 14.4,
+      "n_signals_in_window": 14,
+      "avg_gain_on_hit": 0.376,
+      "source": "combination",
+      "quality_score": 0.3223,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 8,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_spread_bps": {
+          "threshold": 1.232874,
+          "direction": "above"
+        }
+      },
+      "expected_precision": 0.8462,
+      "expected_signals_per_day": 13.3,
+      "n_signals_in_window": 13,
+      "avg_gain_on_hit": 0.3764,
+      "source": "combination",
+      "quality_score": 0.3185,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 9,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.7857,
+      "expected_signals_per_day": 14.4,
+      "n_signals_in_window": 14,
+      "avg_gain_on_hit": 0.3613,
+      "source": "combination",
+      "quality_score": 0.2839,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 10,
+      "conditions": {
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.5789,
+      "expected_signals_per_day": 19.5,
+      "n_signals_in_window": 19,
+      "avg_gain_on_hit": 0.3734,
+      "source": "combination",
+      "quality_score": 0.2162,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 11,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8462,
+      "expected_signals_per_day": 13.3,
+      "n_signals_in_window": 13,
+      "avg_gain_on_hit": 0.3613,
+      "source": "combination",
+      "quality_score": 0.3057,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 12,
+      "conditions": {
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.5789,
+      "expected_signals_per_day": 19.5,
+      "n_signals_in_window": 19,
+      "avg_gain_on_hit": 0.3734,
+      "source": "combination",
+      "quality_score": 0.2162,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 13,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8333,
+      "expected_signals_per_day": 12.3,
+      "n_signals_in_window": 12,
+      "avg_gain_on_hit": 0.3914,
+      "source": "combination",
+      "quality_score": 0.3262,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 14,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_net_flow_5m": {
+          "threshold": 83827412.668907,
+          "direction": "above"
+        }
+      },
+      "expected_precision": 1.0,
+      "expected_signals_per_day": 9.2,
+      "n_signals_in_window": 9,
+      "avg_gain_on_hit": 0.4314,
+      "source": "combination",
+      "quality_score": 0.4314,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 15,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8182,
+      "expected_signals_per_day": 11.3,
+      "n_signals_in_window": 11,
+      "avg_gain_on_hit": 0.4108,
+      "source": "combination",
+      "quality_score": 0.3361,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 16,
+      "conditions": {
+        "ob_spread_bps": {
+          "threshold": 1.232874,
+          "direction": "above"
+        },
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8182,
+      "expected_signals_per_day": 11.3,
+      "n_signals_in_window": 11,
+      "avg_gain_on_hit": 0.3295,
+      "source": "combination",
+      "quality_score": 0.2696,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 17,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_spread_bps": {
+          "threshold": 1.232874,
+          "direction": "above"
+        },
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8182,
+      "expected_signals_per_day": 11.3,
+      "n_signals_in_window": 11,
+      "avg_gain_on_hit": 0.3295,
+      "source": "combination",
+      "quality_score": 0.2696,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 18,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 1.0,
+      "expected_signals_per_day": 9.2,
+      "n_signals_in_window": 9,
+      "avg_gain_on_hit": 0.3314,
+      "source": "combination",
+      "quality_score": 0.3314,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 19,
+      "conditions": {
+        "tx_trade_count": {
+          "threshold": 2387465.0,
+          "direction": "above"
+        },
+        "ob_imbalance_velocity_30s": {
+          "threshold": -0.041683,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.9,
+      "expected_signals_per_day": 10.3,
+      "n_signals_in_window": 10,
+      "avg_gain_on_hit": 0.4108,
+      "source": "combination",
+      "quality_score": 0.3697,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 20,
+      "conditions": {
+        "tx_buy_volume_pct": {
+          "threshold": 0.541449,
+          "direction": "below"
+        },
+        "ob_depth_ratio_velocity": {
+          "threshold": -0.026871,
+          "direction": "below"
+        },
+        "ob_liquidity_score": {
+          "threshold": -0.136019,
+          "direction": "below"
+        }
+      },
+      "expected_precision": 0.8182,
+      "expected_signals_per_day": 11.3,
+      "n_signals_in_window": 11,
+      "avg_gain_on_hit": 0.3792,
+      "source": "combination",
+      "quality_score": 0.3103,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 21,
       "pattern_id": 0,
-      "pattern_label": "high_whale_volume_pct + high_momentum_acceleration_1m + mid_large_trade_count",
+      "pattern_label": "high_trade_count + low_buy_volume_pct + high_imbalance_velocity_30s",
       "feature_ranges": {
-        "tx_whale_volume_pct": [
-          61.48649,
-          92.958967
+        "tx_trade_count": [
+          1987107.6,
+          14271492.0
         ],
-        "pm_momentum_acceleration_1m": [
-          0.075335,
-          0.181457
+        "tx_buy_volume_pct": [
+          0.400723,
+          0.490343
         ],
-        "tx_large_trade_count": [
-          2.0,
-          3.0
+        "ob_imbalance_velocity_30s": [
+          0.036921,
+          0.096291
         ],
-        "ob_spread_velocity": [
-          0.0,
-          2.1e-05
+        "ob_depth_ratio_velocity": [
+          0.028167,
+          0.184543
         ],
-        "wh_flow_acceleration": [
-          -0.000118,
-          0.000107
+        "ob_liquidity_score": [
+          0.094572,
+          0.244972
         ],
-        "tx_trade_intensity": [
-          0.092337,
-          0.260681
+        "tx_avg_trade_size": [
+          13.479442,
+          22.886698
         ],
-        "wh_net_flow_ratio": [
-          -1.0,
-          -0.401904
+        "ob_aggression_ratio": [
+          0.578619,
+          1.526056
         ],
-        "wh_accumulation_ratio": [
-          0.0,
-          0.43425
+        "ob_volume_imbalance": [
+          -0.292192,
+          0.17541
         ]
       },
-      "expected_precision": 0.5714,
-      "expected_signals_per_day": 6.9,
-      "n_signals_in_window": 7,
-      "avg_gain_on_hit": 0.2253,
+      "expected_precision": 1.0,
+      "expected_signals_per_day": 9.2,
+      "n_signals_in_window": 9,
+      "avg_gain_on_hit": 0.3176,
       "source": "cluster",
-      "quality_score": 0.1287,
+      "quality_score": 0.3176,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 22,
+      "pattern_id": 1,
+      "pattern_label": "high_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          1903051.8,
+          14556650.2
+        ],
+        "tx_buy_volume_pct": [
+          0.439939,
+          0.498355
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.109771,
+          -0.04325
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.139679,
+          0.012238
+        ],
+        "ob_liquidity_score": [
+          -0.334591,
+          -0.041343
+        ],
+        "tx_avg_trade_size": [
+          15.511736,
+          26.23868
+        ],
+        "ob_aggression_ratio": [
+          0.401976,
+          1.860208
+        ],
+        "ob_volume_imbalance": [
+          -0.443632,
+          0.257977
+        ]
+      },
+      "expected_precision": 0.875,
+      "expected_signals_per_day": 8.2,
+      "n_signals_in_window": 8,
+      "avg_gain_on_hit": 0.3634,
+      "source": "cluster",
+      "quality_score": 0.318,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 23,
+      "pattern_id": 2,
+      "pattern_label": "high_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          2142352.0,
+          4258443.0
+        ],
+        "tx_buy_volume_pct": [
+          0.515341,
+          0.564024
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.245125,
+          -0.044722
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.222855,
+          -0.026855
+        ],
+        "ob_liquidity_score": [
+          -0.743675,
+          -0.053035
+        ],
+        "tx_avg_trade_size": [
+          17.086731,
+          26.42306
+        ],
+        "ob_aggression_ratio": [
+          0.405019,
+          1.989258
+        ],
+        "ob_volume_imbalance": [
+          -0.437456,
+          0.272572
+        ]
+      },
+      "expected_precision": 0.6364,
+      "expected_signals_per_day": 11.3,
+      "n_signals_in_window": 11,
+      "avg_gain_on_hit": 0.367,
+      "source": "cluster",
+      "quality_score": 0.2336,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 24,
+      "pattern_id": 3,
+      "pattern_label": "high_trade_count + low_buy_volume_pct + mid_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          2277146.7,
+          2400544.3
+        ],
+        "tx_buy_volume_pct": [
+          0.47007,
+          0.477023
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.010896,
+          0.008865
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.033138,
+          0.02339
+        ],
+        "ob_liquidity_score": [
+          -0.011239,
+          0.006602
+        ],
+        "tx_avg_trade_size": [
+          16.342667,
+          18.922148
+        ],
+        "ob_aggression_ratio": [
+          0.317044,
+          0.555099
+        ],
+        "ob_volume_imbalance": [
+          -0.533459,
+          -0.299855
+        ]
+      },
+      "expected_precision": 0.5,
+      "expected_signals_per_day": 2.1,
+      "n_signals_in_window": 2,
+      "avg_gain_on_hit": 0.2418,
+      "source": "cluster",
+      "quality_score": 0.0806,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 25,
+      "pattern_id": 4,
+      "pattern_label": "high_trade_count + mid_buy_volume_pct + high_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          2280313.2,
+          12613518.4
+        ],
+        "tx_buy_volume_pct": [
+          0.508486,
+          0.551408
+        ],
+        "ob_imbalance_velocity_30s": [
+          0.032466,
+          0.073052
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.00826,
+          0.073675
+        ],
+        "ob_liquidity_score": [
+          0.036325,
+          0.073836
+        ],
+        "tx_avg_trade_size": [
+          12.040301,
+          22.478386
+        ],
+        "ob_aggression_ratio": [
+          0.355923,
+          1.306517
+        ],
+        "ob_volume_imbalance": [
+          -0.527026,
+          0.10679
+        ]
+      },
+      "expected_precision": 0.5,
+      "expected_signals_per_day": 4.1,
+      "n_signals_in_window": 4,
+      "avg_gain_on_hit": 0.2337,
+      "source": "cluster",
+      "quality_score": 0.1168,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 26,
+      "pattern_id": 5,
+      "pattern_label": "low_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          664755.0,
+          1052721.2
+        ],
+        "tx_buy_volume_pct": [
+          0.338972,
+          0.445511
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.142197,
+          -0.042703
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.151289,
+          -0.054938
+        ],
+        "ob_liquidity_score": [
+          -0.228346,
+          -0.073998
+        ],
+        "tx_avg_trade_size": [
+          12.577619,
+          23.767981
+        ],
+        "ob_aggression_ratio": [
+          0.494534,
+          1.086617
+        ],
+        "ob_volume_imbalance": [
+          -0.363814,
+          0.024433
+        ]
+      },
+      "expected_precision": 0.5,
+      "expected_signals_per_day": 4.1,
+      "n_signals_in_window": 4,
+      "avg_gain_on_hit": 0.5054,
+      "source": "cluster",
+      "quality_score": 0.2527,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 27,
+      "pattern_id": 6,
+      "pattern_label": "mid_trade_count + low_buy_volume_pct + low_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          1429353.0,
+          1782177.0
+        ],
+        "tx_buy_volume_pct": [
+          0.48183,
+          0.501679
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.175948,
+          -0.169299
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.114977,
+          -0.102193
+        ],
+        "ob_liquidity_score": [
+          -0.258903,
+          -0.190964
+        ],
+        "tx_avg_trade_size": [
+          13.511434,
+          18.63313
+        ],
+        "ob_aggression_ratio": [
+          0.495081,
+          0.789047
+        ],
+        "ob_volume_imbalance": [
+          -0.368371,
+          -0.1473
+        ]
+      },
+      "expected_precision": 0.5,
+      "expected_signals_per_day": 2.1,
+      "n_signals_in_window": 2,
+      "avg_gain_on_hit": 0.3579,
+      "source": "cluster",
+      "quality_score": 0.1193,
+      "quality_approved": true
+    },
+    {
+      "rule_id": 28,
+      "pattern_id": 7,
+      "pattern_label": "mid_trade_count + mid_buy_volume_pct + low_imbalance_velocity_30s",
+      "feature_ranges": {
+        "tx_trade_count": [
+          1227351.3,
+          1535816.4
+        ],
+        "tx_buy_volume_pct": [
+          0.513655,
+          0.56062
+        ],
+        "ob_imbalance_velocity_30s": [
+          -0.107226,
+          -0.064325
+        ],
+        "ob_depth_ratio_velocity": [
+          -0.077849,
+          -0.029556
+        ],
+        "ob_liquidity_score": [
+          -0.110774,
+          -0.057466
+        ],
+        "tx_avg_trade_size": [
+          9.610137,
+          23.314328
+        ],
+        "ob_aggression_ratio": [
+          0.272377,
+          0.522059
+        ],
+        "ob_volume_imbalance": [
+          -0.579472,
+          -0.334077
+        ]
+      },
+      "expected_precision": 0.5,
+      "expected_signals_per_day": 4.1,
+      "n_signals_in_window": 4,
+      "avg_gain_on_hit": 0.5167,
+      "source": "cluster",
+      "quality_score": 0.2584,
       "quality_approved": true
     }
   ]

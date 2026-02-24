@@ -16,6 +16,8 @@ build/
 # DuckDB databases
 *.duckdb
 *.duckdb.wal
+*.block
+.tmp/
 
 # .NET build artifacts
 *.dll

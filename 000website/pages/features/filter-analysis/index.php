@@ -1,9 +1,9 @@
 <?php
 /**
  * Filter Analysis Dashboard - View auto-generated filter suggestions with historical tracking
- * Migrated from: 000old_code/solana_node/v2/filter-analizes/index.php
- * 
- * Uses DuckDB API for data operations
+ *
+ * Data source: raw OB/trade/whale Parquet cache + follow_the_goat_buyins outcomes
+ * Features are computed from raw market microstructure (same pipeline as pump analytics)
  */
 
 // --- Database API Client ---
@@ -347,8 +347,20 @@ ob_start();
             </ol>
         </nav>
         <h1 class="page-title fw-medium fs-18 mb-0">Filter Analysis Dashboard</h1>
+        <?php
+        // Show raw cache status inline
+        $ob_parquet = '/root/follow_the_goat/cache/ob_latest.parquet';
+        if (file_exists($ob_parquet)) {
+            $age = time() - filemtime($ob_parquet);
+            $age_class = $age < 5 ? 'success' : ($age < 30 ? 'warning' : 'danger');
+            echo '<span class="badge bg-' . $age_class . '-transparent fs-10 me-2">Raw cache: OB ' . $age . 's ago</span>';
+        } else {
+            echo '<span class="badge bg-danger-transparent fs-10 me-2">Raw cache: not populated</span>';
+        }
+        ?>
+        <span class="text-muted fs-11">Data source: raw OB/trade/whale Parquet + follow_the_goat_buyins</span>
         <?php if (!empty($summary['last_updated'])): ?>
-        <span class="text-muted fs-11">Data updated: <?php echo date('M j, Y g:i A', strtotime($summary['last_updated'])); ?></span>
+        <span class="text-muted fs-11"> &middot; Updated: <?php echo date('M j, Y g:i A', strtotime($summary['last_updated'])); ?></span>
         <?php endif; ?>
     </div>
     <div class="d-flex gap-2 align-items-center">

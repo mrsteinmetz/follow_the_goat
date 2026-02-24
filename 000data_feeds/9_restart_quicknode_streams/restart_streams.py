@@ -74,6 +74,37 @@ logger = logging.getLogger(__name__)
 # DATABASE OPERATIONS
 # =============================================================================
 
+def ensure_actions_table() -> bool:
+    """
+    Ensure the actions table exists (for cooldown and logging).
+    Safe to call every cycle; CREATE TABLE IF NOT EXISTS is idempotent.
+    """
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS actions (
+                        id BIGSERIAL PRIMARY KEY,
+                        event_type VARCHAR(100) NOT NULL,
+                        triggered_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        success BOOLEAN NOT NULL,
+                        error_message TEXT,
+                        metadata JSONB,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_actions_event_type ON actions(event_type)
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_actions_created_at ON actions(created_at)
+                """)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not ensure actions table: {e}")
+        return False
+
+
 def check_trade_latency() -> Optional[float]:
     """
     Check the average latency of recent trades.
@@ -156,7 +187,8 @@ def check_trade_staleness() -> Dict[str, Any]:
 
 def seconds_since_last_restart() -> Optional[float]:
     """
-    Return seconds since last successful stream restart, or None if no history.
+    Return seconds since last stream restart attempt (success or failure).
+    Used for cooldown to avoid hammering QuickNode API when restarts keep failing.
     """
     try:
         with get_postgres() as conn:
@@ -165,7 +197,7 @@ def seconds_since_last_restart() -> Optional[float]:
                     """
                     SELECT MAX(created_at) AS last_restart_at
                     FROM actions
-                    WHERE event_type = 'stream_restart' AND success = TRUE
+                    WHERE event_type = 'stream_restart'
                     """
                 )
                 row = cursor.fetchone() or {}
@@ -191,32 +223,20 @@ def log_action(
 ) -> bool:
     """
     Log an action to the actions table.
-    
-    Args:
-        event_type: Type of event (e.g., 'stream_restart')
-        success: Whether the action succeeded
-        error_message: Error details if failed
-        metadata: Additional event data (JSON)
-    
-    Returns:
-        True if logged successfully, False otherwise
+    If the table is missing or insert fails, logs a warning and returns False (does not raise).
     """
     try:
-        # Convert metadata dict to JSON string for PostgreSQL
         metadata_json = json.dumps(metadata) if metadata else None
-        
         with get_postgres() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     INSERT INTO actions (event_type, success, error_message, metadata)
                     VALUES (%s, %s, %s, %s::jsonb)
                 """, [event_type, success, error_message, metadata_json])
-                
         logger.debug(f"Logged action: {event_type} (success={success})")
         return True
-        
     except Exception as e:
-        logger.error(f"Error logging action: {e}", exc_info=True)
+        logger.warning(f"Could not log action to actions table: {e}")
         return False
 
 
@@ -232,6 +252,7 @@ def check_webhook_health() -> bool:
         True if webhook is healthy, False otherwise
     """
     try:
+        # Use /health (no DB) so we don't fail when DB is slow; stream restarts only need webhook process up
         response = requests.get("http://localhost:8001/health", timeout=5)
         if response.status_code == 200:
             logger.info("✓ Webhook server is healthy")
@@ -415,14 +436,15 @@ def restart_stream(stream_id: str) -> Dict[str, Any]:
         }
 
 
-def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict[str, Any]:
+def restart_all_streams(trigger_seconds: float, reason: str = "latency", skip_webhook_check: bool = False) -> Dict[str, Any]:
     """
     Restart all configured QuickNode streams.
-    Checks webhook health first before attempting restart.
+    By default checks webhook health first; use skip_webhook_check=True for manual --force restarts.
     
     Args:
         trigger_seconds: The value that triggered the restart
-        reason: Reason for restart (latency, no_transactions, etc.)
+        reason: Reason for restart (latency, no_transactions, manual_force, etc.)
+        skip_webhook_check: If True, do not require webhook to be up (e.g. for manual recovery)
     
     Returns:
         Dict with overall success status and details
@@ -435,19 +457,21 @@ def restart_all_streams(trigger_seconds: float, reason: str = "latency") -> Dict
             'error': error_msg
         }
     
-    # CRITICAL: Check webhook health first
-    logger.info("Checking webhook server health before restarting streams...")
-    webhook_healthy = check_webhook_health()
-    
-    if not webhook_healthy:
-        error_msg = "Webhook server is not responding - cannot restart streams safely"
-        logger.error(f"❌ {error_msg}")
-        logger.error("   Please check if webhook_server component is running!")
-        return {
-            'success': False,
-            'error': error_msg,
-            'webhook_healthy': False
-        }
+    webhook_healthy = False
+    if not skip_webhook_check:
+        logger.info("Checking webhook server health before restarting streams...")
+        webhook_healthy = check_webhook_health()
+        if not webhook_healthy:
+            error_msg = "Webhook server is not responding - cannot restart streams safely"
+            logger.error(f"❌ {error_msg}")
+            logger.error("   Please check if webhook_server component is running! (Use --force to restart anyway)")
+            return {
+                'success': False,
+                'error': error_msg,
+                'webhook_healthy': False
+            }
+    else:
+        logger.warning("Skipping webhook check (--force). Ensure webhook_server is started so transactions can flow.")
     
     results = {}
     
@@ -490,6 +514,18 @@ def run_monitoring_cycle() -> Dict[str, Any]:
         Dict with cycle results
     """
     try:
+        # Skip if QuickNode is not configured (avoids spamming failed restarts)
+        if not QUICKNODE_API_KEY or not QUICKNODE_STREAM_1 or not QUICKNODE_STREAM_2:
+            logger.debug("QuickNode not configured (quicknode_key / quicknode_stream_1|2) - skipping monitor")
+            return {
+                'success': True,
+                'action_taken': False,
+                'reason': 'not_configured',
+            }
+
+        # Ensure actions table exists so cooldown and logging work
+        ensure_actions_table()
+
         # Cooldown guard (avoid restarting too frequently)
         last_restart_age = seconds_since_last_restart()
         if last_restart_age is not None and last_restart_age < RESTART_COOLDOWN_SECONDS:
@@ -652,7 +688,13 @@ def run_monitoring_cycle() -> Dict[str, Any]:
 def main():
     """
     Main entry point for standalone execution.
+    Use --force to restart streams immediately, bypassing cooldown and webhook check (e.g. no transactions for a long time).
     """
+    import argparse
+    parser = argparse.ArgumentParser(description="QuickNode stream latency monitor and restart")
+    parser.add_argument("--force", action="store_true", help="Restart streams now, skip cooldown and webhook check")
+    args = parser.parse_args()
+
     logger.info("Starting QuickNode stream monitoring cycle...")
     
     # Verify configuration
@@ -669,6 +711,26 @@ def main():
     logger.info(f"  - Sample size: {TRADES_SAMPLE_SIZE} trades")
     logger.info(f"  - Stream 1: {QUICKNODE_STREAM_1}")
     logger.info(f"  - Stream 2: {QUICKNODE_STREAM_2}")
+    
+    if args.force:
+        logger.info("--force: restarting streams now (skip cooldown and webhook check)")
+        ensure_actions_table()
+        result = restart_all_streams(3840.0, reason="manual_force", skip_webhook_check=True)
+        log_action(
+            event_type="stream_restart",
+            success=result["success"],
+            error_message=result.get("error"),
+            metadata={
+                "reason": "manual_force",
+                "trigger_seconds": 3840.0,
+                "results": result.get("results", {}),
+            },
+        )
+        if result.get("success"):
+            logger.info("✓ Streams restarted. Start webhook_server if not running so transactions can flow.")
+        else:
+            logger.error(f"✗ Restart failed: {result.get('error')}")
+        sys.exit(0 if result.get("success") else 1)
     
     result = run_monitoring_cycle()
     

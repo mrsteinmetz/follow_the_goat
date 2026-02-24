@@ -1,0 +1,17 @@
+[Unit]
+Description=Follow The Goat - Start all scheduler components
+After=network.target postgresql.service
+# Run after DB is up; does not depend on ftg-master/master2 (component-based only)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+WorkingDirectory=/root/follow_the_goat
+Environment="PATH=/root/follow_the_goat/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/root/follow_the_goat/venv/bin/python scripts/start_missing_components.py
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

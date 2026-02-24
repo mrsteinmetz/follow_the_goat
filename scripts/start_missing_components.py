@@ -29,7 +29,7 @@ def get_running_components():
         )
         running = {}
         for line in result.stdout.split('\n'):
-            if 'python3 scheduler/run_component.py --component' in line:
+            if 'run_component.py' in line and '--component' in line:
                 parts = line.split()
                 pid = int(parts[1])
                 # Extract component name
@@ -65,6 +65,14 @@ def get_enabled_components():
         print(f"Error fetching enabled components: {e}")
         return []
 
+def _python_cmd():
+    """Use same Python as this script (e.g. venv) when starting child processes."""
+    venv_py = PROJECT_ROOT / "venv" / "bin" / "python"
+    if venv_py.exists():
+        return str(venv_py)
+    return sys.executable
+
+
 def start_component(component_name, dry_run=False):
     """Start a component."""
     log_file = f"/tmp/{component_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -76,7 +84,7 @@ def start_component(component_name, dry_run=False):
     try:
         cmd = [
             "nohup",
-            "python3",
+            _python_cmd(),
             "scheduler/run_component.py",
             "--component",
             component_name

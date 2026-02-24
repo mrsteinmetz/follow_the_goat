@@ -66,7 +66,7 @@ def process_price_cycles_job():
 # MASTER2 JOBS (Trading Logic)
 # =============================================================================
 
-@track_job("train_validator", "Train validator (every 20s)")
+@track_job("train_validator", "Train validator (every 5s)")
 def run_train_validator():
     """Run a single validator training cycle."""
     try:
@@ -263,7 +263,9 @@ def run_restart_quicknode_streams():
             if result.get('action_taken'):
                 restart_success = result.get('restart_success', False)
                 status = "successfully" if restart_success else "with errors"
-                logger.info(f"Stream restart triggered {status} (latency: {result['latency']:.2f}s)")
+                trigger = result.get('latency') or result.get('trigger_seconds')
+                trigger_str = f"{trigger:.2f}s" if trigger is not None else "n/a"
+                logger.info(f"Stream restart triggered {status} (trigger: {trigger_str}, reason: {result.get('reason', '?')})")
         else:
             logger.error(f"Stream monitoring failed: {result.get('error', 'Unknown error')}")
     except Exception as e:
@@ -312,29 +314,40 @@ _local_api_server = None
 def start_webhook_api_in_background(host: str = "0.0.0.0", port: int = 8001):
     """Start FastAPI webhook server in background thread."""
     global _webhook_server
-    
+
+    # If already responding on this port, nothing to do — avoids "address already in use" errors
+    # when the process is restarted while the old uvicorn thread is still winding down.
+    if is_webhook_responding():
+        logger.info(f"Webhook already responding on port {port}, skipping start")
+        return
+
     import threading
     import uvicorn
-    from features.webhook.app import app  # Use the proper webhook app
-    
-    # The app from features/webhook/app.py already has CORS middleware and all endpoints
-    
+    from features.webhook.app import app
+
     config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)
-    
+
     def run_server():
         try:
             server.run()
         except Exception as e:
             logger.error(f"Webhook server crashed: {e}", exc_info=True)
-    
+
     thread = threading.Thread(target=run_server, daemon=True, name="WebhookServerThread")
     thread.start()
-    
+
     _webhook_server = server
-    logger.info(f"✓ Webhook server started on http://{host}:{port}")
+    logger.info(f"✓ Webhook server starting on http://{host}:{port}")
+
     import time
-    time.sleep(0.5)
+    time.sleep(1.5)  # Give uvicorn time to bind
+
+    if not is_webhook_responding():
+        _webhook_server = None
+        raise RuntimeError(
+            f"Webhook server failed to start on port {port} — port may already be in use by another process"
+        )
 
 
 def stop_webhook_api():
@@ -348,6 +361,16 @@ def stop_webhook_api():
             logger.info("✓ Webhook server stopped")
         except Exception as e:
             logger.error(f"Error stopping webhook server: {e}")
+
+
+def is_webhook_responding() -> bool:
+    """Return True if webhook responds to GET /health (used by run_component to detect crashes)."""
+    try:
+        import urllib.request
+        req = urllib.request.urlopen("http://127.0.0.1:8001/health", timeout=2)
+        return req.status == 200
+    except Exception:
+        return False
 
 
 def start_php_server(host: str = "0.0.0.0", port: int = 8000):
@@ -391,9 +414,9 @@ def start_binance_stream_in_background(symbol: str = "SOLUSDT", mode: str = "con
     if str(binance_path) not in sys.path:
         sys.path.insert(0, str(binance_path))
     
-    from binance_order_book_stream import OrderBookCollector
+    from stream_binance_order_book_data import BinanceOrderBookCollector
     
-    _binance_collector = OrderBookCollector(symbol=symbol, mode=mode)
+    _binance_collector = BinanceOrderBookCollector(symbol=symbol, mode=mode)
     _binance_collector.start()
     logger.info(f"✓ Binance stream started for {symbol}")
 
@@ -578,10 +601,10 @@ def run_sde_overnight_sweep():
             sys.path.insert(0, trading_path)
 
         from signal_discovery_engine import run_sweep, apply_best_filters, setup_logging
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         hours = int(os.getenv("SDE_HOURS", "24"))
-        date_str = datetime.now().strftime("%Y%m%d")
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
         output_path = f"/tmp/sde_overnight_{date_str}.json"
         log_path = f"/tmp/sde_overnight_{date_str}.log"
 
@@ -603,4 +626,163 @@ def run_sde_overnight_sweep():
 
     except Exception as e:
         logger.error(f"SDE overnight sweep error: {e}", exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Backfill Raw Cache — populate Parquet from PostgreSQL (startup + hourly)
+# ---------------------------------------------------------------------------
+
+def run_backfill_raw_cache():
+    """Backfill raw OB/trade/whale Parquet cache from PostgreSQL.
+
+    Runs once on startup and then hourly to ensure the cache covers the last 24h.
+    This is the source of truth for both the pump model training and the
+    live signal detection.  The live data feeds (binance_stream, webhook_server)
+    keep it fresh in between.
+    """
+    try:
+        from datetime import datetime, timezone, timedelta
+        from core.raw_data_cache import OB_PARQUET, TRADE_PARQUET, WHALE_PARQUET, _CACHE_DIR
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from core.database import get_postgres
+
+        hours = 24
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        _CACHE_DIR.mkdir(exist_ok=True)
+
+        logger.info(f"[backfill] Starting raw cache backfill (last {hours}h)...")
+
+        def _f(rows, key):
+            return pa.array([float(r[key]) if r[key] is not None else None for r in rows],
+                            type=pa.float64())
+
+        # OB snapshots
+        with get_postgres() as pg:
+            with pg.cursor() as cur:
+                cur.execute("""
+                    SELECT timestamp, mid_price, spread_bps,
+                           bid_liquidity AS bid_liq, ask_liquidity AS ask_liq,
+                           volume_imbalance AS vol_imb, depth_imbalance_ratio AS depth_ratio,
+                           microprice, microprice_dev_bps AS microprice_dev,
+                           net_liquidity_change_1s AS net_liq_1s,
+                           bid_slope, ask_slope,
+                           bid_depth_bps_5 AS bid_dep_5bps, ask_depth_bps_5 AS ask_dep_5bps
+                    FROM order_book_features WHERE timestamp >= %s ORDER BY timestamp
+                """, [cutoff])
+                ob_rows = cur.fetchall()
+        if ob_rows:
+            tbl = pa.table({
+                'ts': pa.array([r['timestamp'] for r in ob_rows], type=pa.timestamp('us', tz='UTC')),
+                'mid_price': _f(ob_rows, 'mid_price'), 'spread_bps': _f(ob_rows, 'spread_bps'),
+                'bid_liq': _f(ob_rows, 'bid_liq'), 'ask_liq': _f(ob_rows, 'ask_liq'),
+                'vol_imb': _f(ob_rows, 'vol_imb'), 'depth_ratio': _f(ob_rows, 'depth_ratio'),
+                'microprice': _f(ob_rows, 'microprice'), 'microprice_dev': _f(ob_rows, 'microprice_dev'),
+                'net_liq_1s': _f(ob_rows, 'net_liq_1s'), 'bid_slope': _f(ob_rows, 'bid_slope'),
+                'ask_slope': _f(ob_rows, 'ask_slope'),
+                'bid_dep_5bps': _f(ob_rows, 'bid_dep_5bps'), 'ask_dep_5bps': _f(ob_rows, 'ask_dep_5bps'),
+            })
+            tmp = _CACHE_DIR / "ob_latest.bfill.parquet"
+            pq.write_table(tbl, str(tmp), compression='snappy')
+            tmp.replace(OB_PARQUET)
+
+        # Trades
+        with get_postgres() as pg:
+            with pg.cursor() as cur:
+                cur.execute("""
+                    SELECT trade_timestamp, sol_amount, stablecoin_amount, price,
+                           direction, (perp_direction IS NOT NULL) AS is_perp
+                    FROM sol_stablecoin_trades WHERE trade_timestamp >= %s ORDER BY trade_timestamp
+                """, [cutoff])
+                tr_rows = cur.fetchall()
+        if tr_rows:
+            tbl = pa.table({
+                'ts': pa.array([r['trade_timestamp'] for r in tr_rows], type=pa.timestamp('us', tz='UTC')),
+                'sol_amount': pa.array([float(r['sol_amount'] or 0) for r in tr_rows], type=pa.float64()),
+                'stable_amt': pa.array([float(r['stablecoin_amount'] or 0) for r in tr_rows], type=pa.float64()),
+                'price': pa.array([float(r['price'] or 0) for r in tr_rows], type=pa.float64()),
+                'direction': pa.array([str(r['direction'] or 'buy') for r in tr_rows], type=pa.string()),
+                'is_perp': pa.array([bool(r['is_perp']) for r in tr_rows], type=pa.bool_()),
+            })
+            tmp = _CACHE_DIR / "trade_latest.bfill.parquet"
+            pq.write_table(tbl, str(tmp), compression='snappy')
+            tmp.replace(TRADE_PARQUET)
+
+        # Whales
+        with get_postgres() as pg:
+            with pg.cursor() as cur:
+                cur.execute("""
+                    SELECT timestamp,
+                           abs_change AS sol_moved, direction,
+                           CASE WHEN movement_significance ~ '^[0-9.]+$'
+                                THEN movement_significance::DOUBLE PRECISION
+                                ELSE NULL END AS significance,
+                           percentage_moved
+                    FROM whale_movements WHERE timestamp >= %s ORDER BY timestamp
+                """, [cutoff])
+                wh_rows = cur.fetchall()
+        if wh_rows:
+            tbl = pa.table({
+                'ts': pa.array([r['timestamp'] for r in wh_rows], type=pa.timestamp('us', tz='UTC')),
+                'sol_moved': pa.array([float(r['sol_moved'] or 0) for r in wh_rows], type=pa.float64()),
+                'direction': pa.array([str(r['direction'] or 'out') for r in wh_rows], type=pa.string()),
+                'significance': pa.array([float(r['significance']) if r['significance'] is not None else None
+                                           for r in wh_rows], type=pa.float64()),
+                'pct_moved': pa.array([float(r['percentage_moved'] or 0) for r in wh_rows], type=pa.float64()),
+            })
+            tmp = _CACHE_DIR / "whale_latest.bfill.parquet"
+            pq.write_table(tbl, str(tmp), compression='snappy')
+            tmp.replace(WHALE_PARQUET)
+
+        logger.info(
+            f"[backfill] Complete — OB={len(ob_rows):,} trades={len(tr_rows):,} whales={len(wh_rows):,}"
+        )
+    except Exception as e:
+        logger.error(f"Backfill raw cache error: {e}", exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Mega Signal Simulator — continuous GA + exit grid optimizer (standalone)
+# ---------------------------------------------------------------------------
+
+def run_mega_simulator():
+    """Run one full loop of the Mega Signal Simulator (GA + exit grid search).
+
+    Each run:
+      1. Builds a dense 30-second feature matrix from DuckDB + PostgreSQL
+      2. Runs the genetic algorithm to find optimal entry signal combinations
+      3. Grid-searches 1,200 exit tier configurations for each top signal
+      4. Validates with walk-forward holdout, saves results to simulation_results
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mega_simulator",
+            PROJECT_ROOT / "scripts" / "mega_simulator.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.run_one_loop(run_number=1)
+    except Exception as e:
+        logger.error(f"Mega simulator error: {e}", exc_info=True)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Email Report — System Health Summary (every 12h)
+# ---------------------------------------------------------------------------
+
+def run_send_email_report():
+    """Generate and email the system health report (every 12 hours)."""
+    try:
+        from features.email_report.mailer import send_report
+        sent = send_report()
+        if sent:
+            logger.info("System health email report sent successfully.")
+        else:
+            logger.info("System health email report skipped (SMTP not configured or error).")
+    except Exception as e:
+        logger.error(f"Email report job error: {e}", exc_info=True)
         raise

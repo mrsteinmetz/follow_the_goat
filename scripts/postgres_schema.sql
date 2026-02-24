@@ -1002,6 +1002,64 @@ ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS rule_id TEXT;
 ALTER TABLE pump_signal_outcomes ADD COLUMN IF NOT EXISTS pattern_id TEXT;
 
 -- =============================================================================
+-- PUMP FINGERPRINT RUN LOG (AI-assisted analysis per training run)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS pump_fingerprint_runs (
+    id                  BIGSERIAL PRIMARY KEY,
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    lookback_hours      INT,
+    volume_regime       VARCHAR(20),
+    n_total_entries     INT,
+    n_pumps             INT,
+    n_independent_pumps INT,
+    pump_rate_pct       DOUBLE PRECISION,
+    n_recommended_rules INT,
+    n_approved_patterns INT,
+    n_combinations      INT,
+    top_features        JSONB,        -- top 5 features by separation score
+    recommended_rules   JSONB,        -- approved rule details
+    llm_input           TEXT,         -- formatted summary sent to Claude
+    ai_summary          TEXT,         -- Claude's analysis and recommendations
+    ai_model            VARCHAR(50)   -- model name used (e.g. claude-sonnet-4-5)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fingerprint_runs_created
+    ON pump_fingerprint_runs (created_at DESC);
+
+-- =============================================================================
+-- SIMULATION RESULTS
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS simulation_results (
+    id               BIGSERIAL PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    rank             INTEGER,
+    conditions_json  JSONB,
+    n_features       INTEGER,
+    n_signals        INTEGER,
+    signals_per_day  DOUBLE PRECISION,
+    precision_pct    DOUBLE PRECISION,
+    recall_pct       DOUBLE PRECISION,
+    exit_config_json JSONB,
+    ev_per_trade     DOUBLE PRECISION,
+    daily_ev         DOUBLE PRECISION,
+    win_rate         DOUBLE PRECISION,
+    sharpe           DOUBLE PRECISION,
+    insample_ev      DOUBLE PRECISION,
+    oos_ev           DOUBLE PRECISION,
+    oos_gap          DOUBLE PRECISION,
+    oos_consistency  DOUBLE PRECISION,   -- fraction of OOS folds where EV > 0
+    ga_exit_json     JSONB,              -- GA's evolved exit config (before grid refinement)
+    data_hours       INTEGER,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sim_results_run_id   ON simulation_results (run_id);
+CREATE INDEX IF NOT EXISTS idx_sim_results_daily_ev ON simulation_results (daily_ev DESC);
+CREATE INDEX IF NOT EXISTS idx_sim_results_created  ON simulation_results (created_at DESC);
+
+-- =============================================================================
 -- SCHEMA COMPLETE
 -- =============================================================================
 

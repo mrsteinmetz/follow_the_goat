@@ -33,7 +33,7 @@ import sys
 import time
 from itertools import combinations as iter_combinations
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 import uuid
 
@@ -44,9 +44,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.trading_engine import get_engine
 from core.database import get_postgres
-from core.filter_cache import sync_cache_incremental, get_cached_trades, get_cache_stats
 
 # Setup logging
 logger = logging.getLogger("create_new_patterns")
@@ -250,126 +248,164 @@ def load_config() -> Dict[str, Any]:
 # Data Loading
 # =============================================================================
 
-def load_trade_data(engine, hours: int = 24) -> pd.DataFrame:
+def _compute_raw_features_at(con, ts, window_min: int = 5) -> Optional[Dict[str, Any]]:
+    """Compute aggregated OB/trade/whale features for a window ending at `ts`.
+
+    Args:
+        con: in-memory DuckDB connection from open_reader()
+        ts: datetime — end of the window
+        window_min: lookback in minutes
+
+    Returns dict of features, or None if not enough OB data.
     """
-    Load trade data from DuckDB cache (with auto-sync).
-    
-    OPTIMIZED: Uses DuckDB cache for 10-50x faster queries vs PostgreSQL.
-    Cache is automatically synced incrementally on each run.
+    try:
+        win_sec = window_min * 60
+        ts_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+        row = con.execute(f"""
+            WITH ref AS (SELECT TIMESTAMPTZ '{ts_str}' AS t),
+            ob_w AS (
+                SELECT
+                    COUNT(*)                          AS ob_n,
+                    AVG(vol_imb)                      AS ob_avg_vol_imb,
+                    AVG(depth_ratio)                  AS ob_avg_depth_ratio,
+                    AVG(spread_bps)                   AS ob_avg_spread_bps,
+                    SUM(bid_liq - ask_liq)            AS ob_net_liq_change,
+                    AVG(CASE WHEN ask_liq > 0 THEN bid_liq / ask_liq END) AS ob_bid_ask_ratio,
+                    AVG(mid_price)                    AS ob_avg_mid,
+                    -- 1-min sub-window imbalance
+                    AVG(vol_imb)  FILTER (WHERE o.ts >= ref.t - INTERVAL '60 seconds') AS ob_imb_1m,
+                    AVG(depth_ratio) FILTER (WHERE o.ts >= ref.t - INTERVAL '60 seconds') AS ob_depth_1m,
+                    -- trend: latest minus oldest half
+                    AVG(vol_imb)  FILTER (WHERE o.ts >= ref.t - INTERVAL '150 seconds')
+                        - AVG(vol_imb)  FILTER (WHERE o.ts < ref.t - INTERVAL '150 seconds')  AS ob_imb_trend,
+                    AVG(depth_ratio) FILTER (WHERE o.ts >= ref.t - INTERVAL '150 seconds')
+                        - AVG(depth_ratio) FILTER (WHERE o.ts < ref.t - INTERVAL '150 seconds') AS ob_depth_trend,
+                    -- liquidity acceleration
+                    SUM(bid_liq - ask_liq) FILTER (WHERE o.ts >= ref.t - INTERVAL '60 seconds')
+                        / NULLIF(SUM(bid_liq - ask_liq) FILTER (WHERE o.ts < ref.t - INTERVAL '60 seconds'), 0) AS ob_liq_accel
+                FROM ob_snapshots o, ref
+                WHERE o.ts BETWEEN ref.t - INTERVAL '{win_sec} seconds' AND ref.t
+            ),
+            tr_w AS (
+                SELECT
+                    COUNT(*)                                                         AS tr_n,
+                    AVG(CASE WHEN direction='buy' THEN 1.0 ELSE 0.0 END)             AS tr_buy_ratio,
+                    AVG(CASE WHEN sol_amount > 500 THEN 1.0 ELSE 0.0 END)            AS tr_large_ratio,
+                    AVG(sol_amount)                                                   AS tr_avg_size,
+                    -- buy acceleration: recent vs earlier
+                    AVG(CASE WHEN direction='buy' THEN 1.0 ELSE 0.0 END)
+                        FILTER (WHERE t.ts >= ref.t - INTERVAL '60 seconds')
+                    / NULLIF(AVG(CASE WHEN direction='buy' THEN 1.0 ELSE 0.0 END)
+                        FILTER (WHERE t.ts < ref.t - INTERVAL '60 seconds'), 0) AS tr_buy_accel
+                FROM raw_trades t, ref
+                WHERE t.ts BETWEEN ref.t - INTERVAL '{win_sec} seconds' AND ref.t
+            ),
+            wh_w AS (
+                SELECT
+                    COUNT(*)                                                          AS wh_n,
+                    SUM(CASE WHEN direction='in' THEN sol_moved ELSE -sol_moved END) AS wh_net_flow,
+                    AVG(CASE WHEN direction='in' THEN 1.0 ELSE 0.0 END)              AS wh_inflow_ratio
+                FROM whale_events w, ref
+                WHERE w.ts BETWEEN ref.t - INTERVAL '{win_sec} seconds' AND ref.t
+            )
+            SELECT ob_w.*, tr_w.*, wh_w.*
+            FROM ob_w, tr_w, wh_w
+        """).fetchone()
+
+        if not row or (row[0] or 0) < 3:  # ob_n < 3
+            return None
+
+        cols = [
+            'ob_n', 'ob_avg_vol_imb', 'ob_avg_depth_ratio', 'ob_avg_spread_bps',
+            'ob_net_liq_change', 'ob_bid_ask_ratio', 'ob_avg_mid',
+            'ob_imb_1m', 'ob_depth_1m', 'ob_imb_trend', 'ob_depth_trend', 'ob_liq_accel',
+            'tr_n', 'tr_buy_ratio', 'tr_large_ratio', 'tr_avg_size', 'tr_buy_accel',
+            'wh_n', 'wh_net_flow', 'wh_inflow_ratio',
+        ]
+        return {c: (float(v) if v is not None else None) for c, v in zip(cols, row)}
+    except Exception as e:
+        logger.debug(f"Feature compute error at {ts}: {e}")
+        return None
+
+
+def load_trade_data(engine=None, hours: int = 24) -> pd.DataFrame:
+    """Load gateway filter training data from raw Parquet cache + follow_the_goat_buyins.
+
+    For each real copy-trade in the last N hours:
+      1. Look up raw OB/trade/whale features in a 5-min window ending at followed_at
+      2. Label: is_good = potential_gains >= good_trade_threshold
+
+    The `engine` parameter is accepted for API compatibility but is not used.
     """
-    start_time = time.time()
-    
+    t0 = time.time()
     config = load_config()
-    ratio_only = bool(config.get('is_ratio', False))
-    
-    # Ensure cache exists and is up-to-date
-    logger.info("  Checking DuckDB cache...")
-    try:
-        cache_age_seconds = sync_cache_incremental()
-        
-        if cache_age_seconds < 60:
-            logger.info(f"  Cache is fresh ({cache_age_seconds:.0f}s old)")
-        elif cache_age_seconds < 3600:
-            logger.info(f"  Cache synced ({cache_age_seconds/60:.1f} minutes old)")
-        else:
-            logger.info(f"  Cache synced ({cache_age_seconds/3600:.1f} hours old)")
-        
-    except Exception as e:
-        logger.error(f"  Cache sync failed: {e}", exc_info=True)
-        logger.warning("  Falling back to PostgreSQL direct query...")
-        return load_trade_data_fallback(hours, ratio_only)
-    
-    # Query DuckDB cache
-    logger.info("  Loading data from DuckDB cache...")
-    query_start = time.time()
-    
-    try:
-        df = get_cached_trades(hours=hours, ratio_only=ratio_only)
-        
-        if len(df) == 0:
-            logger.warning("No trade data found in cache")
-            return pd.DataFrame()
-        
-        logger.info(f"  Query returned {len(df)} rows in {time.time() - query_start:.1f}s")
-        
-        unique_trades = df['trade_id'].nunique()
-        total_time = time.time() - start_time
-        logger.info(f"  Loaded {len(df)} rows ({unique_trades} unique trades) in {total_time:.1f}s total")
-        
-        return df
-        
-    except Exception as e:
-        logger.error(f"  DuckDB query failed: {e}", exc_info=True)
-        logger.warning("  Falling back to PostgreSQL direct query...")
-        return load_trade_data_fallback(hours, ratio_only)
+    threshold = float(config.get('good_trade_threshold', 0.3))
 
+    from core.raw_data_cache import OB_PARQUET, open_reader
 
-def load_trade_data_fallback(hours: int = 24, ratio_only: bool = False) -> pd.DataFrame:
-    """
-    Fallback to load trade data directly from PostgreSQL (if DuckDB cache fails).
-    """
-    start_time = time.time()
-    
-    # Step 1: Get distinct filter columns (fast query)
-    logger.info("  Getting distinct filter columns from PostgreSQL...")
-    filter_columns = _get_filter_columns(hours, ratio_only=ratio_only)
-    
-    if not filter_columns:
-        logger.warning("No filter columns found")
+    if not OB_PARQUET.exists() or OB_PARQUET.stat().st_size < 10_000:
+        logger.warning("Raw Parquet not ready — no gateway filter data available")
         return pd.DataFrame()
-    
-    logger.info(f"  Found {len(filter_columns)} filter columns in {time.time() - start_time:.1f}s")
-    
-    # Step 2: Build pivoted query using conditional aggregation
-    pivot_columns = []
-    for col in filter_columns:
-        safe_col = col.replace("'", "''")
-        pivot_columns.append(
-            f"MAX(tfv.filter_value) FILTER (WHERE tfv.filter_name = '{safe_col}') AS \"{col}\""
-        )
-    
-    pivot_sql = ",\n                ".join(pivot_columns)
-    
-    query = f"""
-        SELECT 
-            b.id as trade_id,
-            b.play_id,
-            b.followed_at,
-            b.potential_gains,
-            b.our_status,
-            tfv.minute,
-            COALESCE(tfv.sub_minute, 0) as sub_minute,
-            (tfv.minute * 2 + COALESCE(tfv.sub_minute, 0)) as interval_idx,
-            {pivot_sql}
-        FROM follow_the_goat_buyins b
-        INNER JOIN trade_filter_values tfv ON tfv.buyin_id = b.id
-        WHERE b.potential_gains IS NOT NULL
-          AND b.followed_at >= NOW() - INTERVAL '{hours} hours'
-        GROUP BY b.id, b.play_id, b.followed_at, b.potential_gains, b.our_status, tfv.minute, tfv.sub_minute
-        ORDER BY b.id, tfv.minute, tfv.sub_minute
-    """
-    
-    logger.info("  Executing pivoted query in PostgreSQL...")
-    query_start = time.time()
-    results = _read_from_postgres(query, [])
-    
-    if not results:
-        logger.warning("No trade data found with resolved outcomes")
+
+    # Load real buyins with confirmed outcomes
+    logger.info("  Loading follow_the_goat_buyins from PostgreSQL...")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    with get_postgres() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT id, followed_at, potential_gains
+                FROM follow_the_goat_buyins
+                WHERE followed_at >= %s
+                  AND potential_gains IS NOT NULL
+                  AND wallet_address NOT LIKE 'TRAINING_TEST_%%'
+                  AND wallet_address NOT LIKE 'PUMP_V4_%%'
+                ORDER BY followed_at
+            """, [cutoff])
+            buyins = cursor.fetchall()
+
+    if not buyins:
+        logger.warning("No real buyins with outcomes found")
         return pd.DataFrame()
-    
-    logger.info(f"  Query returned {len(results)} rows in {time.time() - query_start:.1f}s")
-    
-    df = pd.DataFrame(results)
-    
-    for col in filter_columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    unique_trades = df['trade_id'].nunique()
-    total_time = time.time() - start_time
-    logger.info(f"  Loaded {len(df)} rows ({unique_trades} unique trades) in {total_time:.1f}s total")
-    
+
+    logger.info(f"  {len(buyins)} buyins found — computing raw features...")
+    con = open_reader()
+
+    rows = []
+    skipped = 0
+    for b in buyins:
+        ts = b['followed_at']
+        # Ensure timezone-aware for Parquet timestamps
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        feats = _compute_raw_features_at(con, ts, window_min=5)
+        if feats is None:
+            skipped += 1
+            continue
+        rows.append({
+            'trade_id':       b['id'],
+            'followed_at':    ts,
+            'potential_gains': float(b['potential_gains']),
+            'is_good':        int(float(b['potential_gains']) >= threshold),
+            'minute':         0,
+            **feats,
+        })
+
+    con.close()
+
+    if not rows:
+        logger.warning(f"No feature rows computed (skipped {skipped}/{len(buyins)})")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    elapsed = time.time() - t0
+    good = int(df['is_good'].sum())
+    logger.info(
+        f"  {len(df)} rows computed in {elapsed:.1f}s "
+        f"(good={good}, bad={len(df)-good}, skipped={skipped})"
+    )
     return df
+
+
 
 
 def get_filterable_columns(df: pd.DataFrame) -> List[str]:
@@ -1148,28 +1184,10 @@ def run() -> Dict[str, Any]:
     }
     
     try:
-        # Step 1: Get engine
-        logger.info("\n[Step 1/6] Getting engine...")
-        try:
-            engine = get_engine()
-            logger.info(f"Engine acquired: {type(engine).__name__}")
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to get engine: {e}", exc_info=True)
-            result['error'] = f'Engine acquisition failed: {e}'
-            return result
-        
-        if not engine._running:
-            logger.warning("TradingDataEngine not running, starting it...")
-            try:
-                engine.start()
-                logger.info("Engine started")
-            except Exception as e:
-                logger.error(f"CRITICAL: Failed to start engine: {e}", exc_info=True)
-                result['error'] = f'Engine start failed: {e}'
-                return result
-        
-        # Step 2: Load trade data
-        logger.info("\n[Step 2/6] Loading trade data...")
+        engine = None  # engine no longer needed — raw Parquet cache is used directly
+
+        # Step 1: Load trade data from raw Parquet cache
+        logger.info("\n[Step 1/6] Loading trade data (raw Parquet cache)...")
         try:
             df = load_trade_data(engine, max_hours)
             logger.info(f"Data loaded: {len(df)} rows")
@@ -1192,7 +1210,7 @@ def run() -> Dict[str, Any]:
         logger.info(f"  Bad trades (< {threshold}%): {bad_count:,} ({bad_count/len(df)*100:.1f}%)")
         
         # Step 3: Build catalog + get filterable columns
-        logger.info("\n[Step 3/6] Building filter catalog and splitting train/test...")
+        logger.info("\n[Step 2/6] Building filter catalog and splitting train/test...")
         filterable_columns = get_filterable_columns(df)
         column_to_id = save_filter_catalog(engine, filterable_columns)
         logger.info(f"  {len(filterable_columns)} filterable columns (absolute prices excluded)")
@@ -1204,7 +1222,7 @@ def run() -> Dict[str, Any]:
         logger.info(f"  Train: {train_trades} trades | Test: {test_trades} trades")
         
         # Step 4: Search for best combo across all minutes
-        logger.info("\n[Step 4/6] Exhaustive combo search across minutes...")
+        logger.info("\n[Step 3/6] Exhaustive combo search across minutes...")
         
         all_suggestions = []
         best_combo_overall = None
@@ -1277,7 +1295,7 @@ def run() -> Dict[str, Any]:
             save_suggestions(engine, all_suggestions, column_to_id, max_hours)
         
         # Step 5: Sync best combo to pattern config
-        logger.info("\n[Step 5/6] Syncing best filters to pattern config...")
+        logger.info("\n[Step 4/6] Syncing best filters to pattern config...")
         
         if not best_combo_overall:
             result['error'] = "No filter combinations beat baseline on test set"
@@ -1367,7 +1385,7 @@ def run() -> Dict[str, Any]:
             result['filters_synced'] = sync_result.get('filters_synced', 0)
         
         # Step 6: Update AI-enabled plays
-        logger.info("\n[Step 6/6] Updating AI-enabled plays...")
+        logger.info("\n[Step 5/6] Updating AI-enabled plays...")
         if 'project_id' not in dir():
             project_id = get_or_create_auto_project(engine)
         filters_synced = result.get('filters_synced', 0)

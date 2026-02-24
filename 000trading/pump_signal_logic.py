@@ -73,12 +73,12 @@ MIN_PUMP_PCT = 0.2              # Target gain (0.2%)
 MAX_DRAWDOWN_PCT = 0.10         # Max dip before reaching target (tighter than v1's 0.15%)
 FORWARD_WINDOW = 10             # Look 10 min ahead
 EARLY_WINDOW = 4                # Must reach target within first 4 minutes
-IMMEDIATE_DIP_MAX = -0.08       # Max allowed dip in first 2 min after entry
+IMMEDIATE_DIP_MAX = -0.12       # Max allowed dip in first 2 min after entry
 SUSTAINED_PCT = 0.10            # Price must still be >= +0.10% at minute 4 (sustained move)
 MAX_RETRACEMENT_RATIO = 0.50    # Retracement filter (defined but NOT in label CASE yet — measurement first)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-LOOKBACK_HOURS = 48
+LOOKBACK_HOURS = 24
 RULES_REFRESH_INTERVAL = 300
 TRADE_COST_PCT = 0.1
 
@@ -165,6 +165,11 @@ _gate_stats: Dict[str, int] = {
 
 _price_buffer: deque = deque(maxlen=200)
 
+# ── Simulator rules cache (loaded from simulation_results PostgreSQL table) ──
+_sim_rules: List[Dict[str, Any]] = []
+_sim_rules_loaded_at: float = 0.0
+SIM_RULES_TTL: float = 300.0  # refresh every 5 min
+
 # ── Volatility regime tracking ───────────────────────────────────────────────
 _vol_buffer: deque = deque(maxlen=720)     # ~12 hours at 1 sample per ~minute
 
@@ -211,6 +216,8 @@ _CB_CACHE_TTL: float = 30.0  # seconds between DB queries
 _rules: Optional[Dict[str, Any]] = None
 _rules_metadata: Dict[str, Any] = {}
 _FINGERPRINT_REPORT_PATH = _PROJECT_ROOT / "cache" / "pump_fingerprint_report.json"
+_current_volume_regime: str = "unknown"  # regime when rules were discovered
+_rule_performance: Dict[str, Dict[str, Any]] = {}  # per-rule hit rates / disabled+boosted flags
 
 
 def record_signal_outcome(buyin_id: int, hit_target: bool,
@@ -243,7 +250,12 @@ def record_signal_outcome(buyin_id: int, hit_target: bool,
 
 
 def _get_live_outcomes() -> Dict[str, Any]:
-    """Get recent outcomes from PostgreSQL, cached for _CB_CACHE_TTL seconds."""
+    """Get recent outcomes from PostgreSQL, cached for _CB_CACHE_TTL seconds.
+
+    Uses last 30 signals (reduced from 50) with time-weighted win rate:
+    outcomes from the last 48h are weighted 2x vs older outcomes, so
+    recent regime shifts dominate the circuit breaker decision.
+    """
     global _cb_cache, _cb_cache_time
     now = time.time()
     if _cb_cache is not None and (now - _cb_cache_time) < _CB_CACHE_TTL:
@@ -251,30 +263,63 @@ def _get_live_outcomes() -> Dict[str, Any]:
 
     try:
         rows = postgres_query(
-            """SELECT hit_target, gain_pct FROM pump_signal_outcomes
-               ORDER BY created_at DESC LIMIT 50""")
+            """SELECT hit_target, gain_pct, created_at FROM pump_signal_outcomes
+               ORDER BY created_at DESC LIMIT 30""")
         n = len(rows)
         hits = sum(1 for r in rows if r['hit_target']) if n else 0
-        win_rate = hits / n if n else None
-        _cb_cache = {'n': n, 'hits': hits, 'win_rate': win_rate}
+
+        # Time-weighted win rate: 2x weight for outcomes in last 48h
+        cutoff_48h = datetime.now(timezone.utc) - timedelta(hours=48)
+        cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+        w_hits, w_total = 0.0, 0.0
+        n_recent_24h = 0
+        for r in rows:
+            created = r.get('created_at')
+            if created is not None:
+                # psycopg2 returns timezone-aware datetime; ensure comparable
+                if hasattr(created, 'tzinfo') and created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                w = 2.0 if created >= cutoff_48h else 1.0
+                if created >= cutoff_24h:
+                    n_recent_24h += 1
+            else:
+                w = 1.0
+            w_total += w
+            if r.get('hit_target'):
+                w_hits += w
+
+        win_rate = w_hits / w_total if w_total > 0 else None
+        _cb_cache = {'n': n, 'hits': hits, 'win_rate': win_rate, 'n_recent_24h': n_recent_24h}
     except Exception as e:
         logger.debug(f"Circuit breaker DB read error: {e}")
-        _cb_cache = {'n': 0, 'hits': 0, 'win_rate': None}
+        _cb_cache = {'n': 0, 'hits': 0, 'win_rate': None, 'n_recent_24h': 0}
     _cb_cache_time = now
     return _cb_cache
 
 
 def _check_circuit_breaker() -> bool:
-    """Return True if the circuit breaker is tripped (live win rate too low)."""
+    """Return True if the circuit breaker is tripped (live win rate too low).
+
+    The CB only activates when there are at least 5 recent outcomes in the
+    last 24h.  This prevents stale historical data from a prior system or
+    rule set from permanently blocking new signals — a common issue after
+    rule refreshes or system migrations.
+    """
     global _circuit_breaker_paused
     info = _get_live_outcomes()
-    if info['n'] < 10:
-        return False  # not enough data to judge
+    n_recent = info.get('n_recent_24h', 0)
+    if n_recent < 5:
+        # Not enough fresh signal history — let new rules prove themselves
+        if _circuit_breaker_paused:
+            logger.info(f"Circuit breaker RESET: only {n_recent} outcomes in last 24h "
+                        f"(need 5 to engage CB)")
+            _circuit_breaker_paused = False
+        return False
     win_rate = info['win_rate']
     if win_rate is not None and win_rate < 0.35:
         if not _circuit_breaker_paused:
             logger.warning(f"Circuit breaker TRIPPED: live win rate {win_rate:.1%} "
-                           f"({info['hits']}/{info['n']}) — pausing signals")
+                           f"({info['hits']}/{info['n']}, {n_recent} in 24h) — pausing signals")
             _circuit_breaker_paused = True
         return True
     if _circuit_breaker_paused:
@@ -390,7 +435,10 @@ def _load_fingerprint_rules() -> Optional[Dict[str, Any]]:
 
     Called by refresh_pump_rules() instead of _train_model().
     Returns dict with combinations, patterns, thresholds, metadata.
+    Also updates _current_volume_regime from the report.
     """
+    global _current_volume_regime
+
     if not _FINGERPRINT_REPORT_PATH.exists():
         logger.warning(f"No fingerprint report at {_FINGERPRINT_REPORT_PATH}")
         return None
@@ -401,6 +449,8 @@ def _load_fingerprint_rules() -> Optional[Dict[str, Any]]:
     except (json.JSONDecodeError, OSError) as e:
         logger.error(f"Failed to load fingerprint report: {e}")
         return None
+
+    _current_volume_regime = report.get('volume_regime', 'unknown')
 
     return {
         'combinations': report.get('best_combinations', []),
@@ -434,6 +484,8 @@ def match_approved_pattern(features: Dict[str, float]) -> Optional[Dict[str, Any
 
     For each approved pattern, checks if ALL features in the pattern's
     feature_ranges have current values within [min, max].
+    Skips patterns marked disabled in _rule_performance.
+    Annotates the result with 'boosted' flag when applicable.
 
     Returns the best matching pattern (highest precision), or None.
     """
@@ -448,6 +500,10 @@ def match_approved_pattern(features: Dict[str, float]) -> Optional[Dict[str, Any
     best_precision = -1.0
 
     for pattern in patterns:
+        pattern_id = pattern.get('pattern_id') or pattern.get('label')
+        if pattern_id and _rule_performance.get(pattern_id, {}).get('disabled', False):
+            continue
+
         feature_ranges = pattern.get('feature_ranges', {})
         if not feature_ranges:
             continue
@@ -467,7 +523,10 @@ def match_approved_pattern(features: Dict[str, float]) -> Optional[Dict[str, Any
             prec = pattern.get('precision', 0.0)
             if prec > best_precision:
                 best_precision = prec
-                best_match = pattern
+                best_match = dict(pattern)  # copy so we can annotate safely
+                best_match['boosted'] = bool(
+                    pattern_id and _rule_performance.get(pattern_id, {}).get('boosted', False)
+                )
 
     return best_match
 
@@ -477,6 +536,8 @@ def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any
 
     For each combination rule, checks if ALL feature conditions are met
     (value > threshold for bullish features, < threshold for bearish).
+    Skips rules marked disabled in _rule_performance.
+    Annotates the result with 'boosted' flag when applicable.
 
     Returns the best matching rule (highest score = precision * n_signals), or None.
     """
@@ -491,6 +552,10 @@ def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any
     best_score = -1.0
 
     for combo in combos:
+        rule_id = combo.get('rule_id')
+        if rule_id and _rule_performance.get(rule_id, {}).get('disabled', False):
+            continue
+
         feat_names = combo.get('features', [])
         thresholds = combo.get('thresholds', [])
         directions = combo.get('directions', [])
@@ -523,9 +588,103 @@ def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any
             score = combo.get('score', 0.0)
             if score > best_score:
                 best_score = score
-                best_match = combo
+                best_match = dict(combo)  # copy so we can annotate safely
+                best_match['boosted'] = bool(
+                    rule_id and _rule_performance.get(rule_id, {}).get('boosted', False)
+                )
 
     return best_match
+
+
+# =============================================================================
+# SIMULATOR RULES — direct check against raw_data_cache feature names
+# =============================================================================
+
+def _load_sim_rules() -> List[Dict[str, Any]]:
+    """Load top simulation rules from simulation_results (PostgreSQL).
+
+    Selects rules that generalise well (low OOS gap) with high win rate.
+    Feature names match raw_data_cache.get_live_features() exactly —
+    no remapping needed.
+    """
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT conditions_json, win_rate, ev_per_trade, daily_ev,
+                           exit_config_json, sharpe, oos_gap,
+                           COALESCE(oos_consistency, 0.5) AS oos_consistency
+                    FROM simulation_results
+                    WHERE win_rate   >= 0.65
+                      AND n_signals  >= 10
+                      AND oos_gap    <= 0.004
+                      AND daily_ev   >  0
+                      AND COALESCE(oos_consistency, 0) >= 0.33
+                    ORDER BY daily_ev * COALESCE(oos_consistency, 0.5) DESC
+                    LIMIT 8
+                """)
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        logger.warning(f"[sim_rules] Failed to load: {e}")
+        return []
+
+
+def check_sim_rules(live_features: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Check live raw-cache features against best simulation_results rules.
+
+    Feature names in conditions_json use the same naming as
+    raw_data_cache.get_live_features() — no translation required.
+
+    Returns the first matching rule dict (highest daily_ev), or None.
+    """
+    global _sim_rules, _sim_rules_loaded_at
+
+    now = time.time()
+    if now - _sim_rules_loaded_at > SIM_RULES_TTL or not _sim_rules:
+        _sim_rules = _load_sim_rules()
+        _sim_rules_loaded_at = now
+        logger.debug(f"[sim_rules] Loaded {len(_sim_rules)} rules from simulation_results")
+
+    if not _sim_rules:
+        return None
+
+    for rule in _sim_rules:
+        conditions = rule.get('conditions_json') or []
+        if not conditions:
+            continue
+
+        all_met = True
+        n_checked = 0
+        for cond in conditions:
+            feat      = cond.get('feature')
+            direction = cond.get('direction')   # '<' or '>'
+            threshold = cond.get('threshold')
+
+            if feat is None or direction is None or threshold is None:
+                continue
+
+            val = live_features.get(feat)
+            if val is None:
+                all_met = False
+                break
+            try:
+                val = float(val)
+            except (TypeError, ValueError):
+                all_met = False
+                break
+
+            if direction == '<' and val >= threshold:
+                all_met = False
+                break
+            elif direction == '>' and val <= threshold:
+                all_met = False
+                break
+            n_checked += 1
+
+        if all_met and n_checked >= 2:
+            return rule  # first match (ordered by daily_ev DESC)
+
+    return None
 
 
 # =============================================================================
@@ -723,8 +882,7 @@ def _trail_cache_columns() -> List[str]:
     return _TRAIL_CACHE_COLUMNS
 
 
-_TRAIL_CACHE_MIN_RETENTION_HOURS = 336  # 14 days — DuckDB accumulates long history
-                                        # even though PostgreSQL only keeps 24h
+_TRAIL_CACHE_MIN_RETENTION_HOURS = 24  # matches PostgreSQL 24h retention window
 
 
 def _sync_trail_cache(hours: int) -> duckdb.DuckDBPyConnection:
@@ -969,6 +1127,24 @@ def _load_and_label_data(lookback_hours: Optional[int] = None) -> Optional[pd.Da
             logger.info(f"    clean_pump: peak={cp['max_fwd'].mean():.3f}%, "
                         f"worst_dip={cp['min_fwd'].mean():.3f}%, "
                         f"time_to_peak={cp['time_to_peak'].mean():.1f}m")
+
+        # ── Measurement: IMMEDIATE_DIP_MAX widening (-0.08 → -0.12) ──────────
+        if 'min_fwd_imm' in df.columns:
+            try:
+                dip_old_mask = df['min_fwd_imm'] > -0.08
+                dip_new_mask = df['min_fwd_imm'] > -0.12
+                dip_added_pumps = int(
+                    (dip_new_mask & ~dip_old_mask & df['label'].eq('clean_pump')).sum()
+                )
+                dip_added_total = int((dip_new_mask & ~dip_old_mask).sum())
+                logger.info(
+                    f"  IMMEDIATE_DIP_MAX widening (-0.08 → -0.12): "
+                    f"+{dip_added_pumps} clean_pump labels, +{dip_added_total} total rows "
+                    f"now passing dip filter "
+                    f"({int(dip_old_mask.sum())} → {int(dip_new_mask.sum())})"
+                )
+            except Exception:
+                pass
 
         # ── Measurement: log impact of sustained floor vs retracement ratio ──
         # Helps decide whether to add retracement ratio later.
@@ -1856,7 +2032,7 @@ def refresh_pump_rules():
     """Regenerate fingerprint analysis and load rules.
 
     Called every 5 minutes by the scheduler (refresh_pump_model component).
-    Runs the full fingerprint analysis on 14 days of data, writes the
+    Runs the full fingerprint analysis on 24h of data, writes the
     JSON report, then loads the resulting rules.
 
     Also persists training labels for the dashboard and computes
@@ -1869,7 +2045,7 @@ def refresh_pump_rules():
 
     # Persist training labels for the pumps chart (uses existing data loading)
     try:
-        df = _load_and_label_data(lookback_hours=336)
+        df = _load_and_label_data(lookback_hours=24)
         if df is not None and len(df) > 0:
             _persist_training_labels(df)
     except Exception as e:
@@ -1878,7 +2054,7 @@ def refresh_pump_rules():
     # Run fingerprint analysis (writes to cache/pump_fingerprint_report.json)
     try:
         from pump_fingerprint import run_fingerprint_analysis
-        report = run_fingerprint_analysis(lookback_hours=336)
+        report = run_fingerprint_analysis(lookback_hours=24)
     except Exception as e:
         logger.error(f"Fingerprint analysis failed: {e}", exc_info=True)
         report = None
@@ -1905,14 +2081,17 @@ def refresh_pump_rules():
     _cb_cache_time = 0.0
     _circuit_breaker_paused = False
 
-    # Compute per-rule performance from recent outcomes
+    # Compute per-rule performance from recent outcomes and cache globally
+    global _rule_performance
     try:
-        rule_perf = _compute_rule_performance()
-        if rule_perf:
-            n_disabled = sum(1 for rp in rule_perf.values()
+        _rule_performance = _compute_rule_performance()
+        if _rule_performance:
+            n_disabled = sum(1 for rp in _rule_performance.values()
                             if rp.get('disabled', False))
-            logger.info(f"  Rule performance: {len(rule_perf)} tracked, "
-                        f"{n_disabled} disabled")
+            n_boosted = sum(1 for rp in _rule_performance.values()
+                           if rp.get('boosted', False))
+            logger.info(f"  Rule performance: {len(_rule_performance)} tracked, "
+                        f"{n_disabled} disabled, {n_boosted} boosted")
     except Exception as e:
         logger.debug(f"Rule performance computation failed: {e}")
 
@@ -1941,11 +2120,15 @@ def maybe_refresh_rules():
     file read) — the heavy fingerprint analysis runs in the separate
     refresh_pump_model component which writes the JSON report.
     """
-    global _last_rules_refresh
+    global _last_rules_refresh, _rule_performance
     now = time.time()
     if _rules is None or (now - _last_rules_refresh >= RULES_REFRESH_INTERVAL):
         _load_cached_model()
         _last_rules_refresh = now
+        try:
+            _rule_performance = _compute_rule_performance()
+        except Exception as e:
+            logger.debug(f"Rule performance refresh failed: {e}")
 
 
 # =============================================================================
@@ -2093,6 +2276,27 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     # Track volatility for monitoring
     _update_vol_buffer(trail_row.get('pm_realized_vol_1m'))
 
+    # --- VOLUME REGIME CHECK (warning only — no hard block) ---
+    tx_intensity = trail_row.get('tx_trade_intensity')
+    if tx_intensity is not None:
+        try:
+            tx_val = float(tx_intensity)
+            if tx_val < 0.8:
+                live_regime = "low"
+            elif tx_val < 1.5:
+                live_regime = "medium"
+            else:
+                live_regime = "high"
+            if (_current_volume_regime != "unknown"
+                    and live_regime != _current_volume_regime):
+                logger.warning(
+                    f"Volume regime drift: rules discovered in '{_current_volume_regime}' "
+                    f"regime, current market is '{live_regime}' "
+                    f"(tx_trade_intensity={tx_val:.3f})"
+                )
+        except (TypeError, ValueError):
+            pass
+
     # --- PATTERN MATCHING ---
     features = extract_signal_features(trail_row)
 
@@ -2100,32 +2304,40 @@ def check_pump_signal(trail_row: dict, market_price: float) -> bool:
     combo_match = match_combination_rule(features)
 
     # Fire logic:
-    # 1. Strong pattern (precision >= 55%) — fire even without combo
+    # 1. Strong pattern (precision >= 55%, or >= 45% if boosted) — fire even without combo
     # 2. Pattern + combo confirmation — fire
-    # 3. Very strong combo (precision >= 60%) — fire even without pattern
+    # 3. Very strong combo (precision >= 60%, or >= 50% if boosted) — fire without pattern
     fired = False
     fire_reason = ""
 
-    if pattern_match and pattern_match.get('precision', 0) >= 0.55:
+    pattern_boosted = pattern_match and pattern_match.get('boosted', False)
+    combo_boosted = combo_match and combo_match.get('boosted', False)
+    pattern_prec_threshold = 0.45 if pattern_boosted else 0.55
+    combo_prec_threshold = 0.50 if combo_boosted else 0.60
+
+    if pattern_match and pattern_match.get('precision', 0) >= pattern_prec_threshold:
+        boost_tag = " [BOOSTED]" if pattern_boosted else ""
         fired = True
         fire_reason = (f"Pattern: {pattern_match.get('label', '?')} "
                        f"(prec={pattern_match['precision']:.0%}, "
-                       f"n={pattern_match.get('n_occurrences', '?')})")
+                       f"n={pattern_match.get('n_occurrences', '?')}){boost_tag}")
 
     elif pattern_match and combo_match:
+        boost_tag = " [BOOSTED]" if (pattern_boosted or combo_boosted) else ""
         fired = True
         combo_feats = ' + '.join(combo_match.get('features', []))
         fire_reason = (f"Pattern: {pattern_match.get('label', '?')} "
                        f"(prec={pattern_match['precision']:.0%}) + "
                        f"Combo: [{combo_feats}] "
-                       f"(prec={combo_match.get('precision', 0):.0%})")
+                       f"(prec={combo_match.get('precision', 0):.0%}){boost_tag}")
 
-    elif combo_match and combo_match.get('precision', 0) >= 0.60:
+    elif combo_match and combo_match.get('precision', 0) >= combo_prec_threshold:
+        boost_tag = " [BOOSTED]" if combo_boosted else ""
         fired = True
         combo_feats = ' + '.join(combo_match.get('features', []))
         fire_reason = (f"Combo: [{combo_feats}] "
                        f"(prec={combo_match['precision']:.0%}, "
-                       f"n={combo_match.get('n_signals', '?')})")
+                       f"n={combo_match.get('n_signals', '?')}){boost_tag}")
 
     if not fired:
         if not pattern_match:
@@ -2194,20 +2406,31 @@ def _ensure_observation_table() -> None:
                 confidence DOUBLE PRECISION,
                 fire_reason TEXT,
                 features_json TEXT,
+                signal_fired BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Add signal_fired column to existing tables that pre-date this change
+        postgres_execute(
+            "ALTER TABLE pump_signal_observations "
+            "ADD COLUMN IF NOT EXISTS signal_fired BOOLEAN DEFAULT FALSE"
+        )
         _obs_table_created = True
     except Exception:
         pass
 
 
 def _record_observation(buyin_id: int, market_price: float, trail_row: dict,
-                        confidence: float, matched_rule: dict) -> None:
-    """Record an observation-mode signal for later analysis.
+                        confidence: float, matched_rule: dict,
+                        signal_fired: bool = True) -> None:
+    """Record one observation-mode cycle snapshot for later analysis.
 
-    Writes to pump_signal_observations table. After 14 days we can query
-    this table joined with price data to compute virtual P&L.
+    Called every 5s cycle in PUMP_OBSERVATION_MODE — for both fired signals
+    (signal_fired=True) and non-firing cycles (signal_fired=False).  This
+    gives a continuous audit trail so you can inspect what the system saw
+    each cycle and why it did or didn't fire.
+
+    Writes to pump_signal_observations table.
     """
     _ensure_observation_table()
     try:
@@ -2223,14 +2446,16 @@ def _record_observation(buyin_id: int, market_price: float, trail_row: dict,
 
         postgres_execute(
             """INSERT INTO pump_signal_observations
-               (buyin_id, market_price, rule_id, pattern_id, confidence, fire_reason, features_json)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+               (buyin_id, market_price, rule_id, pattern_id, confidence,
+                fire_reason, features_json, signal_fired)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
             [buyin_id, market_price,
              matched_rule.get('rule_id', ''),
              matched_rule.get('pattern_id', ''),
              confidence,
              matched_rule.get('fire_reason', ''),
-             json.dumps(features_snapshot)]
+             json.dumps(features_snapshot),
+             signal_fired]
         )
     except Exception as e:
         logger.warning(f"Failed to record observation: {e}")
@@ -2241,9 +2466,9 @@ def _record_observation(buyin_id: int, market_price: float, trail_row: dict,
 # =============================================================================
 
 def check_and_fire_pump_signal(
-    buyin_id: int,
-    market_price: float,
-    price_cycle: Optional[int],
+    buyin_id: Optional[int] = None,
+    market_price: float = 0.0,
+    price_cycle: Optional[int] = None,
 ) -> bool:
     global _last_entry_time
 
@@ -2256,31 +2481,89 @@ def check_and_fire_pump_signal(
     if _rules is None:
         return False
 
+    # Get live features from raw Parquet cache (fresh, no pre-computation lag).
+    # Raw cache is populated by binance_stream (OB) and webhook_server (trades/whales).
+    # If cache is not yet warm enough, skip this cycle.
+    trail_row = None
     try:
-        trail_row = postgres_query_one(
-            "SELECT * FROM buyin_trail_minutes WHERE buyin_id=%s AND minute=0 AND (sub_minute=0 OR sub_minute IS NULL)",
-            [buyin_id])
+        from core.raw_data_cache import get_live_features
+        live = get_live_features(window_min=5)
+        if live and live.get('ob_n', 0) >= 3:
+            # Use a timestamp-based signal key so context is retrievable without buyin_id
+            signal_key = int(time.time())
+            trail_row = {
+                'buyin_id':                  signal_key,
+                'minute':                    0,
+                'ob_volume_imbalance':        live.get('ob_avg_vol_imb'),
+                'ob_depth_imbalance_ratio':   live.get('ob_avg_depth_ratio'),
+                'ob_spread_bps':              live.get('ob_avg_spread_bps'),
+                'ob_net_flow_5m':             live.get('ob_net_liq_change'),
+                'ob_aggression_ratio':        live.get('ob_bid_ask_ratio'),
+                'ob_imbalance_shift_1m':      live.get('ob_imb_1m'),
+                'ob_imbalance_velocity_30s':  live.get('ob_imb_trend'),
+                'ob_depth_ratio_velocity':    live.get('ob_depth_trend'),
+                'ob_liquidity_score':         live.get('ob_liq_accel'),
+                'tx_buy_volume_pct':          live.get('tr_buy_ratio'),
+                'tx_whale_volume_pct':        live.get('tr_large_ratio'),
+                'tx_avg_trade_size':          live.get('tr_avg_size'),
+                'tx_aggressive_buy_ratio':    live.get('tr_buy_accel'),
+                'tx_trade_count':             live.get('tr_n'),
+                'tx_trade_intensity':         live.get('tr_n'),  # proxy
+                'wh_net_flow_sol':            live.get('wh_net_flow'),
+                'wh_accumulation_ratio':      live.get('wh_inflow_ratio'),
+                'wh_movement_count':          live.get('wh_n'),
+            }
     except Exception as e:
-        logger.error(f"V4 trail read error: {e}")
+        logger.debug(f"Raw cache features unavailable: {e}")
+
+    if trail_row is None:
+        logger.debug("V4: skipping cycle — raw cache not yet warm (ob_n < 3)")
         return False
 
-    if not trail_row:
-        return False
+    # ── Path A: Simulator rules (primary — uses raw feature names directly) ───
+    # `live` is guaranteed non-None and ob_n >= 3 here (trail_row guard passed)
+    sim_match = check_sim_rules(live)
+    signal_fires_sim = sim_match is not None
 
-    if not check_pump_signal(trail_row, market_price):
-        _log_gate_summary()
-        return False
+    # ── Path B: Fingerprint rules (fallback — uses mapped V4 names) ───────────
+    signal_fires_fp = check_pump_signal(trail_row, market_price)
     _log_gate_summary()
 
-    # Observation mode: log signal but don't execute trade
-    if PUMP_OBSERVATION_MODE:
-        ctx = _signal_context.get(int(trail_row.get('buyin_id', buyin_id)), {})
-        logger.info(f"OBSERVATION: Signal would fire for buyin #{buyin_id} @ {market_price:.4f}")
-        _record_observation(
-            buyin_id, market_price, trail_row,
-            confidence=ctx.get('pattern_precision') or ctx.get('combo_precision') or 0.0,
-            matched_rule=ctx,
+    # Signal fires if EITHER path matches
+    signal_fires = signal_fires_sim or signal_fires_fp
+
+    if signal_fires_sim and not signal_fires_fp:
+        logger.info(
+            f"[sim_rules] Signal via simulator rule | "
+            f"win_rate={sim_match.get('win_rate', 0):.0%} "
+            f"ev/trade={sim_match.get('ev_per_trade', 0):.4f} "
+            f"daily_ev={sim_match.get('daily_ev', 0):.3f}"
         )
+
+    # Observation mode: record EVERY cycle (fired or not) so there is a
+    # continuous 5-second reference trail in pump_signal_observations.
+    if PUMP_OBSERVATION_MODE:
+        sig_key = int(trail_row.get('buyin_id', 0))
+        ctx = _signal_context.get(sig_key, {}) if signal_fires_fp else {}
+        if signal_fires_sim and sim_match:
+            ctx['sim_rule'] = {
+                'win_rate':     sim_match.get('win_rate'),
+                'ev_per_trade': sim_match.get('ev_per_trade'),
+                'daily_ev':     sim_match.get('daily_ev'),
+                'conditions':   sim_match.get('conditions_json'),
+            }
+        confidence = ctx.get('pattern_precision') or ctx.get('combo_precision') or 0.0
+        if signal_fires:
+            logger.info(f"OBSERVATION: Signal would fire @ {market_price:.4f}")
+        _record_observation(
+            sig_key, market_price, trail_row,
+            confidence=confidence,
+            matched_rule=ctx,
+            signal_fired=signal_fires,
+        )
+        return False
+
+    if not signal_fires:
         return False
 
     # Cooldown
@@ -2319,14 +2602,15 @@ def check_and_fire_pump_signal(
     bt = datetime.now(timezone.utc).replace(tzinfo=None)
 
     # Get signal context for the entry log
-    ctx = _signal_context.get(int(trail_row.get('buyin_id', buyin_id)), {})
+    sig_key = int(trail_row.get('buyin_id', 0))
+    ctx = _signal_context.get(sig_key, {})
     fire_reason = ctx.get('fire_reason', 'unknown')
     pat_prec = ctx.get('pattern_precision')
     combo_prec = ctx.get('combo_precision')
 
     entry_log = json.dumps({
         'signal_type': 'pump_detection_v4',
-        'source_buyin_id': buyin_id,
+        'signal_key': sig_key,
         'fire_reason': fire_reason,
         'pattern_precision': pat_prec,
         'combo_precision': combo_prec,

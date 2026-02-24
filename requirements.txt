@@ -21,6 +21,7 @@ pydantic>=2.5.0
 # Legacy Flask API (still used by some features)
 Flask>=3.0.0
 flask-cors>=4.0.0
+waitress>=3.0.0
 
 # WebSocket (Binance order book stream)
 websocket-client>=1.7.0
@@ -36,7 +37,14 @@ scikit-learn>=1.3.0
 # Environment management
 python-dotenv>=1.0.0
 
+# AI / LLM
+anthropic>=0.40.0  # Claude API for fingerprint run analysis
+
 # Solana SDK (for swap testing)
 solders>=0.18.0  # Solana Python SDK
 base58>=2.1.1  # Base58 encoding for keys
+
+# Reporting / Analysis
+matplotlib>=3.7.0
+scipy>=1.10.0
 

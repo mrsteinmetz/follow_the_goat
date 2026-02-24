@@ -37,6 +37,11 @@ DEFAULT_COMPONENT_DEFS = [
     ComponentDef("local_api_5052", "service", "master2", "FastAPI Local API (port 5052)", expected_interval_ms=5000),
     # standalone jobs
     ComponentDef("sde_overnight_sweep", "job", "standalone", "Signal Discovery Engine - Overnight Sweep (every 12h)", expected_interval_ms=43200000),
+    ComponentDef("send_email_report", "job", "standalone", "System Health Email Report (every 12h)", expected_interval_ms=43200000),
+    # raw cache backfill — runs once at startup to pre-populate Parquet files from PostgreSQL
+    ComponentDef("backfill_raw_cache", "job", "standalone", "Backfill Raw Cache from PostgreSQL (startup + hourly)", expected_interval_ms=3600000),
+    # mega simulator — self-running GA + exit optimizer (every 30 min)
+    ComponentDef("mega_simulator", "job", "standalone", "Mega Signal Simulator — GA + Exit Grid Optimizer (continuous)", expected_interval_ms=1800000),
 ]
 
 

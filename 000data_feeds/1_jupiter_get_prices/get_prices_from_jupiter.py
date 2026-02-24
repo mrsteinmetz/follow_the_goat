@@ -31,7 +31,7 @@ except ImportError:
 import requests
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from core.database import get_postgres
@@ -244,7 +244,7 @@ def insert_prices_postgres(prices_data: dict) -> tuple[int, bool]:
     if not prices_data:
         return 0, False
     
-    ts = datetime.utcnow()
+    ts = datetime.now(timezone.utc)
     records = []
     
     for mint, data in prices_data.items():
@@ -324,7 +324,7 @@ def get_latest_prices() -> dict:
 
 def get_price_history(token: str, hours: float = 1.0) -> list:
     """Get price history for a token."""
-    cutoff = datetime.now() - timedelta(hours=hours)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     try:
         from core.database import get_postgres

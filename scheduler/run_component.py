@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import signal
@@ -88,6 +89,9 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         run_refresh_pump_model,
         # Standalone jobs
         run_sde_overnight_sweep,
+        run_send_email_report,
+        run_backfill_raw_cache,
+        run_mega_simulator,
     )
 
     return {
@@ -107,6 +111,9 @@ def _interval_job_specs() -> dict[str, IntervalJobSpec]:
         "export_job_status": IntervalJobSpec("export_job_status", 5.0, export_job_status_to_file),
         # Standalone jobs
         "sde_overnight_sweep": IntervalJobSpec("sde_overnight_sweep", 43200.0, run_sde_overnight_sweep),
+        "send_email_report": IntervalJobSpec("send_email_report", 43200.0, run_send_email_report),
+        "backfill_raw_cache": IntervalJobSpec("backfill_raw_cache", 3600.0, run_backfill_raw_cache),
+        "mega_simulator": IntervalJobSpec("mega_simulator", 1800.0, run_mega_simulator),
     }
 
 
@@ -121,8 +128,8 @@ def _service_specs() -> dict[str, ManagedServiceSpec]:
         jobs.stop_webhook_api()
 
     def webhook_is_running() -> bool:
-        srv = getattr(jobs, "_webhook_server", None)
-        return srv is not None and getattr(srv, "should_exit", False) is False
+        # Actual HTTP check so we restart if the webhook thread crashed
+        return jobs.is_webhook_responding()
 
     def php_start() -> None:
         jobs.start_php_server(host="0.0.0.0", port=8000)
@@ -162,9 +169,38 @@ def _service_specs() -> dict[str, ManagedServiceSpec]:
     }
 
 
+_rc_logger = logging.getLogger("run_component")
+
+
+def _safe_get_enabled(component_id: str, default: bool = True) -> bool:
+    """Call get_component_enabled without raising — returns default on DB error."""
+    try:
+        result = get_component_enabled(component_id)
+        return result if result is not None else default
+    except Exception as e:
+        _rc_logger.warning(f"[{component_id}] DB unavailable in get_component_enabled, assuming enabled={default}: {e}")
+        return default
+
+
+def _safe_upsert_heartbeat(*args, **kwargs) -> None:
+    """Call upsert_heartbeat without raising — silently ignores DB errors."""
+    try:
+        upsert_heartbeat(*args, **kwargs)
+    except Exception as e:
+        _rc_logger.warning(f"DB unavailable in upsert_heartbeat (non-fatal): {e}")
+
+
+def _safe_record_error(*args, **kwargs) -> None:
+    """Call record_error_event without raising — silently ignores DB errors."""
+    try:
+        record_error_event(*args, **kwargs)
+    except Exception as e:
+        _rc_logger.warning(f"DB unavailable in record_error_event (non-fatal): {e}")
+
+
 def run_interval_component(component_id: str, instance_id: str, spec: IntervalJobSpec) -> int:
     started_at = _utcnow()
-    upsert_heartbeat(component_id, instance_id, status="running", host=HOST, pid=os.getpid(), started_at=started_at)
+    _safe_upsert_heartbeat(component_id, instance_id, status="running", host=HOST, pid=os.getpid(), started_at=started_at)
 
     next_run = time.time()
     heartbeat_every = 5.0
@@ -173,11 +209,11 @@ def run_interval_component(component_id: str, instance_id: str, spec: IntervalJo
     while True:
         now = time.time()
 
-        # Heartbeat (even if disabled)
+        # Heartbeat (even if disabled) — DB errors here must not crash the loop
         if now - last_hb >= heartbeat_every:
-            enabled = get_component_enabled(component_id)
+            enabled = _safe_get_enabled(component_id, default=True)
             hb_status = "disabled" if enabled is False else "running"
-            upsert_heartbeat(component_id, instance_id, status=hb_status, host=HOST, pid=os.getpid(), started_at=started_at)
+            _safe_upsert_heartbeat(component_id, instance_id, status=hb_status, host=HOST, pid=os.getpid(), started_at=started_at)
             last_hb = now
 
         # Sleep until next scheduled tick
@@ -189,7 +225,7 @@ def run_interval_component(component_id: str, instance_id: str, spec: IntervalJo
         # Schedule next tick
         next_run = max(next_run + spec.interval_seconds, now + spec.interval_seconds)
 
-        enabled = get_component_enabled(component_id)
+        enabled = _safe_get_enabled(component_id, default=True)
         if enabled is False:
             continue
 
@@ -197,7 +233,7 @@ def run_interval_component(component_id: str, instance_id: str, spec: IntervalJo
             spec.run_once()
         except Exception as e:
             tb_text = safe_capture_traceback(e)
-            record_error_event(
+            _safe_record_error(
                 component_id=component_id,
                 instance_id=instance_id,
                 host=HOST,
@@ -206,7 +242,7 @@ def run_interval_component(component_id: str, instance_id: str, spec: IntervalJo
                 traceback_text=tb_text,
                 context={"component_id": component_id, "type": "interval_job"},
             )
-            upsert_heartbeat(
+            _safe_upsert_heartbeat(
                 component_id,
                 instance_id,
                 status="error",
@@ -221,12 +257,13 @@ def run_interval_component(component_id: str, instance_id: str, spec: IntervalJo
 
 def run_managed_service(component_id: str, instance_id: str, spec: ManagedServiceSpec) -> int:
     started_at = _utcnow()
-    upsert_heartbeat(component_id, instance_id, status="idle", host=HOST, pid=os.getpid(), started_at=started_at)
+    _safe_upsert_heartbeat(component_id, instance_id, status="idle", host=HOST, pid=os.getpid(), started_at=started_at)
 
     heartbeat_every = 5.0
 
     while True:
-        enabled = get_component_enabled(component_id)
+        # DB errors here must NEVER crash the service process — assume enabled when uncertain
+        enabled = _safe_get_enabled(component_id, default=True)
 
         if enabled is False:
             # Ensure stopped
@@ -234,7 +271,7 @@ def run_managed_service(component_id: str, instance_id: str, spec: ManagedServic
                 try:
                     spec.stop()
                 except Exception as e:
-                    record_error_event(
+                    _safe_record_error(
                         component_id=component_id,
                         instance_id=instance_id,
                         host=HOST,
@@ -243,7 +280,7 @@ def run_managed_service(component_id: str, instance_id: str, spec: ManagedServic
                         traceback_text=safe_capture_traceback(e),
                         context={"component_id": component_id, "type": "service_stop"},
                     )
-            upsert_heartbeat(component_id, instance_id, status="disabled", host=HOST, pid=os.getpid(), started_at=started_at)
+            _safe_upsert_heartbeat(component_id, instance_id, status="disabled", host=HOST, pid=os.getpid(), started_at=started_at)
             time.sleep(heartbeat_every)
             continue
 
@@ -252,7 +289,7 @@ def run_managed_service(component_id: str, instance_id: str, spec: ManagedServic
             try:
                 spec.start()
             except Exception as e:
-                record_error_event(
+                _safe_record_error(
                     component_id=component_id,
                     instance_id=instance_id,
                     host=HOST,
@@ -261,7 +298,7 @@ def run_managed_service(component_id: str, instance_id: str, spec: ManagedServic
                     traceback_text=safe_capture_traceback(e),
                     context={"component_id": component_id, "type": "service_start"},
                 )
-                upsert_heartbeat(
+                _safe_upsert_heartbeat(
                     component_id,
                     instance_id,
                     status="error",
@@ -275,7 +312,7 @@ def run_managed_service(component_id: str, instance_id: str, spec: ManagedServic
                 continue
 
         # Running
-        upsert_heartbeat(component_id, instance_id, status="running", host=HOST, pid=os.getpid(), started_at=started_at)
+        _safe_upsert_heartbeat(component_id, instance_id, status="running", host=HOST, pid=os.getpid(), started_at=started_at)
         time.sleep(heartbeat_every)
 
 

@@ -112,6 +112,15 @@
                                 </a>
                             </li>
 
+                            <!-- Pump Analytics -->
+                            <li class="slide">
+                                <a href="/pages/features/pump-analytics/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><path d="M40,208H216" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><path d="M64,208V136" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><path d="M104,208V88" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><path d="M144,208V136" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><path d="M184,208V48" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/></svg>
+                                    <span class="side-menu__label">Pump Analytics</span>
+                                    <span class="badge bg-info-transparent ms-auto">New</span>
+                                </a>
+                            </li>
+
                               <!-- Start::slide__category -->
                               <li class="slide__category"><span class="category-name">Data Streams</span></li>
                             <!-- End::slide__category -->

@@ -49,6 +49,20 @@ logging.basicConfig(level=logging.INFO)
 
 
 # =============================================================================
+# GLOBAL ERROR HANDLING (prevent crashes from taking down the server)
+# =============================================================================
+
+@app.errorhandler(Exception)
+def handle_uncaught(exc):
+    """Catch uncaught exceptions and return 500 instead of crashing the process. Let HTTP errors (404, etc.) pass through."""
+    from werkzeug.exceptions import HTTPException
+    if isinstance(exc, HTTPException):
+        return exc
+    logger.error(f"Uncaught exception: {exc}", exc_info=True)
+    return jsonify({"error": "Internal server error", "status": "error"}), 500
+
+
+# =============================================================================
 # HEALTH & STATUS ENDPOINTS
 # =============================================================================
 
@@ -78,7 +92,7 @@ def health_check():
                 'cycles': cycles_count,
                 'buyins': buyins_count
             },
-            'timestamp': datetime.utcnow().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         })
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
@@ -273,6 +287,385 @@ def get_pump_training_entries():
             return jsonify({'entries': [], 'count': 0})  # Table not created yet (no refresh run)
         logger.error(f"Get pump training entries failed: {e}", exc_info=True)
         return jsonify({'error': str(e), 'entries': [], 'count': 0}), 500
+
+
+@app.route('/pump/analytics', methods=['GET'])
+def get_pump_analytics():
+    """Pump Analytics dashboard data: signal outcomes, continuation history,
+    fingerprint rules summary, and aggregate stats."""
+    hours = request.args.get('hours', 24, type=int)
+    hours = max(1, min(168, hours))
+    limit = request.args.get('limit', 50, type=int)
+    limit = max(1, min(200, limit))
+
+    result = {
+        'signal_summary': {},
+        'continuation_summary': {},
+        'fingerprint_rules': {},
+        'recent_outcomes': [],
+        'recent_continuation': [],
+    }
+
+    def _ts(val):
+        if hasattr(val, 'isoformat'):
+            return val.isoformat()
+        return str(val) if val is not None else None
+
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cur:
+                # --- Signal outcomes summary ---
+                cur.execute("""
+                    SELECT
+                        COUNT(*)                                      AS n_total,
+                        COUNT(*) FILTER (WHERE hit_target = TRUE)     AS n_hits,
+                        AVG(gain_pct)                                 AS avg_gain,
+                        AVG(confidence)                               AS avg_confidence,
+                        AVG(readiness_score)                          AS avg_readiness
+                    FROM pump_signal_outcomes
+                    WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
+                """, [hours])
+                row = cur.fetchone()
+                n_total = int(row['n_total'] or 0)
+                n_hits = int(row['n_hits'] or 0)
+                result['signal_summary'] = {
+                    'n_total': n_total,
+                    'n_hits': n_hits,
+                    'win_rate': round(n_hits / n_total * 100, 1) if n_total > 0 else None,
+                    'avg_gain': round(float(row['avg_gain']), 4) if row['avg_gain'] is not None else None,
+                    'avg_confidence': round(float(row['avg_confidence']), 4) if row['avg_confidence'] is not None else None,
+                    'avg_readiness': round(float(row['avg_readiness']), 4) if row['avg_readiness'] is not None else None,
+                }
+
+                # --- Circuit breaker (last 20 outcomes) ---
+                cur.execute("""
+                    SELECT hit_target, gain_pct
+                    FROM pump_signal_outcomes
+                    ORDER BY created_at DESC
+                    LIMIT 20
+                """)
+                cb_rows = cur.fetchall()
+                cb_n = len(cb_rows)
+                cb_hits = sum(1 for r in cb_rows if r.get('hit_target'))
+                cb_wr = round(cb_hits / cb_n * 100, 1) if cb_n > 0 else None
+                result['signal_summary']['circuit_breaker'] = {
+                    'n_recent': cb_n,
+                    'hits_recent': cb_hits,
+                    'win_rate_recent': cb_wr,
+                    'tripped': cb_wr is not None and cb_wr < 35.0 and cb_n >= 10,
+                }
+
+                # --- Recent outcomes ---
+                cur.execute("""
+                    SELECT id, buyin_id, hit_target, gain_pct, confidence,
+                           readiness_score, rule_id, pattern_id,
+                           top_features_json, gates_passed_json, created_at
+                    FROM pump_signal_outcomes
+                    WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, [hours, limit])
+                for r in cur.fetchall():
+                    result['recent_outcomes'].append({
+                        'id': r['id'],
+                        'buyin_id': r.get('buyin_id'),
+                        'hit_target': r.get('hit_target'),
+                        'gain_pct': round(float(r['gain_pct']), 4) if r.get('gain_pct') is not None else None,
+                        'confidence': round(float(r['confidence']), 4) if r.get('confidence') is not None else None,
+                        'readiness_score': round(float(r['readiness_score']), 4) if r.get('readiness_score') is not None else None,
+                        'rule_id': r.get('rule_id'),
+                        'pattern_id': r.get('pattern_id'),
+                        'top_features': r.get('top_features_json'),
+                        'gates_passed': r.get('gates_passed_json'),
+                        'created_at': _ts(r.get('created_at')),
+                    })
+
+                # --- Continuation history summary ---
+                cur.execute("""
+                    SELECT
+                        COUNT(*)                                  AS n_total,
+                        COUNT(*) FILTER (WHERE passed = TRUE)     AS n_passed
+                    FROM pump_continuation_history
+                    WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
+                """, [hours])
+                ch = cur.fetchone()
+                ch_total = int(ch['n_total'] or 0)
+                ch_passed = int(ch['n_passed'] or 0)
+                result['continuation_summary'] = {
+                    'n_total': ch_total,
+                    'n_passed': ch_passed,
+                    'pass_rate_pct': round(ch_passed / ch_total * 100, 1) if ch_total > 0 else None,
+                }
+
+                # --- Recent continuation checks ---
+                cur.execute("""
+                    SELECT id, buyin_id, passed, reason, rules_checked,
+                           pre_entry_change_1m, rule_details, created_at
+                    FROM pump_continuation_history
+                    WHERE created_at >= NOW() - INTERVAL '1 hour' * %s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, [hours, limit])
+                for r in cur.fetchall():
+                    result['recent_continuation'].append({
+                        'id': r['id'],
+                        'buyin_id': r.get('buyin_id'),
+                        'passed': r.get('passed'),
+                        'reason': r.get('reason'),
+                        'rules_checked': r.get('rules_checked'),
+                        'pre_entry_change_1m': round(float(r['pre_entry_change_1m']), 4) if r.get('pre_entry_change_1m') is not None else None,
+                        'rule_details': r.get('rule_details'),
+                        'created_at': _ts(r.get('created_at')),
+                    })
+
+        # --- Fingerprint rules (from JSON cache on disk) ---
+        fp_path = PROJECT_ROOT / 'cache' / 'pump_fingerprint_report.json'
+        if fp_path.exists():
+            try:
+                fp = json.loads(fp_path.read_text())
+                ds = fp.get('data_summary', {})
+                top_feats = fp.get('feature_rankings', [])[:15]
+                patterns = fp.get('approved_patterns', [])
+                combos = fp.get('top_combinations', [])
+                result['fingerprint_rules'] = {
+                    'generated_at': fp.get('generated_at'),
+                    'lookback_hours': fp.get('lookback_hours'),
+                    'n_entries': ds.get('total_entries'),
+                    'n_pumps': ds.get('n_pumps'),
+                    'n_independent_pumps': ds.get('n_independent_pumps'),
+                    'pump_rate_pct': ds.get('pump_rate_pct'),
+                    'n_approved_patterns': len(patterns),
+                    'n_combinations': len(combos),
+                    'top_features': [{
+                        'feature': f.get('feature'),
+                        'separation': round(float(f.get('abs_separation', 0)), 4),
+                        'median_pump': f.get('median_pump'),
+                        'median_non_pump': f.get('median_non_pump'),
+                        'rule_eligible': f.get('rule_eligible'),
+                    } for f in top_feats],
+                    'approved_patterns': [{
+                        'cluster_id': p.get('cluster_id'),
+                        'precision': p.get('precision'),
+                        'n_pumps': p.get('n_pumps'),
+                        'features': list(p.get('feature_ranges', {}).keys()) if isinstance(p.get('feature_ranges'), dict) else [],
+                    } for p in patterns[:20]],
+                    'combinations': [{
+                        'features': c.get('features'),
+                        'precision': c.get('precision'),
+                        'support': c.get('support'),
+                    } for c in combos[:20]],
+                }
+            except Exception as e:
+                logger.warning(f"Failed to read fingerprint report: {e}")
+                result['fingerprint_rules'] = {'error': str(e)}
+        else:
+            result['fingerprint_rules'] = {'error': 'No fingerprint report found'}
+
+        # --- Raw cache status (Parquet files written by data feeds) ---
+        try:
+            from core.raw_data_cache import OB_PARQUET, TRADE_PARQUET, WHALE_PARQUET, open_reader
+            import time as _time
+
+            def _parquet_info(p):
+                if not p.exists():
+                    return {'exists': False, 'rows': 0, 'age_seconds': None, 'size_kb': 0}
+                age = _time.time() - p.stat().st_mtime
+                return {
+                    'exists': True,
+                    'size_kb': round(p.stat().st_size / 1024),
+                    'age_seconds': round(age, 1),
+                }
+
+            ob_info    = _parquet_info(OB_PARQUET)
+            trade_info = _parquet_info(TRADE_PARQUET)
+            whale_info = _parquet_info(WHALE_PARQUET)
+
+            # Row counts via in-memory DuckDB (fast, no lock)
+            try:
+                con = open_reader()
+                ob_info['rows']    = con.execute("SELECT COUNT(*) FROM ob_snapshots").fetchone()[0]
+                trade_info['rows'] = con.execute("SELECT COUNT(*) FROM raw_trades").fetchone()[0]
+                whale_info['rows'] = con.execute("SELECT COUNT(*) FROM whale_events").fetchone()[0]
+                con.close()
+            except Exception:
+                pass
+
+            # Live market features
+            live_feats = None
+            try:
+                from core.raw_data_cache import get_live_features
+                live_feats = get_live_features(window_min=5)
+            except Exception:
+                pass
+
+            result['raw_cache'] = {
+                'ob':     ob_info,
+                'trades': trade_info,
+                'whales': whale_info,
+                'live_features': live_feats,
+            }
+        except Exception as rc_err:
+            result['raw_cache'] = {'error': str(rc_err)}
+
+        # --- Cycle tracker summary (ground-truth pump counts) ---
+        try:
+            with get_postgres() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT
+                            COUNT(*) FILTER (WHERE max_percent_increase >= 0.2) AS p02,
+                            COUNT(*) FILTER (WHERE max_percent_increase >= 0.3) AS p03,
+                            COUNT(*) FILTER (WHERE max_percent_increase >= 0.4) AS p04
+                        FROM cycle_tracker
+                        WHERE cycle_start_time >= NOW() - INTERVAL '1 hour' * %s
+                    """, [hours])
+                    ct = cur.fetchone()
+                    result['cycle_tracker'] = {
+                        'pumps_0_2pct': int(ct['p02'] or 0),
+                        'pumps_0_3pct': int(ct['p03'] or 0),
+                        'pumps_0_4pct': int(ct['p04'] or 0),
+                        'hours': hours,
+                    }
+        except Exception as ct_err:
+            result['cycle_tracker'] = {'error': str(ct_err)}
+
+        return jsonify(result)
+
+    except Exception as e:
+        tbl = str(e)
+        if 'does not exist' in tbl or 'relation' in tbl.lower():
+            return jsonify(result)
+        logger.error(f"Pump analytics failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/pump/opportunity_funnel', methods=['GET'])
+def get_pump_opportunity_funnel():
+    """Daily opportunity funnel for play 3 pump signals and historical trade scatter."""
+    days = request.args.get('days', 7, type=int)
+    days = max(1, min(30, days))
+
+    PUMP_PLAY_ID = 3
+
+    result = {
+        'daily_funnel': [],
+        'all_time_trades': [],
+        'summary': {},
+    }
+
+    def _ts(val):
+        if hasattr(val, 'isoformat'):
+            return val.isoformat()
+        return str(val) if val is not None else None
+
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cur:
+                # --- Daily cycle counts (no_go + sold + error = total cycles) ---
+                cur.execute("""
+                    SELECT DATE(created_at) AS day,
+                           COUNT(*) AS total_cycles,
+                           COUNT(*) FILTER (WHERE our_status = 'sold') AS trades_made
+                    FROM follow_the_goat_buyins
+                    WHERE play_id = %s
+                      AND created_at >= NOW() - INTERVAL '1 day' * %s
+                    GROUP BY 1 ORDER BY 1
+                """, [PUMP_PLAY_ID, days])
+                cycle_rows = {str(r['day']): r for r in cur.fetchall()}
+
+                # --- Daily continuation breakdown by reason category ---
+                # Note: passed=TRUE can still have "flat"/"error" reasons — categorize by text
+                cur.execute("""
+                    SELECT DATE(h.created_at) AS day,
+                           COUNT(*) AS total,
+                           COUNT(*) FILTER (
+                               WHERE h.reason NOT ILIKE '%%flat%%'
+                                 AND h.reason NOT ILIKE '%%not rising%%'
+                                 AND h.reason NOT ILIKE '%%error%%'
+                           ) AS cont_passed,
+                           COUNT(*) FILTER (
+                               WHERE h.reason ILIKE '%%flat%%'
+                                  OR h.reason ILIKE '%%not rising%%'
+                           ) AS cont_flat,
+                           COUNT(*) FILTER (
+                               WHERE h.reason ILIKE '%%error%%'
+                           ) AS cont_errors
+                    FROM pump_continuation_history h
+                    JOIN follow_the_goat_buyins b ON b.id = h.buyin_id AND b.play_id = %s
+                    WHERE h.created_at >= NOW() - INTERVAL '1 day' * %s
+                    GROUP BY 1 ORDER BY 1
+                """, [PUMP_PLAY_ID, days])
+                cont_rows = {str(r['day']): r for r in cur.fetchall()}
+
+                all_days = sorted(set(list(cycle_rows.keys()) + list(cont_rows.keys())))
+                total_cycles_sum = 0
+                total_trades_sum = 0
+                for day in all_days:
+                    cy = cycle_rows.get(day, {})
+                    co = cont_rows.get(day, {})
+                    tc = int(cy.get('total_cycles') or 0)
+                    tm = int(cy.get('trades_made') or 0)
+                    total_cycles_sum += tc
+                    total_trades_sum += tm
+                    result['daily_funnel'].append({
+                        'date': day,
+                        'total_cycles': tc,
+                        'trades_made': tm,
+                        'cont_passed': int(co.get('cont_passed') or 0),
+                        'cont_flat': int(co.get('cont_flat') or 0),
+                        'cont_errors': int(co.get('cont_errors') or 0),
+                    })
+
+                n_days = len(all_days) or 1
+                result['summary'] = {
+                    'days': days,
+                    'total_cycles': total_cycles_sum,
+                    'total_trades': total_trades_sum,
+                    'avg_trades_per_day': round(total_trades_sum / n_days, 1),
+                }
+
+                # --- All-time sold trades for play 3 ---
+                cur.execute("""
+                    SELECT id, followed_at, our_entry_price, our_exit_price,
+                           our_profit_loss, our_status, entry_log, created_at
+                    FROM follow_the_goat_buyins
+                    WHERE play_id = %s AND our_status = 'sold'
+                    ORDER BY created_at ASC
+                """, [PUMP_PLAY_ID])
+                trades = cur.fetchall()
+                wins = 0
+                for t in trades:
+                    pnl = float(t['our_profit_loss']) if t.get('our_profit_loss') is not None else None
+                    gain_pct = None
+                    if t.get('our_exit_price') and t.get('our_entry_price') and float(t['our_entry_price']) > 0:
+                        gain_pct = round((float(t['our_exit_price']) - float(t['our_entry_price'])) / float(t['our_entry_price']) * 100, 4)
+                    if pnl is not None and pnl > 0:
+                        wins += 1
+                    el = t.get('entry_log')
+                    if not isinstance(el, dict):
+                        el = {}
+                    result['all_time_trades'].append({
+                        'id': t['id'],
+                        'followed_at': _ts(t.get('followed_at')),
+                        'created_at': _ts(t.get('created_at')),
+                        'our_entry_price': float(t['our_entry_price']) if t.get('our_entry_price') is not None else None,
+                        'our_exit_price': float(t['our_exit_price']) if t.get('our_exit_price') is not None else None,
+                        'our_profit_loss': pnl,
+                        'gain_pct': gain_pct,
+                        'model_confidence': el.get('model_confidence'),
+                    })
+                n_trades = len(trades)
+                result['summary']['win_rate_pct'] = round(wins / n_trades * 100, 1) if n_trades > 0 else None
+                result['summary']['total_all_time_trades'] = n_trades
+
+        return jsonify(result)
+
+    except Exception as e:
+        tbl = str(e)
+        if 'does not exist' in tbl or 'relation' in tbl.lower():
+            return jsonify(result)
+        logger.error(f"Pump opportunity funnel failed: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 # =============================================================================
@@ -1557,9 +1950,9 @@ def scheduler_components():
         from scheduler.component_registry import ensure_default_components_registered
         ensure_default_components_registered()
 
-        # psycopg2 returns naive datetimes for TIMESTAMP (no time zone) columns.
-        # Use naive UTC for comparisons to avoid offset-aware/naive subtraction errors.
-        now = datetime.utcnow()
+        # scheduler_component_heartbeats uses TIMESTAMP WITHOUT TIME ZONE (naive UTC).
+        # Strip tzinfo so subtraction works without TypeError.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
 
         with get_postgres() as conn:
             with conn.cursor() as cursor:
@@ -1893,10 +2286,8 @@ def get_order_book_features():
     """Get order book features with PHP-compatible column names."""
     try:
         limit = min(int(request.args.get('limit', 100)), 5000)
-        
         with get_postgres() as conn:
             with conn.cursor() as cursor:
-                # Calculate best_bid and best_ask from JSON arrays
                 cursor.execute("""
                     SELECT 
                         id,
@@ -1927,7 +2318,6 @@ def get_order_book_features():
                     LIMIT %s
                 """, [limit])
                 results = cursor.fetchall()
-        
         return jsonify({
             'results': results,
             'count': len(results),
@@ -3161,6 +3551,22 @@ def query():
 
 
 # =============================================================================
+# EMAIL REPORT PREVIEW
+# =============================================================================
+
+@app.route('/email_report')
+def email_report_preview():
+    """Render the system health email report as a live HTML page."""
+    try:
+        from features.email_report.report import generate_html
+        html = generate_html()
+        return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+    except Exception as e:
+        logger.error(f"Email report generation failed: {e}", exc_info=True)
+        return f"<pre>Error generating report:\n{e}</pre>", 500, {'Content-Type': 'text/html'}
+
+
+# =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
 
@@ -3188,8 +3594,14 @@ def main():
     print("\n✓ PostgreSQL connection verified")
     print(f"\nStarting server on http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.\n")
-    
-    app.run(host=args.host, port=args.port, debug=False)
+
+    # Prefer Waitress (production WSGI) for stability; fallback to Flask dev server with threading
+    try:
+        import waitress
+        # Threaded server: handles concurrent requests without blocking; no connection exhaustion
+        waitress.serve(app, host=args.host, port=args.port, threads=8, connection_limit=100)
+    except ImportError:
+        app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 
 if __name__ == '__main__':

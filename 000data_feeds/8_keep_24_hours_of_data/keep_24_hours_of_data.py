@@ -167,6 +167,19 @@ def archive_table_data(
         # STEP 2: Convert to DataFrame and save to Parquet
         df = pd.DataFrame(rows)
         
+        # Serialize any object/mixed-type columns (lists, dicts, etc.) to JSON strings
+        # so PyArrow can handle them without type errors
+        import json
+        for col in df.columns:
+            if df[col].dtype == object:
+                def _to_json(v):
+                    if v is None:
+                        return None
+                    if isinstance(v, (list, dict)):
+                        return json.dumps(v)
+                    return v
+                df[col] = df[col].map(_to_json)
+        
         # Generate filename with current date
         date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
         filename = f"{table_name}_{date_str}.parquet"

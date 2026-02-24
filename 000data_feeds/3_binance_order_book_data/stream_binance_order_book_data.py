@@ -33,7 +33,7 @@ import json
 import time
 import threading
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable
 from collections import deque
 
@@ -42,6 +42,16 @@ from core.config import settings
 
 # Configure logging
 logger = logging.getLogger("binance_stream")
+
+# DuckDB raw cache — lazy singleton so import errors don't break the stream
+_ob_cache = None
+
+def _get_ob_cache():
+    global _ob_cache
+    if _ob_cache is None:
+        from core.raw_data_cache import OBCache
+        _ob_cache = OBCache()
+    return _ob_cache
 
 
 def _compute_microprice(best_bid: float, bid_size: float, best_ask: float, ask_size: float) -> float:
@@ -219,13 +229,11 @@ class BinanceOrderBookCollector:
                 net_liquidity_change_1s = float(total_depth_10 - prev_total)
         except Exception:
             net_liquidity_change_1s = None
-        
-        # Venue and quote asset
-        venue = 'binance'
-        quote_asset = 'USDT' if self.symbol.endswith('USDT') else 'BUSD'
-        
+
+        # Columns matching order_book_features table (include symbol if column exists)
         features = {
-            'timestamp': orderbook_data['timestamp'],  # Changed from 'ts' to match table schema
+            'timestamp': orderbook_data['timestamp'],
+            'symbol': self.symbol,
             'mid_price': mid_price,
             'spread_bps': relative_spread_bps,
             'bid_liquidity': bid_depth_10,
@@ -251,15 +259,36 @@ class BinanceOrderBookCollector:
             'asks_json': json.dumps(asks[:20]),
             'source': orderbook_data['source']
         }
-        
         return features
     
     def _write_to_engine(self, features: Dict) -> bool:
-        """Write features to PostgreSQL."""
+        """Write features to PostgreSQL and DuckDB raw cache."""
         try:
             # Write to PostgreSQL
             postgres_insert('order_book_features', features)
             self.stats['writes_queued'] += 1
+
+            # Dual-write to DuckDB raw cache (non-blocking, buffered)
+            try:
+                _get_ob_cache().append(
+                    ts             = features['timestamp'],
+                    mid_price      = features.get('mid_price'),
+                    spread_bps     = features.get('spread_bps'),
+                    bid_liq        = features.get('bid_liquidity'),
+                    ask_liq        = features.get('ask_liquidity'),
+                    vol_imb        = features.get('volume_imbalance'),
+                    depth_ratio    = features.get('depth_imbalance_ratio'),
+                    microprice     = features.get('microprice'),
+                    microprice_dev = features.get('microprice_dev_bps'),
+                    net_liq_1s     = features.get('net_liquidity_change_1s'),
+                    bid_slope      = features.get('bid_slope'),
+                    ask_slope      = features.get('ask_slope'),
+                    bid_dep_5bps   = features.get('bid_depth_bps_5'),
+                    ask_dep_5bps   = features.get('ask_depth_bps_5'),
+                )
+            except Exception as de:
+                logger.debug(f"DuckDB OB write skipped: {de}")
+
             return True
         except Exception as e:
             logger.error(f"PostgreSQL write error: {e}")
@@ -280,7 +309,7 @@ class BinanceOrderBookCollector:
                 data = json.loads(message)
                 
                 orderbook = {
-                    'timestamp': datetime.utcnow(),
+                    'timestamp': datetime.now(timezone.utc),
                     'bids': [[float(bid[0]), float(bid[1])] for bid in data['bids']],
                     'asks': [[float(ask[0]), float(ask[1])] for ask in data['asks']],
                     'source': 'WEBSOCKET'

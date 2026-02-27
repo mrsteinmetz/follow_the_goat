@@ -106,6 +106,19 @@ def run_follow_the_goat():
         logger.error(f"Follow the goat job error: {e}", exc_info=True)
 
 
+@track_job("wallet_executor", "Paper wallet executor (every 1s)")
+def run_wallet_executor():
+    """Run a single wallet executor cycle."""
+    try:
+        trading_path = PROJECT_ROOT / "000trading"
+        if str(trading_path) not in sys.path:
+            sys.path.insert(0, str(trading_path))
+        from wallet_executor import run_wallet_cycle
+        run_wallet_cycle()
+    except Exception as e:
+        logger.error(f"Wallet executor job error: {e}", exc_info=True)
+
+
 @track_job("trailing_stop_seller", "Trailing stop seller (every 1s)")
 def run_trailing_stop_seller():
     """Run a single trailing stop monitoring cycle."""

@@ -668,6 +668,296 @@ def get_pump_opportunity_funnel():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/pump/feature_export', methods=['GET'])
+def get_pump_feature_export():
+    """Export the last N rows (default 100) of the 30-second feature matrix used by mega_simulator.
+
+    Reads directly from the DuckDB Parquet caches (ob_snapshots, raw_trades, whale_events),
+    buckets to 30-second intervals, computes 5-min rolling window features in DuckDB using
+    window functions, and returns every row with all 26 feature columns + timestamp + mid_price.
+
+    Also returns:
+      - feature_meta: name/group/description for every feature
+      - simulation_rules: up to 20 recently saved GA-approved rules from simulation_results
+    """
+    n_rows = request.args.get('rows', 100, type=int)
+    n_rows = max(10, min(500, n_rows))
+
+    # Feature metadata (name, group, description) — mirrors mega_simulator.FEATURES
+    FEATURE_META = [
+        # Order book: 5-min rolling
+        {"name": "ob_avg_vol_imb",      "group": "Order Book (5-min)",      "description": "(bid_vol - ask_vol) / total — positive = buy pressure dominates"},
+        {"name": "ob_avg_depth_ratio",  "group": "Order Book (5-min)",      "description": "bid depth / ask depth — >1 means more buy-side liquidity"},
+        {"name": "ob_avg_spread_bps",   "group": "Order Book (5-min)",      "description": "bid-ask spread in basis points — lower = tighter, more liquid market"},
+        {"name": "ob_net_liq_change",   "group": "Order Book (5-min)",      "description": "sum of net_liq_1s — net liquidity flow; positive = liquidity building on buy side"},
+        {"name": "ob_bid_ask_ratio",    "group": "Order Book (5-min)",      "description": "bid_liq / ask_liq — overall liquidity skew across all price levels"},
+        # Order book: acceleration
+        {"name": "ob_imb_trend",        "group": "Order Book (Acceleration)", "description": "ob_imb_1m - ob_imb_5m — is volume imbalance accelerating vs baseline?"},
+        {"name": "ob_depth_trend",      "group": "Order Book (Acceleration)", "description": "ob_depth_1m - ob_depth_5m — is buy-side depth building faster than average?"},
+        {"name": "ob_liq_accel",        "group": "Order Book (Acceleration)", "description": "ob_bid_ask_1m - ob_bid_ask_5m — is liquidity skew rising in the last minute?"},
+        # Order book: microstructure
+        {"name": "ob_slope_ratio",      "group": "Order Book (Microstructure)", "description": "bid_slope / |ask_slope| — how steep is the buy side vs sell side of the book?"},
+        {"name": "ob_depth_5bps_ratio", "group": "Order Book (Microstructure)", "description": "bid_dep_5bps / ask_dep_5bps — close-to-mid depth imbalance within 5bps of mid"},
+        {"name": "ob_microprice_dev",   "group": "Order Book (Microstructure)", "description": "microprice - mid_price — directional pressure; positive = micro buying pressure"},
+        # Trades
+        {"name": "tr_buy_ratio",        "group": "Trades",   "description": "buy_vol / total_vol — fraction of volume on buy side; >0.55 = buying dominance"},
+        {"name": "tr_large_ratio",      "group": "Trades",   "description": "vol from trades >50 SOL / total — institutional/whale trade activity proxy"},
+        {"name": "tr_buy_accel",        "group": "Trades",   "description": "1-min buy ratio / 5-min buy ratio — is buy momentum building? >1 = acceleration"},
+        {"name": "tr_avg_size",         "group": "Trades",   "description": "average trade size in SOL — larger = more conviction per execution"},
+        {"name": "tr_n",                "group": "Trades",   "description": "total trade count in 5-min window — overall market activity level"},
+        # Whale
+        {"name": "wh_inflow_ratio",     "group": "Whale Activity", "description": "whale_in_sol / total_whale_sol — net accumulation fraction; >0.6 = whales accumulating"},
+        {"name": "wh_net_flow",         "group": "Whale Activity", "description": "whale_in_sol - whale_out_sol — signed net SOL flow from tracked wallets"},
+        {"name": "wh_large_count",      "group": "Whale Activity", "description": "events with significance >0.5 (MAJOR/SIGNIFICANT moves) in last 5 min"},
+        {"name": "wh_n",                "group": "Whale Activity", "description": "total whale event count in window — how active are tracked wallets?"},
+        {"name": "wh_avg_pct_moved",    "group": "Whale Activity", "description": "avg % of each whale's wallet moved — conviction; high = meaningful position change"},
+        {"name": "wh_urgency_ratio",    "group": "Whale Activity", "description": "fraction of events moving >50% of wallet — urgent / panic moves"},
+        # Price momentum
+        {"name": "pm_price_change_30s", "group": "Price Momentum", "description": "price % change in last 30 seconds"},
+        {"name": "pm_price_change_1m",  "group": "Price Momentum", "description": "price % change in last 1 minute"},
+        {"name": "pm_price_change_5m",  "group": "Price Momentum", "description": "price % change in last 5 minutes"},
+        {"name": "pm_velocity_30s",     "group": "Price Momentum", "description": "momentum acceleration: 1m_change - 5m_change; positive = price speeding up short-term"},
+    ]
+
+    try:
+        from core.raw_data_cache import open_reader
+        con = open_reader()
+
+        try:
+            # Build 30-second bucketed + 5-min rolling feature matrix entirely in DuckDB.
+            # 5-min window = 10 buckets of 30s; 1-min window = 2 buckets of 30s.
+            rows_raw = con.execute(f"""
+                WITH
+                -- ── 30-second OB buckets ─────────────────────────────────────
+                ob_b AS (
+                    SELECT
+                        CAST(EPOCH(ts) / 30 AS BIGINT) * 30            AS bucket_epoch,
+                        AVG(vol_imb)                                    AS _vi,
+                        AVG(depth_ratio)                                AS _dr,
+                        AVG(spread_bps)                                 AS _sp,
+                        AVG(net_liq_1s)                                 AS _nl,
+                        AVG(bid_liq / NULLIF(ask_liq, 0))               AS _ba,
+                        AVG(bid_slope / NULLIF(ABS(ask_slope), 0))      AS _sr,
+                        AVG(bid_dep_5bps / NULLIF(ask_dep_5bps, 0))     AS _d5,
+                        AVG(microprice_dev)                             AS _mpd,
+                        AVG(mid_price)                                  AS mid_price
+                    FROM ob_snapshots
+                    WHERE ts >= NOW() - INTERVAL '6 hours'
+                    GROUP BY 1
+                ),
+                -- ── 30-second Trade buckets ──────────────────────────────────
+                tr_b AS (
+                    SELECT
+                        CAST(EPOCH(ts) / 30 AS BIGINT) * 30            AS bucket_epoch,
+                        COUNT(*)                                        AS tr_n_raw,
+                        SUM(sol_amount)                                 AS tr_total,
+                        SUM(CASE WHEN direction='buy' THEN sol_amount ELSE 0 END)
+                          / NULLIF(SUM(sol_amount), 0)                  AS tr_buy_ratio_raw,
+                        SUM(CASE WHEN sol_amount > 50 THEN sol_amount ELSE 0 END)
+                          / NULLIF(SUM(sol_amount), 0)                  AS tr_large_ratio_raw,
+                        AVG(sol_amount)                                 AS tr_avg_size_raw
+                    FROM raw_trades
+                    WHERE ts >= NOW() - INTERVAL '6 hours'
+                    GROUP BY 1
+                ),
+                -- ── 30-second Whale buckets ──────────────────────────────────
+                wh_b AS (
+                    SELECT
+                        CAST(EPOCH(ts) / 30 AS BIGINT) * 30            AS bucket_epoch,
+                        COUNT(*)                                        AS wh_n_raw,
+                        SUM(CASE WHEN direction IN ('in','receiving')  THEN ABS(sol_moved) ELSE 0 END)
+                          - SUM(CASE WHEN direction IN ('out','sending') THEN ABS(sol_moved) ELSE 0 END)
+                                                                        AS wh_net_flow_raw,
+                        SUM(CASE WHEN direction IN ('in','receiving') THEN ABS(sol_moved) ELSE 0 END)
+                          / NULLIF(SUM(ABS(sol_moved)), 0)              AS wh_inflow_ratio_raw,
+                        COUNT(CASE WHEN significance > 0.5 THEN 1 END) AS wh_large_count_raw,
+                        AVG(pct_moved)                                  AS wh_avg_pct_raw,
+                        COUNT(CASE WHEN pct_moved > 50 THEN 1 END) * 1.0
+                          / NULLIF(COUNT(*), 0)                         AS wh_urgency_ratio_raw
+                    FROM whale_events
+                    WHERE ts >= NOW() - INTERVAL '6 hours'
+                    GROUP BY 1
+                ),
+                -- ── Join all sources on bucket_epoch ────────────────────────
+                joined AS (
+                    SELECT
+                        TIMESTAMPTZ 'epoch' + ob._vi * 0 + ob.bucket_epoch * INTERVAL '1 second'
+                                                                        AS bucket_ts,
+                        ob.bucket_epoch,
+                        ob.mid_price,
+                        ob._vi, ob._dr, ob._sp, ob._nl, ob._ba,
+                        ob._sr, ob._d5, ob._mpd,
+                        COALESCE(tr.tr_n_raw, 0)                        AS tr_n_raw,
+                        COALESCE(tr.tr_buy_ratio_raw, 0.5)              AS tr_buy_ratio_raw,
+                        COALESCE(tr.tr_large_ratio_raw, 0)              AS tr_large_ratio_raw,
+                        COALESCE(tr.tr_avg_size_raw, 0)                 AS tr_avg_size_raw,
+                        COALESCE(wh.wh_n_raw, 0)                        AS wh_n_raw,
+                        COALESCE(wh.wh_net_flow_raw, 0)                 AS wh_net_flow_raw,
+                        COALESCE(wh.wh_inflow_ratio_raw, 0.5)           AS wh_inflow_ratio_raw,
+                        COALESCE(wh.wh_large_count_raw, 0)              AS wh_large_count_raw,
+                        COALESCE(wh.wh_avg_pct_raw, 0)                  AS wh_avg_pct_raw,
+                        COALESCE(wh.wh_urgency_ratio_raw, 0)            AS wh_urgency_ratio_raw
+                    FROM ob_b ob
+                    LEFT JOIN tr_b tr USING (bucket_epoch)
+                    LEFT JOIN wh_b wh USING (bucket_epoch)
+                ),
+                -- ── 5-min rolling (10 buckets) + 1-min rolling (2 buckets) ─
+                rolled AS (
+                    SELECT
+                        bucket_ts,
+                        mid_price,
+                        -- OB 5-min rolling averages
+                        AVG(_vi)  OVER w5  AS ob_avg_vol_imb,
+                        AVG(_dr)  OVER w5  AS ob_avg_depth_ratio,
+                        AVG(_sp)  OVER w5  AS ob_avg_spread_bps,
+                        AVG(_nl)  OVER w5  AS ob_net_liq_change,
+                        AVG(_ba)  OVER w5  AS ob_bid_ask_ratio,
+                        -- OB 1-min rolling
+                        AVG(_vi)  OVER w1  AS _ob_vi_1m,
+                        AVG(_dr)  OVER w1  AS _ob_dr_1m,
+                        AVG(_ba)  OVER w1  AS _ob_ba_1m,
+                        -- OB microstructure 5-min
+                        AVG(_sr)  OVER w5  AS ob_slope_ratio,
+                        AVG(_d5)  OVER w5  AS ob_depth_5bps_ratio,
+                        AVG(_mpd) OVER w5  AS ob_microprice_dev,
+                        -- Trades 5-min rolling
+                        AVG(tr_buy_ratio_raw)   OVER w5  AS tr_buy_ratio,
+                        AVG(tr_large_ratio_raw) OVER w5  AS tr_large_ratio,
+                        AVG(tr_avg_size_raw)    OVER w5  AS tr_avg_size,
+                        SUM(tr_n_raw)           OVER w5  AS tr_n,
+                        AVG(tr_buy_ratio_raw)   OVER w1  AS _tr_buy_1m,
+                        -- Whale 5-min rolling
+                        AVG(wh_inflow_ratio_raw) OVER w5  AS wh_inflow_ratio,
+                        SUM(wh_net_flow_raw)     OVER w5  AS wh_net_flow,
+                        SUM(wh_large_count_raw)  OVER w5  AS wh_large_count,
+                        SUM(wh_n_raw)            OVER w5  AS wh_n,
+                        AVG(wh_avg_pct_raw)      OVER w5  AS wh_avg_pct_moved,
+                        AVG(wh_urgency_ratio_raw) OVER w5 AS wh_urgency_ratio,
+                        -- Price momentum via LAG on mid_price
+                        mid_price                                       AS p_now,
+                        LAG(mid_price, 1)  OVER (ORDER BY bucket_epoch) AS p_30s_ago,
+                        LAG(mid_price, 2)  OVER (ORDER BY bucket_epoch) AS p_1m_ago,
+                        LAG(mid_price, 10) OVER (ORDER BY bucket_epoch) AS p_5m_ago
+                    FROM joined
+                    WINDOW
+                        w5 AS (ORDER BY bucket_epoch ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
+                        w1 AS (ORDER BY bucket_epoch ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+                )
+                SELECT
+                    bucket_ts                                            AS timestamp,
+                    ROUND(mid_price::DOUBLE, 4)                          AS mid_price,
+                    -- All 26 features in canonical order
+                    ROUND(ob_avg_vol_imb::DOUBLE, 6)                     AS ob_avg_vol_imb,
+                    ROUND(ob_avg_depth_ratio::DOUBLE, 6)                 AS ob_avg_depth_ratio,
+                    ROUND(ob_avg_spread_bps::DOUBLE, 4)                  AS ob_avg_spread_bps,
+                    ROUND(ob_net_liq_change::DOUBLE, 6)                  AS ob_net_liq_change,
+                    ROUND(ob_bid_ask_ratio::DOUBLE, 6)                   AS ob_bid_ask_ratio,
+                    ROUND((_ob_vi_1m - ob_avg_vol_imb)::DOUBLE, 6)      AS ob_imb_trend,
+                    ROUND((_ob_dr_1m - ob_avg_depth_ratio)::DOUBLE, 6)  AS ob_depth_trend,
+                    ROUND((_ob_ba_1m - ob_bid_ask_ratio)::DOUBLE, 6)    AS ob_liq_accel,
+                    ROUND(ob_slope_ratio::DOUBLE, 6)                     AS ob_slope_ratio,
+                    ROUND(ob_depth_5bps_ratio::DOUBLE, 6)                AS ob_depth_5bps_ratio,
+                    ROUND(ob_microprice_dev::DOUBLE, 6)                  AS ob_microprice_dev,
+                    ROUND(tr_buy_ratio::DOUBLE, 6)                       AS tr_buy_ratio,
+                    ROUND(tr_large_ratio::DOUBLE, 6)                     AS tr_large_ratio,
+                    ROUND(CASE WHEN AVG(tr_buy_ratio) OVER (ORDER BY bucket_ts ROWS BETWEEN 9 PRECEDING AND CURRENT ROW) > 0
+                               THEN _tr_buy_1m / AVG(tr_buy_ratio) OVER (ORDER BY bucket_ts ROWS BETWEEN 9 PRECEDING AND CURRENT ROW)
+                               ELSE 1.0 END::DOUBLE, 6)                  AS tr_buy_accel,
+                    ROUND(tr_avg_size::DOUBLE, 4)                        AS tr_avg_size,
+                    CAST(tr_n AS BIGINT)                                  AS tr_n,
+                    ROUND(wh_inflow_ratio::DOUBLE, 6)                    AS wh_inflow_ratio,
+                    ROUND(wh_net_flow::DOUBLE, 4)                        AS wh_net_flow,
+                    CAST(wh_large_count AS BIGINT)                       AS wh_large_count,
+                    CAST(wh_n AS BIGINT)                                  AS wh_n,
+                    ROUND(wh_avg_pct_moved::DOUBLE, 4)                   AS wh_avg_pct_moved,
+                    ROUND(wh_urgency_ratio::DOUBLE, 6)                   AS wh_urgency_ratio,
+                    ROUND(CASE WHEN p_30s_ago > 0 THEN (p_now - p_30s_ago) / p_30s_ago * 100 ELSE 0 END::DOUBLE, 6) AS pm_price_change_30s,
+                    ROUND(CASE WHEN p_1m_ago  > 0 THEN (p_now - p_1m_ago)  / p_1m_ago  * 100 ELSE 0 END::DOUBLE, 6) AS pm_price_change_1m,
+                    ROUND(CASE WHEN p_5m_ago  > 0 THEN (p_now - p_5m_ago)  / p_5m_ago  * 100 ELSE 0 END::DOUBLE, 6) AS pm_price_change_5m,
+                    ROUND(CASE WHEN p_1m_ago > 0 AND p_5m_ago > 0
+                               THEN (p_now - p_1m_ago) / p_1m_ago * 100 - (p_now - p_5m_ago) / p_5m_ago * 100
+                               ELSE 0 END::DOUBLE, 6)                    AS pm_velocity_30s
+                FROM rolled
+                WHERE p_5m_ago IS NOT NULL
+                ORDER BY timestamp DESC
+                LIMIT {n_rows}
+            """).fetchall()
+
+            col_names = [
+                'timestamp', 'mid_price',
+                'ob_avg_vol_imb', 'ob_avg_depth_ratio', 'ob_avg_spread_bps',
+                'ob_net_liq_change', 'ob_bid_ask_ratio',
+                'ob_imb_trend', 'ob_depth_trend', 'ob_liq_accel',
+                'ob_slope_ratio', 'ob_depth_5bps_ratio', 'ob_microprice_dev',
+                'tr_buy_ratio', 'tr_large_ratio', 'tr_buy_accel', 'tr_avg_size', 'tr_n',
+                'wh_inflow_ratio', 'wh_net_flow', 'wh_large_count', 'wh_n',
+                'wh_avg_pct_moved', 'wh_urgency_ratio',
+                'pm_price_change_30s', 'pm_price_change_1m',
+                'pm_price_change_5m', 'pm_velocity_30s',
+            ]
+            rows_out = []
+            for r in rows_raw:
+                d = dict(zip(col_names, r))
+                # Serialise timestamp
+                ts_val = d.get('timestamp')
+                if hasattr(ts_val, 'isoformat'):
+                    d['timestamp'] = ts_val.isoformat()
+                elif ts_val is not None:
+                    d['timestamp'] = str(ts_val)
+                rows_out.append(d)
+
+        finally:
+            con.close()
+
+        # Pull up to 20 approved GA rules from simulation_results for context
+        sim_rules = []
+        try:
+            with get_postgres() as pg:
+                with pg.cursor() as cur:
+                    cur.execute("""
+                        SELECT run_id, rank, conditions_json, win_rate,
+                               signals_per_day, oos_ev, oos_consistency, data_hours
+                        FROM simulation_results
+                        WHERE win_rate >= 0.55
+                        ORDER BY created_at DESC
+                        LIMIT 20
+                    """)
+                    for r in cur.fetchall():
+                        sim_rules.append({
+                            'run_id':           r['run_id'],
+                            'rank':             r['rank'],
+                            'conditions':       r['conditions_json'],
+                            'win_rate_pct':     round(float(r['win_rate']) * 100, 1) if r['win_rate'] else None,
+                            'signals_per_day':  round(float(r['signals_per_day']), 1) if r['signals_per_day'] else None,
+                            'oos_precision_pct':round(float(r['oos_ev']) * 100, 1) if r.get('oos_ev') else None,
+                            'oos_consistency_pct': round(float(r['oos_consistency']) * 100, 0) if r.get('oos_consistency') else None,
+                            'data_hours':       round(float(r['data_hours']), 1) if r.get('data_hours') else None,
+                        })
+        except Exception as rule_err:
+            logger.warning(f"feature_export: simulation_results query failed: {rule_err}")
+
+        return jsonify({
+            'rows':          rows_out,
+            'n_rows':        len(rows_out),
+            'feature_meta':  FEATURE_META,
+            'simulation_rules': sim_rules,
+            'bucket_seconds': 30,
+            'window_seconds': 300,
+            'note': (
+                'Each row is one 30-second bucket. All features are computed as '
+                '5-minute rolling windows over the preceding 10 buckets '
+                '(acceleration features use 1-min = 2 buckets). '
+                'Rows are ordered newest-first. '
+                'simulation_rules are the most recent GA-approved rules '
+                '(win_rate >= 55%) from the mega_simulator.'
+            ),
+        })
+
+    except Exception as e:
+        logger.error(f"feature_export failed: {e}", exc_info=True)
+        return jsonify({'error': str(e), 'rows': [], 'n_rows': 0}), 500
+
+
 # =============================================================================
 # TRADING ENDPOINTS
 # =============================================================================
@@ -1415,6 +1705,130 @@ def cleanup_no_gos():
         })
     except Exception as e:
         logger.error(f"Cleanup no-gos failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/wallets', methods=['GET'])
+def get_wallets():
+    """Get all paper wallets with balance and P/L summary."""
+    try:
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("""
+                    SELECT id, name, balance, initial_balance, is_test, play_ids, fee_rate,
+                           invest_pct, created_at, updated_at
+                    FROM wallets
+                    ORDER BY id
+                """)
+                wallets_raw = cursor.fetchall()
+
+        wallets = []
+        for w in wallets_raw:
+            wallet_id = w['id']
+
+            with get_postgres() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        SELECT
+                            COALESCE(SUM(profit_loss_usdc), 0) AS total_pl_usdc,
+                            COUNT(*) FILTER (WHERE status = 'closed') AS closed_trades,
+                            COUNT(*) FILTER (WHERE status = 'open') AS open_trades,
+                            COUNT(*) FILTER (WHERE status IN ('cancelled', 'missed')) AS cancelled_trades,
+                            COUNT(*) FILTER (WHERE status = 'closed' AND profit_loss_usdc > 0) AS winning_trades,
+                            COUNT(*) FILTER (WHERE status = 'closed' AND profit_loss_usdc <= 0) AS losing_trades
+                        FROM wallet_trades
+                        WHERE wallet_id = %s
+                    """, [wallet_id])
+                    stats = cursor.fetchone()
+
+            play_ids = w['play_ids']
+            if isinstance(play_ids, str):
+                import json as _json
+                try:
+                    play_ids = _json.loads(play_ids)
+                except Exception:
+                    play_ids = []
+
+            initial = float(w['initial_balance'])
+            balance = float(w['balance'])
+            total_pl = float(stats['total_pl_usdc']) if stats else 0.0
+            total_pl_pct = round((total_pl / initial) * 100, 2) if initial > 0 else 0.0
+
+            wallets.append({
+                'id': wallet_id,
+                'name': w['name'],
+                'balance': balance,
+                'initial_balance': initial,
+                'is_test': bool(w['is_test']),
+                'play_ids': play_ids,
+                'fee_rate': float(w['fee_rate']),
+                'invest_pct': float(w['invest_pct']) if w.get('invest_pct') is not None else 0.20,
+                'total_pl_usdc': round(total_pl, 4),
+                'total_pl_pct': total_pl_pct,
+                'closed_trades': int(stats['closed_trades'] or 0) if stats else 0,
+                'open_trades': int(stats['open_trades'] or 0) if stats else 0,
+                'cancelled_trades': int(stats['cancelled_trades'] or 0) if stats else 0,
+                'winning_trades': int(stats['winning_trades'] or 0) if stats else 0,
+                'losing_trades': int(stats['losing_trades'] or 0) if stats else 0,
+                'updated_at': w['updated_at'].isoformat() if w.get('updated_at') else None,
+            })
+
+        return jsonify({'success': True, 'wallets': wallets})
+    except Exception as e:
+        logger.error(f"Get wallets failed: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/wallets/<int:wallet_id>/trades', methods=['GET'])
+def get_wallet_trades(wallet_id):
+    """Get trade history for a specific wallet."""
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+        status_filter = request.args.get('status', None)
+
+        query_params = [wallet_id]
+        status_clause = ""
+        if status_filter:
+            status_clause = "AND wt.status = %s"
+            query_params.append(status_filter)
+
+        with get_postgres() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(f"""
+                    SELECT wt.id, wt.wallet_id, wt.buyin_id, wt.play_id, wt.status,
+                           wt.entry_price, wt.position_usdc, wt.sol_amount, wt.buy_fee_usdc,
+                           wt.exit_price, wt.sell_fee_usdc, wt.profit_loss_usdc,
+                           wt.profit_loss_pct, wt.closed_at, wt.created_at
+                    FROM wallet_trades wt
+                    WHERE wt.wallet_id = %s {status_clause}
+                    ORDER BY wt.id DESC
+                    LIMIT %s
+                """, query_params + [limit])
+                rows = cursor.fetchall()
+
+        trades = []
+        for r in rows:
+            trades.append({
+                'id': r['id'],
+                'wallet_id': r['wallet_id'],
+                'buyin_id': r['buyin_id'],
+                'play_id': r['play_id'],
+                'status': r['status'],
+                'entry_price': float(r['entry_price']) if r.get('entry_price') else None,
+                'position_usdc': float(r['position_usdc']) if r.get('position_usdc') else None,
+                'sol_amount': float(r['sol_amount']) if r.get('sol_amount') else None,
+                'buy_fee_usdc': float(r['buy_fee_usdc']) if r.get('buy_fee_usdc') else None,
+                'exit_price': float(r['exit_price']) if r.get('exit_price') else None,
+                'sell_fee_usdc': float(r['sell_fee_usdc']) if r.get('sell_fee_usdc') else None,
+                'profit_loss_usdc': float(r['profit_loss_usdc']) if r.get('profit_loss_usdc') else None,
+                'profit_loss_pct': float(r['profit_loss_pct']) if r.get('profit_loss_pct') else None,
+                'closed_at': r['closed_at'].isoformat() if r.get('closed_at') else None,
+                'created_at': r['created_at'].isoformat() if r.get('created_at') else None,
+            })
+
+        return jsonify({'success': True, 'trades': trades, 'count': len(trades)})
+    except Exception as e:
+        logger.error(f"Get wallet trades failed: {e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

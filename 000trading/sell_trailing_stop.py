@@ -42,7 +42,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from decimal import Decimal
-from logging.handlers import RotatingFileHandler, MemoryHandler
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -76,7 +76,7 @@ if not logger.handlers:
     console_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     console_handler.setFormatter(console_format)
     
-    # File handler with rotation
+    # File handler with rotation - writes directly, no buffering
     log_file = LOGS_DIR / "sell_trailing_stop.log"
     file_handler = RotatingFileHandler(
         log_file,
@@ -84,22 +84,14 @@ if not logger.handlers:
         backupCount=5,
         encoding='utf-8'
     )
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_format = logging.Formatter(
         '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
     )
     file_handler.setFormatter(file_format)
-    
-    # Memory handler - buffers logs, flushes on ERROR
-    memory_handler = MemoryHandler(
-        capacity=1000,
-        flushLevel=logging.ERROR,
-        target=file_handler,
-        flushOnClose=False
-    )
-    
+
     logger.addHandler(console_handler)
-    logger.addHandler(memory_handler)
+    logger.addHandler(file_handler)
 
 
 # =============================================================================
@@ -168,11 +160,16 @@ class TrailingStopSeller:
         # In-memory tracking for positions
         self.position_tracking: Dict[int, Dict[str, Any]] = {}
         self.position_tracking_lock = threading.Lock()
-        
+
         # Cache for sell_logic per play
         self.sell_logic_cache: Dict[int, Dict[str, Any]] = {}
         self.cache_timestamps: Dict[int, float] = {}
         self.cache_lock = threading.Lock()
+
+        # Throttle price_checks inserts: only write every N seconds per position
+        self._price_check_interval = 3.0  # seconds between inserts per position
+        self._last_price_check: Dict[int, float] = {}
+        self._price_check_lock = threading.Lock()
         
         # Statistics
         self.stats = {
@@ -190,116 +187,61 @@ class TrailingStopSeller:
         logger.info(f"TrailingStopSeller initialized (live_trade={live_trade}, monitor_live={monitor_live})")
     
     def get_current_sol_price(self) -> Optional[float]:
-        """
-        Get the latest SOL price from prices table.
-        
-        Returns:
-            Current SOL price as float, or None if not found.
-        """
+        """Get the latest SOL price from prices table using the connection pool."""
         try:
-            # Create fresh connection with autocommit to avoid stale reads
-            import psycopg2
-            import psycopg2.extras
-            from core.config import settings
-            
-            conn = psycopg2.connect(
-                host=settings.postgres.host,
-                user=settings.postgres.user,
-                password=settings.postgres.password,
-                database=settings.postgres.database,
-                port=settings.postgres.port,
-                cursor_factory=psycopg2.extras.RealDictCursor,
-                connect_timeout=5
-            )
-            
-            # Enable autocommit to always see the latest data
-            conn.autocommit = True
-            
-            try:
+            with get_postgres() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("""
-                    SELECT price, timestamp, id
-                    FROM prices 
-                    WHERE token = 'SOL'
-                    ORDER BY timestamp DESC 
-                    LIMIT 1
-                """)
+                        SELECT price, timestamp, id
+                        FROM prices
+                        WHERE token = 'SOL'
+                        ORDER BY timestamp DESC
+                        LIMIT 1
+                    """)
                     result = cursor.fetchone()
-                    
                     if result:
-                        price = float(result.get('price'))
-                        logger.debug(f"Current SOL price: ${price:.6f} (ID: {result.get('id')})")
+                        price = float(result['price'])
+                        logger.debug(f"Current SOL price: ${price:.6f} (ID: {result['id']})")
                         return price
                     else:
                         logger.warning("No SOL price data found in prices table")
                         return None
-            finally:
-                conn.close()
-                    
         except Exception as e:
-            import traceback
-            logger.error(f"Error getting current SOL price: {e}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Error getting current SOL price: {e}", exc_info=True)
             return None
     
     def get_open_positions(self) -> List[Dict[str, Any]]:
-        """Get all open positions that we're tracking (matching live_trade mode)."""
+        """Get all open positions that we're tracking using the connection pool."""
         try:
-            # Create fresh connection with autocommit to avoid stale reads
-            import psycopg2
-            import psycopg2.extras
-            from core.config import settings
-            
-            conn = psycopg2.connect(
-                host=settings.postgres.host,
-                user=settings.postgres.user,
-                password=settings.postgres.password,
-                database=settings.postgres.database,
-                port=settings.postgres.port,
-                cursor_factory=psycopg2.extras.RealDictCursor,
-                connect_timeout=5
-            )
-            
-            # Enable autocommit to always see the latest data
-            conn.autocommit = True
-            
-            try:
+            with get_postgres() as conn:
                 with conn.cursor() as cursor:
-                    # Build query depending on monitoring filter
                     base_sql = """
-                    SELECT 
-                        id,
-                        play_id,
-                        wallet_address,
-                        original_trade_id,
-                        price as entry_price,
-                        quote_amount,
-                        base_amount,
-                        followed_at,
-                        our_entry_price,
-                        our_position_size,
-                        price_movements,
-                        live_trade,
-                        higest_price_reached,
-                        tolerance
-                    FROM follow_the_goat_buyins 
-                    WHERE our_status = 'pending'
-                """
-                
+                        SELECT
+                            id,
+                            play_id,
+                            wallet_address,
+                            original_trade_id,
+                            price as entry_price,
+                            quote_amount,
+                            base_amount,
+                            followed_at,
+                            our_entry_price,
+                            our_position_size,
+                            price_movements,
+                            live_trade,
+                            higest_price_reached,
+                            tolerance
+                        FROM follow_the_goat_buyins
+                        WHERE our_status = 'pending'
+                    """
                     if self.monitor_live is True:
                         base_sql += " AND live_trade = 1"
                     elif self.monitor_live is False:
                         base_sql += " AND live_trade = 0"
-                
                     base_sql += " ORDER BY followed_at ASC"
-                
                     cursor.execute(base_sql)
                     result = cursor.fetchall()
                     return [dict(row) for row in (result or [])]
-            finally:
-                conn.close()
-                
         except Exception as e:
             logger.error(f"Error getting open positions: {e}")
             return []
@@ -307,8 +249,7 @@ class TrailingStopSeller:
     def get_sell_logic_for_play(self, play_id: int) -> Dict[str, Any]:
         """Load and cache sell_logic JSON for a given play_id with TTL."""
         current_time = time.time()
-        
-        # Thread-safe cache check
+
         with self.cache_lock:
             if play_id in self.sell_logic_cache:
                 cache_age = current_time - self.cache_timestamps.get(play_id, 0)
@@ -316,59 +257,33 @@ class TrailingStopSeller:
                     return self.sell_logic_cache[play_id]
                 else:
                     logger.debug(f"Cache expired for play {play_id} (age: {cache_age:.1f}s)")
-        
-        # Cache miss or expired - fetch from database
+
         try:
-            # Create fresh connection with autocommit to avoid stale reads
-            import psycopg2
-            import psycopg2.extras
-            from core.config import settings
-            
-            conn = psycopg2.connect(
-                host=settings.postgres.host,
-                user=settings.postgres.user,
-                password=settings.postgres.password,
-                database=settings.postgres.database,
-                port=settings.postgres.port,
-                cursor_factory=psycopg2.extras.RealDictCursor,
-                connect_timeout=5
-            )
-            
-            # Enable autocommit to always see the latest data
-            conn.autocommit = True
-            
-            try:
+            with get_postgres() as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute("""
-                    SELECT sell_logic
-                    FROM follow_the_goat_plays
-                    WHERE id = %s
-                    LIMIT 1
-                """, [play_id])
+                    cursor.execute(
+                        "SELECT sell_logic FROM follow_the_goat_plays WHERE id = %s LIMIT 1",
+                        [play_id]
+                    )
                     result = cursor.fetchone()
-                
+
+            logic = None
+            if result and result.get('sell_logic'):
+                raw = result['sell_logic']
+                try:
+                    logic = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
                     logic = None
-                    if result and result.get('sell_logic'):
-                        raw = result['sell_logic']
-                        try:
-                            logic = json.loads(raw) if isinstance(raw, str) else raw
-                        except Exception:
-                            logic = None
-                
-                    if not logic:
-                        # Use default tolerance rules
-                        logic = self._get_default_tolerance_rules()
-                
-                    # Thread-safe cache update
-                    with self.cache_lock:
-                        self.sell_logic_cache[play_id] = logic
-                        self.cache_timestamps[play_id] = current_time
-                
-                    logger.debug(f"Cache refreshed for play {play_id}")
-                    return logic
-            finally:
-                conn.close()
-                
+
+            if not logic:
+                logic = self._get_default_tolerance_rules()
+
+            with self.cache_lock:
+                self.sell_logic_cache[play_id] = logic
+                self.cache_timestamps[play_id] = current_time
+
+            logger.debug(f"Cache refreshed for play {play_id}")
+            return logic
         except Exception as e:
             logger.error(f"Error loading sell_logic for play {play_id}: {e}")
             return self._get_default_tolerance_rules()
@@ -793,90 +708,69 @@ class TrailingStopSeller:
     
     def save_price_movement(self, position_id: int, movement_data: Dict[str, Any], skip_price_update: bool = False) -> bool:
         """
-        Save price movement data to PostgreSQL.
-        
-        Args:
-            position_id: The buyin position ID
-            movement_data: Movement data dict
-            skip_price_update: If True, skip the current_price update (handled by batch)
+        Save price movement data to PostgreSQL using the connection pool.
+        Price check inserts are throttled to at most once every _price_check_interval
+        seconds per position to keep the price_checks table manageable.
+        Backfill records (new position init) are always written immediately.
         """
         try:
-            # Create fresh connection with autocommit for immediate writes
-            import psycopg2
-            import psycopg2.extras
-            from core.config import settings
-            
-            conn = psycopg2.connect(
-                host=settings.postgres.host,
-                user=settings.postgres.user,
-                password=settings.postgres.password,
-                database=settings.postgres.database,
-                port=settings.postgres.port,
-                cursor_factory=psycopg2.extras.RealDictCursor,
-                connect_timeout=5
-            )
-            
-            # Enable autocommit for immediate writes
-            conn.autocommit = True
-            
-            try:
-                current_price = movement_data.get('current_price')
-                should_sell = movement_data.get('should_sell', False)
-            
-                # Only update current_price if not being batched
-                if not skip_price_update:
-                    try:
-                        with conn.cursor() as cursor:
-                            cursor.execute(
-                                "UPDATE follow_the_goat_buyins SET current_price = %s WHERE id = %s",
-                                [current_price, position_id]
-                            )
-                            # Autocommit handles the commit automatically
-                    except Exception as e:
-                        logger.error(f"Error updating current_price for position {position_id}: {e}")
-            
-                # Write price check to database for historical tracking
-                checked_at = movement_data.get('timestamp')
-                entry_price = movement_data.get('entry_price')
-                highest_price = movement_data.get('highest_price')
-                reference_price = movement_data.get('reference_price')
-                gain_from_entry = movement_data.get('gain_from_entry_decimal')
-                drop_from_high = movement_data.get('drop_from_high_decimal')
-                drop_from_entry = movement_data.get('drop_from_entry_decimal')
-                drop_from_reference = movement_data.get('drop_from_reference_decimal')
-                tolerance = movement_data.get('tolerance_decimal')
-                basis = movement_data.get('basis')
-                bucket = movement_data.get('bucket')
-                applied_rule = json.dumps(movement_data.get('applied_rule')) if movement_data.get('applied_rule') else None
-                is_backfill = movement_data.get('backfilled', False)
-            
-                # Insert price check to PostgreSQL
+            current_price = movement_data.get('current_price')
+            is_backfill = movement_data.get('backfilled', False)
+
+            # Update current_price if not batched
+            if not skip_price_update and current_price is not None:
                 try:
-                    with conn.cursor() as cursor:
-                        cursor.execute("""
-                            INSERT INTO follow_the_goat_buyins_price_checks (
-                                buyin_id, checked_at, current_price, entry_price, highest_price,
-                                reference_price, gain_from_entry, drop_from_high, drop_from_entry,
-                                drop_from_reference, tolerance, basis, bucket, applied_rule,
-                                should_sell, is_backfill
-                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """, [
-                            position_id, checked_at, current_price, entry_price, highest_price,
-                            reference_price, gain_from_entry, drop_from_high, drop_from_entry,
-                            drop_from_reference, tolerance, basis, bucket, applied_rule,
-                            should_sell, is_backfill
-                        ])
-                        # Autocommit handles the commit automatically
-                        if not is_backfill:
-                            logger.info(f"✓ Price check recorded for position {position_id}: ${current_price:.6f}")
+                    postgres_execute(
+                        "UPDATE follow_the_goat_buyins SET current_price = %s WHERE id = %s",
+                        [current_price, position_id]
+                    )
                 except Exception as e:
-                    logger.error(f"Price_checks insert failed for position {position_id}: {e}")
-            
-                logger.debug(f"Price movement saved for position {position_id}: ${current_price:.6f}")
-                return True
-            finally:
-                conn.close()
-                
+                    logger.error(f"Error updating current_price for position {position_id}: {e}")
+
+            # Throttle price_checks inserts — skip if too soon since last insert for this position
+            # Always write backfill records and sell-trigger records immediately
+            should_sell = movement_data.get('should_sell', False)
+            now = time.time()
+            if not is_backfill and not should_sell:
+                with self._price_check_lock:
+                    last = self._last_price_check.get(position_id, 0)
+                    if now - last < self._price_check_interval:
+                        return True  # Skip this insert — too soon
+                    self._last_price_check[position_id] = now
+
+            # Insert price check
+            try:
+                postgres_execute("""
+                    INSERT INTO follow_the_goat_buyins_price_checks (
+                        buyin_id, checked_at, current_price, entry_price, highest_price,
+                        reference_price, gain_from_entry, drop_from_high, drop_from_entry,
+                        drop_from_reference, tolerance, basis, bucket, applied_rule,
+                        should_sell, is_backfill
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, [
+                    position_id,
+                    movement_data.get('timestamp'),
+                    current_price,
+                    movement_data.get('entry_price'),
+                    movement_data.get('highest_price'),
+                    movement_data.get('reference_price'),
+                    movement_data.get('gain_from_entry_decimal'),
+                    movement_data.get('drop_from_high_decimal'),
+                    movement_data.get('drop_from_entry_decimal'),
+                    movement_data.get('drop_from_reference_decimal'),
+                    movement_data.get('tolerance_decimal'),
+                    movement_data.get('basis'),
+                    movement_data.get('bucket'),
+                    json.dumps(movement_data.get('applied_rule')) if movement_data.get('applied_rule') else None,
+                    should_sell,
+                    is_backfill,
+                ])
+                if not is_backfill:
+                    logger.debug(f"✓ Price check recorded for position {position_id}: ${current_price:.6f}")
+            except Exception as e:
+                logger.error(f"Price_checks insert failed for position {position_id}: {e}")
+
+            return True
         except Exception as e:
             logger.error(f"Error saving price movement for position {position_id}: {e}")
             return False

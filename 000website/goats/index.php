@@ -305,6 +305,50 @@ ob_start();
             grid-template-columns: 1fr;
         }
     }
+
+    .wallet-info {
+        margin-top: 0.75rem;
+        padding-top: 0.75rem;
+        border-top: 1px dashed var(--default-border);
+    }
+
+    .wallet-info-header {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.7rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        margin-bottom: 0.5rem;
+    }
+
+    .wallet-info-grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.5rem;
+    }
+
+    .wallet-info-item {
+        text-align: center;
+    }
+
+    .wallet-info-value {
+        font-size: 0.85rem;
+        font-weight: 700;
+        color: var(--default-text-color);
+    }
+
+    .wallet-info-value.positive { color: rgb(var(--success-rgb)); }
+    .wallet-info-value.negative { color: rgb(var(--danger-rgb)); }
+    .wallet-info-value.neutral  { color: var(--text-muted); }
+
+    .wallet-info-label {
+        font-size: 0.65rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        margin-top: 0.15rem;
+    }
 </style>
 <?php
 $styles = ob_get_clean();
@@ -565,6 +609,28 @@ ob_start();
                     <div class="play-performance-item">
                         <div class="play-performance-value neutral" id="perf-live-<?php echo $play['id']; ?>">--</div>
                         <div class="play-performance-label">No Gos</div>
+                    </div>
+                </div>
+
+                <!-- Wallet info row (shown only if a wallet is linked to this play) -->
+                <div class="wallet-info" id="wallet-info-<?php echo $play['id']; ?>" style="display:none;">
+                    <div class="wallet-info-header">
+                        <i class="ri-wallet-3-line"></i>
+                        <span id="wallet-name-<?php echo $play['id']; ?>">Wallet</span>
+                    </div>
+                    <div class="wallet-info-grid">
+                        <div class="wallet-info-item">
+                            <div class="wallet-info-value neutral" id="wallet-balance-<?php echo $play['id']; ?>">--</div>
+                            <div class="wallet-info-label">Balance</div>
+                        </div>
+                        <div class="wallet-info-item">
+                            <div class="wallet-info-value neutral" id="wallet-pl-<?php echo $play['id']; ?>">--</div>
+                            <div class="wallet-info-label">Wallet P/L</div>
+                        </div>
+                        <div class="wallet-info-item">
+                            <div class="wallet-info-value neutral" id="wallet-trades-<?php echo $play['id']; ?>">--</div>
+                            <div class="wallet-info-label">Trades</div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -864,8 +930,55 @@ ob_start();
         }
     }
 
+    async function loadWalletData() {
+        try {
+            const response = await fetch(API_BASE + '?endpoint=/wallets');
+            const result = await response.json();
+            if (!result.success || !result.wallets) return;
+
+            for (const wallet of result.wallets) {
+                const playIds = wallet.play_ids || [];
+                for (const playId of playIds) {
+                    const walletSection = document.getElementById('wallet-info-' + playId);
+                    if (!walletSection) continue;
+
+                    walletSection.style.display = '';
+
+                    const nameEl = document.getElementById('wallet-name-' + playId);
+                    if (nameEl) nameEl.textContent = wallet.name;
+
+                    const balanceEl = document.getElementById('wallet-balance-' + playId);
+                    if (balanceEl) {
+                        balanceEl.textContent = '$' + wallet.balance.toFixed(2);
+                        balanceEl.className = 'wallet-info-value neutral';
+                    }
+
+                    const plEl = document.getElementById('wallet-pl-' + playId);
+                    if (plEl) {
+                        const pl = wallet.total_pl_usdc;
+                        const plPct = wallet.total_pl_pct;
+                        const sign = pl >= 0 ? '+' : '';
+                        plEl.textContent = sign + '$' + pl.toFixed(2) + ' (' + sign + plPct.toFixed(2) + '%)';
+                        plEl.className = 'wallet-info-value ' + (pl > 0 ? 'positive' : pl < 0 ? 'negative' : 'neutral');
+                    }
+
+                    const tradesEl = document.getElementById('wallet-trades-' + playId);
+                    if (tradesEl) {
+                        const open = wallet.open_trades || 0;
+                        const closed = wallet.closed_trades || 0;
+                        tradesEl.textContent = closed + ' closed' + (open > 0 ? ' / ' + open + ' open' : '');
+                        tradesEl.className = 'wallet-info-value neutral';
+                    }
+                }
+            }
+        } catch (error) {
+            console.error('Error loading wallet data:', error);
+        }
+    }
+
     if (<?php echo count($plays_data); ?> > 0) {
         loadPlayMetrics();
+        loadWalletData();
     }
 
     async function cleanupNoGos() {

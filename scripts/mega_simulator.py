@@ -1,18 +1,33 @@
 """
-Mega Signal Simulator
-=====================
-Self-running, indefinitely-looping optimization engine for pump trading signals.
+Mega Signal Simulator  v3 — Path-Filtered Precision Engine
+===========================================================
+Finds entry rules where the price reliably goes UP by at least PUMP_THRESHOLD
+within FWD_MINUTES of the signal WITHOUT triggering the live stop loss first.
 
-Each loop (~30 min):
-  1. Loads a dense feature time series from DuckDB (30-second buckets, rolling 5-min
-     windows) and forward price paths from PostgreSQL.
-  2. Runs a genetic algorithm to search millions of entry signal combinations —
-     2-4 feature thresholds scored by daily Expected Value.
-  3. For the top entry rules, grid-searches 1,200+ exit tier configurations
-     (stop-loss × min-hold × trailing tolerances).
-  4. Validates on a held-out time window (walk-forward) to detect overfitting.
-  5. Saves the best configurations to the simulation_results PostgreSQL table
-     and prints a live leaderboard to stdout.
+Goal: detect moments where SOL will gain ≥0.2% in the next 7 minutes cleanly
+(i.e. price doesn't drop below the 0.445% stop loss before reaching target).
+
+Each loop (~20 min):
+  1. Loads DuckDB feature data (30-second buckets, 5-min rolling windows).
+  2. Runs a GA scoring rules on PATH-FILTERED PRECISION:
+       fitness = precision × signals_per_day × consistency_mult
+     where precision = fraction of signals where:
+       - price reaches +PUMP_THRESHOLD (0.2%) within FWD_MINUTES
+       - AND price never drops below -LIVE_STOP_LOSS (0.445%) first
+  3. Hard-rejects rules where:
+       - precision < MIN_DIRECTIONAL_PRECISION (0.55)
+       - OOS precision < MIN_OOS_PRECISION (0.52) on held-out folds
+  4. Saves qualifying rules to simulation_results.
+     win_rate column = path-filtered precision (aligns with live trading).
+
+Why this matters:
+  v2 measured "did price ever touch +0.1% in 7 min?" — this was too optimistic.
+  Rules firing after tiny dips (pm_price_change_30s < -0.07%) showed 80% precision
+  in simulation but only 35-43% in live trading, because the dip continued long
+  enough to trigger the stop loss (-0.44%) BEFORE the price recovered to +0.1%.
+
+  v3 uses path-filtered labels and MAX_SIGNALS=100 to force selectivity.
+  Rules must find moments where price rises cleanly without a prior stop-out.
 
 Usage:
     python3 scripts/mega_simulator.py
@@ -54,15 +69,24 @@ logger = logging.getLogger("mega_sim")
 
 # ── constants ─────────────────────────────────────────────────────────────────
 COST_PCT        = 0.001          # 0.1% round-trip cost
-PUMP_THRESHOLD  = 0.003          # 0.3% min forward gain = "pump" (must clear 0.1% cost × 2 + margin)
-FWD_MINUTES     = 7              # forward window: catch SHARP pumps, not slow drift
+PUMP_THRESHOLD  = 0.002          # 0.2% min forward gain (raised: must exceed stop-loss spread)
+FWD_MINUTES     = 7              # forward window to check for the gain
 BUCKET_SECONDS  = 30             # feature time series granularity
 FEATURE_WINDOW  = 300            # rolling window for features (5 min)
-MIN_SIGNALS     = 25             # minimum signals/day — below this is statistically meaningless
-MAX_SIGNALS     = 300            # ignore rules that fire too frequently (noise)
-REFRESH_MINUTES = 30             # data refresh interval (kept for reference)
-OOS_FOLDS       = 3              # walk-forward folds (more = more robust overfitting detection)
-PRE_ENTRY_TOP_GUARD = 0.0015     # skip entry if price already rose >0.15% in last 2 min (buying top)
+MIN_SIGNALS     = 5              # minimum signals/day
+MAX_SIGNALS     = 100            # cap signals/day — forces selectivity (was 300, too loose)
+OOS_FOLDS       = 4              # more folds = harder overfitting bar
+PRE_ENTRY_TOP_GUARD = 0.0015     # skip entry if price already rose >0.15% in last 2 min
+
+# ── Live stop-loss threshold (from actual play sell_logic tolerance_rules) ────
+# Labels are path-filtered: only count as win if target reached BEFORE stop triggers.
+# Value matches the "decreases" tolerance in all play sell_logic configs (0.4445%).
+LIVE_STOP_LOSS = 0.00445
+
+# ── precision gates (the core anti-overfitting controls) ──────────────────────
+MIN_DIRECTIONAL_PRECISION = 0.55   # rule must be right ≥55% of the time in-sample
+MIN_OOS_PRECISION         = 0.52   # AND ≥52% on each held-out OOS fold (hard reject below)
+MIN_OOS_FOLDS_PASSING     = 3      # at least 3 of 4 OOS folds must beat MIN_OOS_PRECISION
 
 # GA parameters
 GA_POPULATION       = 600
@@ -73,26 +97,9 @@ GA_MUTATION         = 0.25
 GA_MIN_CONDS        = 2
 GA_MAX_CONDS        = 4
 GA_TOURNAMENT_K     = 5
-GA_DB_SEED_FRAC     = 0.08       # fraction seeded from DB — kept low to preserve diversity
-GA_IMPORTANCE_FRAC  = 0.35       # fraction using feature-importance sampling
-SHARPE_WEIGHT       = 0.25       # Sharpe weight — lower to avoid boosting tiny-sample 100% rules
-GA_MIN_SIG_HARD     = 25         # hard minimum signals: rules below this get -999 fitness
-
-# Exit evolution ranges (evolved jointly with entry conditions in the GA)
-EXIT_SL_RANGE     = (0.001, 0.008)    # stop-loss range
-EXIT_HOLD_RANGE   = (0,     180)      # min-hold seconds
-EXIT_T1B_RANGE    = (0.001, 0.005)    # tier-1 boundary (gain% where tier 1 ends)
-EXIT_T2B_RANGE    = (0.002, 0.010)    # tier-2 boundary (gain% where tier 2 ends)
-EXIT_T1TOL_RANGE  = (0.002, 0.008)    # tier-1 trailing tolerance (early, loose)
-EXIT_T2TOL_RANGE  = (0.001, 0.004)    # tier-2 trailing tolerance (medium)
-EXIT_T3TOL_RANGE  = (0.0001, 0.001)   # tier-3 trailing tolerance (high-gain lock-in)
-
-# Final exit grid-search (refinement pass on top GA individuals)
-STOP_LOSS_GRID    = [0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.008]
-MIN_HOLD_GRID     = [0, 30, 60, 90, 120, 180]
-TIER1_SPLIT_GRID  = [0.0005, 0.001, 0.0015, 0.002, 0.003]
-TIER2_TOL_GRID    = [0.003, 0.002, 0.0015, 0.001, 0.0008, 0.0005]
-TIER3_TOL_GRID    = [0.002, 0.001, 0.0005, 0.0003, 0.0001]
+GA_DB_SEED_FRAC     = 0.08
+GA_IMPORTANCE_FRAC  = 0.35
+GA_MIN_SIG_HARD     = 20         # hard minimum signals
 
 # Hall of Fame — all-time best rules across all runs (in-memory, updated each loop)
 _hall_of_fame: List[Dict[str, Any]] = []
@@ -156,7 +163,7 @@ def build_feature_matrix() -> Optional[Dict[str, Any]]:
 
     Returns a dict with:
         features   : np.ndarray (N × n_features)
-        labels     : np.ndarray (N,) — 1 if max forward gain ≥ 0.2%
+        labels     : np.ndarray (N,) — 1 if max forward gain ≥ PUMP_THRESHOLD (0.1%)
         max_gains  : np.ndarray (N,) — actual max forward gain
         price_highs: list of np.ndarray — per-row 30s hi prices (for exit sim)
         price_lows : list of np.ndarray — per-row 30s lo prices
@@ -458,14 +465,32 @@ def build_feature_matrix() -> Optional[Dict[str, Any]]:
 
         max_gain     = (fwd_hi.max() - entry) / entry if entry > 0 else 0.0
         max_gains[i] = max_gain
-        labels[i]    = 1 if max_gain >= PUMP_THRESHOLD else 0
+
+        # Path-filtered label: only count as win if price reaches PUMP_THRESHOLD
+        # BEFORE triggering the stop loss (LIVE_STOP_LOSS below entry).
+        # This aligns simulation with live trading — the previous approach of checking
+        # max forward gain alone was optimistic (ignored that stop loss fires first
+        # during dips, even when price eventually recovers past the target).
+        hit_target  = False
+        stopped_out = False
+        for k in range(len(fwd_hi)):
+            lo_gain = (fwd_lo[k] - entry) / entry
+            hi_gain = (fwd_hi[k] - entry) / entry
+            if lo_gain < -LIVE_STOP_LOSS:
+                stopped_out = True
+                break
+            if hi_gain >= PUMP_THRESHOLD:
+                hit_target = True
+                break
+        labels[i] = 1 if (hit_target and not stopped_out) else 0
 
         price_highs.append(fwd_hi)
         price_lows.append(fwd_lo)
 
     logger.info(
         f"Feature matrix: {N} rows × {N_FEATURES} features | "
-        f"pumps={labels.sum()} ({labels.mean()*100:.1f}%) | "
+        f"clean_pumps={labels.sum()} ({labels.mean()*100:.1f}%) | "
+        f"max_gain_pumps={int((max_gains >= PUMP_THRESHOLD).sum())} ({(max_gains >= PUMP_THRESHOLD).mean()*100:.1f}% raw) | "
         f"data={data_hours:.1f}h"
     )
 
@@ -495,6 +520,7 @@ def _sim_exit_batch(
     stop_loss: float,
     min_hold_buckets: int,
 ) -> np.ndarray:
+    # NOTE: retained for backward-compat imports only — no longer called by the GA.
     """Simulate trailing-stop exits for all entries where mask=True.
 
     Returns an array of exit returns (fraction, not %) for each entry in mask.
@@ -596,52 +622,20 @@ def simulate_exits(
 # =============================================================================
 
 class Individual:
-    """One candidate = entry conditions + exit parameters (evolved jointly).
+    """One candidate = a set of 2-4 entry conditions only.
 
-    Exit parameters:
-        stop_loss   : fraction (e.g. 0.003 = stop out at -0.3% from entry)
-        min_hold_s  : seconds to hold before any trailing stop activates
-        t1_boundary : gain fraction where tier-1 (loose) trailing ends
-        t2_boundary : gain fraction where tier-2 (medium) trailing ends
-        t1_tol      : trailing tolerance in tier 1 (before first gain target)
-        t2_tol      : trailing tolerance in tier 2
-        t3_tol      : trailing tolerance in tier 3 (high gain, tight lock-in)
+    Fitness is measured purely by directional precision:
+      what fraction of the time does the price go up ≥PUMP_THRESHOLD
+      within FWD_MINUTES after the signal fires?
+
+    No exit parameters are evolved — the GA cannot game the fitness
+    metric by finding clever exits that look profitable on noise.
     """
-    __slots__ = ("conditions", "fitness_val",
-                 "stop_loss", "min_hold_s",
-                 "t1_boundary", "t2_boundary",
-                 "t1_tol", "t2_tol", "t3_tol")
+    __slots__ = ("conditions", "fitness_val")
 
-    def __init__(
-        self,
-        conditions: List[Tuple[int, int, float]],
-        stop_loss:   float = 0.003,
-        min_hold_s:  int   = 60,
-        t1_boundary: float = 0.0015,
-        t2_boundary: float = 0.003,
-        t1_tol:      float = 0.004,
-        t2_tol:      float = 0.0015,
-        t3_tol:      float = 0.0003,
-    ):
+    def __init__(self, conditions: List[Tuple[int, int, float]]):
         self.conditions  = conditions
         self.fitness_val = -np.inf
-        self.stop_loss   = float(stop_loss)
-        self.min_hold_s  = int(min_hold_s)
-        self.t1_boundary = float(t1_boundary)
-        self.t2_boundary = float(t2_boundary)
-        self.t1_tol      = float(t1_tol)
-        self.t2_tol      = float(t2_tol)
-        self.t3_tol      = float(t3_tol)
-
-    def make_tiers(self) -> List[Tuple[float, float, float]]:
-        """Build the 3-tier tolerance structure from evolved exit params."""
-        t1b = self.t1_boundary
-        t2b = max(self.t2_boundary, t1b + 0.0005)  # ensure ordering
-        return [
-            (0.0,  t1b,  self.t1_tol),
-            (t1b,  t2b,  self.t2_tol),
-            (t2b,  1.0,  self.t3_tol),
-        ]
 
     def apply(self, features: np.ndarray) -> np.ndarray:
         """Return boolean mask (N,) where all entry conditions are satisfied."""
@@ -656,16 +650,10 @@ class Individual:
 
     def to_json(self) -> List[Dict[str, Any]]:
         return [
-            {"feature": FEATURES[fi], "direction": ">" if d > 0 else "<", "threshold": round(float(thr), 6)}
+            {"feature": FEATURES[fi], "direction": ">" if d > 0 else "<",
+             "threshold": round(float(thr), 6)}
             for fi, d, thr in self.conditions
         ]
-
-    def exit_config(self) -> Dict[str, Any]:
-        return {
-            "stop_loss":        round(self.stop_loss, 5),
-            "min_hold_seconds": self.min_hold_s,
-            "tiers":            self.make_tiers(),
-        }
 
     def __repr__(self) -> str:
         parts = [
@@ -675,26 +663,11 @@ class Individual:
         return " AND ".join(parts)
 
 
-def _random_exit_params() -> Dict[str, Any]:
-    """Sample a random exit configuration within the evolved ranges."""
-    sl  = random.uniform(*EXIT_SL_RANGE)
-    hold = random.randint(*EXIT_HOLD_RANGE)
-    t1b  = random.uniform(*EXIT_T1B_RANGE)
-    t2b  = random.uniform(max(EXIT_T2B_RANGE[0], t1b + 0.001), EXIT_T2B_RANGE[1])
-    t1tol = random.uniform(*EXIT_T1TOL_RANGE)
-    t2tol = random.uniform(*EXIT_T2TOL_RANGE)
-    t3tol = random.uniform(*EXIT_T3TOL_RANGE)
-    return dict(stop_loss=sl, min_hold_s=hold,
-                t1_boundary=t1b, t2_boundary=t2b,
-                t1_tol=t1tol, t2_tol=t2tol, t3_tol=t3tol)
-
-
 def _random_individual(features: np.ndarray, use_importance: bool = False) -> Individual:
     n_conds = random.randint(GA_MIN_CONDS, GA_MAX_CONDS)
     imp     = _feature_importance
 
     if use_importance and imp is not None:
-        # Importance-biased sampling: features that appeared in good rules more likely
         probs = imp / imp.sum()
         feat_indices = list(np.random.choice(N_FEATURES, size=min(n_conds, N_FEATURES),
                                               replace=False, p=probs))
@@ -707,17 +680,17 @@ def _random_individual(features: np.ndarray, use_importance: bool = False) -> In
         vals = col[np.isfinite(col)]
         if len(vals) < 10:
             continue
-        pct  = random.uniform(10, 90)
-        thr  = float(np.percentile(vals, pct))
-        d    = random.choice([1, -1])
+        pct = random.uniform(10, 90)
+        thr = float(np.percentile(vals, pct))
+        d   = random.choice([1, -1])
         conds.append((fi, d, thr))
     if not conds:
         return _random_individual(features)
-    return Individual(conds, **_random_exit_params())
+    return Individual(conds)
 
 
 def _crossover(p1: Individual, p2: Individual) -> Individual:
-    """Produce a child by mixing conditions AND exit params from both parents."""
+    """Produce a child by mixing conditions from both parents."""
     all_conds = p1.conditions + p2.conditions
     seen: Dict[int, Tuple] = {}
     for c in all_conds:
@@ -725,44 +698,16 @@ def _crossover(p1: Individual, p2: Individual) -> Individual:
     all_unique = list(seen.values())
     random.shuffle(all_unique)
     n = random.randint(GA_MIN_CONDS, min(GA_MAX_CONDS, len(all_unique)))
-
-    # Blend exit params: randomly pick from each parent per parameter
-    def blend(a, b):
-        return a if random.random() < 0.5 else b
-
-    return Individual(
-        all_unique[:n],
-        stop_loss   = blend(p1.stop_loss,   p2.stop_loss),
-        min_hold_s  = blend(p1.min_hold_s,  p2.min_hold_s),
-        t1_boundary = blend(p1.t1_boundary, p2.t1_boundary),
-        t2_boundary = blend(p1.t2_boundary, p2.t2_boundary),
-        t1_tol      = blend(p1.t1_tol,      p2.t1_tol),
-        t2_tol      = blend(p1.t2_tol,      p2.t2_tol),
-        t3_tol      = blend(p1.t3_tol,      p2.t3_tol),
-    )
-
-
-def _perturb(val: float, lo: float, hi: float, noise_frac: float = 0.15) -> float:
-    """Gaussian perturbation of a scalar exit param, clipped to range."""
-    delta = random.gauss(0, (hi - lo) * noise_frac)
-    return float(np.clip(val + delta, lo, hi))
+    return Individual(all_unique[:n])
 
 
 def _mutate(ind: Individual, features: np.ndarray) -> Individual:
-    """Return a mutated copy — can mutate entry conditions OR exit params."""
-    conds      = list(deepcopy(ind.conditions))
-    stop_loss  = ind.stop_loss
-    min_hold_s = ind.min_hold_s
-    t1b        = ind.t1_boundary
-    t2b        = ind.t2_boundary
-    t1tol      = ind.t1_tol
-    t2tol      = ind.t2_tol
-    t3tol      = ind.t3_tol
+    """Return a mutated copy — mutates entry conditions only."""
+    conds = list(deepcopy(ind.conditions))
+    op    = random.random()
 
-    op = random.random()
-
-    if op < 0.30 and conds:
-        # perturb an entry threshold
+    if op < 0.35 and conds:
+        # Perturb a threshold
         i   = random.randrange(len(conds))
         fi, d, thr = conds[i]
         col = features[:, fi]
@@ -771,17 +716,17 @@ def _mutate(ind: Individual, features: np.ndarray) -> Individual:
         conds[i] = (fi, d, float(np.clip(thr + delta,
                                           np.nanpercentile(col, 5),
                                           np.nanpercentile(col, 95))))
-    elif op < 0.45 and conds:
-        # flip direction of a condition
+    elif op < 0.55 and conds:
+        # Flip direction
         i   = random.randrange(len(conds))
         fi, d, thr = conds[i]
         conds[i] = (fi, -d, thr)
-    elif op < 0.55:
-        # remove a condition
+    elif op < 0.70:
+        # Remove a condition
         if len(conds) > GA_MIN_CONDS:
             conds.pop(random.randrange(len(conds)))
-    elif op < 0.65:
-        # add a new condition
+    else:
+        # Add a new condition
         if len(conds) < GA_MAX_CONDS:
             used_fi = {c[0] for c in conds}
             imp = _feature_importance
@@ -801,33 +746,10 @@ def _mutate(ind: Individual, features: np.ndarray) -> Individual:
                 thr = float(np.percentile(col, random.uniform(10, 90)))
                 d   = random.choice([1, -1])
                 conds.append((fi, d, thr))
-    elif op < 0.75:
-        # mutate stop-loss
-        stop_loss = _perturb(stop_loss, *EXIT_SL_RANGE)
-    elif op < 0.82:
-        # mutate min-hold
-        min_hold_s = int(np.clip(min_hold_s + random.randint(-30, 30),
-                                  EXIT_HOLD_RANGE[0], EXIT_HOLD_RANGE[1]))
-    elif op < 0.88:
-        # mutate tier boundaries
-        t1b = _perturb(t1b, *EXIT_T1B_RANGE)
-        t2b = max(t1b + 0.001, _perturb(t2b, *EXIT_T2B_RANGE))
-    else:
-        # mutate tier tolerances
-        choice = random.randint(0, 2)
-        if choice == 0:
-            t1tol = _perturb(t1tol, *EXIT_T1TOL_RANGE)
-        elif choice == 1:
-            t2tol = _perturb(t2tol, *EXIT_T2TOL_RANGE)
-        else:
-            t3tol = _perturb(t3tol, *EXIT_T3TOL_RANGE)
 
     if not conds:
         return _random_individual(features)
-    return Individual(conds,
-                      stop_loss=stop_loss, min_hold_s=min_hold_s,
-                      t1_boundary=t1b, t2_boundary=t2b,
-                      t1_tol=t1tol, t2_tol=t2tol, t3_tol=t3tol)
+    return Individual(conds)
 
 
 def _compute_fitness(
@@ -838,38 +760,48 @@ def _compute_fitness(
     price_highs: List[np.ndarray],
     price_lows:  List[np.ndarray],
     data_hours: float,
-    # Legacy fixed-exit arguments ignored — Individual carries its own exits now
+    # Ignored legacy arguments kept for call-site compatibility
     fixed_tiers: Optional[List] = None,
     fixed_sl:    float = 0.003,
     fixed_hold:  int   = 2,
 ) -> float:
-    mask   = ind.apply(features)
-    n_sig  = int(mask.sum())
-    # Hard floor: at least GA_MIN_SIG_HARD signals/day (statistical reliability)
+    """
+    Fitness = directional precision × signals_per_day × consistency_mult.
+
+    directional precision = fraction of fired signals where max forward price
+    reaches PUMP_THRESHOLD above entry within FWD_MINUTES.
+
+    No exit simulation — the GA cannot overfit to trailing-stop parameters.
+    Rules that fire on bearish conditions will not achieve ≥55% precision
+    and will be hard-rejected.
+    """
+    mask  = ind.apply(features)
+    n_sig = int(mask.sum())
+
     min_abs = max(GA_MIN_SIG_HARD, MIN_SIGNALS) * (data_hours / 24)
     if n_sig < min_abs:
         return -999.0
     if n_sig > MAX_SIGNALS * (data_hours / 24):
         return -998.0
 
-    # Use individual's own evolved exit parameters
-    tiers  = ind.make_tiers()
-    hold_b = int(ind.min_hold_s / BUCKET_SECONDS)
+    precision = float(labels[mask].mean()) if n_sig > 0 else 0.0
 
-    exits = _sim_exit_batch(
-        mask, price_highs, price_lows, entry_prices,
-        tiers, ind.stop_loss, hold_b,
-    )
-    net       = exits - COST_PCT
-    ev_trade  = float(net.mean())
-    std_trade = float(net.std()) + 1e-9
-    sharpe    = ev_trade / std_trade
+    # Hard reject: precision below the minimum — no matter how many signals
+    if precision < MIN_DIRECTIONAL_PRECISION:
+        return -997.0
+
     sig_per_d = n_sig / data_hours * 24
 
-    # Sharpe-weighted daily EV: rewards consistent strategies over lucky ones.
-    # A strategy with sharpe=2 gets a ~1.8x boost; sharpe=-1 gets 0.6x penalty.
-    sharpe_mult = max(0.3, min(3.0, 1.0 + sharpe * SHARPE_WEIGHT))
-    return ev_trade * sig_per_d * sharpe_mult
+    # Consistency multiplier: reward rules that fire more uniformly across time.
+    # Split data into 4 equal chunks; count how many chunks the rule fires ≥1 signal.
+    chunk = max(1, len(features) // 4)
+    active_chunks = sum(
+        1 for k in range(4)
+        if mask[k * chunk: (k + 1) * chunk].any()
+    )
+    consistency_mult = 0.5 + 0.5 * (active_chunks / 4)
+
+    return precision * sig_per_d * consistency_mult
 
 
 def _update_feature_importance(top_inds: List[Individual]) -> None:
@@ -894,32 +826,29 @@ def _update_feature_importance(top_inds: List[Individual]) -> None:
 
 
 def _seed_from_db(features: np.ndarray) -> List[Individual]:
-    """Load top rules from simulation_results and convert to seeded Individuals.
+    """Load top-precision rules from simulation_results as starting seeds.
 
-    This allows each run to build on the best knowledge found in previous runs
-    rather than starting from a blank slate.
+    Only loads rules with win_rate ≥ MIN_DIRECTIONAL_PRECISION so we don't
+    re-seed the population with the old overfitted rules.
     """
     seeds: List[Individual] = []
     try:
         with get_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT conditions_json, exit_config_json
+                    SELECT conditions_json
                     FROM simulation_results
-                    WHERE win_rate    >= 0.65
-                      AND daily_ev    >  0
-                      AND n_signals   >= 25
-                      AND signals_per_day >= 20
-                    ORDER BY daily_ev DESC
+                    WHERE win_rate        >= %s
+                      AND n_signals       >= %s
+                      AND signals_per_day >= %s
+                    ORDER BY win_rate DESC, signals_per_day DESC
                     LIMIT 30
-                """)
+                """, [MIN_DIRECTIONAL_PRECISION, GA_MIN_SIG_HARD, MIN_SIGNALS])
                 rows = cur.fetchall()
 
         for row in rows:
             try:
-                conds_raw  = row['conditions_json']
-                exit_raw   = row['exit_config_json'] or {}
-
+                conds_raw = row['conditions_json']
                 conds = []
                 for c in conds_raw:
                     feat = c.get('feature')
@@ -928,33 +857,15 @@ def _seed_from_db(features: np.ndarray) -> List[Individual]:
                     fi  = FEAT_IDX[feat]
                     d   = 1 if c.get('direction') == '>' else -1
                     thr = float(c.get('threshold', 0.0))
-                    # Verify the threshold is still in a valid percentile range
-                    col  = features[:, fi]
-                    p5   = float(np.nanpercentile(col, 5))
-                    p95  = float(np.nanpercentile(col, 95))
-                    thr  = float(np.clip(thr, p5, p95))
+                    col = features[:, fi]
+                    p5  = float(np.nanpercentile(col, 5))
+                    p95 = float(np.nanpercentile(col, 95))
+                    thr = float(np.clip(thr, p5, p95))
                     conds.append((fi, d, thr))
 
                 if len(conds) < GA_MIN_CONDS:
                     continue
-
-                # Parse exit config
-                tiers = exit_raw.get('tiers', [])
-                sl    = float(exit_raw.get('stop_loss', 0.003))
-                hold  = int(exit_raw.get('min_hold_seconds', 60))
-                t1b   = float(tiers[0][1]) if len(tiers) > 0 else 0.0015
-                t2b   = float(tiers[1][1]) if len(tiers) > 1 else 0.003
-                t1tol = float(tiers[0][2]) if len(tiers) > 0 else 0.004
-                t2tol = float(tiers[1][2]) if len(tiers) > 1 else 0.0015
-                t3tol = float(tiers[2][2]) if len(tiers) > 2 else 0.0003
-
-                ind = Individual(
-                    conds,
-                    stop_loss=sl, min_hold_s=hold,
-                    t1_boundary=t1b, t2_boundary=t2b,
-                    t1_tol=t1tol, t2_tol=t2tol, t3_tol=t3tol,
-                )
-                seeds.append(ind)
+                seeds.append(Individual(conds))
             except Exception:
                 continue
 
@@ -1034,7 +945,6 @@ def run_genetic_algorithm(
                 f"best_fitness={best_so_far*100:+.4f} | "
                 f"prec={prec*100:.1f}% | "
                 f"n={int(best.apply(features).sum())} | "
-                f"sl={best.stop_loss*100:.2f}% hold={best.min_hold_s}s | "
                 f"rule: {best}"
             )
 
@@ -1077,7 +987,6 @@ def run_genetic_algorithm(
             child.fitness_val = _compute_fitness(
                 child, features, labels, entry_prices,
                 price_highs, price_lows, data_hours,
-                fixed_tiers, fixed_sl, fixed_hold,
             )
             new_pop.append(child)
 
@@ -1099,57 +1008,7 @@ def _tournament(population: List[Individual]) -> Individual:
 # PHASE 4 — EXIT GRID SEARCH
 # =============================================================================
 
-def exit_grid_search(
-    ind: Individual,
-    features:     np.ndarray,
-    labels:       np.ndarray,
-    entry_prices: np.ndarray,
-    price_highs:  List[np.ndarray],
-    price_lows:   List[np.ndarray],
-    data_hours:   float,
-) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    """Grid-search exit config for one entry rule. Returns (best_config, best_metrics)."""
-    mask     = ind.apply(features)
-    n_sig    = int(mask.sum())
-
-    if n_sig < 3:
-        empty_cfg = {"stop_loss": 0.003, "min_hold_seconds": 60,
-                     "tiers": [(0, 0.002, 0.003), (0.002, 0.003, 0.001), (0.003, 1.0, 0.0005)]}
-        return empty_cfg, {"ev_per_trade": -COST_PCT, "daily_ev": 0, "win_rate": 0, "sharpe": 0}
-
-    best_daily_ev = -np.inf
-    best_cfg      = {}
-    best_metrics  = {}
-
-    for sl in STOP_LOSS_GRID:
-        for hold_s in MIN_HOLD_GRID:
-            hold_b = int(hold_s / BUCKET_SECONDS)
-            for t1_split in TIER1_SPLIT_GRID:
-                for t2_tol in TIER2_TOL_GRID:
-                    for t3_tol in TIER3_TOL_GRID:
-                        tiers = [
-                            (0.0,      t1_split, 0.003),
-                            (t1_split, 0.003,    t2_tol),
-                            (0.003,    1.0,      t3_tol),
-                        ]
-                        metrics = simulate_exits(
-                            mask, labels, price_highs, price_lows,
-                            entry_prices, tiers, sl, hold_b,
-                        )
-                        sig_per_d = n_sig / data_hours * 24
-                        daily_ev  = metrics["ev_per_trade"] * sig_per_d
-
-                        if daily_ev > best_daily_ev:
-                            best_daily_ev = daily_ev
-                            best_cfg = {
-                                "stop_loss":         sl,
-                                "min_hold_seconds":  hold_s,
-                                "tiers":             tiers,
-                            }
-                            best_metrics = {**metrics, "daily_ev": daily_ev,
-                                            "signals_per_day": sig_per_d}
-
-    return best_cfg, best_metrics
+# exit_grid_search removed — no longer used in v2 directional precision engine
 
 
 # =============================================================================
@@ -1158,32 +1017,32 @@ def exit_grid_search(
 
 def multi_fold_validate(
     ind:      Individual,
-    exit_cfg: Dict[str, Any],
+    exit_cfg: Dict[str, Any],   # kept for API compat — not used
     data:     Dict[str, Any],
     n_folds:  int = OOS_FOLDS,
 ) -> Tuple[float, float, float]:
-    """Expanding-window walk-forward validation with n_folds OOS windows.
+    """Walk-forward directional-precision validation.
 
-    Splits the data into (n_folds + 1) chunks. For each fold k:
-      - train = all data up to chunk k
-      - test  = chunk k+1 (OOS)
+    Splits the time series into (n_folds + 1) equal chunks.
+    For each fold k:
+      - train window = data[:chunk*(k+1)]
+      - OOS window   = data[chunk*(k+1) : chunk*(k+2)]
 
-    Returns (avg_insample_ev, avg_oos_ev, oos_consistency_score).
-    oos_consistency_score = fraction of folds where OOS EV > 0 (robustness).
+    Measures directional precision (% of signals where label=1) on each window.
+
+    Returns:
+        (avg_insample_precision, avg_oos_precision, oos_folds_passing_rate)
+
+    oos_folds_passing_rate = fraction of OOS folds where precision ≥ MIN_OOS_PRECISION.
+    A rule is considered OOS-valid only if this fraction ≥ MIN_OOS_FOLDS_PASSING/n_folds.
     """
-    features     = data["features"]
-    entry_prices = data["entry_prices"]
-    price_highs  = data["price_highs"]
-    price_lows   = data["price_lows"]
-    N            = len(features)
-
-    tiers  = [(lo, hi, t) for lo, hi, t in exit_cfg["tiers"]]
-    sl     = exit_cfg["stop_loss"]
-    hold_b = int(exit_cfg["min_hold_seconds"] / BUCKET_SECONDS)
+    features = data["features"]
+    labels   = data["labels"]
+    N        = len(features)
 
     chunk = max(1, N // (n_folds + 1))
-    is_evs:  List[float] = []
-    oos_evs: List[float] = []
+    is_precs:  List[float] = []
+    oos_precs: List[float] = []
 
     for fold in range(n_folds):
         train_end  = (fold + 1) * chunk
@@ -1193,34 +1052,30 @@ def multi_fold_validate(
         if test_end <= test_start:
             continue
 
-        train_m = np.zeros(N, dtype=bool)
-        train_m[:train_end] = True
-        test_m  = np.zeros(N, dtype=bool)
-        test_m[test_start:test_end] = True
-
-        def ev_for(mask: np.ndarray) -> float:
-            combined = ind.apply(features) & mask
-            if combined.sum() < 2:
+        def prec_for(start: int, end: int) -> float:
+            window_mask = np.zeros(N, dtype=bool)
+            window_mask[start:end] = True
+            combined = ind.apply(features) & window_mask
+            n = int(combined.sum())
+            if n < 3:
                 return float("nan")
-            exits = _sim_exit_batch(
-                combined, price_highs, price_lows, entry_prices, tiers, sl, hold_b
-            )
-            return float((exits - COST_PCT).mean())
+            return float(labels[combined].mean())
 
-        is_ev  = ev_for(train_m)
-        oos_ev = ev_for(test_m)
+        is_p  = prec_for(0, train_end)
+        oos_p = prec_for(test_start, test_end)
 
-        if not np.isnan(is_ev):
-            is_evs.append(is_ev)
-        if not np.isnan(oos_ev):
-            oos_evs.append(oos_ev)
+        if not np.isnan(is_p):
+            is_precs.append(is_p)
+        if not np.isnan(oos_p):
+            oos_precs.append(oos_p)
 
-    avg_is  = float(np.mean(is_evs))  if is_evs  else 0.0
-    avg_oos = float(np.mean(oos_evs)) if oos_evs else 0.0
-    # fraction of folds where OOS was positive (consistency measure)
-    oos_consistency = float(sum(1 for v in oos_evs if v > 0) / max(1, len(oos_evs)))
+    avg_is  = float(np.mean(is_precs))  if is_precs  else 0.0
+    avg_oos = float(np.mean(oos_precs)) if oos_precs else 0.0
+    oos_passing = float(
+        sum(1 for v in oos_precs if v >= MIN_OOS_PRECISION) / max(1, len(oos_precs))
+    )
 
-    return avg_is, avg_oos, oos_consistency
+    return avg_is, avg_oos, oos_passing
 
 
 # =============================================================================
@@ -1322,10 +1177,12 @@ def _update_hall_of_fame(new_results: List[Dict[str, Any]]) -> None:
     combined = _hall_of_fame + new_results
     # Sort by oos_consistency * avg_oos * daily_ev composite score
     def hof_score(r: Dict) -> float:
-        cons  = r.get('oos_consistency', 0.5)
-        oos   = r.get('oos_ev', 0.0)
-        daily = r.get('daily_ev', 0.0)
-        return daily * max(0.1, cons) * (1.0 + max(0.0, oos) * 10)
+        prec     = r.get('win_rate', 0.0)
+        oos_prec = r.get('oos_ev', 0.0)
+        pass_rt  = r.get('oos_consistency', 0.5)
+        sig_d    = r.get('signals_per_day', 1.0)
+        # Primary: OOS precision × volume; secondary: consistency bonus
+        return oos_prec * sig_d * max(0.3, pass_rt) * (1.0 + max(0.0, prec - 0.55) * 5)
 
     combined.sort(key=hof_score, reverse=True)
     # Deduplicate by feature set (keep best version of each unique rule)
@@ -1346,9 +1203,10 @@ def _update_hall_of_fame(new_results: List[Dict[str, Any]]) -> None:
         best = _hall_of_fame[0]
         logger.info(
             f"[HoF] Top rule: {best.get('rule_str','')} | "
-            f"daily_ev={best.get('daily_ev',0)*100:+.4f}% | "
-            f"win={best.get('win_rate',0):.0%} | "
-            f"oos_cons={best.get('oos_consistency',0):.0%}"
+            f"precision={best.get('win_rate',0):.0%} | "
+            f"oos_prec={best.get('oos_ev',0):.0%} | "
+            f"oos_pass={best.get('oos_consistency',0):.0%} | "
+            f"sig/d={best.get('signals_per_day',0):.1f}"
         )
 
 
@@ -1373,45 +1231,38 @@ def print_hall_of_fame() -> None:
 
 
 def print_leaderboard(top_results: List[Dict[str, Any]], run_id: str) -> None:
-    sep = "=" * 90
+    sep = "=" * 95
     print(f"\n{sep}")
-    print(f"LEADERBOARD  run={run_id}  top={len(top_results)}")
+    print(f"LEADERBOARD  run={run_id}  top={len(top_results)}  "
+          f"(pump_threshold={PUMP_THRESHOLD*100:.1f}%  fwd={FWD_MINUTES}min)")
     print(sep)
-    hdr = f"{'#':>3}  {'daily_EV':>9}  {'EV/trade':>9}  {'prec':>6}  {'sig/d':>6}  {'win%':>6}  {'OOS gap':>8}  Rule"
+    hdr = (f"{'#':>3}  {'Precision':>10}  {'OOS prec':>9}  {'OOSpass':>8}  "
+           f"{'sig/d':>6}  {'OOS gap':>8}  Rule")
     print(hdr)
-    print("-" * 90)
+    print("-" * 95)
     for r in top_results:
-        oos_gap_s = f"{r.get('oos_gap', 0)*100:+.3f}%" if r.get('oos_ev') is not None else "   n/a"
-        ovft_flag = " ⚠" if abs(r.get("oos_gap", 0)) > 0.0005 else ""
+        oos_gap_pp = r.get('oos_gap', 0) * 100
+        ovft_flag  = " ⚠" if oos_gap_pp > 5 else ""
         print(
             f"{r['rank']:>3}  "
-            f"{r['daily_ev']*100:>+8.4f}%  "
-            f"{r['ev_per_trade']*100:>+8.4f}%  "
-            f"{r['precision_pct']*100:>5.1f}%  "
+            f"{r['win_rate']*100:>9.1f}%  "
+            f"{r.get('oos_ev',0)*100:>8.1f}%  "
+            f"{r.get('oos_consistency',0)*100:>7.0f}%  "
             f"{r['signals_per_day']:>6.1f}  "
-            f"{r['win_rate']*100:>5.1f}%  "
-            f"{oos_gap_s:>8}{ovft_flag}  "
-            f"{r['rule_str'][:45]}"
+            f"{oos_gap_pp:>+7.1f}pp{ovft_flag}  "
+            f"{r['rule_str'][:50]}"
         )
     print(sep)
 
     if top_results:
         best = top_results[0]
-        cfg  = best["exit_config"]
-        print(f"\n★  BEST CONFIG (rank 1):")
-        print(f"   Rule:    {best['rule_str']}")
-        t = cfg.get("tiers", [])
-        tier_str = "  |  ".join(
-            f"{lo*100:.2f}-{hi*100:.2f}%: tol={tol*100:.2f}%"
-            for lo, hi, tol in t
-        ) if t else "n/a"
-        print(f"   Exit:    SL={cfg.get('stop_loss',0)*100:.2f}%  "
-              f"hold={cfg.get('min_hold_seconds',0)}s  "
-              f"tiers=[{tier_str}]")
-        print(f"   Stats:   daily_EV={best['daily_ev']*100:+.4f}%  "
-              f"prec={best['precision_pct']*100:.1f}%  "
-              f"{best['signals_per_day']:.1f} sig/day  "
-              f"win={best['win_rate']*100:.1f}%  sharpe={best['sharpe']:.3f}")
+        print(f"\n★  BEST RULE (rank 1):")
+        print(f"   Rule:       {best['rule_str']}")
+        print(f"   Precision:  {best['win_rate']*100:.1f}%  "
+              f"({best['win_rate']*100:.1f}% of signals → price up ≥{PUMP_THRESHOLD*100:.1f}% in {FWD_MINUTES}min)")
+        print(f"   OOS prec:   {best.get('oos_ev',0)*100:.1f}%  "
+              f"(pass rate {best.get('oos_consistency',0)*100:.0f}%)")
+        print(f"   Volume:     {best['signals_per_day']:.1f} signals/day")
     print()
 
 
@@ -1444,6 +1295,7 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
 
     features     = data["features"]
     labels       = data["labels"]
+    max_gains    = data["max_gains"]
     entry_prices = data["entry_prices"]
     price_highs  = data["price_highs"]
     price_lows   = data["price_lows"]
@@ -1467,60 +1319,66 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
     logger.info(f"GA completed in {(time.time()-t0)/60:.1f} min  "
                 f"— refining top {len(top_inds)} individuals")
 
-    # ── Phase 4: Exit Grid Search (refinement of GA's evolved exit params) ────
+    # ── Phase 4: OOS precision validation (replaces exit grid search) ─────────
     top_results = []
     for rank, ind in enumerate(top_inds, start=1):
         mask  = ind.apply(features)
         n_sig = int(mask.sum())
-        if n_sig < 2:
+        if n_sig < 3:
             continue
 
-        # Start from GA's own exit config; grid-search can only improve it
-        t1 = time.time()
-        exit_cfg, exit_metrics = exit_grid_search(
-            ind, features, labels, entry_prices,
-            price_highs, price_lows, data_hours,
-        )
-        t_exit = time.time() - t1
+        precision = float(labels[mask].mean())
+        # Hard reject: in-sample precision below minimum
+        if precision < MIN_DIRECTIONAL_PRECISION:
+            continue
 
-        # ── Phase 5: Multi-fold walk-forward ──────────────────────────────────
-        avg_is, avg_oos, oos_consistency = multi_fold_validate(ind, exit_cfg, data)
+        sig_per_day = n_sig / data_hours * 24
+        recall      = labels[mask].sum() / max(labels.sum(), 1)
+
+        # Walk-forward OOS validation — measures directional precision on held-out data
+        avg_is, avg_oos, oos_pass_rate = multi_fold_validate(ind, {}, data)
         oos_gap = avg_is - avg_oos if not (np.isnan(avg_is) or np.isnan(avg_oos)) else 0.0
 
-        recall = labels[mask].sum() / max(labels.sum(), 1)
+        # Reject rules that don't hold up OOS
+        min_oos_pass = MIN_OOS_FOLDS_PASSING / OOS_FOLDS
+        if avg_oos < MIN_OOS_PRECISION or oos_pass_rate < min_oos_pass:
+            logger.info(
+                f"  Rank {rank:2d}: REJECTED OOS — oos_prec={avg_oos:.3f} "
+                f"pass_rate={oos_pass_rate:.0%} (need ≥{MIN_OOS_PRECISION:.0%} "
+                f"on ≥{min_oos_pass:.0%} folds)"
+            )
+            continue
 
         result = {
-            "rank":             rank,
-            "rule_str":         str(ind),
-            "conditions":       ind.to_json(),
-            "n_features":       len(ind.conditions),
-            "n_signals":        n_sig,
-            "signals_per_day":  exit_metrics.get("signals_per_day", n_sig / data_hours * 24),
-            "precision_pct":    exit_metrics.get("precision", 0.0),
-            "recall_pct":       float(recall),
-            "exit_config":      exit_cfg,
-            "ev_per_trade":     exit_metrics.get("ev_per_trade", 0.0),
-            "daily_ev":         exit_metrics.get("daily_ev", 0.0),
-            "win_rate":         exit_metrics.get("win_rate", 0.0),
-            "sharpe":           exit_metrics.get("sharpe", 0.0),
-            "insample_ev":      avg_is  if not np.isnan(avg_is)  else 0.0,
-            "oos_ev":           avg_oos if not np.isnan(avg_oos) else 0.0,
-            "oos_gap":          oos_gap,
-            "oos_consistency":  oos_consistency,
-            # Include GA's evolved exit for comparison
-            "ga_exit": {
-                "stop_loss":        ind.stop_loss,
-                "min_hold_seconds": ind.min_hold_s,
-                "tiers":            ind.make_tiers(),
-            },
+            "rank":            rank,
+            "rule_str":        str(ind),
+            "conditions":      ind.to_json(),
+            "n_features":      len(ind.conditions),
+            "n_signals":       n_sig,
+            "signals_per_day": sig_per_day,
+            # win_rate = real directional precision — this is what check_sim_rules filters on
+            "win_rate":        precision,
+            "precision_pct":   precision,
+            "recall_pct":      float(recall),
+            # ev_per_trade = forward gain expectation (max gain in FWD_MINUTES when label=1,
+            #                averaged over all signals including non-pumps)
+            "ev_per_trade":    float(max_gains[mask].mean()),
+            "daily_ev":        float(max_gains[mask].mean()) * sig_per_day,
+            "sharpe":          0.0,
+            # OOS metrics
+            "insample_ev":     avg_is,
+            "oos_ev":          avg_oos,
+            "oos_gap":         oos_gap,
+            "oos_consistency": oos_pass_rate,
+            # No exit config — sell_logic is set per-play independently
+            "exit_config":     {},
+            "ga_exit":         {},
         }
         top_results.append(result)
         logger.info(
-            f"  Rank {rank:2d}: daily_EV={result['daily_ev']*100:+.4f}%  "
-            f"win={result['win_rate']*100:.0f}%  "
-            f"n={n_sig}  oos_gap={oos_gap*100:+.3f}%  "
-            f"oos_cons={oos_consistency:.0%}  "
-            f"exit_grid={t_exit:.1f}s"
+            f"  Rank {rank:2d}: precision={precision*100:.1f}%  "
+            f"oos_prec={avg_oos*100:.1f}%  oos_pass={oos_pass_rate:.0%}  "
+            f"n={n_sig}  sig/d={sig_per_day:.1f}  rule: {str(ind)[:60]}"
         )
 
     if not top_results:
@@ -1544,13 +1402,14 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
 def run_continuous() -> None:
     """Run indefinitely — start the next loop immediately after each one finishes."""
     logger.info("=" * 70)
-    logger.info("MEGA SIGNAL SIMULATOR STARTED")
+    logger.info("MEGA SIGNAL SIMULATOR STARTED  (v3 path-filtered labels)")
     logger.info(f"  Features:          {N_FEATURES}")
     logger.info(f"  GA population:     {GA_POPULATION}")
     logger.info(f"  GA generations:    {GA_GENERATIONS}")
-    logger.info(f"  Exit grid configs: "
-                f"{len(STOP_LOSS_GRID)*len(MIN_HOLD_GRID)*len(TIER1_SPLIT_GRID)*len(TIER2_TOL_GRID)*len(TIER3_TOL_GRID)}")
-    logger.info(f"  Pump threshold:    {PUMP_THRESHOLD*100:.1f}%")
+    logger.info(f"  Min precision:     {MIN_DIRECTIONAL_PRECISION*100:.0f}% in-sample / {MIN_OOS_PRECISION*100:.0f}% OOS")
+    logger.info(f"  Pump threshold:    {PUMP_THRESHOLD*100:.2f}%  (target gain before stop)")
+    logger.info(f"  Live stop loss:    {LIVE_STOP_LOSS*100:.3f}%  (stop triggers before target = label=0)")
+    logger.info(f"  Max signals/day:   {MAX_SIGNALS}  (was 300 — lowered for selectivity)")
     logger.info(f"  OOS folds:         {OOS_FOLDS}")
     logger.info("=" * 70)
 

@@ -69,7 +69,9 @@ TRADE_PARQUET  = _CACHE_DIR / "trade_latest.parquet"
 WHALE_PARQUET  = _CACHE_DIR / "whale_latest.parquet"
 
 # Rolling retention (delete rows older than this)
-RETENTION_HOURS = 25
+# 96h gives the mega_simulator 4 days of pattern history to learn from,
+# which drastically reduces overfitting vs the previous 25h window.
+RETENTION_HOURS = 96
 
 # Flush settings
 _FLUSH_ROWS    = 10     # flush after this many buffered rows
@@ -558,6 +560,29 @@ def get_live_features(window_min: int = 5) -> Optional[Dict[str, Any]]:
                           / NULLIF(COUNT(*), 0)                                AS wh_urgency_ratio
                     FROM whale_events w, now n
                     WHERE EPOCH(n.t) - EPOCH(w.ts) BETWEEN 0 AND {win_sec}
+                ),
+
+                -- Price momentum from OB mid_price snapshots
+                -- Matches exactly how mega_simulator computes pm_* features
+                price_now AS (
+                    SELECT AVG(mid_price) AS p
+                    FROM ob_snapshots o, now n
+                    WHERE EPOCH(n.t) - EPOCH(o.ts) BETWEEN 0 AND 10
+                ),
+                price_30s AS (
+                    SELECT AVG(mid_price) AS p
+                    FROM ob_snapshots o, now n
+                    WHERE EPOCH(n.t) - EPOCH(o.ts) BETWEEN 25 AND 35
+                ),
+                price_1m AS (
+                    SELECT AVG(mid_price) AS p
+                    FROM ob_snapshots o, now n
+                    WHERE EPOCH(n.t) - EPOCH(o.ts) BETWEEN 55 AND 65
+                ),
+                price_5m AS (
+                    SELECT AVG(mid_price) AS p
+                    FROM ob_snapshots o, now n
+                    WHERE EPOCH(n.t) - EPOCH(o.ts) BETWEEN 295 AND 305
                 )
 
                 SELECT
@@ -572,8 +597,19 @@ def get_live_features(window_min: int = 5) -> Optional[Dict[str, Any]]:
                     t.tr_n, t.tr_total_sol, t.tr_buy_ratio,
                     t.tr_large_ratio, t.tr_avg_size, t.tr_buy_accel,
                     w.wh_n, w.wh_net_flow, w.wh_inflow_ratio, w.wh_large_count,
-                    w.wh_avg_pct_moved, w.wh_urgency_ratio
-                FROM ob_feats o, trade_feats t, whale_feats w
+                    w.wh_avg_pct_moved, w.wh_urgency_ratio,
+                    -- Price momentum (% change, matching mega_simulator feature names)
+                    CASE WHEN p30s.p > 0
+                         THEN (pnow.p - p30s.p) / p30s.p * 100 ELSE 0 END    AS pm_price_change_30s,
+                    CASE WHEN p1m.p  > 0
+                         THEN (pnow.p - p1m.p)  / p1m.p  * 100 ELSE 0 END    AS pm_price_change_1m,
+                    CASE WHEN p5m.p  > 0
+                         THEN (pnow.p - p5m.p)  / p5m.p  * 100 ELSE 0 END    AS pm_price_change_5m,
+                    CASE WHEN p1m.p  > 0 AND p5m.p > 0
+                         THEN (pnow.p - p1m.p) / p1m.p * 100
+                            - (pnow.p - p5m.p) / p5m.p * 100 ELSE 0 END      AS pm_velocity_30s
+                FROM ob_feats o, trade_feats t, whale_feats w,
+                     price_now pnow, price_30s p30s, price_1m p1m, price_5m p5m
             """).fetchone()
 
         con.close()
@@ -591,6 +627,9 @@ def get_live_features(window_min: int = 5) -> Optional[Dict[str, Any]]:
             'tr_large_ratio', 'tr_avg_size', 'tr_buy_accel',
             'wh_n', 'wh_net_flow', 'wh_inflow_ratio', 'wh_large_count',
             'wh_avg_pct_moved', 'wh_urgency_ratio',
+            # Price momentum — must match mega_simulator FEATURES list exactly
+            'pm_price_change_30s', 'pm_price_change_1m',
+            'pm_price_change_5m', 'pm_velocity_30s',
         ]
         return dict(zip(cols, row))
 
@@ -785,4 +824,7 @@ FEATURE_NAMES = [
     'wh_n', 'wh_net_flow', 'wh_inflow_ratio',
     # Whale — conviction
     'wh_avg_pct_moved', 'wh_urgency_ratio',
+    # Price momentum (matches mega_simulator FEATURES list)
+    'pm_price_change_30s', 'pm_price_change_1m',
+    'pm_price_change_5m', 'pm_velocity_30s',
 ]

@@ -729,6 +729,22 @@ class DatabaseClient {
     public function getTrackedWallets(): ?array {
         return $this->get('/tracked_wallets');
     }
+
+    /**
+     * Get all paper wallets with balance and P/L summary
+     */
+    public function getWallets(): ?array {
+        return $this->get('/wallets');
+    }
+
+    /**
+     * Get trade history for a specific paper wallet
+     */
+    public function getWalletTrades(int $walletId, ?string $status = null, int $limit = 200): ?array {
+        $params = ['limit' => $limit];
+        if ($status !== null) $params['status'] = $status;
+        return $this->get("/wallets/{$walletId}/trades", $params);
+    }
     
     /**
      * Get job execution metrics with execution time analysis

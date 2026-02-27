@@ -102,6 +102,13 @@ WHALE_DUMP_TX_REQUIRED = 0.20          # tx_buy_sell_pressure must exceed this w
 CHASE_GATE_1M_MAX = 0.15               # pm_price_change_1m above this = chasing a spike
 CHASE_GATE_30S_MAX = 0.10              # pm_price_velocity_30s above this = chasing micro spike
 
+# ── Cycle position gate ───────────────────────────────────────────────────────
+# Block entries when the price has already moved too far from the cycle start.
+# Data analysis shows entries with >0.15% already moved from cycle_start have
+# avg exit of -0.050% (chasing) vs +0.060% for entries at 0.10-0.15% moved.
+# Short 1-min gates don't catch slow multi-minute climbs — this uses cycle_tracker.
+CYCLE_CHASE_GATE = float(os.getenv("CYCLE_CHASE_GATE", "0.0015"))  # 0.15% default
+
 # ── Readiness score (fast path) ──────────────────────────────────────────────
 READINESS_THRESHOLD = float(os.getenv("READINESS_THRESHOLD", "0.60"))
 READINESS_COOLDOWN_SEC = 30        # min seconds between fast-path triggers
@@ -157,13 +164,82 @@ _last_train_data_hash: str = ""  # hash of training data to skip identical retra
 
 _gate_stats: Dict[str, int] = {
     'no_rules': 0, 'crash_gate_fail': 0, 'crash_5m_fail': 0,
-    'chase_gate_fail': 0, 'gates_passed': 0,
+    'chase_gate_fail': 0, 'cycle_chase_fail': 0, 'gates_passed': 0,
     'no_pattern': 0, 'no_combo': 0,
     'signal_fired': 0, 'total_checks': 0,
     'circuit_breaker': 0,
 }
 
+# Cache cycle start price to avoid a DB query on every 5-second cycle
+_cycle_start_cache: Dict[int, float] = {}  # {cycle_id: start_price}
+
 _price_buffer: deque = deque(maxlen=200)
+
+# Price momentum cache — avoid a DB round-trip every 5s
+_pm_cache: Dict[str, Any] = {}
+_pm_cache_ts: float = 0.0
+_PM_CACHE_TTL: float = 4.0   # seconds — refresh slightly faster than the 5s cycle
+
+
+def _compute_price_momentum() -> Optional[Dict[str, float]]:
+    """Compute pm_price_change_* features from recent PostgreSQL price rows.
+
+    Returns dict with pm_price_change_30s, pm_price_change_1m, pm_price_change_5m,
+    pm_velocity_30s — in % units, matching mega_simulator feature definitions.
+    Results are cached for _PM_CACHE_TTL seconds to avoid hammering the DB.
+    """
+    global _pm_cache, _pm_cache_ts
+    now = time.time()
+    if now - _pm_cache_ts < _PM_CACHE_TTL and _pm_cache:
+        return _pm_cache
+
+    try:
+        rows = postgres_query("""
+            SELECT price, timestamp
+            FROM prices
+            WHERE token = 'SOL'
+              AND timestamp >= NOW() - INTERVAL '6 minutes'
+            ORDER BY timestamp DESC
+            LIMIT 400
+        """)
+        if not rows or len(rows) < 2:
+            return None
+
+        # Current price = most recent row
+        p_now = float(rows[0]['price'])
+        ts_now = rows[0]['timestamp']
+
+        def _price_ago(seconds: int) -> Optional[float]:
+            """Average price in a ±3s window around `seconds` ago."""
+            target_ts = ts_now - timedelta(seconds=seconds)
+            window = [
+                float(r['price'])
+                for r in rows
+                if abs((r['timestamp'] - target_ts).total_seconds()) <= 3
+            ]
+            return sum(window) / len(window) if window else None
+
+        p_30s = _price_ago(30)
+        p_1m  = _price_ago(60)
+        p_5m  = _price_ago(300)
+
+        ch_30s = (p_now - p_30s) / p_30s * 100 if p_30s else 0.0
+        ch_1m  = (p_now - p_1m)  / p_1m  * 100 if p_1m  else 0.0
+        ch_5m  = (p_now - p_5m)  / p_5m  * 100 if p_5m  else 0.0
+
+        result = {
+            'pm_price_change_30s': ch_30s,
+            'pm_price_change_1m':  ch_1m,
+            'pm_price_change_5m':  ch_5m,
+            'pm_velocity_30s':     ch_1m - ch_5m,
+        }
+        _pm_cache    = result
+        _pm_cache_ts = now
+        return result
+
+    except Exception as e:
+        logger.debug(f"_compute_price_momentum: {e}")
+        return None
 
 # ── Simulator rules cache (loaded from simulation_results PostgreSQL table) ──
 # Keyed by play_id so each play maintains its own filtered rule set.
@@ -605,33 +681,38 @@ def match_combination_rule(features: Dict[str, float]) -> Optional[Dict[str, Any
 # =============================================================================
 
 def _load_sim_rules(
-    win_rate_min: float = 0.65,
-    oos_gap_max: float = 0.004,
+    win_rate_min: float = 0.55,
+    oos_gap_max: float = 0.08,
     daily_ev_min: float = 0.0,
     n_signals_min: int = 10,
 ) -> List[Dict[str, Any]]:
     """Load top simulation rules from simulation_results (PostgreSQL).
 
-    Per-play thresholds allow each play to apply different quality bars
-    when selecting which simulator rules to activate.
-    Feature names match raw_data_cache.get_live_features() exactly —
-    no remapping needed.
+    win_rate here = DIRECTIONAL PRECISION (% of signals where price went up
+    ≥0.1% within 7 min) — NOT exit-simulation win rate.  Rules are sorted by
+    oos_ev (OOS directional precision) × signals_per_day so we prefer rules
+    that are both accurate AND frequent.
+
+    The oos_gap threshold is now in percentage-point units (0.08 = 8pp gap
+    between in-sample and OOS precision is acceptable).
     """
     try:
         with get_postgres() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT conditions_json, win_rate, ev_per_trade, daily_ev,
-                           exit_config_json, sharpe, oos_gap,
-                           COALESCE(oos_consistency, 0.5) AS oos_consistency
+                           exit_config_json, sharpe, oos_gap, oos_ev,
+                           COALESCE(oos_consistency, 0.5) AS oos_consistency,
+                           signals_per_day
                     FROM simulation_results
                     WHERE win_rate   >= %s
                       AND n_signals  >= %s
                       AND oos_gap    <= %s
                       AND daily_ev   >= %s
-                      AND COALESCE(oos_consistency, 0) >= 0.33
-                    ORDER BY daily_ev * COALESCE(oos_consistency, 0.5) DESC
-                    LIMIT 8
+                      AND COALESCE(oos_consistency, 0) >= 0.50
+                      AND COALESCE(oos_ev, 0)          >= 0.50
+                    ORDER BY COALESCE(oos_ev, 0) * signals_per_day DESC
+                    LIMIT 10
                 """, [win_rate_min, n_signals_min, oos_gap_max, daily_ev_min])
                 return [dict(r) for r in cur.fetchall()]
     except Exception as e:
@@ -2174,7 +2255,7 @@ def _log_gate_summary() -> None:
     logger.info(
         f"V4 gates (60s): {total} chk | no_rules={_gate_stats['no_rules']} "
         f"cb={cb} crash={_gate_stats['crash_gate_fail']} 5m={_gate_stats['crash_5m_fail']} "
-        f"chase={_gate_stats['chase_gate_fail']} "
+        f"chase={_gate_stats['chase_gate_fail']} cycle_chase={_gate_stats['cycle_chase_fail']} "
         f"ok={_gate_stats['gates_passed']} no_pat={_gate_stats['no_pattern']} "
         f"no_combo={_gate_stats['no_combo']} "
         f"FIRED={_gate_stats['signal_fired']}"
@@ -2524,6 +2605,17 @@ def check_and_fire_pump_signal(
     try:
         from core.raw_data_cache import get_live_features
         live = get_live_features(window_min=5)
+
+        # Augment with price momentum features if not already included.
+        # These match the mega_simulator pm_* features exactly (% change).
+        if live and 'pm_price_change_30s' not in live:
+            try:
+                _pm = _compute_price_momentum()
+                if _pm:
+                    live.update(_pm)
+            except Exception as _pm_err:
+                logger.debug(f"Price momentum augment failed: {_pm_err}")
+
         if live and live.get('ob_n', 0) >= 3:
             # Use a timestamp-based signal key so context is retrievable without buyin_id
             signal_key = int(time.time())
@@ -2556,6 +2648,27 @@ def check_and_fire_pump_signal(
         logger.debug("V4: skipping cycle — raw cache not yet warm (ob_n < 3)")
         return False
 
+    # ── Global safety gates — apply to ALL signal paths (sim + fingerprint) ─────
+    # Sim-rules previously bypassed these, firing even during circuit-breaker trips
+    # and live crash conditions.  Applied here once so both paths are protected.
+
+    # Gate A: Circuit breaker — pause when live win rate drops below threshold
+    if _check_circuit_breaker():
+        _gate_stats['circuit_breaker'] += 1
+        return False
+
+    # Gate B: Micro 30s crash — block during rapid sell-off
+    crash_ok, _crash_desc = _is_not_crashing()
+    if not crash_ok:
+        _gate_stats['crash_gate_fail'] += 1
+        return False
+
+    # Gate C: 5-minute crash gate — don't enter a sustained downtrend
+    pm_5m_live = live.get('pm_price_change_5m')
+    if pm_5m_live is not None and float(pm_5m_live) < CRASH_GATE_5M:
+        _gate_stats['crash_5m_fail'] += 1
+        return False
+
     # ── Path A: Simulator rules (primary — uses raw feature names directly) ───
     # `live` is guaranteed non-None and ob_n >= 3 here (trail_row guard passed)
     sim_match = check_sim_rules(live, play_id=pump_play_id, sim_filter=sim_filter)
@@ -2577,12 +2690,45 @@ def check_and_fire_pump_signal(
     # Signal fires if EITHER path matches (Path B only fires when no sim rules)
     signal_fires = signal_fires_sim or signal_fires_fp
 
+    # ── Cycle position gate ───────────────────────────────────────────────────
+    # Block if price has already climbed too far from cycle start (chasing).
+    # We only run this check when a signal is about to fire (cheap path).
+    if signal_fires and price_cycle and market_price and CYCLE_CHASE_GATE > 0:
+        try:
+            start_price = _cycle_start_cache.get(price_cycle)
+            if start_price is None:
+                row = postgres_query_one(
+                    "SELECT sequence_start_price FROM cycle_tracker WHERE id = %s",
+                    [price_cycle]
+                )
+                if row and row.get('sequence_start_price'):
+                    start_price = float(row['sequence_start_price'])
+                    _cycle_start_cache[price_cycle] = start_price
+                    # Prune cache: keep only the 5 most recent cycle IDs
+                    if len(_cycle_start_cache) > 5:
+                        oldest = min(_cycle_start_cache)
+                        del _cycle_start_cache[oldest]
+
+            if start_price and start_price > 0:
+                already_moved = (market_price - start_price) / start_price
+                if already_moved > CYCLE_CHASE_GATE:
+                    _gate_stats['cycle_chase_fail'] += 1
+                    logger.info(
+                        f"[cycle_gate] play={pump_play_id} BLOCKED — already "
+                        f"{already_moved*100:.3f}% into cycle "
+                        f"(limit={CYCLE_CHASE_GATE*100:.2f}%, "
+                        f"start={start_price:.4f} current={market_price:.4f})"
+                    )
+                    signal_fires = False
+        except Exception as _cg_err:
+            logger.debug(f"[cycle_gate] check skipped: {_cg_err}")
+
     if signal_fires_sim:
         logger.info(
             f"[sim_rules] play={pump_play_id} Signal via simulator rule | "
-            f"win_rate={sim_match.get('win_rate', 0):.0%} "
-            f"ev/trade={sim_match.get('ev_per_trade', 0):.4f} "
-            f"daily_ev={sim_match.get('daily_ev', 0):.3f}"
+            f"precision={sim_match.get('win_rate', 0):.0%} "
+            f"oos_prec={sim_match.get('oos_ev', 0):.0%} "
+            f"sig/d={sim_match.get('signals_per_day', 0):.1f}"
         )
     elif signal_fires_fp and not play_has_sim_rules:
         logger.info(f"[fingerprint] play={pump_play_id} Signal via fingerprint (no sim rules loaded)")

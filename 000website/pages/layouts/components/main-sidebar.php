@@ -121,6 +121,15 @@
                                 </a>
                             </li>
 
+                            <!-- Paper Wallets -->
+                            <li class="slide">
+                                <a href="/pages/features/wallets/" class="side-menu__item">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="side-menu__icon" viewBox="0 0 256 256"><rect width="256" height="256" fill="none"/><path d="M40,208H216" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16" opacity="0.2"/><path d="M168,48H48A16,16,0,0,0,32,64V192a16,16,0,0,0,16,16H216a8,8,0,0,0,8-8V96a8,8,0,0,0-8-8H48a16,16,0,0,1-16-16h0A16,16,0,0,1,48,56H208a8,8,0,0,0,8-8h0A8,8,0,0,0,208,40H168Z" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="16"/><circle cx="188" cy="152" r="12"/></svg>
+                                    <span class="side-menu__label">Wallets</span>
+                                    <span class="badge bg-success-transparent ms-auto">New</span>
+                                </a>
+                            </li>
+
                               <!-- Start::slide__category -->
                               <li class="slide__category"><span class="category-name">Data Streams</span></li>
                             <!-- End::slide__category -->

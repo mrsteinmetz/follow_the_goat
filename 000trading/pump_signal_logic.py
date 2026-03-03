@@ -247,6 +247,22 @@ _sim_rules: Dict[int, List[Dict[str, Any]]] = {}
 _sim_rules_loaded_at: Dict[int, float] = {}
 SIM_RULES_TTL: float = 300.0  # refresh every 5 min
 
+# Guard rails for per-play simulator filters. These keep DB play configs from
+# becoming so strict that no rules ever load, while still enforcing profitable
+# directional precision thresholds.
+SIM_FILTER_DEFAULTS: Dict[str, float] = {
+    'win_rate_min': 0.60,
+    'oos_gap_max': 0.06,
+    'daily_ev_min': 0.0,
+    'n_signals_min': 10,
+}
+SIM_FILTER_BOUNDS: Dict[str, Tuple[float, float]] = {
+    'win_rate_min': (0.60, 0.72),
+    'oos_gap_max': (0.04, 0.08),
+    'daily_ev_min': (0.0, 1.0),
+    'n_signals_min': (10, 200),
+}
+
 # ── Per-play last-entry timestamp (replaces single global _last_entry_time) ──
 _last_entry_time_per_play: Dict[int, float] = {}
 
@@ -720,6 +736,39 @@ def _load_sim_rules(
         return []
 
 
+def _normalize_sim_filter(sim_filter: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize per-play sim_filter values to safe, loadable bounds."""
+    sf = sim_filter or {}
+
+    def _num(key: str, default: float) -> float:
+        try:
+            return float(sf.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    wr = _num('win_rate_min', SIM_FILTER_DEFAULTS['win_rate_min'])
+    gap = _num('oos_gap_max', SIM_FILTER_DEFAULTS['oos_gap_max'])
+    dev = _num('daily_ev_min', SIM_FILTER_DEFAULTS['daily_ev_min'])
+    ns = _num('n_signals_min', SIM_FILTER_DEFAULTS['n_signals_min'])
+
+    wr_lo, wr_hi = SIM_FILTER_BOUNDS['win_rate_min']
+    gap_lo, gap_hi = SIM_FILTER_BOUNDS['oos_gap_max']
+    dev_lo, dev_hi = SIM_FILTER_BOUNDS['daily_ev_min']
+    ns_lo, ns_hi = SIM_FILTER_BOUNDS['n_signals_min']
+
+    wr = max(wr_lo, min(wr_hi, wr))
+    gap = max(gap_lo, min(gap_hi, gap))
+    dev = max(dev_lo, min(dev_hi, dev))
+    ns = int(max(ns_lo, min(ns_hi, round(ns))))
+
+    return {
+        'win_rate_min': wr,
+        'oos_gap_max': gap,
+        'daily_ev_min': dev,
+        'n_signals_min': ns,
+    }
+
+
 def check_sim_rules(
     live_features: Dict[str, Any],
     play_id: int = 3,
@@ -740,13 +789,28 @@ def check_sim_rules(
     now = time.time()
     play_last_loaded = _sim_rules_loaded_at.get(play_id, 0.0)
     if now - play_last_loaded > SIM_RULES_TTL or play_id not in _sim_rules:
-        sf = sim_filter or {}
+        sf = _normalize_sim_filter(sim_filter)
         rules = _load_sim_rules(
-            win_rate_min=sf.get('win_rate_min', 0.65),
-            oos_gap_max=sf.get('oos_gap_max', 0.004),
-            daily_ev_min=sf.get('daily_ev_min', 0.0),
-            n_signals_min=sf.get('n_signals_min', 10),
+            win_rate_min=sf['win_rate_min'],
+            oos_gap_max=sf['oos_gap_max'],
+            daily_ev_min=sf['daily_ev_min'],
+            n_signals_min=sf['n_signals_min'],
         )
+        if not rules:
+            # Fallback to known-good baseline so strict play overrides cannot
+            # silently disable a play by loading zero simulation rules.
+            fallback_sf = dict(SIM_FILTER_DEFAULTS)
+            rules = _load_sim_rules(
+                win_rate_min=fallback_sf['win_rate_min'],
+                oos_gap_max=fallback_sf['oos_gap_max'],
+                daily_ev_min=fallback_sf['daily_ev_min'],
+                n_signals_min=int(fallback_sf['n_signals_min']),
+            )
+            if rules:
+                logger.warning(
+                    f"[sim_rules] play={play_id} strict filter loaded 0 rules; "
+                    f"falling back to defaults {fallback_sf}"
+                )
         _sim_rules[play_id] = rules
         _sim_rules_loaded_at[play_id] = now
         logger.debug(f"[sim_rules] play={play_id} loaded {len(rules)} rules")
@@ -2583,11 +2647,12 @@ def check_and_fire_pump_signal(
     # Resolve play config — support both new dict API and legacy env-var fallback
     if play_config is not None:
         pump_play_id = int(play_config['play_id'])
-        sim_filter: Dict[str, Any] = play_config.get('sim_filter') or {}
-        play_cooldown = float(sim_filter.get('cooldown_seconds', COOLDOWN_SECONDS))
+        raw_sim_filter: Dict[str, Any] = play_config.get('sim_filter') or {}
+        sim_filter = _normalize_sim_filter(raw_sim_filter)
+        play_cooldown = float(raw_sim_filter.get('cooldown_seconds', COOLDOWN_SECONDS))
     else:
         pump_play_id = int(os.getenv("PUMP_SIGNAL_PLAY_ID", "3"))
-        sim_filter = {}
+        sim_filter = _normalize_sim_filter({})
         play_cooldown = COOLDOWN_SECONDS
 
     if not pump_play_id:
@@ -2669,26 +2734,17 @@ def check_and_fire_pump_signal(
         _gate_stats['crash_5m_fail'] += 1
         return False
 
-    # ── Path A: Simulator rules (primary — uses raw feature names directly) ───
+    # ── Path A: Simulator rules — the ONLY signal source ─────────────────────
     # `live` is guaranteed non-None and ob_n >= 3 here (trail_row guard passed)
+    # Fingerprint/combo fallback is permanently disabled: historical data shows
+    # it fires on noise at ~30% win rate while sim rules achieve 70-76% OOS.
+    # Silence (no match) is always better than a bad entry.
     sim_match = check_sim_rules(live, play_id=pump_play_id, sim_filter=sim_filter)
     signal_fires_sim = sim_match is not None
+    signal_fires_fp = False  # fingerprint path permanently off
+    _log_gate_summary()
 
-    # ── Path B: Fingerprint rules ─────────────────────────────────────────────
-    # Only run if no sim rules are loaded (i.e. simulation_results is empty for
-    # this play). When the simulator has qualifying rules, fingerprint fallback
-    # is DISABLED — live performance shows fingerprint combos fire on noise and
-    # generate losing trades at ~21% win rate vs simulator rules at 78-81%.
-    play_has_sim_rules = bool(_sim_rules.get(pump_play_id))
-    if play_has_sim_rules:
-        signal_fires_fp = False
-        _log_gate_summary()
-    else:
-        signal_fires_fp = check_pump_signal(trail_row, market_price)
-        _log_gate_summary()
-
-    # Signal fires if EITHER path matches (Path B only fires when no sim rules)
-    signal_fires = signal_fires_sim or signal_fires_fp
+    signal_fires = signal_fires_sim
 
     # ── Cycle position gate ───────────────────────────────────────────────────
     # Block if price has already climbed too far from cycle start (chasing).
@@ -2730,22 +2786,39 @@ def check_and_fire_pump_signal(
             f"oos_prec={sim_match.get('oos_ev', 0):.0%} "
             f"sig/d={sim_match.get('signals_per_day', 0):.1f}"
         )
-    elif signal_fires_fp and not play_has_sim_rules:
+        # Store sim rule attribution so record_signal_outcome can write rule_id
+        sig_key = int(trail_row.get('buyin_id', 0))
+        conds = sim_match.get('conditions_json') or []
+        rule_id = 'sim_' + '_'.join(
+            f"{c['feature']}{c['direction']}{float(c['threshold']):.4f}"
+            for c in conds[:3]
+        )
+        _signal_context[sig_key] = {
+            'rule_id':      rule_id,
+            'pattern_id':   None,
+            'top_features': {
+                c['feature']: live.get(c['feature'])
+                for c in conds if c.get('feature')
+            },
+            'gates_passed': {},
+            'fire_reason':  'sim_rule',
+            'win_rate':     sim_match.get('win_rate'),
+            'ev_per_trade': sim_match.get('ev_per_trade'),
+            'daily_ev':     sim_match.get('daily_ev'),
+        }
+        if len(_signal_context) > 200:
+            oldest = sorted(_signal_context.keys())[:100]
+            for k in oldest:
+                _signal_context.pop(k, None)
+    elif signal_fires_fp:
         logger.info(f"[fingerprint] play={pump_play_id} Signal via fingerprint (no sim rules loaded)")
 
     # Observation mode: record EVERY cycle (fired or not) so there is a
     # continuous 5-second reference trail in pump_signal_observations.
     if PUMP_OBSERVATION_MODE:
         sig_key = int(trail_row.get('buyin_id', 0))
-        ctx = _signal_context.get(sig_key, {}) if signal_fires_fp else {}
-        if signal_fires_sim and sim_match:
-            ctx['sim_rule'] = {
-                'win_rate':     sim_match.get('win_rate'),
-                'ev_per_trade': sim_match.get('ev_per_trade'),
-                'daily_ev':     sim_match.get('daily_ev'),
-                'conditions':   sim_match.get('conditions_json'),
-            }
-        confidence = ctx.get('pattern_precision') or ctx.get('combo_precision') or 0.0
+        ctx = _signal_context.get(sig_key, {})
+        confidence = float(sim_match.get('win_rate', 0.0)) if sim_match else 0.0
         if signal_fires:
             logger.info(f"OBSERVATION: Signal would fire @ {market_price:.4f}")
         _record_observation(

@@ -1,33 +1,41 @@
 """
-Mega Signal Simulator  v3 — Path-Filtered Precision Engine
+Mega Signal Simulator  v4 — EV-Optimised Precision Engine
 ===========================================================
 Finds entry rules where the price reliably goes UP by at least PUMP_THRESHOLD
-within FWD_MINUTES of the signal WITHOUT triggering the live stop loss first.
+within FWD_MINUTES of the signal WITHOUT triggering the live stop loss first,
+AND where the expected trade PnL (after trailing-stop giveback and costs) is
+positive.
 
-Goal: detect moments where SOL will gain ≥0.2% in the next 7 minutes cleanly
-(i.e. price doesn't drop below the 0.445% stop loss before reaching target).
+Goal: detect moments where SOL will gain ≥0.5% in the next 10 minutes cleanly
+(i.e. price doesn't drop below the 0.20% stop loss before reaching target).
 
 Each loop (~20 min):
   1. Loads DuckDB feature data (30-second buckets, 5-min rolling windows).
-  2. Runs a GA scoring rules on PATH-FILTERED PRECISION:
-       fitness = precision × signals_per_day × consistency_mult
-     where precision = fraction of signals where:
-       - price reaches +PUMP_THRESHOLD (0.2%) within FWD_MINUTES
-       - AND price never drops below -LIVE_STOP_LOSS (0.445%) first
+  2. Runs a GA scoring rules on EV-WEIGHTED FITNESS:
+       ev_per_trade = precision × net_win - (1-precision) × net_loss
+       fitness = ev_per_trade × signals_per_day × consistency_mult
+     where:
+       - precision = path-filtered directional precision (target hit before stop)
+       - net_win   = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT
+       - net_loss  = LIVE_STOP_LOSS + COST_PCT
   3. Hard-rejects rules where:
-       - precision < MIN_DIRECTIONAL_PRECISION (0.55)
-       - OOS precision < MIN_OOS_PRECISION (0.52) on held-out folds
+       - precision < MIN_DIRECTIONAL_PRECISION (0.60)
+       - OOS precision < MIN_OOS_PRECISION (0.55) on held-out folds
+       - ev_per_trade <= 0 (expected value must be positive)
   4. Saves qualifying rules to simulation_results.
      win_rate column = path-filtered precision (aligns with live trading).
 
-Why this matters:
-  v2 measured "did price ever touch +0.1% in 7 min?" — this was too optimistic.
-  Rules firing after tiny dips (pm_price_change_30s < -0.07%) showed 80% precision
-  in simulation but only 35-43% in live trading, because the dip continued long
-  enough to trigger the stop loss (-0.44%) BEFORE the price recovered to +0.1%.
+Why v4 (from v3):
+  v3 optimised for directional precision alone: "does price reach +0.2%?"
+  But the actual trailing stop only captured +0.04% on wins while losses were
+  -0.18%. At 55% precision: EV = 55%×0.04% - 45%×0.18% = -0.06% per trade.
+  Even perfect signal quality can't overcome the asymmetric risk/reward.
 
-  v3 uses path-filtered labels and MAX_SIGNALS=100 to force selectivity.
-  Rules must find moments where price rises cleanly without a prior stop-out.
+  v4 fixes this by:
+    - Raising PUMP_THRESHOLD to 0.5% (bigger moves overcome costs)
+    - Using EV-based fitness (ensures positive expected PnL)
+    - Raising MIN_DIRECTIONAL_PRECISION to 60% (higher bar for profitability)
+    - Giving 10 minutes for larger moves to develop (was 7)
 
 Usage:
     python3 scripts/mega_simulator.py
@@ -69,23 +77,30 @@ logger = logging.getLogger("mega_sim")
 
 # ── constants ─────────────────────────────────────────────────────────────────
 COST_PCT        = 0.001          # 0.1% round-trip cost
-PUMP_THRESHOLD  = 0.002          # 0.2% min forward gain (raised: must exceed stop-loss spread)
-FWD_MINUTES     = 7              # forward window to check for the gain
+PUMP_THRESHOLD  = 0.005          # 0.5% min forward gain (needs to overcome trailing stop + costs)
+FWD_MINUTES     = 10             # forward window to check for the gain (longer for bigger moves)
 BUCKET_SECONDS  = 30             # feature time series granularity
 FEATURE_WINDOW  = 300            # rolling window for features (5 min)
 MIN_SIGNALS     = 5              # minimum signals/day
-MAX_SIGNALS     = 100            # cap signals/day — forces selectivity (was 300, too loose)
+MAX_SIGNALS     = 60             # cap signals/day — forces selectivity
 OOS_FOLDS       = 4              # more folds = harder overfitting bar
-PRE_ENTRY_TOP_GUARD = 0.0015     # skip entry if price already rose >0.15% in last 2 min
+PRE_ENTRY_TOP_GUARD = 0.002      # skip entry if price already rose >0.2% in last 2 min
 
-# ── Live stop-loss threshold (from actual play sell_logic tolerance_rules) ────
+# ── Live stop-loss threshold ──────────────────────────────────────────────────
 # Labels are path-filtered: only count as win if target reached BEFORE stop triggers.
-# Value matches the "decreases" tolerance in all play sell_logic configs (0.4445%).
-LIVE_STOP_LOSS = 0.00445
+# Set to 0.20% and keep live stop-loss at least this loose on active plays.
+LIVE_STOP_LOSS = 0.002
+
+# ── Target-and-lock exit model (for EV calculation) ──────────────────────────
+# After the target is hit, the trailing stop gives back LOCK_TOLERANCE before exiting.
+# net_win  = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT = 0.003 (0.3%)
+# net_loss = LIVE_STOP_LOSS + COST_PCT                  = 0.003 (0.3%)
+# Breakeven precision = 50%; MIN_DIRECTIONAL_PRECISION of 60% gives a margin.
+LOCK_TOLERANCE  = 0.001          # 0.1% trailing tolerance after target hit
 
 # ── precision gates (the core anti-overfitting controls) ──────────────────────
-MIN_DIRECTIONAL_PRECISION = 0.55   # rule must be right ≥55% of the time in-sample
-MIN_OOS_PRECISION         = 0.52   # AND ≥52% on each held-out OOS fold (hard reject below)
+MIN_DIRECTIONAL_PRECISION = 0.60   # rule must be right ≥60% of the time in-sample
+MIN_OOS_PRECISION         = 0.55   # AND ≥55% on each held-out OOS fold (hard reject below)
 MIN_OOS_FOLDS_PASSING     = 3      # at least 3 of 4 OOS folds must beat MIN_OOS_PRECISION
 
 # GA parameters
@@ -163,7 +178,7 @@ def build_feature_matrix() -> Optional[Dict[str, Any]]:
 
     Returns a dict with:
         features   : np.ndarray (N × n_features)
-        labels     : np.ndarray (N,) — 1 if max forward gain ≥ PUMP_THRESHOLD (0.1%)
+        labels     : np.ndarray (N,) — 1 if price reaches +PUMP_THRESHOLD before -LIVE_STOP_LOSS
         max_gains  : np.ndarray (N,) — actual max forward gain
         price_highs: list of np.ndarray — per-row 30s hi prices (for exit sim)
         price_lows : list of np.ndarray — per-row 30s lo prices
@@ -766,14 +781,15 @@ def _compute_fitness(
     fixed_hold:  int   = 2,
 ) -> float:
     """
-    Fitness = directional precision × signals_per_day × consistency_mult.
+    Fitness = daily_ev × consistency_mult.
 
-    directional precision = fraction of fired signals where max forward price
-    reaches PUMP_THRESHOLD above entry within FWD_MINUTES.
+    daily_ev = ev_per_trade × signals_per_day, where ev_per_trade uses a
+    target-and-lock exit model:
+      net_win  = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT  (what we capture on wins)
+      net_loss = LIVE_STOP_LOSS + COST_PCT                   (what we lose on losses)
+      ev_per_trade = precision × net_win - (1 - precision) × net_loss
 
-    No exit simulation — the GA cannot overfit to trailing-stop parameters.
-    Rules that fire on bearish conditions will not achieve ≥55% precision
-    and will be hard-rejected.
+    Rules with negative EV are hard-rejected regardless of precision.
     """
     mask  = ind.apply(features)
     n_sig = int(mask.sum())
@@ -786,14 +802,21 @@ def _compute_fitness(
 
     precision = float(labels[mask].mean()) if n_sig > 0 else 0.0
 
-    # Hard reject: precision below the minimum — no matter how many signals
     if precision < MIN_DIRECTIONAL_PRECISION:
         return -997.0
 
+    # EV gate: compute expected PnL per trade using target-and-lock model
+    net_win  = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT
+    net_loss = LIVE_STOP_LOSS + COST_PCT
+    ev_per_trade = precision * net_win - (1.0 - precision) * net_loss
+
+    if ev_per_trade <= 0:
+        return -996.0
+
     sig_per_d = n_sig / data_hours * 24
+    daily_ev  = ev_per_trade * sig_per_d
 
     # Consistency multiplier: reward rules that fire more uniformly across time.
-    # Split data into 4 equal chunks; count how many chunks the rule fires ≥1 signal.
     chunk = max(1, len(features) // 4)
     active_chunks = sum(
         1 for k in range(4)
@@ -801,7 +824,7 @@ def _compute_fitness(
     )
     consistency_mult = 0.5 + 0.5 * (active_chunks / 4)
 
-    return precision * sig_per_d * consistency_mult
+    return daily_ev * consistency_mult
 
 
 def _update_feature_importance(top_inds: List[Individual]) -> None:
@@ -1262,6 +1285,8 @@ def print_leaderboard(top_results: List[Dict[str, Any]], run_id: str) -> None:
               f"({best['win_rate']*100:.1f}% of signals → price up ≥{PUMP_THRESHOLD*100:.1f}% in {FWD_MINUTES}min)")
         print(f"   OOS prec:   {best.get('oos_ev',0)*100:.1f}%  "
               f"(pass rate {best.get('oos_consistency',0)*100:.0f}%)")
+        print(f"   EV/trade:   {best['ev_per_trade']*100:+.4f}%  "
+              f"(daily: {best['daily_ev']*100:+.4f}%)")
         print(f"   Volume:     {best['signals_per_day']:.1f} signals/day")
     print()
 
@@ -1349,6 +1374,18 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
             )
             continue
 
+        # Compute realistic EV using target-and-lock exit model
+        net_win  = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT
+        net_loss = LIVE_STOP_LOSS + COST_PCT
+        ev_per_trade = precision * net_win - (1.0 - precision) * net_loss
+
+        if ev_per_trade <= 0:
+            logger.info(
+                f"  Rank {rank:2d}: REJECTED EV — ev={ev_per_trade*100:+.4f}% "
+                f"prec={precision:.0%} (need positive EV)"
+            )
+            continue
+
         result = {
             "rank":            rank,
             "rule_str":        str(ind),
@@ -1356,21 +1393,17 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
             "n_features":      len(ind.conditions),
             "n_signals":       n_sig,
             "signals_per_day": sig_per_day,
-            # win_rate = real directional precision — this is what check_sim_rules filters on
             "win_rate":        precision,
             "precision_pct":   precision,
             "recall_pct":      float(recall),
-            # ev_per_trade = forward gain expectation (max gain in FWD_MINUTES when label=1,
-            #                averaged over all signals including non-pumps)
-            "ev_per_trade":    float(max_gains[mask].mean()),
-            "daily_ev":        float(max_gains[mask].mean()) * sig_per_day,
+            "ev_per_trade":    float(ev_per_trade),
+            "daily_ev":        float(ev_per_trade) * sig_per_day,
             "sharpe":          0.0,
             # OOS metrics
             "insample_ev":     avg_is,
             "oos_ev":          avg_oos,
             "oos_gap":         oos_gap,
             "oos_consistency": oos_pass_rate,
-            # No exit config — sell_logic is set per-play independently
             "exit_config":     {},
             "ga_exit":         {},
         }
@@ -1402,14 +1435,18 @@ def run_one_loop(run_number: int) -> Optional[List[Dict[str, Any]]]:
 def run_continuous() -> None:
     """Run indefinitely — start the next loop immediately after each one finishes."""
     logger.info("=" * 70)
-    logger.info("MEGA SIGNAL SIMULATOR STARTED  (v3 path-filtered labels)")
+    logger.info("MEGA SIGNAL SIMULATOR STARTED  (v4 EV-optimised)")
     logger.info(f"  Features:          {N_FEATURES}")
     logger.info(f"  GA population:     {GA_POPULATION}")
     logger.info(f"  GA generations:    {GA_GENERATIONS}")
     logger.info(f"  Min precision:     {MIN_DIRECTIONAL_PRECISION*100:.0f}% in-sample / {MIN_OOS_PRECISION*100:.0f}% OOS")
     logger.info(f"  Pump threshold:    {PUMP_THRESHOLD*100:.2f}%  (target gain before stop)")
     logger.info(f"  Live stop loss:    {LIVE_STOP_LOSS*100:.3f}%  (stop triggers before target = label=0)")
-    logger.info(f"  Max signals/day:   {MAX_SIGNALS}  (was 300 — lowered for selectivity)")
+    logger.info(f"  Lock tolerance:    {LOCK_TOLERANCE*100:.3f}%  (trailing after target hit)")
+    net_win  = PUMP_THRESHOLD - LOCK_TOLERANCE - COST_PCT
+    net_loss = LIVE_STOP_LOSS + COST_PCT
+    logger.info(f"  Net win/loss:      +{net_win*100:.3f}% / -{net_loss*100:.3f}%  (breakeven={net_loss/(net_win+net_loss)*100:.0f}%)")
+    logger.info(f"  Max signals/day:   {MAX_SIGNALS}")
     logger.info(f"  OOS folds:         {OOS_FOLDS}")
     logger.info("=" * 70)
 

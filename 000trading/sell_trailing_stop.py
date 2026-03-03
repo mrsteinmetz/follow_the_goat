@@ -62,6 +62,15 @@ DEFAULT_MONITOR_INTERVAL_SECONDS = float(
     os.getenv('TRAILING_STOP_INTERVAL_SECONDS', '0.5')
 )
 
+# Fallback sell-logic tolerances — used only when a position has no play_id, or
+# when the DB sell_logic is missing/corrupt.  All active plays must have
+# sell_logic configured; these are a last-resort safety net, not a default policy.
+# Override via env vars so nothing needs a code deploy to tune.
+FALLBACK_STOP_LOSS_PCT = float(os.getenv('FALLBACK_STOP_LOSS_PCT', '0.002'))      # 0.20%
+FALLBACK_TRAILING_PRE_TARGET_PCT = float(os.getenv('FALLBACK_TRAILING_PRE_TARGET_PCT', '0.003'))   # 0.30%
+FALLBACK_TRAILING_POST_TARGET_PCT = float(os.getenv('FALLBACK_TRAILING_POST_TARGET_PCT', '0.001')) # 0.10%
+FALLBACK_TARGET_THRESHOLD_PCT = float(os.getenv('FALLBACK_TARGET_THRESHOLD_PCT', '0.005'))         # 0.50% — pump target
+
 # Setup logging
 LOGS_DIR = Path(__file__).parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
@@ -289,15 +298,21 @@ class TrailingStopSeller:
             return self._get_default_tolerance_rules()
     
     def _get_default_tolerance_rules(self) -> Dict[str, Any]:
-        """Return default tolerance rules."""
+        """Return fallback tolerance rules from env-var-controlled constants.
+
+        These are only used when a play has no sell_logic in the DB — every
+        active play should have sell_logic configured.  The values here are
+        driven by module-level constants so they can be changed via env vars
+        without a code deploy.
+        """
         return {
             "tolerance_rules": {
                 "decreases": [
-                    {"range": [-999999, 0], "tolerance": 0.0001}  # Any loss, tight 0.01% tolerance
+                    {"range": [-999999, 0], "tolerance": FALLBACK_STOP_LOSS_PCT}
                 ],
                 "increases": [
-                    {"range": [0.0, 0.005], "tolerance": 0.003},  # 0% to 0.5% gain
-                    {"range": [0.005, 1.0], "tolerance": 0.001}   # 0.5% to 100% gain
+                    {"range": [0.0, FALLBACK_TARGET_THRESHOLD_PCT], "tolerance": FALLBACK_TRAILING_PRE_TARGET_PCT},
+                    {"range": [FALLBACK_TARGET_THRESHOLD_PCT, 1.0], "tolerance": FALLBACK_TRAILING_POST_TARGET_PCT},
                 ]
             }
         }
@@ -471,7 +486,7 @@ class TrailingStopSeller:
             'highest_price': round(current_price, 8),
             'gain_from_entry_decimal': round(gain_decimal, 6),
             'drop_from_high_decimal': 0.0,
-            'tolerance_decimal': 0.003,
+            'tolerance_decimal': FALLBACK_TRAILING_PRE_TARGET_PCT,
             'should_sell': False,
             'backfilled': True
         }
@@ -533,14 +548,14 @@ class TrailingStopSeller:
         # This applies when price drops below entry
         decreases_rules = tolerance_rules.get('decreases', [])
         stop_loss_rule = self._select_rule(drop_from_entry_decimal, decreases_rules) if decreases_rules else None
-        stop_loss_tolerance = float(stop_loss_rule.get('tolerance')) if stop_loss_rule and stop_loss_rule.get('tolerance') is not None else 0.003
+        stop_loss_tolerance = float(stop_loss_rule.get('tolerance')) if stop_loss_rule and stop_loss_rule.get('tolerance') is not None else FALLBACK_STOP_LOSS_PCT
         
         # Get trailing stop tolerance (from 'increases' rules)
         # CRITICAL: Use HIGHEST GAIN achieved, not current gain, to select the right tier
         # This ensures we use the tightest tolerance we ever qualified for
         increases_rules = tolerance_rules.get('increases', [])
         trailing_rule = self._select_rule(highest_gain_decimal, increases_rules) if increases_rules else None
-        trailing_tolerance = float(trailing_rule.get('tolerance')) if trailing_rule and trailing_rule.get('tolerance') is not None else 0.003
+        trailing_tolerance = float(trailing_rule.get('tolerance')) if trailing_rule and trailing_rule.get('tolerance') is not None else FALLBACK_TRAILING_PRE_TARGET_PCT
         
         # Step 4: TOLERANCE LOCKING - once a tighter tolerance is reached, it never loosens
         with self.position_tracking_lock:
